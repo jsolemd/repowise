@@ -345,6 +345,22 @@ async def test_a_bare_identifier_puts_its_definition_first(tmp_path):
     assert response["results"][1]["evidence"]["exact_name"] is False
 
 
+async def test_the_served_score_agrees_with_the_served_order(tmp_path):
+    """The router reorders; a consumer that re-sorts by score must not undo it."""
+    coordinator = _coordinator(
+        tmp_path,
+        source_dense=[
+            _hit("neighbour", "src/near.py", 0.90),
+            _hit("merged_with", "src/target.py", 0.40),
+        ],
+    )
+    response = await coordinator.search("merged_with", limit=5)
+    scores = [item["relevance_score"] for item in response["results"]]
+    assert _files(response) == ["src/target.py", "src/near.py"]
+    assert scores == sorted(scores, reverse=True)
+    assert scores[0] > scores[1]
+
+
 async def test_the_router_matches_the_last_dotted_segment(tmp_path):
     """``Class.method`` and a stored ``Class::method`` are one name."""
     coordinator = _coordinator(

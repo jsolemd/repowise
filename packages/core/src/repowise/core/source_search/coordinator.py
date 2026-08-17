@@ -726,8 +726,10 @@ class SourceSearchCoordinator:
         meta["timing_ms"] = round(latency_ms, 2)
         meta["source_search"] = self._source_meta()
 
+        results = [item.to_result() for item in window]
+        _clamp_monotone(results)
         response: dict[str, Any] = {
-            "results": [item.to_result() for item in window],
+            "results": results,
             "mode": mode,
             "confidence": confidence,
             "_meta": meta,
@@ -917,6 +919,39 @@ def _shape_phrase(item: _Item) -> str:
     if item.source == SOURCE_FILE_WINDOW:
         return "file window"
     return "chunk"
+
+
+#: Gap held between two clamped scores, at the precision they are served with.
+#: Equal scores would let a consumer's own sort reorder a list this one had a
+#: reason to order.
+_SCORE_EPSILON = 1e-6
+
+
+def _clamp_monotone(results: list[dict[str, Any]]) -> None:
+    """Hold ``relevance_score`` non-increasing along the order actually served.
+
+    Three stages reorder the fused ranking after the scores are computed: the
+    test demotion, the exact-identifier router and the owner policy. All three
+    are deliberate, and all three leave a result whose fused score is higher
+    than the one above it — so a consumer that re-sorts by score sees a
+    different list from the one it was handed, and the reorder is silently
+    undone by whoever trusts the number over the order.
+
+    The order is what carries the ranking decisions, so it wins and the score
+    is clamped to agree with it. The unclamped fusion is still recoverable: the
+    per-result ``evidence`` carries the raw cosine and lexical rank it was built
+    from, and the query log records the true fused score.
+
+    Same resolution ``FullTextSearch`` reached for the same problem across two
+    incomparable BM25 expressions.
+    """
+    ceiling: float | None = None
+    for result in results:
+        score = float(result["relevance_score"])
+        if ceiling is not None and score >= ceiling:
+            score = ceiling
+        result["relevance_score"] = round(score, 6)
+        ceiling = round(score - _SCORE_EPSILON, 6)
 
 
 def _candidates(deduped: Sequence[_Item], limit: int) -> list[dict[str, str]]:
