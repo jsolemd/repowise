@@ -972,6 +972,67 @@ async def test_the_envelope_carries_every_contract_key(tmp_path):
     assert response["candidates"] == [{"path": "src/a.py"}]
 
 
+async def test_a_wiki_result_carries_the_page_id_it_was_retrieved_under(tmp_path):
+    """A page that names no file has nothing else to identify it by.
+
+    ``module_page``/``scc_page``/``repo_overview`` targets are curated ids, not
+    paths, so those results serve ``file: ""`` by design. Without the page id a
+    consumer holds a title it cannot resolve to anything.
+    """
+    coordinator = _coordinator(
+        tmp_path,
+        wiki_dense=[
+            _PageHit(
+                "module_page:src/pkg",
+                "src/pkg",
+                0.90,
+                page_type="module_page",
+                title="Module: src/pkg",
+            ),
+        ],
+    )
+    response = await coordinator.search("how the package fits together", limit=5)
+    result = response["results"][0]
+    assert result["page_id"] == "module_page:src/pkg"
+    assert result["file"] == ""
+
+
+async def test_a_symbol_spotlight_keeps_its_qualified_id_intact(tmp_path):
+    """Carried verbatim, never rebuilt.
+
+    ``f"{kind}:{file}"`` would yield ``symbol_spotlight:src/a.py`` here — a
+    different, perfectly well-formed id belonging to another page — because
+    this response serves the *file* a spotlight names, not its ``::``-qualified
+    target.
+    """
+    coordinator = _coordinator(
+        tmp_path,
+        wiki_dense=[
+            _PageHit(
+                "symbol_spotlight:src/a.py::Foo",
+                "src/a.py::Foo",
+                0.90,
+                page_type="symbol_spotlight",
+                title="Symbol: pkg.mod.Foo",
+            ),
+        ],
+    )
+    response = await coordinator.search("how the thing works", limit=5)
+    result = response["results"][0]
+    assert result["page_id"] == "symbol_spotlight:src/a.py::Foo"
+    assert result["file"] == "src/a.py"
+    assert f"{result['kind']}:{result['file']}" != result["page_id"]
+
+
+async def test_a_source_result_has_no_page_id_key_at_all(tmp_path):
+    """Absent, not null: a chunk is identified by its file and its lines."""
+    coordinator = _coordinator(tmp_path, source_dense=[_hit("alpha", "src/a.py", 0.6)])
+    response = await coordinator.search("how alpha works", limit=5)
+    result = response["results"][0]
+    assert "page_id" not in result
+    assert (result["file"], result["start_line"], result["end_line"]) == ("src/a.py", 1, 9)
+
+
 async def test_the_host_meta_survives_and_the_generation_is_added(tmp_path):
     from repowise.core.source_search.manifest import (
         EmbedderIdentity,

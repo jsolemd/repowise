@@ -282,6 +282,9 @@ class _Item:
     #: the name ``wants_tests``, and a response that said ``exact_name: true``
     #: for it would be claiming something it cannot show.
     suffix_match: bool = False
+    #: A wiki page's own primary key, carried verbatim from the retriever.
+    #: Empty for a source chunk, which is identified by its file and lines.
+    page_id: str = ""
     fused_score: float = 0.0
 
     @property
@@ -314,6 +317,19 @@ class _Item:
         if self.start_line is not None and self.end_line is not None:
             out["start_line"] = self.start_line
             out["end_line"] = self.end_line
+        if self.lane == LANE_WIKI and self.page_id:
+            # The only identity a page type outside ``_FILE_BACKED_PAGE_TYPES``
+            # has. A module page, an SCC page or a repo overview serves
+            # ``file: ""`` by design — it names no file to open — and without
+            # this a consumer holds a title it cannot resolve to anything.
+            #
+            # Carried verbatim, never rebuilt. A page id *looks* like
+            # ``f"{page_type}:{target_path}"`` and rebuilding it from the two
+            # fields beside it is wrong in a way that does not announce itself:
+            # this response serves the file a symbol spotlight names, not its
+            # ``a/b.py::Foo`` target, so the rebuild yields a different,
+            # perfectly well-formed id belonging to another page.
+            out["page_id"] = self.page_id
         return out
 
 
@@ -722,6 +738,7 @@ class SourceSearchCoordinator:
             kind=page_type,
             snippet=getattr(hit, "snippet", "") or "",
             source=SOURCE_WIKI_PAGE,
+            page_id=str(getattr(hit, "page_id", "") or ""),
             is_test=_is_test_related(file_path),
         )
 
