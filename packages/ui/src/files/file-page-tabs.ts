@@ -101,6 +101,22 @@ export function fileTabsFor(data: FileDetailResponse): FileTabDef[] {
   });
 }
 
+/**
+ * Narrow a `?tab=` string to a tab this page actually renders.
+ *
+ * Here rather than beside the `FilePage` shell it seeds, because the shell is
+ * a client component and this runs on the server: a function exported from a
+ * `"use client"` module is a client reference, and calling one during a server
+ * render throws "Attempted to call asFilePageTab() from the server". The
+ * bundler only draws that boundary in a production build, so a dev server
+ * renders the route fine and `next build` output does not.
+ */
+export function asFilePageTab(value: string | undefined): FilePageTab | undefined {
+  return value && (FILE_PAGE_TABS as readonly string[]).includes(value)
+    ? (value as FilePageTab)
+    : undefined;
+}
+
 /** The tab a `?tab=` value resolves to, given what this file actually has.
  *  A deep link to Decisions on an ungoverned file lands on Overview rather
  *  than on a tab that is not in the row. */
