@@ -6,6 +6,7 @@ import { Command } from "cmdk";
 import useSWR from "swr";
 import { Search, LayoutDashboard, Settings, BookOpen, FileCode, Layers, Link2, GitMerge, MessageSquare } from "lucide-react";
 import { useSearch } from "@/lib/hooks/use-search";
+import { paletteFilter, preRankedKeywords } from "./palette-filter";
 import { truncatePath } from "@repowise-dev/ui/lib/format";
 import { commandPaletteShortcutIsClaimed } from "@repowise-dev/ui/lib/command-palette-scope";
 import { fileEntityPath } from "@repowise-dev/ui/shared/entity";
@@ -102,6 +103,9 @@ export function CommandPalette({ repos, workspace }: CommandPaletteProps) {
       open={open}
       onOpenChange={setOpen}
       label="Command palette"
+      // Search hits and file matches arrive already ranked; everything else is
+      // a static entry cmdk should keep matching by name. See `paletteFilter`.
+      filter={paletteFilter}
       className="fixed inset-0 z-[calc(var(--z-modal)+1)] flex items-start justify-center pt-[10vh] sm:pt-[20vh] px-4"
     >
       <div
@@ -253,10 +257,9 @@ export function CommandPalette({ repos, workspace }: CommandPaletteProps) {
                 const dir = path.slice(0, path.length - name.length);
                 return (
                   <Command.Item
-                    // Embed the query so cmdk's own filter keeps our pre-ranked
-                    // matches visible instead of re-filtering them out.
                     key={path}
-                    value={`file ${path} ${query}`}
+                    value={`file ${path}`}
+                    keywords={preRankedKeywords}
                     onSelect={() =>
                       navigate(fileEntityPath(`/repos/${activeRepo.id}`, path))
                     }
@@ -282,6 +285,7 @@ export function CommandPalette({ repos, workspace }: CommandPaletteProps) {
                 <Command.Item
                   key={r.page_id}
                   value={`page-${r.title}`}
+                  keywords={preRankedKeywords}
                   onSelect={() => {
                     // Prefer the active repo for context; fall back to the
                     // first one. File pages open their canonical entity page,
