@@ -63,11 +63,16 @@ __all__ = [
     "AGREEMENT_LEXICAL_DEPTH",
     "CONFIDENT_DENSE_COSINE",
     "DENSE_WEIGHT",
+    "ERROR_ALL_LEGS_FAILED",
     "EXACT_VIA_EMBEDDED",
     "EXACT_VIA_QUERY",
     "LANE_SOURCE",
     "LANE_WIKI",
     "LEG_FETCH",
+    "LEG_SOURCE_DENSE",
+    "LEG_SOURCE_LEXICAL",
+    "LEG_WIKI_DENSE",
+    "LEG_WIKI_LEXICAL",
     "LEXICAL_WEIGHT",
     "MIN_SUFFIX_SEGMENTS",
     "MIN_TAIL_CHARS",
@@ -75,6 +80,7 @@ __all__ = [
     "OWNER_SCORE_BAND",
     "RRF_K",
     "SOURCE_WIKI_PAGE",
+    "LegFailure",
     "SourceSearchCoordinator",
     "WikiFullTextSearch",
     "WikiVectorStore",
@@ -144,6 +150,57 @@ OWNER_SCORE_BAND = 0.10
 CONFIDENT = "confident"
 CAUTION = "caution"
 NO_MATCH = "no_match"
+
+#: The four retrieval legs, named once so a failure report, a reason string and
+#: a test all spell them the same way.
+LEG_SOURCE_DENSE = "source dense"
+LEG_WIKI_DENSE = "wiki dense"
+LEG_SOURCE_LEXICAL = "source lexical"
+LEG_WIKI_LEXICAL = "wiki lexical"
+
+#: Not a lane of its own — it hydrates chunks the lexical leg found alone — so
+#: losing it degrades the evidence without losing the corpus.
+LEG_CHUNK_METADATA = "source chunk metadata"
+
+RETRIEVAL_LEGS = frozenset({LEG_SOURCE_DENSE, LEG_WIKI_DENSE, LEG_SOURCE_LEXICAL, LEG_WIKI_LEXICAL})
+
+#: Errors that mean "slow", not "broken". A store that timed out is expected to
+#: answer the next query, so it keeps the swallow-and-carry-on idiom the stock
+#: retrievers use. Everything else — a schema mismatch, an IO error, an
+#: AttributeError from a bad call — is a condition that will still be true on
+#: the next query and every query after it, and must reach the caller.
+#:
+#: ``CancelledError`` is not here and must not be: it derives from
+#: ``BaseException``, so ``except Exception`` never sees it and a cancelled
+#: request stays cancelled.
+_SOFT_LEG_ERRORS: tuple[type[Exception], ...] = (TimeoutError,)
+
+#: How much of an exception's message travels in the envelope. Enough to
+#: recognise the fault, bounded because it reaches an agent's context window.
+_FAILURE_DETAIL_CHARS = 160
+
+#: Error code for a search that reached no corpus at all.
+ERROR_ALL_LEGS_FAILED = "source_search_unavailable"
+
+
+@dataclass(frozen=True, slots=True)
+class LegFailure:
+    """One retrieval leg that did not answer, and whether it can be expected to.
+
+    *hard* is the whole point. A soft failure is a slow store and the response
+    is simply thinner; a hard failure means the response is describing a corpus
+    it could not read, and saying nothing about that is how a broken index
+    spends twenty-one minutes looking like an empty one.
+    """
+
+    leg: str
+    error: str
+    detail: str
+    hard: bool
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"leg": self.leg, "error": self.error, "detail": self.detail}
+
 
 #: A query that is one bare identifier and nothing else. Bounded length so a
 #: long dotted path of a sentence's worth of words cannot present as a symbol.
@@ -538,7 +595,13 @@ class SourceSearchCoordinator:
         every other tool emits.
         """
         started = time.perf_counter()
-        items, lexical_files = await self._retrieve(query)
+        items, lexical_files, failures = await self._retrieve(query)
+        hard = [failure for failure in failures if failure.hard]
+        if hard and _all_legs_lost(hard, self._attempted_legs()):
+            # Nothing was read. An empty result set here would be a claim about
+            # the repository, and the only true statement available is that the
+            # search did not happen.
+            return self._error_envelope(query, mode, limit, hard, started, base_meta)
         # Read before the deduplication, which keeps one item per file and so
         # can only ever leave one lane standing for it. Corroboration is a
         # question about what was *retrieved*, not about what survived ranking.
@@ -556,6 +619,12 @@ class SourceSearchCoordinator:
             deduped = [owner, *(item for item in deduped if item is not owner)]
             window = deduped[:limit]
         confidence = self._classify(window, lexical_files, owner, source_files)
+        if hard:
+            # Pinned, not capped. Capping alone would leave ``no_match``
+            # untouched, and ``no_match`` is the one answer a half-read corpus
+            # is least entitled to give: it asserts an absence, which is
+            # exactly what a silently dead lane manufactures.
+            confidence = CAUTION
         # Last, and after the owner: see :meth:`_upgrade_line_evidence`.
         self._upgrade_line_evidence(window, ranked)
         latency_ms = (time.perf_counter() - started) * 1000.0
@@ -571,25 +640,43 @@ class SourceSearchCoordinator:
             confidence=confidence,
             latency_ms=latency_ms,
             base_meta=base_meta,
+            hard_failures=hard,
         )
         self._record(query, mode, limit, latency_ms, confidence, window, owner)
         return response
 
     # -- retrieval --------------------------------------------------------
 
-    async def _retrieve(self, query: str) -> tuple[dict[str, _Item], list[str]]:
-        """Both legs, fused. Returns the candidates and the lexical top files.
+    def _attempted_legs(self) -> set[str]:
+        """The retrieval legs this deployment actually has a store for.
+
+        A missing wiki index is a configuration, not a fault, so it must never
+        count towards "everything failed".
+        """
+        legs = {LEG_SOURCE_DENSE, LEG_SOURCE_LEXICAL}
+        if self._wiki_vectors is not None:
+            legs.add(LEG_WIKI_DENSE)
+        if self._wiki_fts is not None:
+            legs.add(LEG_WIKI_LEXICAL)
+        return legs
+
+    async def _retrieve(self, query: str) -> tuple[dict[str, _Item], list[str], list[LegFailure]]:
+        """Both legs, fused. Returns the candidates, the lexical top files, and
+        every leg that did not answer.
 
         The lexical top files come back separately because the confidence rule
         asks a question the ranked items cannot answer on their own: whether a
         file the dense leg likes was *also* found lexically, near the top,
         independently of whether that file survived ranking.
         """
-        dense_source, dense_wiki = await self._dense_legs(query)
-        lexical_source, lexical_wiki = await self._lexical_legs(query)
+        dense_source, dense_wiki, dense_failures = await self._dense_legs(query)
+        lexical_source, lexical_wiki, lexical_failures = await self._lexical_legs(query)
+        failures = [*dense_failures, *lexical_failures]
 
         items: dict[str, _Item] = {}
-        records = await self._chunk_records(dense_source, lexical_source)
+        records, records_failure = await self._chunk_records(dense_source, lexical_source)
+        if records_failure is not None:
+            failures.append(records_failure)
 
         merged_dense = _merge_dense(dense_source, dense_wiki)
         for rank, (lane, hit, key) in enumerate(merged_dense, start=1):
@@ -616,50 +703,69 @@ class SourceSearchCoordinator:
 
         for item in items.values():
             item.fused_score = _rrf(item.dense_rank, item.lexical_rank)
-        return items, lexical_files
+        return items, lexical_files, failures
 
-    async def _dense_legs(self, query: str) -> tuple[list[Any], list[Any]]:
-        """Top-*LEG_FETCH* from each vector store, on one embedding of *query*."""
+    async def _dense_legs(self, query: str) -> tuple[list[Any], list[Any], list[LegFailure]]:
+        """Top-*LEG_FETCH* from each vector store, on one embedding of *query*.
+
+        An embedder that raises takes both dense legs with it, so the failure
+        is recorded against each leg that had a store rather than against the
+        embedder alone — that is what "the dense lane is gone" means to
+        everything downstream, and it keeps the total-failure test honest.
+        """
         try:
             vectors = await self._embedder.embed([query])
-        except Exception:
-            log.debug("source-search dense leg: embedding failed", exc_info=True)
-            return [], []
+        except Exception as exc:
+            failure = _classify_failure("query embedding", exc)
+            legs = [LEG_SOURCE_DENSE] + ([LEG_WIKI_DENSE] if self._wiki_vectors else [])
+            return (
+                [],
+                [],
+                [
+                    LegFailure(
+                        leg=leg,
+                        error=failure.error,
+                        detail=f"query embedding failed: {failure.detail}",
+                        hard=failure.hard,
+                    )
+                    for leg in legs
+                ],
+            )
         if not vectors:
-            return [], []
+            return [], [], []
         vector = [float(v) for v in vectors[0]]
-        source, wiki = await asyncio.gather(
-            _safe(self._source_vectors.search_by_vector(vector, limit=LEG_FETCH), "source dense"),
-            _safe(
+        (source, source_failure), (wiki, wiki_failure) = await asyncio.gather(
+            _run_leg(
+                self._source_vectors.search_by_vector(vector, limit=LEG_FETCH), LEG_SOURCE_DENSE
+            ),
+            _run_leg(
                 self._wiki_vectors.search_by_vector(vector, limit=LEG_FETCH)
                 if self._wiki_vectors is not None
                 else None,
-                "wiki dense",
+                LEG_WIKI_DENSE,
             ),
         )
-        return source, wiki
+        return source, wiki, [f for f in (source_failure, wiki_failure) if f is not None]
 
-    async def _lexical_legs(self, query: str) -> tuple[list[Any], list[Any]]:
+    async def _lexical_legs(self, query: str) -> tuple[list[Any], list[Any], list[LegFailure]]:
         """Top-*LEG_FETCH* from each BM25 index.
 
         The source index tokenizes *query* with the same function that built
         its token stream — that is :meth:`SourceFTSIndex.query`'s contract, and
         the reason a query is handed to it as free text rather than pre-split.
         """
-        try:
-            source = self._source_fts.query(query, limit=LEG_FETCH)
-        except Exception:
-            log.debug("source-search lexical leg: source FTS failed", exc_info=True)
-            source = []
-        wiki = await _safe(
-            self._wiki_fts.search(query, limit=LEG_FETCH) if self._wiki_fts is not None else None,
-            "wiki lexical",
+        source, source_failure = _run_sync_leg(
+            lambda: self._source_fts.query(query, limit=LEG_FETCH), LEG_SOURCE_LEXICAL
         )
-        return source, wiki
+        wiki, wiki_failure = await _run_leg(
+            self._wiki_fts.search(query, limit=LEG_FETCH) if self._wiki_fts is not None else None,
+            LEG_WIKI_LEXICAL,
+        )
+        return source, wiki, [f for f in (source_failure, wiki_failure) if f is not None]
 
     async def _chunk_records(
         self, dense_source: Sequence[Any], lexical_source: Sequence[Any]
-    ) -> dict[str, Any]:
+    ) -> tuple[dict[str, Any], LegFailure | None]:
         """Metadata for every source chunk the lexical leg found alone.
 
         A BM25 hit is an id and a file path. The dense leg already carries the
@@ -668,12 +774,11 @@ class SourceSearchCoordinator:
         known = {hit.chunk_id for hit in dense_source}
         missing = [hit.chunk_id for hit in lexical_source if hit.chunk_id not in known]
         if not missing:
-            return {}
+            return {}, None
         try:
-            return await self._source_vectors.fetch_by_chunk_ids(missing)
-        except Exception:
-            log.debug("source-search: chunk metadata lookup failed", exc_info=True)
-            return {}
+            return await self._source_vectors.fetch_by_chunk_ids(missing), None
+        except Exception as exc:
+            return {}, _classify_failure(LEG_CHUNK_METADATA, exc)
 
     def _item_for(
         self,
@@ -963,10 +1068,18 @@ class SourceSearchCoordinator:
         confidence: str,
         latency_ms: float,
         base_meta: dict[str, Any] | None,
+        hard_failures: Sequence[LegFailure] = (),
     ) -> dict[str, Any]:
         meta = dict(base_meta or {})
         meta["timing_ms"] = round(latency_ms, 2)
-        meta["source_search"] = self._source_meta()
+        source_meta = self._source_meta()
+        if hard_failures:
+            # Only when something is wrong: a healthy response is byte-identical
+            # to the one this served before degradation reporting existed.
+            source_meta["degraded"] = True
+            source_meta["degraded_reason"] = _degraded_reason(hard_failures)
+            source_meta["failed_legs"] = [failure.to_dict() for failure in hard_failures]
+        meta["source_search"] = source_meta
 
         results = [item.to_result() for item in window]
         _clamp_monotone(results)
@@ -992,6 +1105,60 @@ class SourceSearchCoordinator:
                 "answer here, and the results below (if any) are nearest neighbours, not "
                 "evidence."
             )
+        return response
+
+    def _error_envelope(
+        self,
+        query: str,
+        mode: str,
+        limit: int,
+        hard_failures: Sequence[LegFailure],
+        started: float,
+        base_meta: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """The response for a search that reached no corpus at all.
+
+        Deliberately not an empty result set. Zero results is a statement about
+        the repository — "nothing here matches" — and this response cannot make
+        it, because it read nothing. It carries ``status: "error"`` so no
+        consumer can mistake it for an answer, and ``confidence: "caution"``
+        rather than ``no_match`` for the same reason: ``no_match`` is the
+        assertion that would repeat the incident this exists to prevent.
+        """
+        reason = _degraded_reason(hard_failures)
+        latency_ms = (time.perf_counter() - started) * 1000.0
+        log.error(
+            "source-search served no corpus: every retrieval leg failed (%s)",
+            reason,
+            extra={"query": query, "failed_legs": [f.leg for f in hard_failures]},
+        )
+        meta = dict(base_meta or {})
+        meta["timing_ms"] = round(latency_ms, 2)
+        source_meta = self._source_meta()
+        source_meta["degraded"] = True
+        source_meta["degraded_reason"] = reason
+        source_meta["failed_legs"] = [failure.to_dict() for failure in hard_failures]
+        meta["source_search"] = source_meta
+
+        response: dict[str, Any] = {
+            "results": [],
+            "candidates": [],
+            "selected_owner": None,
+            "confidence": CAUTION,
+            "mode": mode,
+            "status": "error",
+            "error": {
+                "code": ERROR_ALL_LEGS_FAILED,
+                "message": (
+                    "Every retrieval leg failed, so this search read no corpus. "
+                    "The result set is empty because nothing was searched, NOT "
+                    f"because nothing matched. Cause: {reason}"
+                ),
+                "failed_legs": [failure.to_dict() for failure in hard_failures],
+            },
+            "_meta": meta,
+        }
+        self._record(query, mode, limit, latency_ms, CAUTION, [], None)
         return response
 
     def _source_meta(self) -> dict[str, Any]:
@@ -1058,19 +1225,60 @@ class SourceSearchCoordinator:
 # ---------------------------------------------------------------------------
 
 
-async def _safe(awaitable: Any, label: str) -> list[Any]:
-    """Await *awaitable*, returning ``[]`` on anything it raises.
+def _classify_failure(leg: str, exc: Exception) -> LegFailure:
+    """Record *exc* against *leg*, and log it at the volume it deserves.
 
-    One leg failing is a degraded answer; two legs failing because one of them
-    raised is no answer at all.
+    A hard failure logs at ERROR with the leg on the record, because it is an
+    operational event someone has to see; a timeout logs at WARNING and is
+    otherwise carried on from.
+    """
+    detail = (str(exc).strip() or type(exc).__name__)[:_FAILURE_DETAIL_CHARS]
+    hard = not isinstance(exc, _SOFT_LEG_ERRORS)
+    extra = {"leg": leg, "error_type": type(exc).__name__, "detail": detail}
+    if hard:
+        log.error("source-search leg %s failed: %s", leg, detail, exc_info=True, extra=extra)
+    else:
+        log.warning("source-search leg %s timed out", leg, extra=extra)
+    return LegFailure(leg=leg, error=type(exc).__name__, detail=detail, hard=hard)
+
+
+async def _run_leg(awaitable: Any, leg: str) -> tuple[list[Any], LegFailure | None]:
+    """Await *awaitable*, returning its rows and how it failed if it did.
+
+    ``None`` for the awaitable means the leg has no store behind it — absent,
+    not broken, and never reported as a failure.
     """
     if awaitable is None:
-        return []
+        return [], None
     try:
-        return list(await awaitable)
-    except Exception:
-        log.debug("source-search leg %s failed", label, exc_info=True)
-        return []
+        return list(await awaitable), None
+    except Exception as exc:
+        return [], _classify_failure(leg, exc)
+
+
+def _run_sync_leg(call: Any, leg: str) -> tuple[list[Any], LegFailure | None]:
+    """:func:`_run_leg` for the synchronous FTS index."""
+    try:
+        return list(call()), None
+    except Exception as exc:
+        return [], _classify_failure(leg, exc)
+
+
+def _degraded_reason(failures: Sequence[LegFailure]) -> str:
+    """One line naming every leg that hard-failed and what it raised."""
+    return "; ".join(f"{f.leg} failed ({f.error}: {f.detail})" for f in failures)
+
+
+def _all_legs_lost(hard: Sequence[LegFailure], attempted: set[str]) -> bool:
+    """Whether every retrieval leg that had a store behind it hard-failed.
+
+    Legs with no store are not counted: a deployment with no wiki index is not
+    a broken one. When this is true the response has read nothing at all, and
+    reporting an empty result set would be inventing an absence.
+    """
+    if not attempted:
+        return False
+    return attempted <= {f.leg for f in hard if f.leg in RETRIEVAL_LEGS}
 
 
 def _merge_dense(

@@ -9,6 +9,7 @@ property of LanceDB or FTS5. The stores' own round-trips are covered by
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import pytest
@@ -1074,6 +1075,243 @@ async def test_a_repository_with_no_manifest_still_answers(tmp_path):
     response = await coordinator.search("how alpha works", limit=5)
     assert response["_meta"]["source_search"]["generation"] is None
     assert response["results"]
+
+
+# ---------------------------------------------------------------------------
+# A store that is broken, not slow
+# ---------------------------------------------------------------------------
+
+
+class _SchemaError(Exception):
+    """Stands in for ``LanceError(Schema)``: raised on every read, forever."""
+
+
+class _BrokenSourceVectors:
+    def __init__(self, exc: Exception | None = None) -> None:
+        self._exc = exc or _SchemaError("Schema error: no such column: vector")
+
+    async def search_by_vector(self, vector: Any, limit: int = 20) -> list:
+        raise self._exc
+
+    async def fetch_by_chunk_ids(self, chunk_ids: Any) -> dict:
+        raise self._exc
+
+
+class _BrokenSourceFTS:
+    def __init__(self, exc: Exception | None = None) -> None:
+        self._exc = exc or _SchemaError("no such table: source_fts")
+
+    def query(self, match: str, limit: int = 20) -> list:
+        raise self._exc
+
+
+class _SlowSourceVectors:
+    async def search_by_vector(self, vector: Any, limit: int = 20) -> list:
+        raise TimeoutError("store did not answer in time")
+
+    async def fetch_by_chunk_ids(self, chunk_ids: Any) -> dict:
+        return {}
+
+
+async def test_a_broken_source_store_is_reported_not_swallowed(tmp_path, caplog):
+    """The incident: a schema error read as an honest empty source lane.
+
+    The wiki lane still answers, so the response is real — but it must say the
+    source corpus was not read, and it must not sound sure of itself.
+    """
+    coordinator = _coordinator(
+        tmp_path,
+        wiki_dense=[_PageHit("file_page:src/a.py", "src/a.py", 0.95)],
+    )
+    coordinator._source_vectors = _BrokenSourceVectors()
+    coordinator._source_fts = _BrokenSourceFTS()
+
+    with caplog.at_level(logging.ERROR, logger="repowise.core.source_search.coordinator"):
+        response = await coordinator.search("how the thing works", limit=5)
+
+    source_meta = response["_meta"]["source_search"]
+    assert source_meta["degraded"] is True
+    assert "source dense" in source_meta["degraded_reason"]
+    assert "source lexical" in source_meta["degraded_reason"]
+    assert "_SchemaError" in source_meta["degraded_reason"]
+    assert {f["leg"] for f in source_meta["failed_legs"]} == {"source dense", "source lexical"}
+
+    # The healthy lane still answers.
+    assert _files(response) == ["src/a.py"]
+    assert "status" not in response
+
+    # A 0.95 cosine would otherwise be confidently correct.
+    assert response["confidence"] == "caution"
+
+    # One structured record per failed leg.
+    records = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert {getattr(r, "leg", None) for r in records} >= {"source dense", "source lexical"}
+
+
+async def test_a_slow_store_is_still_just_swallowed(tmp_path):
+    """A timeout is a thinner answer, not a broken one — no degraded flag.
+
+    The source lexical leg still names the file, so the confidence rules see a
+    corroborated page and would say "confident": that is what proves the
+    timeout did not pin anything, only that it contributed nothing.
+    """
+    coordinator = _coordinator(
+        tmp_path,
+        wiki_dense=[_PageHit("file_page:src/a.py", "src/a.py", 0.95)],
+        source_lexical=[_FTSHit("src/a.py::thing", "src/a.py")],
+    )
+    coordinator._source_vectors = _SlowSourceVectors()
+
+    response = await coordinator.search("how the thing works", limit=5)
+    source_meta = response["_meta"]["source_search"]
+    assert "degraded" not in source_meta
+    assert "failed_legs" not in source_meta
+    assert response["confidence"] == "confident"
+    assert _files(response) == ["src/a.py"]
+
+
+async def test_a_hard_failure_never_lets_the_answer_claim_an_absence(tmp_path):
+    """``no_match`` asserts the corpus has nothing. A half-read corpus cannot."""
+    coordinator = _coordinator(tmp_path, wiki_dense=[])
+    coordinator._source_vectors = _BrokenSourceVectors()
+    coordinator._source_fts = _BrokenSourceFTS()
+
+    response = await coordinator.search("croissant lamination fold schedule", limit=5)
+    assert response["results"] == []
+    assert response["confidence"] == "caution"
+    assert response["_meta"]["source_search"]["degraded"] is True
+
+
+async def test_every_leg_failing_returns_an_error_not_an_empty_answer(tmp_path, caplog):
+    """Zero results would be a claim about the repository. Nothing was read."""
+
+    class _BrokenWikiVectors:
+        async def search_by_vector(self, vector: Any, limit: int = 10) -> list:
+            raise OSError("lancedb: input/output error")
+
+    class _BrokenWikiFTS:
+        async def search(self, query: str, limit: int = 10) -> list:
+            raise _SchemaError("no such table: page_fts")
+
+    coordinator = _coordinator(tmp_path)
+    coordinator._source_vectors = _BrokenSourceVectors()
+    coordinator._source_fts = _BrokenSourceFTS()
+    coordinator._wiki_vectors = _BrokenWikiVectors()
+    coordinator._wiki_fts = _BrokenWikiFTS()
+
+    with caplog.at_level(logging.ERROR, logger="repowise.core.source_search.coordinator"):
+        response = await coordinator.search("how the thing works", limit=5)
+
+    assert response["status"] == "error"
+    assert response["error"]["code"] == "source_search_unavailable"
+    assert {f["leg"] for f in response["error"]["failed_legs"]} == {
+        "source dense",
+        "source lexical",
+        "wiki dense",
+        "wiki lexical",
+    }
+    assert "NOT" in response["error"]["message"]  # not because nothing matched
+    assert response["results"] == []
+    assert response["selected_owner"] is None
+    assert response["confidence"] == "caution"  # never no_match: nothing was read
+    assert response["_meta"]["source_search"]["degraded"] is True
+    assert any("every retrieval leg failed" in r.getMessage() for r in caplog.records)
+
+
+async def test_a_missing_wiki_index_is_not_a_failure(tmp_path):
+    """No store is a configuration; it must not count towards "all legs lost"."""
+    coordinator = SourceSearchCoordinator(
+        repo_path=tmp_path,
+        embedder=_Embedder(),
+        source_vectors=_SourceVectors([_hit("alpha", "src/a.py", 0.6)]),  # type: ignore[arg-type]
+        source_fts=_SourceFTS([]),  # type: ignore[arg-type]
+        wiki_vectors=None,
+        wiki_fts=None,
+        query_log=QueryLog(tmp_path / "log.jsonl"),
+    )
+    response = await coordinator.search("how alpha works", limit=5)
+    assert "status" not in response
+    assert "degraded" not in response["_meta"]["source_search"]
+    assert _files(response) == ["src/a.py"]
+
+
+async def test_a_broken_source_store_with_no_wiki_at_all_is_an_error(tmp_path):
+    """Both of this deployment's legs are the source ones, and both are down."""
+    coordinator = SourceSearchCoordinator(
+        repo_path=tmp_path,
+        embedder=_Embedder(),
+        source_vectors=_BrokenSourceVectors(),  # type: ignore[arg-type]
+        source_fts=_BrokenSourceFTS(),  # type: ignore[arg-type]
+        wiki_vectors=None,
+        wiki_fts=None,
+        query_log=QueryLog(tmp_path / "log.jsonl"),
+    )
+    response = await coordinator.search("how alpha works", limit=5)
+    assert response["status"] == "error"
+    assert response["error"]["code"] == "source_search_unavailable"
+
+
+async def test_a_dead_embedder_takes_both_dense_legs_down_by_name(tmp_path):
+    """The legs are what failed, whatever the cause — and the cause is kept."""
+
+    class _DeadEmbedder:
+        dimensions = 4
+
+        async def embed(self, texts: list[str]) -> list[list[float]]:
+            raise ConnectionError("ollama: connection refused")
+
+    coordinator = _coordinator(tmp_path, embedder=_DeadEmbedder())
+    coordinator._wiki_fts = _WikiFTS([_PageHit("file_page:src/a.py", "src/a.py", 4.0)])
+
+    response = await coordinator.search("how the thing works", limit=5)
+    source_meta = response["_meta"]["source_search"]
+    assert {f["leg"] for f in source_meta["failed_legs"]} == {"source dense", "wiki dense"}
+    assert "query embedding failed" in source_meta["degraded_reason"]
+    assert "connection refused" in source_meta["degraded_reason"]
+    # The lexical lane still answered, so this is a degraded answer, not an error.
+    assert "status" not in response
+    assert _files(response) == ["src/a.py"]
+    assert response["confidence"] == "caution"
+
+
+async def test_losing_only_the_chunk_metadata_lookup_degrades_without_erroring(tmp_path):
+    """It hydrates evidence; it is not a lane, so the corpus is still read."""
+    lexical_only = _hit("solo", "src/solo.py", 0.0)
+
+    class _HalfBroken(_SourceVectors):
+        async def fetch_by_chunk_ids(self, chunk_ids: Any) -> dict:
+            raise _SchemaError("Schema error: no such column: snippet")
+
+    coordinator = _coordinator(
+        tmp_path,
+        source_lexical=[_FTSHit(lexical_only.chunk_id, lexical_only.file_path)],
+    )
+    coordinator._source_vectors = _HalfBroken([])
+    response = await coordinator.search("solo behaviour", limit=5)
+
+    source_meta = response["_meta"]["source_search"]
+    assert source_meta["degraded"] is True
+    assert [f["leg"] for f in source_meta["failed_legs"]] == ["source chunk metadata"]
+    assert "status" not in response
+    assert response["confidence"] == "caution"
+
+
+async def test_a_healthy_search_says_nothing_about_degradation(tmp_path):
+    """The healthy envelope is byte-identical to the pre-degradation one."""
+    hit = _hit("alpha", "src/a.py", 0.6)
+    coordinator = _coordinator(
+        tmp_path,
+        source_dense=[hit],
+        source_lexical=[_FTSHit(hit.chunk_id, hit.file_path)],
+    )
+    response = await coordinator.search("how alpha works", limit=5)
+    assert set(response["_meta"]["source_search"]) == {
+        "generation",
+        "indexed_commit",
+    }
+    assert "status" not in response
+    assert "error" not in response
+    assert response["confidence"] == "confident"
 
 
 # ---------------------------------------------------------------------------
