@@ -14,7 +14,7 @@ score means the same thing on both legs.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any
 
 from repowise.core.providers.embedding.base import Embedder
@@ -25,6 +25,7 @@ __all__ = [
     "SOURCE_CHUNKS_TABLE",
     "STORED_SNIPPET_CHARS",
     "SourceChunkHit",
+    "SourceChunkRecord",
     "SourceChunkVectorStore",
     "StoredVector",
 ]
@@ -49,6 +50,29 @@ class StoredVector:
 
     content_hash: str
     vector: list[float]
+
+
+@dataclass(frozen=True, slots=True)
+class SourceChunkRecord:
+    """A stored chunk's metadata, with no retrieval score attached.
+
+    What a row says about itself, separated from what a particular query
+    thinks of it. The lexical leg needs exactly this: FTS5 ranks ``chunk_id``s
+    and knows nothing about kinds, line bounds or bodies, so a hit it found
+    alone would otherwise reach a caller without the evidence a hit is
+    supposed to carry.
+    """
+
+    chunk_id: str
+    file_path: str
+    name: str
+    kind: str
+    start_line: int
+    end_line: int
+    is_test: bool
+    source: str
+    content_hash: str
+    snippet: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -259,6 +283,22 @@ class SourceChunkVectorStore:
             return 0
         return int(await self._table.count_rows())
 
+    @staticmethod
+    def _record(row: dict[str, Any]) -> SourceChunkRecord:
+        """One stored row as a record, defaulting every field it may be missing."""
+        return SourceChunkRecord(
+            chunk_id=str(row["chunk_id"]),
+            file_path=str(row.get("file_path") or ""),
+            name=str(row.get("name") or ""),
+            kind=str(row.get("kind") or ""),
+            start_line=int(row.get("start_line") or 0),
+            end_line=int(row.get("end_line") or 0),
+            is_test=bool(row.get("is_test")),
+            source=str(row.get("source") or ""),
+            content_hash=str(row.get("content_hash") or ""),
+            snippet=str(row.get("snippet") or ""),
+        )
+
     async def search_by_vector(
         self, vector: Sequence[float], limit: int = 20
     ) -> list[SourceChunkHit]:
@@ -272,20 +312,33 @@ class SourceChunkVectorStore:
         rows = await builder.limit(limit).to_list()
         return [
             SourceChunkHit(
-                chunk_id=str(row["chunk_id"]),
-                file_path=str(row.get("file_path") or ""),
-                name=str(row.get("name") or ""),
-                kind=str(row.get("kind") or ""),
-                start_line=int(row.get("start_line") or 0),
-                end_line=int(row.get("end_line") or 0),
-                is_test=bool(row.get("is_test")),
-                source=str(row.get("source") or ""),
-                content_hash=str(row.get("content_hash") or ""),
-                snippet=str(row.get("snippet") or ""),
+                **asdict(self._record(row)),
                 score=1.0 - float(row.get("_distance", 1.0)),
             )
             for row in rows
         ]
+
+    async def fetch_by_chunk_ids(self, chunk_ids: Sequence[str]) -> dict[str, SourceChunkRecord]:
+        """The stored rows for *chunk_ids*, keyed by id; missing ids are absent.
+
+        A filtered scan rather than a vector query, because the caller already
+        knows which chunks it wants: the lexical leg ranks by BM25 and gets
+        back ids, and a hit only that leg found still has to arrive at a reader
+        with its kind, its line bounds and its body.
+        """
+        if not chunk_ids:
+            return {}
+        await self._ensure_connected()
+        if self._table is None:
+            return {}
+        out: dict[str, SourceChunkRecord] = {}
+        for start in range(0, len(chunk_ids), _IN_CHUNK):
+            batch = chunk_ids[start : start + _IN_CHUNK]
+            rows = await self._table.query().where(_quoted_in("chunk_id", batch)).to_list()
+            for row in rows:
+                record = self._record(row)
+                out[record.chunk_id] = record
+        return out
 
     async def close(self) -> None:
         self._table = None
