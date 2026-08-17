@@ -69,6 +69,7 @@ __all__ = [
     "LANE_WIKI",
     "LEG_FETCH",
     "LEXICAL_WEIGHT",
+    "MIN_SUFFIX_SEGMENTS",
     "MIN_TAIL_CHARS",
     "NO_MATCH_DENSE_COSINE",
     "OWNER_SCORE_BAND",
@@ -172,6 +173,22 @@ _EMBEDDED_IDENTIFIER_RE = re.compile(
 #: symbol, and matching every ``py`` in the corpus is noise, not evidence.
 MIN_TAIL_CHARS = 3
 
+#: Fewest segments an identifier must have before it may match a longer name by
+#: its tail. A one-segment identifier would match half the corpus — ``tests``
+#: ends ``wants_tests``, ``run_tests``, ``skip_tests`` — which is a category,
+#: not an answer. Two segments is where the tail stops being a common word and
+#: starts being a name.
+MIN_SUFFIX_SEGMENTS = 2
+
+#: Splits a camel hump, taken before anything is lowercased: run the rule after
+#: folding case and there are no humps left to find. Same order, and the same
+#: reason, as :func:`repowise.core.source_search.fts.tokenize`.
+_CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+
+#: Everything that is not part of a segment — underscores, dots, colons, the
+#: spaces the camel rule inserts.
+_SEGMENT_BREAK = re.compile(r"[^A-Za-z0-9]+")
+
 #: How an item came by its exact-name evidence. The whole query *being* the
 #: identifier is a stronger claim than the query merely carrying it, and the two
 #: reorder by different rules, so the response says which one it was.
@@ -260,6 +277,11 @@ class _Item:
     #: "" when no identifier matched this item's name, else which router
     #: matched it — see :data:`EXACT_VIA_QUERY` / :data:`EXACT_VIA_EMBEDDED`.
     exact_via: str = ""
+    #: Whether an embedded identifier matched the *tail* of this item's name.
+    #: Deliberately not folded into ``exact_via``: ``query_wants_tests`` is not
+    #: the name ``wants_tests``, and a response that said ``exact_name: true``
+    #: for it would be claiming something it cannot show.
+    suffix_match: bool = False
     fused_score: float = 0.0
 
     @property
@@ -339,6 +361,39 @@ def _norm_identifier(text: str) -> str:
     writes.
     """
     return text.strip().lower().replace("::", ".")
+
+
+def _segments(name: str) -> tuple[str, ...]:
+    """*name* split into its lowercase parts, however it spells the boundaries.
+
+    ``query_wants_tests``, ``queryWantsTests`` and ``query.wants.tests`` are one
+    name written three ways, and all three segment to
+    ``("query", "wants", "tests")``. Camel humps are cut first, because folding
+    case first would leave none to cut.
+    """
+    spaced = _CAMEL_BOUNDARY.sub(" ", name.strip())
+    return tuple(part.lower() for part in _SEGMENT_BREAK.split(spaced) if part)
+
+
+def _suffix_matches(identifier: Sequence[str], name: Sequence[str]) -> bool:
+    """Whether *name* ends with *identifier* on a segment boundary.
+
+    This is what lets ``wants_tests`` find ``query_wants_tests`` — the thing a
+    person means when they name a helper by the part of it that carries the
+    meaning. Comparing whole segments rather than characters is what makes it a
+    boundary match and not a substring one: ``ants_tests`` shares nine trailing
+    characters with ``query_wants_tests`` and none of its segments, so it is
+    correctly no match at all.
+
+    Strictly longer, because an equal-length match is the same name, and that
+    is the stronger claim the full-name tier above this one already makes.
+    """
+    width = len(identifier)
+    return (
+        width >= MIN_SUFFIX_SEGMENTS
+        and len(name) > width
+        and tuple(name[-width:]) == tuple(identifier)
+    )
 
 
 def _name_matchers(identifier: str) -> set[str]:
@@ -485,6 +540,8 @@ class SourceSearchCoordinator:
             deduped = [owner, *(item for item in deduped if item is not owner)]
             window = deduped[:limit]
         confidence = self._classify(window, lexical_files, owner, source_files)
+        # Last, and after the owner: see :meth:`_upgrade_line_evidence`.
+        self._upgrade_line_evidence(window, ranked)
         latency_ms = (time.perf_counter() - started) * 1000.0
 
         response = self._envelope(
@@ -714,6 +771,9 @@ class SourceSearchCoordinator:
     def _route_embedded(identifiers: Sequence[str], ranked: list[_Item]) -> list[_Item]:
         """Definitions of an identifier the query *mentions*, ahead of the rest.
 
+        Three tiers: the name *is* the identifier, the name *ends with* it on a
+        segment boundary, then everything else.
+
         Deliberately weaker than :meth:`_route_exact`, in one specific way: it
         has no "mentions the literal somewhere" tier. When the whole query is
         one identifier, containment is the second-best evidence there is,
@@ -721,26 +781,31 @@ class SourceSearchCoordinator:
         that happens to name a symbol, the sentence is carrying most of the
         intent and containment is nearly free — half the files in a subsystem
         mention any given helper — so promoting on it would let a weak signal
-        overrule the fusion. A name match is not free, and that is the one this
-        keeps.
+        overrule the fusion. A name match is not free, and neither is a
+        boundary-aligned tail; those are the two this keeps.
 
         The partition is stable, so the fused order, the test demotion and
-        everything else that ranked these items survives inside both tiers.
+        everything else that ranked these items survives inside every tier.
         """
         wanted: set[str] = set()
         for identifier in identifiers:
             wanted |= _name_matchers(identifier)
+        tails = [_segments(identifier) for identifier in identifiers]
 
-        matched: list[_Item] = []
-        rest: list[_Item] = []
+        tiers: list[list[_Item]] = [[], [], []]
         for item in ranked:
             name = _norm_identifier(item.match_name)
             if name and name in wanted:
                 item.exact_via = EXACT_VIA_EMBEDDED
-                matched.append(item)
-            else:
-                rest.append(item)
-        return matched + rest
+                tiers[0].append(item)
+                continue
+            segments = _segments(item.match_name)
+            if segments and any(_suffix_matches(tail, segments) for tail in tails):
+                item.suffix_match = True
+                tiers[1].append(item)
+                continue
+            tiers[2].append(item)
+        return [item for tier in tiers for item in tier]
 
     @staticmethod
     def _dedupe_by_file(ranked: Sequence[_Item]) -> list[_Item]:
@@ -759,6 +824,37 @@ class SourceSearchCoordinator:
                 seen.add(item.file)
             out.append(item)
         return out
+
+    @staticmethod
+    def _upgrade_line_evidence(window: list[_Item], ranked: Sequence[_Item]) -> None:
+        """Re-seat each served file on an item that can point at its lines.
+
+        A wiki page and the chunk it describes are one file to open, and when
+        the page ranks first the file arrives with prose about itself and no
+        line bounds. A chunk further down for the same file takes the page's
+        slot without taking its position: nothing is re-ranked, only re-cited.
+
+        Runs *after* the owner is chosen, and that ordering is the whole
+        subtlety. The owner policy prefers a chunk to a page, which is a
+        judgement about which file to open — and it can only make it while it
+        can still see that a file is page-backed. Upgrading first erases that,
+        every file starts looking chunk-backed, and the preference silently
+        stops firing (measured: one behavioural case lost rank 1 to exactly
+        this). Choose the owner on what retrieval found, then improve the
+        citation.
+
+        Never at the cost of name evidence: an exact-name page keeps its slot
+        against a chunk that matched nothing, because that trades the stronger
+        claim for the better citation.
+        """
+        best_with_lines: dict[str, _Item] = {}
+        for item in ranked:
+            if item.file and item.start_line is not None:
+                best_with_lines.setdefault(item.file, item)
+        for position, item in enumerate(window):
+            candidate = best_with_lines.get(item.file) if item.file else None
+            if candidate is not None and _shows_lines_better(item, candidate):
+                window[position] = candidate
 
     # -- owner and confidence ---------------------------------------------
 
@@ -790,6 +886,8 @@ class SourceSearchCoordinator:
             reason = "exact name match"
         elif winner.exact_via == EXACT_VIA_EMBEDDED:
             reason = "embedded identifier match"
+        elif winner.suffix_match:
+            reason = "embedded identifier suffix match"
         elif winner.dense_rank is not None and winner.lexical_rank is not None:
             reason = "dense+lexical agreement"
         elif winner.dense_rank is not None:
@@ -996,20 +1094,37 @@ def _fused_sort_key(item: _Item) -> tuple[float, int, int, str]:
 
 
 def _owner_sort_key(item: _Item, position: int, wants_tests: bool) -> tuple[int, ...]:
-    """Owner preference: openable, exact name, product code, shape, then rank.
+    """Owner preference: openable, name evidence, product code, shape, rank.
 
     Openability leads because the owner is a file to open. A page named by a
     group key can be a perfectly good *result* and can never be the answer to
     "what do I open", so it is passed over however well it ranked.
+
+    Name evidence is graded rather than boolean, so the owner agrees with the
+    order the routers produced: the name itself, then a boundary-aligned tail,
+    then no name evidence at all.
     """
     return (
         0 if item.file else 1,
-        0 if item.exact_name else 1,
+        0 if item.exact_name else (1 if item.suffix_match else 2),
         0 if wants_tests else (1 if item.is_test else 0),
         _SOURCE_RANK.get(item.source, 3),
         0 if item.kind in _DEFINITION_KINDS else 1,
         position,
     )
+
+
+def _shows_lines_better(kept: _Item, candidate: _Item) -> bool:
+    """Whether *candidate* should take *kept*'s slot for their shared file.
+
+    Only to gain line bounds, and only when nothing else is given up: an
+    incumbent carrying name evidence keeps its slot against a candidate
+    carrying none, because "this is the symbol you named" outranks "here are
+    some lines from the same file".
+    """
+    if kept.start_line is not None or candidate.start_line is None:
+        return False
+    return not kept.exact_name or candidate.exact_name
 
 
 def _uncorroborated_page(source_files: set[str], owner: _Item | None) -> bool:

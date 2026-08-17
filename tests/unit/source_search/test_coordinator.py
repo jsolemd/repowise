@@ -493,6 +493,192 @@ async def test_an_embedded_identifier_matches_a_wiki_symbol_page(tmp_path):
     assert response["results"][0]["evidence"]["exact_name"] is True
 
 
+@pytest.mark.parametrize(
+    ("identifier", "name"),
+    [
+        # The motivating shape: named by the part that carries the meaning.
+        ("wants_tests", "query_wants_tests"),
+        ("wants_tests", "_query_wants_tests"),
+        # Three spellings of one boundary, on either side of the comparison.
+        ("wants_tests", "queryWantsTests"),
+        ("wantsTests", "query_wants_tests"),
+        ("wants.tests", "query_wants_tests"),
+        # More than one segment of prefix is still a suffix.
+        ("wants_tests", "the_query_wants_tests"),
+    ],
+)
+def test_a_boundary_aligned_tail_matches(identifier, name):
+    from repowise.core.source_search.coordinator import _segments, _suffix_matches
+
+    assert _suffix_matches(_segments(identifier), _segments(name))
+
+
+@pytest.mark.parametrize(
+    ("identifier", "name", "why"),
+    [
+        # The boundary requirement: nine shared characters, no shared segment.
+        ("ants_tests", "query_wants_tests", "not aligned to a boundary"),
+        # One segment would match half the corpus.
+        ("tests", "query_wants_tests", "single segment"),
+        ("py", "refresh_py", "single segment"),
+        # Equal length is the same name — the full-name tier's claim, not this one.
+        ("wants_tests", "wants_tests", "same name, stronger tier owns it"),
+        # A tail is a tail, not a head and not a middle.
+        ("query_wants", "query_wants_tests", "prefix, not suffix"),
+        ("wants_tests", "wants_tests_helper", "suffix of the wrong end"),
+        # Segments must be contiguous.
+        ("query_tests", "query_wants_tests", "segments not adjacent"),
+    ],
+)
+def test_a_tail_that_is_not_a_boundary_suffix_does_not_match(identifier, name, why):
+    from repowise.core.source_search.coordinator import _segments, _suffix_matches
+
+    assert not _suffix_matches(_segments(identifier), _segments(name)), why
+
+
+async def test_a_suffix_match_ranks_below_a_full_name_match(tmp_path):
+    coordinator = _coordinator(
+        tmp_path,
+        source_dense=[
+            _hit("unrelated", "src/other.py", 0.90),
+            _hit("query_wants_tests", "src/suffix.py", 0.50),
+            _hit("wants_tests", "src/exact.py", 0.10),
+        ],
+    )
+    response = await coordinator.search("fix the wants_tests classifier", limit=5)
+    assert _files(response) == ["src/exact.py", "src/suffix.py", "src/other.py"]
+
+
+async def test_a_suffix_match_does_not_claim_an_exact_name(tmp_path):
+    """``query_wants_tests`` is not the name ``wants_tests``. Say what is true."""
+    coordinator = _coordinator(
+        tmp_path,
+        source_dense=[
+            _hit("unrelated", "src/other.py", 0.90),
+            _hit("query_wants_tests", "src/suffix.py", 0.10),
+        ],
+    )
+    response = await coordinator.search("fix the wants_tests classifier", limit=5)
+    assert _files(response) == ["src/suffix.py", "src/other.py"]
+    assert response["results"][0]["evidence"]["exact_name"] is False
+    assert response["selected_owner"] == {
+        "file": "src/suffix.py",
+        "reason": "embedded identifier suffix match",
+    }
+
+
+async def test_a_suffix_match_alone_does_not_make_the_answer_confident(tmp_path):
+    """Confidence still comes from the cosine and the lexical agreement."""
+    coordinator = _coordinator(
+        tmp_path,
+        source_dense=[_hit("query_wants_tests", "src/suffix.py", 0.35)],
+    )
+    response = await coordinator.search("fix the wants_tests classifier", limit=5)
+    assert response["selected_owner"]["reason"] == "embedded identifier suffix match"
+    assert response["confidence"] == "caution"
+
+
+async def test_a_single_segment_identifier_promotes_nothing_by_tail(tmp_path):
+    coordinator = _coordinator(
+        tmp_path,
+        source_dense=[
+            _hit("unrelated", "src/other.py", 0.90),
+            _hit("run_tests", "src/runner.py", 0.10),
+        ],
+    )
+    # ``parseTests`` is one identifier of two segments; its tail ``tests`` alone
+    # must not drag in every name that happens to end with it.
+    response = await coordinator.search("fix the parseTests helper", limit=5)
+    assert _files(response) == ["src/other.py", "src/runner.py"]
+
+
+# ---------------------------------------------------------------------------
+# Dedupe keeps the item that can show its lines
+# ---------------------------------------------------------------------------
+
+
+async def test_a_chunk_takes_a_pages_slot_without_taking_its_rank(tmp_path):
+    """One file to open; serve the item that can point at the lines."""
+    page = _PageHit("file_page:src/a.py", "src/a.py", 0.90)
+    coordinator = _coordinator(
+        tmp_path,
+        wiki_dense=[page],
+        wiki_lexical=[page],
+        source_dense=[
+            _hit("thing", "src/a.py", 0.50),
+            _hit("other", "src/b.py", 0.80),
+        ],
+    )
+    response = await coordinator.search("how the thing works", limit=5)
+    # src/a.py keeps the rank its page earned, and arrives with line bounds.
+    assert _files(response) == ["src/a.py", "src/b.py"]
+    top = response["results"][0]
+    assert top["evidence"]["lane"] == "source"
+    assert (top["start_line"], top["end_line"]) == (1, 9)
+
+
+async def test_the_owner_is_chosen_before_the_citation_is_upgraded(tmp_path):
+    """Upgrading first would hide that a file is page-backed, and the owner
+    policy's preference for a chunk over a page would silently stop firing."""
+    coordinator = _coordinator(
+        tmp_path,
+        # The page ranks first, but only a page names src/page.py.
+        wiki_dense=[_PageHit("file_page:src/page.py", "src/page.py", 0.90)],
+        source_dense=[
+            _hit("real", "src/chunk.py", 0.80, kind="function"),
+            _hit("aside", "src/page.py", 0.10),
+        ],
+    )
+    response = await coordinator.search("how the thing works", limit=5)
+    # The chunk-backed file wins the owner, because at the moment that was
+    # decided src/page.py was still visibly a page.
+    assert response["selected_owner"]["file"] == "src/chunk.py"
+    assert "preferred over a closely-scored wiki page" in response["selected_owner"]["reason"]
+    # And src/page.py is still re-cited onto the lines it does have.
+    served = {item["file"]: item for item in response["results"]}
+    assert served["src/page.py"]["evidence"]["lane"] == "source"
+    assert "start_line" in served["src/page.py"]
+
+
+async def test_the_page_keeps_its_slot_when_no_chunk_names_the_file(tmp_path):
+    """Nothing to upgrade to: the page is the only thing that names src/a.py."""
+    page = _PageHit("file_page:src/a.py", "src/a.py", 0.90)
+    coordinator = _coordinator(
+        tmp_path,
+        # Both legs, so the owner policy's shape rules cannot promote the
+        # unrelated chunk over it and the dedupe is what the test is watching.
+        wiki_dense=[page],
+        wiki_lexical=[page],
+        source_dense=[_hit("other", "src/b.py", 0.50)],
+    )
+    response = await coordinator.search("how the thing works", limit=5)
+    assert _files(response) == ["src/a.py", "src/b.py"]
+    assert response["results"][0]["evidence"]["lane"] == "wiki"
+    assert "start_line" not in response["results"][0]
+
+
+async def test_lines_are_never_bought_with_name_evidence(tmp_path):
+    """An exact-name page outranks a chunk that matched nothing in its file."""
+    coordinator = _coordinator(
+        tmp_path,
+        wiki_dense=[
+            _PageHit(
+                "symbol_spotlight:src/a.py::pkg.merged_with",
+                "src/a.py::pkg.merged_with",
+                0.90,
+                page_type="symbol_spotlight",
+                title="Symbol: pkg.merged_with",
+            )
+        ],
+        source_dense=[_hit("unrelated_helper", "src/a.py", 0.50)],
+    )
+    response = await coordinator.search("merged_with", limit=5)
+    top = response["results"][0]
+    assert top["file"] == "src/a.py"
+    assert top["evidence"]["lane"] == "wiki"
+    assert top["evidence"]["exact_name"] is True
+
+
 async def test_a_short_trailing_segment_is_not_a_name(tmp_path):
     """``refresh.py`` must not make every symbol called ``py`` an exact match."""
     coordinator = _coordinator(
