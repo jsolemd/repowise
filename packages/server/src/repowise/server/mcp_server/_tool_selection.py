@@ -19,11 +19,16 @@ deltas), so "expose the default plus one more" stays a one-line config edit.
 Filtering happens once, after registration, by removing the deselected tools
 from the FastMCP tool manager. There is no per-call cost and tool schemas are
 untouched.
+
+On top of that selection sits one hard exclusion, ``REPOWISE_TOOLS_NO_GENERATIVE``
+(see :data:`GENERATIVE_TOOL_NAMES`), which no profile, delta or allowlist can
+override.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import Iterable, Sequence
 from pathlib import Path
 from typing import Any
@@ -49,6 +54,54 @@ LEAN_TOOLS = frozenset(
     {"get_answer", "get_context", "get_symbol", "search_codebase", "get_risk", "get_why"}
 )
 _LEAN_WORKSPACE_EXTRAS = frozenset({"list_repos"})
+
+# The only two tools that call an LLM: get_answer synthesizes a cited answer,
+# generate_refactoring_code writes a patch. Every other tool reads the local
+# index. Named here rather than derived from a per-tool flag because the point
+# of the list is to be auditable — an operator reads two names, not seventeen
+# tool modules.
+GENERATIVE_TOOL_NAMES = frozenset({"get_answer", "generate_refactoring_code"})
+
+# Hard exclusion switch for the tools above. Deployments exist that must be
+# able to *demonstrate* the server never generates — no API key to leak, no
+# model output in the audit trail, an agent host that supplies its own model —
+# and for them "it is not in the config" is not an answer, because a config is
+# editable by whoever the deployment is being defended against. With this set,
+# the two tools are removed from the served surface at bind time and cannot be
+# selected back in by any profile, delta or explicit allowlist.
+NO_GENERATIVE_ENV = "REPOWISE_TOOLS_NO_GENERATIVE"
+
+
+def no_generative_tools_enabled() -> bool:
+    """Whether the generative tools are hard-excluded from the surface.
+
+    Off by default; on for ``1``/``true``/``yes``/``on`` (case-insensitive).
+    Read at the call site, not at import, so a test or an embedding process can
+    set it after this module is loaded.
+    """
+    return os.environ.get(NO_GENERATIVE_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _strip_generative(enabled: set[str], *, tokens: Sequence[str] | None) -> set[str]:
+    """Remove the generative tools from a resolved selection when excluded.
+
+    Runs after every profile/delta/allowlist path, which is what makes the
+    exclusion unconditional: there is no ordering of config tokens that lands
+    downstream of it. A selection that explicitly named one of the tools gets a
+    warning per name, because that is a real conflict between two operator
+    intents and silently winning it would look like the config was ignored.
+    """
+    if not no_generative_tools_enabled():
+        return enabled
+    named = {t.lstrip("+-").strip() for t in (tokens or ())}
+    for name in sorted(enabled & GENERATIVE_TOOL_NAMES & named):
+        _log.warning(
+            "Suppressing generative MCP tool %r requested by the tool selection: %s is set",
+            name,
+            NO_GENERATIVE_ENV,
+        )
+    return enabled - GENERATIVE_TOOL_NAMES
+
 
 # Snapshot of every tool registered on the server, captured once after the
 # registry applies them and before any selection trims the live set. Selection
@@ -78,14 +131,38 @@ def snapshot_full_surface(mcp: Any) -> None:
     Called once by ``ensure_full_surface``, right after the registry attaches
     every tool. Safe to call again; the first non-empty snapshot wins so a later
     call (after the set has been trimmed) cannot shrink the source of truth.
+
+    Also the enforcement point for :data:`NO_GENERATIVE_ENV`: the excluded tools
+    are dropped from the live manager *and* from the snapshot before either is
+    read. Selection only ever rebuilds from the snapshot, so a tool removed here
+    has no path back onto the surface — and a server that never runs selection
+    at all (any consumer that reads ``mcp_server.mcp`` directly) still never
+    advertises it.
     """
     global _full_surface
-    if _full_surface is not None:
-        return
     manager = getattr(mcp, "_tool_manager", None)
     registered = getattr(manager, "_tools", None)
     if registered:
+        _purge_generative(registered)
+    if _full_surface is not None:
+        return
+    if registered:
         _full_surface = dict(registered)
+
+
+def _purge_generative(registered: dict[str, Any]) -> None:
+    """Drop the generative tools from a live FastMCP tool mapping, in place."""
+    if not no_generative_tools_enabled():
+        return
+    removed = sorted(GENERATIVE_TOOL_NAMES & registered.keys())
+    for name in removed:
+        del registered[name]
+    if removed:
+        _log.info(
+            "Generative MCP tools excluded from the served surface (%s): %s",
+            NO_GENERATIVE_ENV,
+            ", ".join(removed),
+        )
 
 
 def _normalize_override(override: str | Sequence[str] | None) -> list[str] | None:
@@ -122,8 +199,22 @@ def resolve_enabled_tools(
     - otherwise: an explicit allowlist (only the named tools).
 
     Workspace-only tools are never enabled outside a workspace, even when named
-    explicitly, because they cannot do useful work there.
+    explicitly, because they cannot do useful work there. The same is true of
+    the generative tools while :data:`NO_GENERATIVE_ENV` is set — every branch
+    below lands in :func:`_strip_generative`, so no override outranks it.
     """
+    tokens = _normalize_override(override)
+    enabled = _resolve_selection(entries, is_workspace=is_workspace, tokens=tokens)
+    return _strip_generative(enabled, tokens=tokens)
+
+
+def _resolve_selection(
+    entries: Iterable[ToolEntry],
+    *,
+    is_workspace: bool,
+    tokens: list[str] | None,
+) -> set[str]:
+    """Resolve the profile/delta/allowlist selection, before hard exclusions."""
     catalog = {e.name: e for e in entries}
 
     def usable(entry: ToolEntry) -> bool:
@@ -131,7 +222,6 @@ def resolve_enabled_tools(
 
     default_surface = {name for name, e in catalog.items() if e.default and usable(e)}
 
-    tokens = _normalize_override(override)
     if tokens is None:
         return default_surface
 
@@ -262,6 +352,12 @@ def describe_tool_surface(repo_path: str | None) -> dict[str, Any]:
     UI needs to render and edit the selection: ``default`` (in the curated
     default set for this mode), ``requires_workspace``, and ``enabled`` (in the
     currently-resolved surface).
+
+    Hard-excluded tools are omitted from the rows rather than listed as
+    disabled: the UI's row is a toggle, and a toggle that cannot change the
+    surface is worse than an absent one. They stay in the catalog the two
+    resolves see, so a config that names one is still reported as a suppressed
+    request rather than as an unknown tool.
     """
     _ensure_registered()
 
@@ -285,6 +381,7 @@ def describe_tool_surface(repo_path: str | None) -> dict[str, Any]:
             "enabled": e.name in enabled,
         }
         for e in sorted(entries, key=lambda e: e.name)
+        if not (no_generative_tools_enabled() and e.name in GENERATIVE_TOOL_NAMES)
     ]
     return {
         "is_workspace": is_workspace,
