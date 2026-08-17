@@ -1,308 +1,379 @@
-﻿"""MCP Tool 6: get_dependency_path — dependency graph path finding."""
+"""MCP Tool: get_dependency_path — file dependencies or pure call chains."""
 
 from __future__ import annotations
 
 import json
+from itertools import islice
 from typing import Any
 
 from sqlalchemy import select
 
 from repowise.core.ingestion.models import TEMPORAL_EDGE_TYPES
 from repowise.core.persistence.database import get_session
-from repowise.core.persistence.models import (
-    GitMetadata,
-    GraphEdge,
-    GraphNode,
-)
+from repowise.core.persistence.models import GitMetadata, GraphEdge, GraphNode
 from repowise.core.registry import mcp_tool_registry as mcp
+from repowise.server.mcp_server._dependency_queries import (
+    GraphTargetResolution,
+    graph_node_path,
+    resolve_graph_target,
+)
+from repowise.server.mcp_server._graph_utils import build_visual_context
 from repowise.server.mcp_server._helpers import (
     _get_exclude_spec,
     _get_repo,
     _resolve_repo_context,
     _unsupported_repo_all,
+    attach_ignored_arguments,
     filter_graph_nodes,
     is_excluded,
+    resolve_enum_argument,
 )
+
+_PATH_MODES = frozenset({"files", "calls"})
+_CALL_EDGE_TYPES = ("calls", "references")
+_MAX_PATHS = 5
+
+
+def _resolution_payload(resolution: GraphTargetResolution) -> dict[str, Any]:
+    node = resolution.node
+    return {
+        "query": resolution.query,
+        "node": node.node_id if node is not None else None,
+        "node_type": node.node_type if node is not None else None,
+        "matched_by": resolution.matched_by,
+    }
+
+
+def _resolution_failure(
+    resolution: GraphTargetResolution,
+    *,
+    endpoint: str,
+    mode: str,
+) -> dict[str, Any]:
+    base: dict[str, Any] = {
+        "status": resolution.status,
+        "mode": mode,
+        "path": [],
+        "paths": [],
+        "distance": -1,
+        "endpoint": endpoint,
+        "query": resolution.query,
+    }
+    if resolution.status == "ambiguous":
+        base.update(
+            {
+                "match_count": len(resolution.candidates),
+                "candidates": resolution.candidates,
+                "candidates_truncated": resolution.candidates_truncated,
+                "explanation": (
+                    f"{endpoint.title()} symbol '{resolution.query}' is ambiguous; "
+                    "choose one candidate symbol_id and retry."
+                ),
+            }
+        )
+    elif resolution.status == "graph_missing":
+        base.update(
+            {
+                "candidates": resolution.candidates,
+                "explanation": (
+                    f"{endpoint.title()} symbol '{resolution.query}' exists in the symbol "
+                    "index but has no dependency-graph node. Run repowise update."
+                ),
+            }
+        )
+    else:
+        base["explanation"] = f"{endpoint.title()} node '{resolution.query}' not found in graph"
+    return base
+
+
+def _path_with_relationships(
+    path: list[str],
+    relations: dict[tuple[str, str], set[str]],
+) -> list[dict[str, str]]:
+    """Preserve the legacy path shape while choosing relation labels stably."""
+    result: list[dict[str, str]] = []
+    relation_priority = {"calls": 0, "references": 1}
+    for index, node in enumerate(path):
+        relationship = ""
+        if index < len(path) - 1:
+            edge_types = relations[(node, path[index + 1])]
+            relationship = min(edge_types, key=lambda edge: (relation_priority.get(edge, 2), edge))
+        result.append({"node": node, "relationship": relationship})
+    return result
+
+
+async def _attach_co_change_signal(
+    result: dict[str, Any],
+    *,
+    session_factory: Any,
+    repository_id: str,
+    source: str,
+    target: str,
+) -> None:
+    """Attach the legacy file-level coupling fallback when it exists."""
+    async with get_session(session_factory) as session:
+        src_res = await session.execute(
+            select(GitMetadata).where(
+                GitMetadata.repository_id == repository_id,
+                GitMetadata.file_path == source,
+            )
+        )
+        src_meta = src_res.scalar_one_or_none()
+    if not src_meta or not src_meta.co_change_partners_json:
+        return
+    for partner in json.loads(src_meta.co_change_partners_json):
+        if partner.get("file_path", "") != target:
+            continue
+        result["co_change_signal"] = {
+            "co_change_count": partner.get("co_change_count", partner.get("count", 0)),
+            "last_co_change": partner.get("last_co_change"),
+            "note": (
+                "No import dependency, but these files co-change frequently — "
+                "likely logical coupling."
+            ),
+        }
+        return
 
 
 @mcp.tool(default=False)
-async def get_dependency_path(source: str, target: str, repo: str | None = None) -> dict:
-    """Find how two files/modules are connected in the dependency graph.
+async def get_dependency_path(
+    source: str,
+    target: str,
+    repo: str | None = None,
+    mode: str = "files",
+    limit_paths: int = 1,
+) -> dict[str, Any]:
+    """Find shortest file dependencies or calls-only symbol chains.
 
-    When no direct path exists, returns visual context: nearest common
-    ancestors, shared neighbors, community analysis, and bridge suggestions
-    to help debug architectural silos.
+    ``mode="files"`` preserves the existing dependency traversal. Use
+    ``mode="calls"`` for symbol-level chains containing only ``calls`` and
+    ``references`` edges. Bare symbol names resolve when unique; ambiguous
+    names return candidates. Up to five distinct shortest chains can be
+    requested without changing the legacy top-level ``path`` result.
 
     Args:
-        source: Source file or module path.
-        target: Target file or module path.
+        source: Source file path, symbol id, or unambiguous symbol name.
+        target: Target file path, symbol id, or unambiguous symbol name.
         repo: Repository path, name, or ID.
+        mode: ``files`` (default) or pure symbol-level ``calls`` traversal.
+        limit_paths: Number of distinct shortest chains to return (1-5).
     """
     if repo == "all":
         return _unsupported_repo_all("get_dependency_path")
+
+    ignored: list[dict[str, Any]] = []
+    resolved_mode = (
+        resolve_enum_argument(
+            mode,
+            _PATH_MODES,
+            argument="mode",
+            ignored=ignored,
+        )
+        or "files"
+    )
+    effective_limit = max(1, min(limit_paths, _MAX_PATHS))
+
     ctx = await _resolve_repo_context(repo)
     exclude_spec = _get_exclude_spec(ctx.path)
-    for _p in (source, target):
-        if is_excluded(_p, exclude_spec):
-            return {"error": f"'{_p}' is excluded by exclude_patterns."}
+    for path in (source, target):
+        if is_excluded(path, exclude_spec):
+            result: dict[str, Any] = {
+                "error": f"'{path}' is excluded by exclude_patterns.",
+                "mode": resolved_mode,
+                "path": [],
+                "paths": [],
+                "distance": -1,
+            }
+            attach_ignored_arguments(result, ignored)
+            return result
 
     async with get_session(ctx.session_factory) as session:
         repository = await _get_repo(session)
+        repository_id = repository.id
+        source_resolution = await resolve_graph_target(session, repository_id, source)
+        target_resolution = await resolve_graph_target(session, repository_id, target)
 
-        # Drop the temporal relation only. A ``co_changes`` edge records that
-        # two files move together in history, so leaving it in makes it a free
-        # hop and the tool reports a "dependency path" no code creates.
-        #
-        # Containment stays, unlike in the consumers that answer "what depends
-        # on this file". ``defines`` is the only bridge from the file layer to
-        # the symbol layer, and no edge points back the other way, so excluding
-        # it cannot suppress a false file-to-file path — there is none to
-        # suppress — while it does delete the real ones: a --defines--> a::foo
-        # --calls--> b::bar is how a caller asks which file reaches a function.
+        for endpoint, resolution in (
+            ("source", source_resolution),
+            ("target", target_resolution),
+        ):
+            if resolution.status != "resolved":
+                result = _resolution_failure(
+                    resolution,
+                    endpoint=endpoint,
+                    mode=resolved_mode,
+                )
+                attach_ignored_arguments(result, ignored)
+                return result
+
+        source_node = source_resolution.node
+        target_node = target_resolution.node
+        assert source_node is not None and target_node is not None
+
+        if resolved_mode == "calls":
+            for endpoint, node in (("source", source_node), ("target", target_node)):
+                if node.node_type != "symbol":
+                    result = {
+                        "status": "invalid_target_type",
+                        "mode": resolved_mode,
+                        "path": [],
+                        "paths": [],
+                        "distance": -1,
+                        "endpoint": endpoint,
+                        "query": source if endpoint == "source" else target,
+                        "resolved_node": node.node_id,
+                        "explanation": (
+                            "mode='calls' requires symbol endpoints. Pass a symbol id "
+                            "(path::Name) or an unambiguous symbol name."
+                        ),
+                    }
+                    attach_ignored_arguments(result, ignored)
+                    return result
+
+        for node in (source_node, target_node):
+            if is_excluded(graph_node_path(node), exclude_spec):
+                result = {
+                    "error": f"'{graph_node_path(node)}' is excluded by exclude_patterns.",
+                    "mode": resolved_mode,
+                    "path": [],
+                    "paths": [],
+                    "distance": -1,
+                }
+                attach_ignored_arguments(result, ignored)
+                return result
+
+        edge_stmt = select(GraphEdge).where(GraphEdge.repository_id == repository_id)
+        node_stmt = select(GraphNode).where(GraphNode.repository_id == repository_id)
+        if resolved_mode == "calls":
+            edge_stmt = edge_stmt.where(GraphEdge.edge_type.in_(_CALL_EDGE_TYPES))
+            node_stmt = node_stmt.where(GraphNode.node_type == "symbol")
+        else:
+            # ``co_changes`` is historical correlation, not a code dependency.
+            # Containment remains for compatibility: it is the bridge from a
+            # file to the symbol it defines in the existing traversal.
+            edge_stmt = edge_stmt.where(GraphEdge.edge_type.notin_(TEMPORAL_EDGE_TYPES))
+
         edge_result = await session.execute(
-            select(GraphEdge).where(
-                GraphEdge.repository_id == repository.id,
-                GraphEdge.edge_type.notin_(TEMPORAL_EDGE_TYPES),
+            edge_stmt.order_by(
+                GraphEdge.source_node_id,
+                GraphEdge.target_node_id,
+                GraphEdge.edge_type,
             )
         )
-        edges = edge_result.scalars().all()
-
-        node_result = await session.execute(
-            select(GraphNode).where(
-                GraphNode.repository_id == repository.id,
-            )
-        )
+        node_result = await session.execute(node_stmt.order_by(GraphNode.node_id))
+        edges = list(edge_result.scalars().all())
         nodes = filter_graph_nodes(list(node_result.scalars().all()), exclude_spec)
 
     try:
         import networkx as nx
     except ImportError:
-        return {
+        result = {
+            "mode": resolved_mode,
             "path": [],
+            "paths": [],
             "distance": -1,
             "explanation": "networkx not available for path queries",
         }
+        attach_ignored_arguments(result, ignored)
+        return result
 
-    # Build the graph only from surviving nodes/edges so shortest paths, common
-    # ancestors, shared neighbors, and bridges never route through excluded files.
-    allowed = {n.node_id for n in nodes} if exclude_spec else None
-    graph = nx.DiGraph()
-    # Seed every surviving node, not just the endpoints of surviving edges. A
-    # file whose only edges were temporal is still indexed, and the "no direct
-    # path" branch below has a co-change fallback written precisely for it —
-    # unreachable if the node never entered the graph, which also made the
-    # "not found in graph" message untrue.
-    graph.add_nodes_from(n.node_id for n in nodes)
-    for e in edges:
-        if allowed is not None and (
-            e.source_node_id not in allowed or e.target_node_id not in allowed
-        ):
+    allowed = {node.node_id for node in nodes}
+    graph: nx.DiGraph[str] = nx.DiGraph()
+    graph.add_nodes_from(sorted(allowed))
+    relations: dict[tuple[str, str], set[str]] = {}
+    for edge in edges:
+        if edge.source_node_id not in allowed or edge.target_node_id not in allowed:
             continue
-        graph.add_edge(
-            e.source_node_id,
-            e.target_node_id,
-            edge_type=e.edge_type,
-        )
+        graph.add_edge(edge.source_node_id, edge.target_node_id)
+        relations.setdefault((edge.source_node_id, edge.target_node_id), set()).add(edge.edge_type)
 
-    if source not in graph:
-        return {
+    resolved_source = source_node.node_id
+    resolved_target = target_node.node_id
+    resolved = {
+        "source": _resolution_payload(source_resolution),
+        "target": _resolution_payload(target_resolution),
+    }
+    if resolved_source not in graph or resolved_target not in graph:
+        missing = "source" if resolved_source not in graph else "target"
+        missing_node = resolved_source if missing == "source" else resolved_target
+        result = {
+            "status": "not_found",
+            "mode": resolved_mode,
             "path": [],
+            "paths": [],
             "distance": -1,
-            "explanation": f"Source node '{source}' not found in graph",
+            "resolved": resolved,
+            "explanation": f"{missing.title()} node '{missing_node}' not found in graph",
         }
-    if target not in graph:
-        return {
-            "path": [],
-            "distance": -1,
-            "explanation": f"Target node '{target}' not found in graph",
-        }
+        attach_ignored_arguments(result, ignored)
+        return result
 
     try:
-        path = nx.shortest_path(graph, source, target)
+        raw_paths = list(
+            islice(
+                nx.all_shortest_paths(graph, resolved_source, resolved_target),
+                effective_limit + 1,
+            )
+        )
     except nx.NetworkXNoPath:
-        result_data: dict[str, Any] = {
+        result = {
+            "status": "no_path",
+            "mode": resolved_mode,
             "path": [],
+            "paths": [],
             "distance": -1,
+            "resolved": resolved,
+            "limit_paths": effective_limit,
             "explanation": "No direct dependency path found",
-            "visual_context": _build_visual_context(graph, source, target, nodes, nx),
+            "visual_context": build_visual_context(
+                graph,
+                resolved_source,
+                resolved_target,
+                nodes,
+                nx,
+            ),
         }
-        # Phase 4: check co-change coupling even without import dependency
-        async with get_session(ctx.session_factory) as session:
-            src_res = await session.execute(
-                select(GitMetadata).where(
-                    GitMetadata.repository_id == repository.id,
-                    GitMetadata.file_path == source,
-                )
+        if (
+            resolved_mode == "files"
+            and source_node.node_type == "file"
+            and target_node.node_type == "file"
+        ):
+            await _attach_co_change_signal(
+                result,
+                session_factory=ctx.session_factory,
+                repository_id=repository_id,
+                source=resolved_source,
+                target=resolved_target,
             )
-            src_meta = src_res.scalar_one_or_none()
-            if src_meta and src_meta.co_change_partners_json:
-                partners = json.loads(src_meta.co_change_partners_json)
-                for p in partners:
-                    partner_path = p.get("file_path", "")
-                    if partner_path == target:
-                        result_data["co_change_signal"] = {
-                            "co_change_count": p.get("co_change_count", 0),
-                            "last_co_change": p.get("last_co_change"),
-                            "note": (
-                                "No import dependency, but these files co-change "
-                                "frequently — likely logical coupling."
-                            ),
-                        }
-                        break
-        return result_data
+        attach_ignored_arguments(result, ignored)
+        return result
 
-    # Build path with relationships
-    path_with_info = []
-    for i, node in enumerate(path):
-        relationship = ""
-        if i < len(path) - 1:
-            next_node = path[i + 1]
-            relationship = graph[node][next_node].get("edge_type", "imports")
-        path_with_info.append({"node": node, "relationship": relationship})
-
-    return {
-        "path": path_with_info,
-        "distance": len(path) - 1,
-        "explanation": f"Shortest path from {source} to {target} has {len(path) - 1} hops",
-    }
-
-
-def _build_visual_context(
-    graph: Any,
-    source: str,
-    target: str,
-    nodes: list,
-    nx: Any,
-) -> dict:
-    """Build diagnostic context when no directed path exists."""
-    node_meta = {n.node_id: n for n in nodes}
-    context: dict[str, Any] = {}
-
-    # --- Reverse path check ---
-    try:
-        rev_path = nx.shortest_path(graph, target, source)
-        context["reverse_path"] = {
-            "exists": True,
-            "path": rev_path,
-            "distance": len(rev_path) - 1,
-            "note": f"A path exists in the reverse direction ({target} -> {source}). "
-            "The dependency flows the other way.",
+    paths_truncated = len(raw_paths) > effective_limit
+    raw_paths = raw_paths[:effective_limit]
+    paths = [
+        {
+            "path": _path_with_relationships(path, relations),
+            "distance": len(path) - 1,
         }
-    except nx.NetworkXNoPath:
-        context["reverse_path"] = {"exists": False}
-
-    # --- Nearest common ancestors (via undirected graph) ---
-    undirected = graph.to_undirected()
-    source_reachable = set(nx.single_source_shortest_path_length(undirected, source))
-    target_reachable = set(nx.single_source_shortest_path_length(undirected, target))
-    common = source_reachable & target_reachable
-    common.discard(source)
-    common.discard(target)
-
-    if common:
-        source_dist = nx.single_source_shortest_path_length(undirected, source)
-        target_dist = nx.single_source_shortest_path_length(undirected, target)
-        scored = [(node, source_dist[node] + target_dist[node]) for node in common]
-        scored.sort(key=lambda x: x[1])
-        context["nearest_common_ancestors"] = [
-            {
-                "node": node,
-                "distance_from_source": source_dist[node],
-                "distance_from_target": target_dist[node],
-            }
-            for node, _ in scored[:5]
-        ]
-    else:
-        context["nearest_common_ancestors"] = []
-
-    # --- Shared neighbors (direct) ---
-    source_neighbors = set(graph.predecessors(source)) | set(graph.successors(source))
-    target_neighbors = set(graph.predecessors(target)) | set(graph.successors(target))
-    shared = source_neighbors & target_neighbors
-    if shared:
-        context["shared_neighbors"] = sorted(shared)
-    else:
-        context["shared_neighbors"] = []
-
-    # --- Community analysis ---
-    src_meta = node_meta.get(source)
-    tgt_meta = node_meta.get(target)
-    src_community = src_meta.community_id if src_meta else None
-    tgt_community = tgt_meta.community_id if tgt_meta else None
-
-    context["community"] = {
-        "source_community": src_community,
-        "target_community": tgt_community,
-        "same_community": src_community is not None and src_community == tgt_community,
+        for path in raw_paths
+    ]
+    first = paths[0]
+    result = {
+        "status": "found",
+        "mode": resolved_mode,
+        # Backward-compatible single-path fields remain the first chain.
+        "path": first["path"],
+        "distance": first["distance"],
+        "paths": paths,
+        "paths_truncated": paths_truncated,
+        "limit_paths": effective_limit,
+        "resolved": resolved,
+        "explanation": (
+            f"Shortest path from {resolved_source} to {resolved_target} has "
+            f"{first['distance']} hops"
+        ),
     }
-
-    # --- Bridge suggestions: high-centrality nodes between communities ---
-    if src_community is not None and tgt_community is not None and src_community != tgt_community:
-        # Find nodes that have edges crossing these two communities
-        bridge_nodes = []
-        nodes_by_community: dict[int, set[str]] = {}
-        for n in nodes:
-            nodes_by_community.setdefault(n.community_id, set()).add(n.node_id)
-
-        src_community_nodes = nodes_by_community.get(src_community, set())
-        tgt_community_nodes = nodes_by_community.get(tgt_community, set())
-
-        for node_id in graph.nodes():
-            neighbors = set(graph.predecessors(node_id)) | set(graph.successors(node_id))
-            touches_src = bool(neighbors & src_community_nodes)
-            touches_tgt = bool(neighbors & tgt_community_nodes)
-            if touches_src and touches_tgt:
-                meta = node_meta.get(node_id)
-                bridge_nodes.append(
-                    {
-                        "node": node_id,
-                        "pagerank": meta.pagerank if meta else 0.0,
-                    }
-                )
-        bridge_nodes.sort(key=lambda x: x["pagerank"], reverse=True)
-        context["bridge_suggestions"] = bridge_nodes[:5]
-    else:
-        context["bridge_suggestions"] = []
-
-    # --- Connectivity summary ---
-    # Check if they're in completely disconnected components
-    components = list(nx.weakly_connected_components(graph))
-    src_comp = next((c for c in components if source in c), set())
-    tgt_comp = next((c for c in components if target in c), set())
-    actually_disconnected = src_comp != tgt_comp
-
-    if actually_disconnected:
-        context["disconnected"] = True
-        context["source_component_size"] = len(src_comp)
-        context["target_component_size"] = len(tgt_comp)
-        context["suggestion"] = (
-            "These nodes are in completely separate dependency clusters with "
-            "no shared connections. Look for shared configuration files, API "
-            "contracts, or event buses that should bridge them."
-        )
-    else:
-        context["disconnected"] = False
-        if context["nearest_common_ancestors"]:
-            top = context["nearest_common_ancestors"][0]["node"]
-            context["suggestion"] = (
-                f"No direct path, but both nodes connect through '{top}'. "
-                "This shared dependency may be the architectural bridge point."
-            )
-        elif context["shared_neighbors"]:
-            context["suggestion"] = (
-                f"No direct path, but they share neighbor(s): "
-                f"{', '.join(context['shared_neighbors'])}. "
-                "These shared files may serve as the missing link."
-            )
-        elif context["reverse_path"].get("exists"):
-            context["suggestion"] = (
-                "No direct path in this direction, but a reverse path exists. "
-                "The dependency flows the other way."
-            )
-        else:
-            context["suggestion"] = (
-                "These nodes are in the same cluster but have no direct "
-                "or reverse dependency. Check for indirect connections."
-            )
-
-    return context
+    if limit_paths != effective_limit:
+        result["limit_paths_requested"] = limit_paths
+    attach_ignored_arguments(result, ignored)
+    return result

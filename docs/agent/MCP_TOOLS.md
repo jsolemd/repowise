@@ -2,7 +2,7 @@
 
 repowise exposes a curated set of tools via the [Model Context Protocol](https://modelcontextprotocol.io) (MCP). These tools give AI coding assistants (Claude Code, Codex, Cursor, Cline, Windsurf) structured access to your codebase intelligence: dependency graph, git history, documentation, and architectural decisions.
 
-17 tools are registered in total. A single-repo server advertises 11 by default: the ten flagship tools below plus `list_repos`. Workspace mode adds 2 more automatically (`get_architecture`, `get_blast_radius`), for 13. Four further tools are off by default everywhere and must be opted in. The surface is configurable; see [Configuring the tool surface](#configuring-the-tool-surface).
+18 tools are registered in total. A single-repo server advertises 11 by default: the ten flagship tools below plus `list_repos`. Workspace mode adds 2 more automatically (`get_architecture`, `get_blast_radius`), for 13. Five further tools are off by default everywhere and must be opted in. The surface is configurable; see [Configuring the tool surface](#configuring-the-tool-surface).
 
 **Start the MCP server:**
 
@@ -37,7 +37,8 @@ repowise mcp --transport sse --port 7338 # legacy SSE transport
 [get_architecture](#get_architecture) &middot;
 [get_blast_radius](#get_blast_radius)
 
-**Opt-in tools (off by default everywhere, 4)**
+**Opt-in tools (off by default everywhere, 5)**
+[get_dependents](#get_dependents) &middot;
 [get_dependency_path](#get_dependency_path) &middot;
 [get_execution_flows](#get_execution_flows) &middot;
 [generate_refactoring_code](#generate_refactoring_code) &middot;
@@ -72,7 +73,7 @@ The default surface is deliberately small: fewer, richer tools mean fewer round-
 
 - **Default (single-repo):** 11 tools, the ten flagship tools plus `list_repos`.
 - **Default (workspace):** those 11 plus `get_architecture` and `get_blast_radius`, added automatically when the server starts inside a workspace. They are never advertised outside one.
-- **Opt-in tools:** `get_dependency_path`, `get_execution_flows`, `generate_refactoring_code`, and `get_conformance` are registered but off by default. Turn them on per repo; `get_conformance` only does useful work in workspace mode (name it there).
+- **Opt-in tools:** `get_dependents`, `get_dependency_path`, `get_execution_flows`, `generate_refactoring_code`, and `get_conformance` are registered but off by default. Turn them on per repo; `get_conformance` only does useful work in workspace mode (name it there).
 
 **Configure it in `.repowise/config.yaml`** under an `mcp.tools` key. Four shapes are supported:
 
@@ -175,8 +176,8 @@ This exists because the alternative is a lie: `get_dead_code(kind="unused_export
 used to filter on the plural, match nothing, and recommend *"No dead code found
 matching your filters."* beside a summary counting hundreds of unused exports
 ([#1496](https://github.com/repowise-dev/repowise/issues/1496)). It covers
-`get_dead_code` (`kind`, `tier`, `min_confidence`), `get_context` (`include`)
-and `search_codebase` (`kind`).
+`get_dead_code` (`kind`, `tier`, `min_confidence`), `get_context` (`include`),
+`get_dependency_path` (`mode`), and `search_codebase` (`kind`).
 
 `get_dead_code`'s `min_confidence` additionally accepts the tier names the
 response is organised by — `"high"` (0.8), `"medium"` (0.5), `"low"` (0.0) — as
@@ -927,22 +928,48 @@ get_architecture()
 
 *(Registered but off by default in every mode; enable with `mcp.tools: ["+name"]` or `repowise mcp --tools "+name"`. See [Configuring the tool surface](#configuring-the-tool-surface).)*
 
-#### `get_dependency_path`
+#### `get_dependents`
 
-Shortest dependency path between two files or modules.
+Complete inbound dependents for a file or symbol, with test filtering and honest pagination.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `source` | string | Yes | Source file or module path |
-| `target` | string | Yes | Target file or module path |
+| `target` | string | Yes | File path, exact symbol id, qualified symbol name, or unambiguous bare symbol name |
 | `repo` | string | No | *(workspace only)* Target repo alias; `"all"` is not supported |
+| `depth` | int | No | Inbound traversal depth, clamped to 1-8 (default 1) |
+| `include_tests` | boolean | No | Include tests and allow traversal through them (default false) |
+| `offset` | int | No | Zero-based offset into the ranked result set (default 0) |
+| `limit` | int | No | Page size, clamped to 1-100 (default 25) |
 
-**Returns:** The dependency path when one exists. When no direct path exists, visual context instead: nearest common ancestors, shared neighbors, community analysis, and bridge suggestions, to help debug architectural silos.
+**Returns:** `dependents` is the requested page; `total` and `counts_by_depth` describe the complete filtered traversal before pagination. Results rank by `reference_count`, then PageRank. `reference_count` means distinct persisted graph relations into the preceding breadth-first frontier—not source call-site occurrences, because graph rows are aggregated per source/target/edge type. File targets follow the canonical file-dependency edge set; symbol targets follow the canonical symbol-use edge set. `pagination.has_more` and `next_offset` make every remaining row recoverable.
+
+**When to use:** Before changing a file or symbol, to enumerate direct consumers or a bounded transitive impact frontier without test files crowding out production dependencies.
+
+```
+get_dependents(target="src/db/models.py")
+get_dependents(target="reconcile_project_files", depth=3, limit=50)
+get_dependents(target="src/db/models.py", include_tests=true, offset=25)
+```
+
+#### `get_dependency_path`
+
+Shortest dependency paths between files, or pure call/reference chains between symbols.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `source` | string | Yes | Source file path, exact symbol id, qualified symbol name, or unambiguous bare symbol name |
+| `target` | string | Yes | Target file path, exact symbol id, qualified symbol name, or unambiguous bare symbol name |
+| `repo` | string | No | *(workspace only)* Target repo alias; `"all"` is not supported |
+| `mode` | string | No | `"files"` preserves the existing dependency traversal (default); `"calls"` admits symbol-level `calls`/`references` edges only |
+| `limit_paths` | int | No | Distinct shortest chains to return, clamped to 1-5 (default 1) |
+
+**Returns:** The legacy top-level `path` and `distance` remain the first shortest chain. `paths` carries up to `limit_paths` distinct shortest chains and `paths_truncated` says whether more shortest chains exist. Symbol names resolve when unique; ambiguity returns structured candidates and no fabricated path. In `mode="calls"`, every returned relationship is exactly `calls` or `references`; imports and containment can never enter the graph. When no path exists, visual context instead describes nearest common ancestors, shared neighbors, communities, and bridge suggestions.
 
 **When to use:** Understanding how two parts of the codebase are (or aren't) connected, or why an expected dependency doesn't show up.
 
 ```
 get_dependency_path(source="src/api/routes.py", target="src/db/models.py")
+get_dependency_path(source="handle_search_code", target="build_evidence", mode="calls", limit_paths=3)
 ```
 
 #### `get_execution_flows`
@@ -992,7 +1019,7 @@ In workspace mode (initialized with `repowise init .`), all tools accept an opti
 
 - **Omit `repo`**: queries the default (primary) repo
 - **`repo="backend"`**: targets a specific repo by alias
-- **`repo="all"`**: queries across all workspace repos (fully supported by `search_codebase`; `get_context` and `get_overview` also accept it; not supported by `get_symbol`, `get_dependency_path`, or `get_execution_flows`)
+- **`repo="all"`**: queries across all workspace repos (fully supported by `search_codebase`; `get_context` and `get_overview` also accept it; not supported by `get_symbol`, `get_dependents`, `get_dependency_path`, or `get_execution_flows`)
 
 The MCP server automatically enriches responses with cross-repo intelligence:
 - **Co-change partners** from other repos surfaced in `get_context` and `get_risk`

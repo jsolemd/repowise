@@ -373,7 +373,7 @@ mcp:
 - `lean` selects the agent-lean profile: `get_answer`, `get_context`,
   `get_symbol`, `search_codebase`, `get_risk`, `get_why` (plus `list_repos` in workspace
   mode), small enough that Claude Code can keep every schema always loaded.
-- Opt-in tools are `get_dependency_path`, `get_execution_flows`,
+- Opt-in tools are `get_dependents`, `get_dependency_path`, `get_execution_flows`,
   `generate_refactoring_code`, and `get_conformance` (the last only usable in
   workspace mode).
 - Workspace-only tools (`get_blast_radius`, `get_architecture`) are added
