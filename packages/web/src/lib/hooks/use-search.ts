@@ -3,7 +3,11 @@
 import useSWR from "swr";
 import { useDebounce } from "./use-debounce";
 import { search } from "@/lib/api/search";
-import type { SearchResultResponse } from "@/lib/api/types";
+import type { SearchEnvelope } from "@repowise-dev/api-client/search";
+
+/** What a search that has not run yet looks like, so callers never branch on
+ *  `undefined` before reading `results`. */
+const NOTHING: SearchEnvelope = { results: [], candidates: [], selected_owner: null };
 
 export function useSearch(
   query: string,
@@ -19,7 +23,7 @@ export function useSearch(
     debounced.trim().length >= 2
       ? `search:${debounced}:${opts?.search_type}:${opts?.repo_id ?? "all"}`
       : null;
-  const { data, error, isLoading } = useSWR<SearchResultResponse[]>(
+  const { data, error, isLoading } = useSWR<SearchEnvelope>(
     key,
     () =>
       search(debounced, {
@@ -29,8 +33,10 @@ export function useSearch(
       }),
     { revalidateOnFocus: false },
   );
+  const envelope = data ?? NOTHING;
   return {
-    results: data ?? [],
+    envelope,
+    results: envelope.results,
     error,
     isLoading: isLoading && !!key,
     isTyping: query !== debounced,

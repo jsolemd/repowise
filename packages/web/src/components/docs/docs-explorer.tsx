@@ -201,8 +201,11 @@ export function DocsExplorer({ repoId }: DocsExplorerProps) {
       const byId = new Map(pages.map((p) => [p.id, p]));
       const seen = new Set<string>();
       const hits: { page: PageSummary; snippet?: string }[] = [];
-      for (const r of [...fulltext, ...semantic]) {
-        const page = byId.get(r.page_id);
+      // A hit with no page id is one this reader cannot open: the hybrid
+      // search host also answers out of the source index, and a symbol or a
+      // window of a file is not a page in the tree beside it.
+      for (const r of [...fulltext.results, ...semantic.results]) {
+        const page = r.page_id ? byId.get(r.page_id) : undefined;
         if (!page || seen.has(page.id)) continue;
         seen.add(page.id);
         hits.push({ page, ...(r.snippet ? { snippet: r.snippet } : {}) });

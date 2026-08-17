@@ -4,16 +4,29 @@ import { useEffect, useState, useCallback, useMemo } from "react";
 import { usePathname, useRouter } from "next/navigation";
 import { Command } from "cmdk";
 import useSWR from "swr";
-import { Search, LayoutDashboard, Settings, BookOpen, FileCode, Layers, Link2, GitMerge, MessageSquare } from "lucide-react";
+import { Search, LayoutDashboard, Settings, BookOpen, FileCode, Layers, Link2, GitMerge, MessageSquare, BookText, Lightbulb } from "lucide-react";
 import { useSearch } from "@/lib/hooks/use-search";
 import { paletteFilter, preRankedKeywords } from "./palette-filter";
+import {
+  formatLineRange,
+  groupSearchResults,
+  rankDecisions,
+  type SearchGroupId,
+} from "@/lib/search/result-groups";
 import { truncatePath } from "@repowise-dev/ui/lib/format";
 import { commandPaletteShortcutIsClaimed } from "@repowise-dev/ui/lib/command-palette-scope";
 import { fileEntityPath } from "@repowise-dev/ui/shared/entity";
 import { getFilesIndex } from "@/lib/api/files";
+import { listDecisions } from "@/lib/api/decisions";
 import { repoNavItems } from "@/components/layout/nav-items";
-import { pageHref } from "@/lib/utils/page-href";
 import type { RepoResponse, WorkspaceResponse } from "@/lib/api/types";
+
+/** One icon per section, so the three read apart at a glance. */
+const GROUP_ICON: Record<SearchGroupId, typeof FileCode> = {
+  code: FileCode,
+  docs: BookText,
+  decisions: Lightbulb,
+};
 
 interface CommandPaletteProps {
   repos: RepoResponse[];
@@ -27,7 +40,7 @@ export function CommandPalette({ repos, workspace }: CommandPaletteProps) {
   const router = useRouter();
   const pathname = usePathname();
 
-  const { results, isLoading } = useSearch(query, { limit: 8 });
+  const { envelope, isLoading } = useSearch(query, { limit: 8 });
 
   // Active repo: from the URL when inside one, else the only repo.
   const activeRepo = useMemo(() => {
@@ -67,6 +80,30 @@ export function CommandPalette({ repos, workspace }: CommandPaletteProps) {
     scored.sort((a, b) => a.score - b.score || a.path.length - b.path.length);
     return scored.slice(0, 12).map((s) => s.path);
   }, [query, activeRepo, filesData]);
+
+  // Decisions are not in the search index — it holds wiki pages and source
+  // chunks — so the palette matches the repo's records itself, on the same
+  // lazy-once-open terms as the file list above.
+  const { data: decisionsData } = useSWR(
+    open && activeRepo ? `decisions-index:${activeRepo.id}` : null,
+    () => listDecisions(activeRepo!.id, { limit: 200 }),
+    { revalidateOnFocus: false },
+  );
+
+  const grouped = useMemo(
+    () =>
+      groupSearchResults({
+        envelope,
+        decisions: rankDecisions(decisionsData ?? [], query),
+        linkPrefix: `/repos/${activeRepo?.id ?? repos[0]?.id ?? ""}`,
+      }),
+    [envelope, decisionsData, query, activeRepo, repos],
+  );
+
+  // Only when the server said so. The stock search host classifies nothing,
+  // and rendering its silence as a verdict would be inventing one.
+  const lowConfidence = grouped.confidence === "caution";
+  const noMatch = grouped.confidence === "no_match";
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
@@ -130,6 +167,15 @@ export function CommandPalette({ repos, workspace }: CommandPaletteProps) {
           <Command.Empty className="px-4 py-8 text-center text-sm text-[var(--color-text-tertiary)]">
             {isLoading ? "Searching…" : "No results found."}
           </Command.Empty>
+
+          {/* A `no_match` verdict, said plainly. Not `Command.Empty`: the Ask
+              row always matches, so cmdk never considers the list empty and
+              would never render it. */}
+          {noMatch && grouped.emptyMessage && (
+            <p className="px-5 py-6 text-center text-sm leading-relaxed text-[var(--color-text-tertiary)] [text-wrap:pretty]">
+              {grouped.emptyMessage}
+            </p>
+          )}
 
           {/* Quick-ask — always available when a repo is in scope */}
           {activeRepo && (
@@ -278,31 +324,58 @@ export function CommandPalette({ repos, workspace }: CommandPaletteProps) {
             </Command.Group>
           )}
 
-          {/* Search results */}
-          {results.length > 0 && (
-            <Command.Group heading="Pages" className="px-2 pb-1">
-              {results.map((r) => (
-                <Command.Item
-                  key={r.page_id}
-                  value={`page-${r.title}`}
-                  keywords={preRankedKeywords}
-                  onSelect={() => {
-                    // Prefer the active repo for context; fall back to the
-                    // first one. File pages open their canonical entity page,
-                    // everything else opens inside the docs SPA.
-                    const repoId = activeRepo?.id ?? repos[0]?.id ?? "";
-                    navigate(pageHref(repoId, r.page_id));
-                  }}
-                  className="flex flex-col items-start rounded-md px-3 py-2 text-sm cursor-pointer hover:bg-[var(--color-bg-elevated)] data-[selected=true]:bg-[var(--color-bg-elevated)]"
-                >
-                  <span className="text-[var(--color-text-primary)] font-medium">{r.title}</span>
-                  <span className="text-xs text-[var(--color-text-tertiary)] font-mono">
-                    {truncatePath(r.target_path, 50)}
-                  </span>
-                </Command.Item>
-              ))}
-            </Command.Group>
-          )}
+          {/* Search results, in sections: Code, Documentation, Decisions. */}
+          {grouped.groups.map((group) => {
+            const Icon = GROUP_ICON[group.id];
+            return (
+              <Command.Group
+                key={group.id}
+                heading={
+                  // The caution note rides on the first section rather than
+                  // above the list: it qualifies the answers, and a reader who
+                  // never scrolls to them does not need warning about them.
+                  lowConfidence && group.id === grouped.groups[0]?.id ? (
+                    <span className="flex items-baseline gap-2">
+                      {group.heading}
+                      <span className="text-[10px] font-normal normal-case tracking-normal text-[var(--color-text-tertiary)]">
+                        low confidence — no exact match, closest by meaning
+                      </span>
+                    </span>
+                  ) : (
+                    group.heading
+                  )
+                }
+                className="px-2 pb-1"
+              >
+                {group.entries.map((entry) => {
+                  const lines = formatLineRange(entry);
+                  return (
+                    <Command.Item
+                      key={entry.key}
+                      value={`${group.id}-${entry.key}`}
+                      keywords={preRankedKeywords}
+                      onSelect={() => navigate(entry.href)}
+                      className="flex items-start gap-2.5 rounded-md px-3 py-2 text-sm cursor-pointer hover:bg-[var(--color-bg-elevated)] data-[selected=true]:bg-[var(--color-bg-elevated)]"
+                    >
+                      <Icon className="mt-0.5 h-4 w-4 shrink-0 text-[var(--color-text-tertiary)]" />
+                      <span className="flex min-w-0 flex-col items-start">
+                        <span className="truncate text-[var(--color-text-primary)] font-medium">
+                          {entry.label}
+                        </span>
+                        <span className="truncate text-xs text-[var(--color-text-tertiary)] font-mono">
+                          {truncatePath(entry.detail, 46)}
+                          {lines && `:${lines}`}
+                          {entry.alsoMatched
+                            ? ` +${entry.alsoMatched} more`
+                            : ""}
+                        </span>
+                      </span>
+                    </Command.Item>
+                  );
+                })}
+              </Command.Group>
+            );
+          })}
         </Command.List>
 
         <div className="border-t border-[var(--color-border-default)] px-4 py-2 flex items-center gap-4 text-xs text-[var(--color-text-tertiary)]">
