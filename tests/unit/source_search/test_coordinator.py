@@ -1305,10 +1305,13 @@ async def test_a_healthy_search_says_nothing_about_degradation(tmp_path):
         source_lexical=[_FTSHit(hit.chunk_id, hit.file_path)],
     )
     response = await coordinator.search("how alpha works", limit=5)
-    assert set(response["_meta"]["source_search"]) == {
-        "generation",
-        "indexed_commit",
-    }
+    source_meta = response["_meta"]["source_search"]
+    # The absence of these is the claim, not the exact key set: a repository
+    # with a manifest also carries its chunk counts here, and asserting the
+    # whole shape would fail for a reason that has nothing to do with health.
+    assert "degraded" not in source_meta
+    assert "failed_legs" not in source_meta
+    assert "degraded_reason" not in source_meta
     assert "status" not in response
     assert "error" not in response
     assert response["confidence"] == "confident"
