@@ -310,13 +310,16 @@ def _merge_lexical(
     """One lexical ranking from two BM25 tables, by rank rather than by score.
 
     Both legs return a negated FTS5 ``bm25()``, which looks comparable and is
-    not. ``source_fts`` indexes two short columns over 8,200 chunk-sized
-    documents; ``page_fts`` indexes four columns over ~1,000 whole pages, and
-    the wiki arm builds a *selectivity-filtered* MATCH expression while the
-    source arm ORs every token. BM25 is normalised against its own corpus'
-    average document length and term frequencies, so those are two different
-    scales wearing the same units, and merging them by score hands the entire
-    ranking to whichever table happens to produce larger numbers.
+    not. The two tables differ in every input that scale depends on: column
+    count and length (``source_fts`` indexes two short columns, ``page_fts``
+    four), document size (a chunk against a whole generated page), corpus size,
+    and the expression itself — the wiki arm builds a *selectivity-filtered*
+    MATCH while the source arm ORs every token. BM25 normalises against its own
+    corpus' average document length and term frequencies, so these are two
+    different scales wearing the same units, and merging them by score hands
+    the ranking to whichever table happens to produce larger numbers. On the
+    SoleMD.Infra corpus that is 8,200 chunks against ~1,000 pages, and the
+    spread is wide enough to decide the whole window.
 
     Interleaving asks each table only what it can answer — the order of its
     own hits — and lets RRF weigh the merged position against the dense leg.
