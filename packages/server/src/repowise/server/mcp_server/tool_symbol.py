@@ -20,14 +20,18 @@ The tool is intentionally additive — get_context remains the right call for
 "explain this file" or "what's the relationship between A and B" questions.
 get_symbol is for "show me the body of this function".
 
-Resolution strategy (in order):
-  1. Exact match on WikiSymbol.symbol_id (the canonical "{path}::{name}" key)
-  2. Exact match on (file_path, qualified_name) — supports class.method form
-  3. Exact match on (file_path, name) — supports unqualified names
-  4. Suffix match — a bare filename or partial path ("answer.py::get_answer")
-     resolves against any file whose path ends with that segment, on the leaf
-     name; mirrors get_context's basename ladder. A total miss returns
-     ``suggestions`` (real path-qualified ids) instead of a bare "not found".
+Resolution runs the ladder in ``_symbol_lookup``, shared with get_context so
+an id lifted from one tool resolves in the other. Path-qualified rungs first
+(exact symbol_id, then (file, qualified_name), then (file, name), then a
+file-path suffix match for a remembered filename), and when none of those
+match, the whole target is retried as a path-less name: an exact qualified
+name, a qualified tail (``Class.method``), a bare name, and finally the same
+ladder case-folded. A total miss returns ``suggestions`` (real path-qualified
+ids) instead of a bare "not found", and a target matching several symbols
+returns ``status: "ambiguous"`` with every match rather than a picked one.
+
+A list of targets is served in one call as ``{"results": [...]}``, request
+order preserved; the reply to a single target is unchanged.
 
 The tool also resolves **omission refs**: a ``symbol_id`` of the form
 ``"repowise#<12-hex>"`` (from a ``[repowise#<ref>: ...]`` truncation marker)
@@ -64,11 +68,14 @@ from repowise.server.mcp_server._helpers import (
 from repowise.server.mcp_server._meta import build_meta as _build_meta
 from repowise.server.mcp_server._meta import symbol_hint as _symbol_hint
 from repowise.server.mcp_server._symbol_lookup import (
+    MAX_AMBIGUITY_CANDIDATES,
     NAME_SEPARATORS,
+    SymbolMatch,
     bare_name,
     name_variants,
     order_candidates,
     parse_symbol_id,
+    resolve_symbol_match,
     resolve_symbol_rows,
     symbol_id_variants,
 )
@@ -112,6 +119,11 @@ _MAX_FALLBACK_MATCHES = 8
 # an exact range read that fetches them.
 _AMBIGUITY_CHAR_BUDGET = 20_000
 
+# Above this many matches, candidates are served as metadata plus the id that
+# fetches them, not as bodies. A handful of overloads are told apart by their
+# bodies; a common leaf name is told apart by its path.
+_MAX_AMBIGUITY_BODIES = 4
+
 
 # Callee expansion. A symbol whose body names the next symbol you need is the
 # common case, and fetching that next one is a fresh round trip: the chain gets
@@ -130,6 +142,12 @@ _MAX_CALLEES_PER_HOP = 12
 # Callee bodies are context for the root symbol, not the subject of the call,
 # so they are bounded tighter than the root's ~600.
 _MAX_CALLEE_BODY_LINES = 150
+
+# Targets served by one batched call. An agent that has read a card and wants
+# four of its symbols should spend one round trip, not four; past ~20 the
+# response is large enough that the agent is really asking for the file, and
+# ``get_context(include=["skeleton"])`` answers that in one call instead.
+_MAX_BATCH_TARGETS = 20
 
 
 async def _expand_callees(
@@ -538,26 +556,31 @@ async def _render_ambiguous(
     repository: Any,
     t0: float,
     context_lines: int,
+    match: SymbolMatch,
 ) -> dict:
-    """Serve EVERY candidate body for an ambiguous symbol id in one response.
+    """Serve every candidate for an ambiguous target in one response.
 
     A deterministic-but-wrong pick reads as authoritative and sends the agent
     editing the wrong overload; returning all candidates costs bytes once and
     removes the guess. The first candidate always renders; the rest render
     while the char budget lasts and are otherwise listed with the exact range
     read that fetches them.
+
+    Bodies are served only for a handful of candidates. A path-qualified id
+    matching several rows is a genuine overload set, and the bodies are what
+    tell them apart. A bare name matching 123 symbols is a vague question, and
+    123 bodies answer it by exhausting the context window — those get the
+    metadata and the exact id to ask again with.
     """
     repo_root = Path(str(ctx.path))
     text_cache: dict[str, str | None] = {}
     candidates: list[dict] = []
     not_rendered: list[dict] = []
     remaining = _AMBIGUITY_CHAR_BUDGET
+    listed = rows[:MAX_AMBIGUITY_CANDIDATES]
+    with_bodies = len(rows) <= _MAX_AMBIGUITY_BODIES
 
-    for i, row in enumerate(rows):
-        if row.file_path not in text_cache:
-            text_cache[row.file_path] = _read_file_text(repo_root, row.file_path)
-        text = text_cache[row.file_path]
-
+    for i, row in enumerate(listed):
         entry: dict[str, Any] = {
             "symbol_id": row.symbol_id,
             "file": row.file_path,
@@ -565,7 +588,16 @@ async def _render_ambiguous(
             "kind": row.kind,
             "qualified_name": row.qualified_name,
             "signature": row.signature,
+            "start_line": row.start_line,
         }
+        if not with_bodies:
+            entry["fetch_with"] = row.symbol_id
+            candidates.append(entry)
+            continue
+
+        if row.file_path not in text_cache:
+            text_cache[row.file_path] = _read_file_text(repo_root, row.file_path)
+        text = text_cache[row.file_path]
         if text is None:
             entry["note"] = "source file could not be read"
             not_rendered.append(entry)
@@ -588,22 +620,36 @@ async def _render_ambiguous(
         entry["source"] = numbered
         candidates.append(entry)
 
-    response: dict[str, Any] = {
-        "symbol_id": symbol_id,
-        "ambiguous": True,
-        "match_count": len(rows),
-        "candidates": candidates,
-        "note": (
+    if with_bodies:
+        note = (
             f"{len(rows)} symbols match this id (overloads, re-exports, or "
             "conditional definitions). All candidate bodies are included — "
             "none was silently chosen; pick by signature and line range."
-        ),
+        )
+    else:
+        note = (
+            f"{len(rows)} symbols match {symbol_id!r} — too many to serve bodies for, "
+            "and none was chosen for you. Call get_symbol again with the "
+            "``fetch_with`` id of the one you meant, or qualify the name "
+            "(Class.method) to narrow it here."
+        )
+    response: dict[str, Any] = {
+        "symbol_id": symbol_id,
+        "status": match.status,
+        "ambiguous": True,
+        "match_count": len(rows),
+        "candidates": candidates,
+        "note": note,
         "_meta": _build_meta(
             timing_ms=(time.perf_counter() - t0) * 1000,
             repository=repository,
-            targets=sorted({r.file_path for r in rows}),
+            targets=sorted({r.file_path for r in listed}),
         ),
     }
+    if match.rung:
+        response["resolution"] = match.rung
+    if len(rows) > len(listed) or match.truncated:
+        response["note"] += f" Only the first {len(listed)} of them are listed."
     if not_rendered:
         response["not_rendered"] = not_rendered
         response["note"] += (
@@ -622,35 +668,34 @@ async def _render_ambiguous(
 
 @mcp.tool()
 async def get_symbol(
-    symbol_id: str | None = None,
+    symbol_id: str | list[str] | None = None,
     context_lines: int = 0,
     repo: str | None = None,
     query: str | None = None,
-    id: str | None = None,
+    id: str | list[str] | None = None,
     depth: int = 1,
 ) -> dict:
-    """Follow-up read of one symbol whose id another response already gave you.
+    """Follow-up read of symbols another response, or the source, already named.
 
     **Not an entry point.** ``get_answer`` already ships ``symbol_bodies``, and
     for a whole file ``get_context(include=["skeleton"])`` or a plain Read is
     one call instead of many. Reach here for a body that was elided, or for a
     ``continuation`` / omission ref. Never walk a file symbol by symbol.
 
-    Raw source of one indexed symbol, bounded (~600 lines). ``source`` uses
-    Read's exact line-numbered format; treat it as an already-performed Read.
-    ``verified: true`` = bounds checked (or corrected) against the live file:
-    no follow-up Read needed. ``bounds: "approximate"`` = the symbol moved and
-    re-location failed. An ambiguous id (overloads, re-exports) returns ALL
-    matching bodies in ``candidates``; none is silently chosen. Also serves
-    live range reads ("path.py:140-180", ≤200 lines, always verified) and
-    omission refs ("repowise#<12-hex>"). An index miss returns fallback_lines
-    from a live grep rather than a dead end. When ``truncated`` is true the
-    response carries a ``continuation`` token: the exact range read that
-    fetches the remainder; pass it straight back to get_symbol.
+    Raw source, bounded (~600 lines). ``source`` uses Read's exact
+    line-numbered format; treat it as an already-performed Read. ``verified:
+    true`` = bounds checked against the live file, no follow-up Read needed;
+    ``bounds: "approximate"`` = the symbol moved and re-location failed.
+    ``status: "ambiguous"`` = several symbols match, all in ``candidates``,
+    none chosen for you. ``truncated`` brings a ``continuation`` token: the
+    range read that fetches the rest, passed straight back here.
 
     Args:
-        symbol_id: "path/to/file.py::Name", "path/to/file.py:140-180" for a
-            live range, or an omission ref.
+        symbol_id: one target, or a list of up to 20 for one round trip
+            (reply becomes {"results": [...]} in request order). A target is
+            "path/file.py::Name", a qualified "Class.method", a bare
+            "function_name", "path/file.py:140-180" for a live range, or an
+            omission ref "repowise#<12-hex>".
         context_lines: extra lines before/after (0-50).
         repo: usually omitted.
         query: omission refs only, regex/substring filter on lines.
@@ -669,15 +714,91 @@ async def get_symbol(
     # on ``symbol_id`` — one isError early teaches the agent to abandon the
     # server (agent-context doctrine). Accept both; ``symbol_id`` wins when both
     # are given.
-    if not symbol_id and id:
-        symbol_id = id
-    if not symbol_id or not symbol_id.strip():
+    raw = symbol_id if symbol_id not in (None, "", []) else id
+    targets, over_cap = _normalize_targets(raw)
+    if not targets:
         return {
-            "symbol_id": symbol_id,
+            "symbol_id": raw,
             "error": "symbol_id is required",
             "_meta": _build_meta(timing_ms=(time.perf_counter() - t0) * 1000),
         }
 
+    if isinstance(raw, list):
+        return await _serve_batch(targets, over_cap, context_lines, query, depth, ctx, t0)
+    return await _serve_symbol(targets[0], context_lines, query, depth, ctx, t0)
+
+
+def _normalize_targets(raw: str | list[str] | None) -> tuple[list[str], list[str]]:
+    """Split *raw* into (served targets, targets dropped for exceeding the cap).
+
+    Blank entries are dropped rather than served as errors: a trailing empty
+    string in a generated list is a formatting artefact, not a question.
+    """
+    if raw is None:
+        return [], []
+    items = raw if isinstance(raw, list) else [raw]
+    cleaned = [t.strip() for t in items if isinstance(t, str) and t.strip()]
+    return cleaned[:_MAX_BATCH_TARGETS], cleaned[_MAX_BATCH_TARGETS:]
+
+
+async def _serve_batch(
+    targets: list[str],
+    over_cap: list[str],
+    context_lines: int,
+    query: str | None,
+    depth: int,
+    ctx: Any,
+    t0: float,
+) -> dict:
+    """Serve a list of targets in request order, one response.
+
+    Per-item ``_meta`` is folded into the envelope's: repeating the same
+    freshness and embedder block 20 times is pure duplication in the agent's
+    context, and the only per-item field worth keeping is the declared
+    counterfactual, which sums.
+    """
+    results: list[dict] = []
+    replaced = 0
+    for target in targets:
+        item = await _serve_symbol(target, context_lines, query, depth, ctx, t0)
+        meta = item.pop("_meta", None)
+        if isinstance(meta, dict):
+            declared = meta.get("replaced_tokens")
+            if isinstance(declared, int):
+                replaced += declared
+        item.setdefault("target", target)
+        results.append(item)
+
+    response: dict[str, Any] = {
+        "results": results,
+        "count": len(results),
+        "resolved_count": sum(1 for r in results if r.get("error") is None),
+        "_meta": _build_meta(timing_ms=(time.perf_counter() - t0) * 1000),
+    }
+    if over_cap:
+        # Serve what fits and say what did not, rather than rejecting the call:
+        # an isError on a 21-item batch costs the 20 answers that were ready.
+        response["not_served"] = over_cap
+        response["note"] = (
+            f"Batch capped at {_MAX_BATCH_TARGETS} targets; {len(over_cap)} were not "
+            "served and are listed in not_served. Send them as a second call."
+        )
+    if replaced:
+        from repowise.server.mcp_server._savings import declare_replaced
+
+        declare_replaced(response, replaced)
+    return response
+
+
+async def _serve_symbol(
+    symbol_id: str,
+    context_lines: int,
+    query: str | None,
+    depth: int,
+    ctx: Any,
+    t0: float,
+) -> dict:
+    """Resolve and serve exactly one target. The single-call response shape."""
     omission_ref = _extract_omission_ref(symbol_id)
     if omission_ref is not None:
         return _resolve_omission_ref(symbol_id, omission_ref, query, ctx.path, t0)
@@ -707,10 +828,10 @@ async def get_symbol(
 
     async with get_session(ctx.session_factory) as session:
         repository = await _get_repo(session)
-        rows = await _resolve_symbol(session, repository.id, symbol_id)
+        match = await resolve_symbol_match(session, repository.id, symbol_id)
 
     exclude_spec = _get_exclude_spec(ctx.path)
-    rows = [r for r in rows if not is_excluded(r.file_path, exclude_spec)]
+    rows = [r for r in match.rows if not is_excluded(r.file_path, exclude_spec)]
     if not rows:
         # Dead-end recovery: constants/imports/aliases between indexed
         # symbols miss the index but live in the file — grep the live file
@@ -778,7 +899,7 @@ async def get_symbol(
         }
 
     if len(rows) > 1:
-        return await _render_ambiguous(rows, symbol_id, ctx, repository, t0, context_lines)
+        return await _render_ambiguous(rows, symbol_id, ctx, repository, t0, context_lines, match)
 
     row = rows[0]
     repo_root = Path(str(ctx.path))
@@ -842,6 +963,13 @@ async def get_symbol(
             targets=[row.file_path],
         ),
     }
+    if row.symbol_id != symbol_id:
+        # The caller asked by name and got back a canonical id. Say which rung
+        # bridged the two: a request for "helper" answered with "HELPER" is a
+        # correct case-folded match and reads as a bug without the label, and
+        # ``resolved_from`` is what an agent quotes when it re-asks.
+        response["resolution"] = match.rung
+        response["resolved_from"] = symbol_id
     if truncated and not check.approximate and end < check.end_line:
         # The body exceeds the serve cap. Hand back the exact range read that
         # fetches the remainder so the agent never has to guess the next span

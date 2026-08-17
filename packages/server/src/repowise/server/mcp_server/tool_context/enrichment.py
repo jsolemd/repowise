@@ -39,6 +39,7 @@ from repowise.core.persistence.models import (
     Repository,
 )
 from repowise.server.mcp_server._helpers import filter_dicts_by_key, filter_path_list
+from repowise.server.mcp_server._test_linkage import resolve_test_linkage
 from repowise.server.schemas.intelligence import SYMBOL_RELATION_GROUP_OF
 
 # Minimum confidence for call edges to filter false positives
@@ -632,11 +633,25 @@ async def _resolve_health(
         "max_ccn": metric.max_ccn,
         "max_nesting": metric.max_nesting,
         "nloc": metric.nloc,
+        # NOT "does this file have tests" — that is the card's ``tested``, from
+        # the test-linkage resolver both this tool and get_risk read. This is
+        # the index-time paired-filename heuristic that feeds the health
+        # *score*, and it is reported unchanged because the score was computed
+        # from it. The two answer different questions and diverge on ~7% of
+        # files; where they do, the note below says so rather than leaving the
+        # reader to pick a side (see _test_linkage).
         "has_test_file": metric.has_test_file,
         "module": metric.module,
         "duplication_pct": metric.duplication_pct,
         "top_biomarkers": top_biomarkers,
     }
+    linkage = await resolve_test_linkage(session, repo_id, file_path)
+    if bool(metric.has_test_file) is not linkage.tested:
+        health["has_test_file_note"] = (
+            f"has_test_file is the paired-filename heuristic behind the health score; "
+            f"the file's actual test linkage is tested={linkage.tested} "
+            f"(basis={linkage.basis}) — see the card's guarding_tests."
+        )
     if coverage_row is not None:
         health["coverage"] = {
             "source_format": coverage_row.source_format,

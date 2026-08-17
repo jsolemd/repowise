@@ -251,7 +251,7 @@ The workhorse tool. Returns docs, symbols, ownership, freshness, and community m
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `targets` | list[string] | Yes | File paths, module names, or symbol IDs. Batch multiple targets in one call. Symbol ids take the same `"path/to/file.py::Name"` form `get_symbol` accepts, with the same `::` / `.` / `/` separator normalisation, so an id from either tool works in the other. |
+| `targets` | list[string] | Yes | File paths, module names, or symbols. Batch multiple targets in one call. Symbol targets take exactly the forms `get_symbol` accepts and resolve through the same ladder, so an id from either tool works in the other: a full `"path/to/file.py::Name"`, a qualified `"Class.method"` / `"Class::method"` / `"pkg.mod.Class.method"`, or a bare name. |
 | `include` | list[string] | No | Additional data to include: `"full_doc"` (full wiki markdown), `"callers"` (who calls this, symbol targets), `"callees"` (what this calls, symbol targets), `"ownership"` (primary owner, bus factor, contributor count), `"last_change"` (last commit date + author), `"metrics"` (PageRank, betweenness, percentiles), `"community"` (cluster membership + neighbors), `"decisions"` (full decision records; default returns titles only), `"skeleton"` (file targets only; the file with bodies elided: every signature, imports, and the bodies of the most central symbols, token-budgeted; typically ~15% of the full file's tokens) |
 | `compact` | boolean | No | Default `true`. Set `false` for full structure block and importer list. |
 | `repo` | string | No | *(workspace only)* Target repo alias, or `"all"` |
@@ -267,6 +267,31 @@ When the symbol half of a `path::Name` target does not resolve but the file
 half does, the reply is that file's card with `resolved_to` naming the file and
 a `note` saying which symbol was not found. The file's symbol list is where the
 correct id is, so this is a partial answer rather than a dead end.
+
+**Test linkage.** Every file and symbol card carries `tested` (bool),
+`test_linkage_basis`, and — when something does guard it — `guarding_tests`
+(up to 10 paths) with `guarding_test_count`. `get_risk`'s `test_gap` is the
+negation of the same `tested`, read from the same resolver, so the two tools
+cannot disagree about a file. The basis says how strong the claim is:
+`coverage` (a coverage run proved these tests execute the file), `graph`
+(these test files import it), `naming` (nothing references it, but a
+conventionally-named test file exists — a convention, not evidence), `self`
+(the file is itself test material), or `none`. The `health` block's
+`has_test_file` is a *different* question — the index-time paired-filename
+heuristic that feeds the health score — and carries a note when it diverges
+from the linkage.
+
+**Ambiguity.** A name matching several symbols returns `status: "ambiguous"`,
+an exact `match_count`, and up to 20 `candidates`
+(`symbol_id`/`file`/`name`/`qualified_name`/`kind`/`start_line`). The card
+still describes the first match and the `note` says which, so the reply is
+usable, but nothing is presented as *the* answer.
+
+**A path that does not exist** returns `status: "not_found"` with
+`suggestions`: files under the target if it looked like a directory, then a
+filename match, then the closest indexed paths by edit distance — so a typo
+(`src/auth/servce.py`) comes back with `src/auth/service.py` rather than a bare
+error. When nothing resembles it, the error says so explicitly.
 
 **When to use:** Before reading or modifying code. Pass all relevant targets in one call to minimize round-trips. In workspace mode, enriched with cross-repo co-change and contract data.
 
@@ -299,7 +324,7 @@ Also resolves **omission refs** (`repowise#<12-hex>`) from truncated responses.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `symbol_id` | string | Yes | One of three forms: `"path/to/file.py::SymbolName"` (canonical, from `get_context`'s symbol list; normalises `::` / `.` / `/` separators across languages), `"path/to/file.py:140-180"` (a live range read, 200 lines max), or an omission ref `"repowise#<12-hex>"` / a pasted whole `[repowise#...]` marker. |
+| `symbol_id` | string \| list[string] | Yes | A target, or a list of up to 20 (see **Batching** below). A target is `"path/to/file.py::SymbolName"` (canonical, from `get_context`'s symbol list; normalises `::` / `.` / `/` separators across languages), a qualified name with no path (`"AuthService.login"`, `"AuthService::login"`, `"auth.service.AuthService.login"`), a bare name (`"reconcile_symbols_for_files"`), `"path/to/file.py:140-180"` (a live range read, 200 lines max), or an omission ref `"repowise#<12-hex>"` / a pasted whole `[repowise#...]` marker. |
 | `query` | string | No | Omission refs only: return just the stored lines matching this regex (or substring). Ignored for symbol ids and range reads. |
 | `context_lines` | int | No | Extra source lines before/after the symbol (0-50, default 0) |
 | `depth` | int | No | Follow the call graph outward from this symbol and include what it calls, with bodies (1-3, default 1 = this symbol only). Out-of-range values clamp. |
@@ -309,12 +334,37 @@ Also resolves **omission refs** (`repowise#<12-hex>`) from truncated responses.
 each line prefixed with its file line number in the same format as a `Read`
 result), its exact start/end line numbers, kind, and a `truncated` flag; on a
 miss, an `error` with the closest matches (`fallback_lines` from a live grep).
-When several indexed symbols match the id (overloads, re-exports, conditional
-definitions) the response has `ambiguous: true` and a `candidates` list with
-every matching body — none is silently chosen; candidates past the response
-budget appear in `not_rendered` with a `fetch_with` range read. For an
-omission ref: the stored content plus provenance (`source`, `created_at`,
-`original_tokens`).
+When several indexed symbols match the target (overloads, re-exports,
+conditional definitions, or a leaf name that is simply common) the response has
+`status: "ambiguous"`, `ambiguous: true`, an exact `match_count`, and a
+`candidates` list — none is silently chosen. Each candidate carries
+`symbol_id`, `file`, `name`, `qualified_name`, `kind`, and `start_line`; with
+four or fewer matches it also carries the body, and above that a `fetch_with`
+id to re-call with instead (a bare `__init__` matches 123 symbols on a real
+index, and 123 bodies answer nothing). At most 20 are listed; `match_count` is
+always the true total. For an omission ref: the stored content plus provenance
+(`source`, `created_at`, `original_tokens`).
+
+**Resolution order.** Path-qualified rungs first — exact `symbol_id`, then
+`(file, qualified_name)`, then `(file, name)`, then a file-path suffix match so
+a remembered filename (`answer.py::get_answer`) resolves. If the target names a
+file (it contains a `/` or its first segment ends in a source-file extension)
+resolution stops there: `nope/wrong.py::alpha` returns retryable `suggestions`
+rather than an `alpha` from some other file, because the caller asserted a path
+and meant it. Otherwise the whole target is retried as a name: exact
+`qualified_name`, then a qualified tail on a separator boundary
+(`Class.method` under `pkg.mod.Class.method`), then the bare `name`, then the
+leaf segment alone. Only if all of that comes back empty is the ladder walked
+again case-insensitively, so an exact match always outranks a case-folded one
+in languages where `Foo` and `foo` are two symbols.
+
+**Batching.** Pass a list to fetch several targets in one round trip. The
+reply becomes `{"results": [...], "count", "resolved_count"}` — one entry per
+target, in request order, each the same shape a single-target call returns,
+plus the `target` string it came from. Per-item `_meta` is folded into the
+envelope's. A single target returns the flat shape, unchanged. Over 20 targets,
+the first 20 are served and the rest are named in `not_served` rather than the
+call failing.
 
 With `depth` above 1 the response also carries `callee_bodies`: the symbols
 this one calls, transitively, each with its `depth` (hops from the root), its
@@ -341,6 +391,9 @@ get_symbol(symbol_id="src/auth/service.py::AuthService")
 get_symbol(symbol_id="src/auth/service.py::login", context_lines=10)
 get_symbol(symbol_id="src/auth/service.py::login", depth=2)
 get_symbol(symbol_id="src/auth/service.py:140-180")
+get_symbol(symbol_id="AuthService.login")          # qualified, no path
+get_symbol(symbol_id="reconcile_symbols_for_files") # bare name
+get_symbol(symbol_id=["AuthService.login", "src/db/models.py::User"])
 get_symbol(symbol_id="repowise#a1b2c3d4e5f6")
 get_symbol(symbol_id="repowise#a1b2c3d4e5f6", query="FAILED")
 ```
@@ -428,6 +481,12 @@ Modification risk assessment for files or a set of changed files.
 | `repo` | string | No | *(workspace only)* Target repo alias |
 
 **Returns:** Per-file `hotspot_score` (0-1 churn percentile), `health_score` (0-10), hotspot status, dependent count, co-change partners (each with a recency-decayed `weight`, not an integer count), blast radius, recommended reviewers, test gap analysis, security signals. In workspace mode, enriched with cross-repo co-change partners and contract dependencies.
+
+Test-gap analysis is the same resolver `get_context` reports from, so the two
+tools always agree about a file: `test_gap` is the negation of `tested`, and
+the payload carries the `test_linkage_basis` and the `guarding_tests` the
+verdict rests on. See [Test linkage](#get_context) under `get_context` for
+what each basis claims.
 
 > **Scales.** Ratios derived from ownership or percentile columns are 0-1 (`hotspot_score`, `owner_pct`, `recent_owner_pct`); coverage and gap fields are 0-100 (`coverage_pct`, `branch_coverage_pct`, `share_of_repo_gap_pct`, `change_entropy_pct`, `churn_percentile`). The `_pct` suffix alone does not tell you which — check this table. Every emitted float is rounded to 4 significant digits.
 

@@ -12,13 +12,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from repowise.core.persistence.models import (
     GitMetadata,
-    GraphNode,
     Repository,
 )
-from repowise.core.persistence.sql import LIKE_ESCAPE, escape_like
 from repowise.server.mcp_server._helpers import (
     filter_dicts_by_key,
 )
+from repowise.server.mcp_server._test_linkage import resolve_test_linkage
 
 #: A file carrying this many counted bug fixes reads as bug-prone. Same trigger
 #: the PR bot uses for prior defects, so the two surfaces agree on "a lot".
@@ -178,60 +177,33 @@ def _compute_impact_surface(
 
 
 async def _check_test_gap(session: AsyncSession, repo_id: str, target: str) -> bool:
-    """Return True if *target* has no test, coverage-backed where the map has data.
+    """Return True if nothing tests *target*.
 
-    A file with a per-test coverage row (from ``repowise coverage add``) is
-    coverage-*proven* tested, so it is never a gap. Where the map has no data for
-    the file, fall back to the filename pattern (test_<name>, <name>_test,
-    <name>.spec.*) - an honest "unknown", never asserted as untested. Test files
-    themselves (is_test=True) are never a gap.
+    Kept as a named function because the REST file view imports it, so that
+    surface answers the question the same way the two MCP tools do. Thin
+    negation of :func:`resolve_test_linkage`, which ``get_context`` also
+    answers from. It used to be its own substring scan over the test nodes
+    while get_context carried the health engine's paired-filename column, and
+    the two tools contradicted each other on the same file (49 of 751 on the
+    SoleMD.Infra mirror). One owner of the question was the only fix; see
+    ``_test_linkage`` for the evidence ladder.
     """
-    import os
+    return not (await resolve_test_linkage(session, repo_id, target)).tested
 
-    from repowise.core.persistence.crud import covered_source_files
 
-    # Test files don't need tests — skip the check entirely
-    node_res = await session.execute(
-        select(GraphNode.is_test)
-        .where(
-            GraphNode.repository_id == repo_id,
-            GraphNode.node_id == target,
-        )
-        .limit(1)
-    )
-    row = node_res.scalar_one_or_none()
-    if row is True:
-        return False
+async def _attach_test_linkage(
+    result_data: dict[str, Any], session: AsyncSession, repo_id: str, target: str
+) -> None:
+    """Write ``test_gap`` and the linkage that justifies it onto *result_data*.
 
-    # Coverage proves a test exercises this file: not a gap.
-    if await covered_source_files(session, repo_id, {target}):
-        return False
-
-    base = os.path.splitext(os.path.basename(target))[0]
-    ext = os.path.splitext(target)[1].lstrip(".")
-    # Build a LIKE pattern broad enough to catch test_<base>, <base>_test,
-    # <base>.spec.*. Escaped whole: the underscores are ours and meant
-    # literally, and *base* is a filename, where an underscore is the norm.
-    # Unescaped, "%test_my_module%" also matches "testXmyXmodule", and a false
-    # hit here reports a file as tested when nothing tests it.
-    patterns = [
-        f"%{escape_like(f'test_{base}')}%",
-        f"%{escape_like(f'{base}_test')}%",
-        f"%{escape_like(f'{base}.spec.{ext}')}%",
-    ]
-    for pat in patterns:
-        res = await session.execute(
-            select(GraphNode)
-            .where(
-                GraphNode.repository_id == repo_id,
-                GraphNode.is_test == True,  # noqa: E712
-                GraphNode.node_id.like(pat, escape=LIKE_ESCAPE),
-            )
-            .limit(1)
-        )
-        if res.scalar_one_or_none() is not None:
-            return False
-    return True
+    ``test_gap`` alone tells an agent to write a test but not which existing
+    ones to run first, and a bare boolean is also the shape that let the old
+    contradiction hide: naming the guarding tests makes the claim checkable in
+    the same payload that makes it.
+    """
+    linkage = await resolve_test_linkage(session, repo_id, target)
+    result_data["test_gap"] = not linkage.tested
+    result_data.update(linkage.as_payload())
 
 
 async def _get_security_signals(session: AsyncSession, repo_id: str, target: str) -> list[dict]:
@@ -394,7 +366,9 @@ async def _assess_one_target(
     """Assess risk for a single target file.
 
     Enriches each result with:
-    - test_gap: bool — True when no test file matching this file's basename exists.
+    - test_gap: bool — True when nothing tests this file (see _test_linkage).
+    - tested / test_linkage_basis / guarding_tests: the evidence test_gap was
+      derived from — the same block get_context reports, from the same source.
     - security_signals: list of {kind, severity, snippet} from security_findings.
     """
     repo_id = repository.id
@@ -425,7 +399,7 @@ async def _assess_one_target(
             node_meta,
             exclude_spec,
         )
-        result_data["test_gap"] = await _check_test_gap(session, repo_id, target)
+        await _attach_test_linkage(result_data, session, repo_id, target)
         result_data["security_signals"] = await _get_security_signals(session, repo_id, target)
         result_data["risk_summary"] = f"{target} — no git metadata available"
         return result_data
@@ -483,7 +457,7 @@ async def _assess_one_target(
         result_data["defect_profile"] = defect_profile
 
     # C. Test gaps + security signals
-    result_data["test_gap"] = await _check_test_gap(session, repo_id, target)
+    await _attach_test_linkage(result_data, session, repo_id, target)
     result_data["security_signals"] = await _get_security_signals(session, repo_id, target)
 
     capped = getattr(meta, "commit_count_capped", False)

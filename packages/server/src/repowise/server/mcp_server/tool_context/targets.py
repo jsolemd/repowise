@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import posixpath
 import re
 from pathlib import Path
 from typing import Any
@@ -39,7 +40,12 @@ from repowise.server.mcp_server._helpers import (
     is_excluded,
     read_repo_file_text,
 )
-from repowise.server.mcp_server._symbol_lookup import resolve_symbol_rows
+from repowise.server.mcp_server._symbol_lookup import (
+    MAX_AMBIGUITY_CANDIDATES,
+    SymbolMatch,
+    resolve_symbol_match,
+)
+from repowise.server.mcp_server._test_linkage import resolve_test_linkage
 from repowise.server.mcp_server.tool_context.enrichment import (
     _resolve_call_graph,
     _resolve_community,
@@ -231,6 +237,63 @@ def _size_exclusion_note(repo_root: Any, target: str) -> str | None:
     )
 
 
+#: Characters of the queried stem used to gather the near-miss pool. Long
+#: enough that the LIKE stays selective, short enough that a typo in the tail
+#: (``servce`` for ``service``) still lands inside the pool.
+_NEAR_MISS_PREFIX = 4
+
+#: Ceiling on the pool difflib ranks. Bounds the cost on a large index, where
+#: the alternative is dragging every path through Python for a failed lookup.
+_NEAR_MISS_POOL = 200
+
+#: Minimum difflib ratio for a path to be offered. Below this the "suggestion"
+#: is noise, and a wrong path offered confidently is worse than none.
+_NEAR_MISS_CUTOFF = 0.6
+
+
+async def _near_miss_paths(session: AsyncSession, repo_id: str, target: str) -> list[str]:
+    """Indexed paths that look like a misspelling of *target*.
+
+    Two steps on purpose: SQL narrows to files whose basename opens the same
+    way, then difflib ranks that pool. Ranking the whole index in Python would
+    be correct and unaffordable; a bare ``LIKE`` on the typed name is
+    affordable and matches nothing, which is the case this exists for.
+    """
+    from difflib import get_close_matches
+
+    normalized = target.replace("\\", "/").strip("/")
+    stem = posixpath.splitext(posixpath.basename(normalized))[0]
+    prefix = stem[:_NEAR_MISS_PREFIX]
+    if len(prefix) < 2:
+        return []
+
+    like = f"%{escape_like(prefix)}%"
+    # Three sources, because a file can be missing from any one of them: no git
+    # history, no generated page, or (for a generated page) no graph node.
+    queries = (
+        select(GitMetadata.file_path).where(
+            GitMetadata.repository_id == repo_id,
+            GitMetadata.file_path.like(like, escape=LIKE_ESCAPE),
+        ),
+        select(Page.target_path).where(
+            Page.repository_id == repo_id,
+            Page.page_type == "file_page",
+            Page.target_path.like(like, escape=LIKE_ESCAPE),
+        ),
+        select(GraphNode.node_id).where(
+            GraphNode.repository_id == repo_id,
+            GraphNode.node_type == "file",
+            GraphNode.node_id.like(like, escape=LIKE_ESCAPE),
+        ),
+    )
+    pool: set[str] = set()
+    for query in queries:
+        res = await session.execute(query.limit(_NEAR_MISS_POOL))
+        pool.update(row[0] for row in res.all() if row[0] and row[0] != target)
+
+    return get_close_matches(normalized, sorted(pool), n=5, cutoff=_NEAR_MISS_CUTOFF)
+
+
 async def _resolve_one_target(
     session: AsyncSession,
     repository: Repository,
@@ -263,6 +326,8 @@ async def _resolve_one_target(
     # Set only when a symbol target resolved through the call graph rather than
     # the symbol index (index-only mode); carries the fields the node has.
     graph_symbol: GraphNode | None = None
+    # How the symbol ladder resolved this target, if it was tried at all.
+    sym_match = SymbolMatch(query=target)
 
     if page and page.repository_id == repo_id:
         target_type = "file"
@@ -333,37 +398,36 @@ async def _resolve_one_target(
         else:
             # 3. Try symbol.
             #
-            # A "{path}::{Name}" target goes through the shared symbol lookup,
-            # the same ladder get_symbol uses, so an id lifted from one tool's
-            # response resolves in the other, in whichever separator style the
-            # caller wrote the qualified part. Matching such a target verbatim
-            # against WikiSymbol.name can only ever miss (a stored name is one
-            # segment, never a path-qualified id), and the ilike below would
-            # then scan for a "%path::Class.method%" substring that no name
-            # column contains. Both rungs are skipped for qualified ids.
-            if "::" in target:
-                sym_matches = await resolve_symbol_rows(session, repo_id, target)
-            else:
+            # Every symbol form goes through the shared ladder get_symbol uses
+            # — a full "{path}::{Name}" id, a qualified "Class.method", or a
+            # bare name — so an id lifted from one tool's response resolves in
+            # the other, in whichever separator style the caller wrote it, and
+            # a name an agent read off a call site resolves without a path it
+            # does not have yet.
+            sym_match = await resolve_symbol_match(session, repo_id, target)
+            if not sym_match.rows and "::" not in target:
+                # Exploratory substring rung, get_context only. The ladder
+                # above matches whole names; a caller browsing for "auth"
+                # wants AuthService, and get_context is the tool where that
+                # guess is cheap (a card, not a body). Never for a qualified
+                # id: no name column contains "path::Class.method".
                 res = await session.execute(
-                    select(WikiSymbol).where(
+                    select(WikiSymbol)
+                    .where(
                         WikiSymbol.repository_id == repo_id,
-                        WikiSymbol.name == target,
+                        WikiSymbol.name.ilike(f"%{escape_like(target)}%", escape=LIKE_ESCAPE),
                     )
+                    .order_by(WikiSymbol.file_path, WikiSymbol.start_line, WikiSymbol.symbol_id)
+                    .limit(10)
                 )
-                sym_matches = list(res.scalars().all())
-                if not sym_matches:
-                    res = await session.execute(
-                        select(WikiSymbol)
-                        .where(
-                            WikiSymbol.repository_id == repo_id,
-                            WikiSymbol.name.ilike(f"%{escape_like(target)}%", escape=LIKE_ESCAPE),
-                        )
-                        .limit(10)
+                substring_rows = list(res.scalars().all())
+                if substring_rows:
+                    sym_match = SymbolMatch(
+                        query=target, rows=substring_rows, rung="name_substring"
                     )
-                    sym_matches = list(res.scalars().all())
-            if sym_matches:
+            if sym_match.rows:
                 target_type = "symbol"
-                file_path_for_git = sym_matches[0].file_path
+                file_path_for_git = sym_match.rows[0].file_path
             else:
                 # 4. Try file page by target_path search
                 res = await session.execute(
@@ -517,14 +581,32 @@ async def _resolve_one_target(
                     .limit(5)
                 )
                 suggestions = [row[0] for row in res.all() if row[0] != target]
+            if not suggestions:
+                # A mistyped path — ``srv/auth/servce.py`` — matches none of the
+                # rungs above, and an error with no suggestions is where the
+                # agent gives up on the tool and starts globbing. Spelling is
+                # the likeliest cause, so answer it as one.
+                suggestions = await _near_miss_paths(session, repo_id, target)
             suggestions = filter_path_list(suggestions, exclude_spec)
             if suggestions:
                 return {
                     "target": target,
-                    "error": f"Target not found: '{target}'",
+                    "status": "not_found",
+                    "error": (
+                        f"Target not found: '{target}'. Closest indexed paths are "
+                        "listed in suggestions — retry with one of them."
+                    ),
                     "suggestions": suggestions,
                 }
-            return {"target": target, "error": f"Target not found: '{target}'"}
+            return {
+                "target": target,
+                "status": "not_found",
+                "error": (
+                    f"Target not found: '{target}', and no indexed path resembles it. "
+                    "Check the path against get_overview, or pass a symbol name "
+                    "instead of a path."
+                ),
+            }
 
     result_data["target"] = target
     result_data["type"] = target_type
@@ -774,7 +856,7 @@ async def _resolve_one_target(
             # In index-only mode the symbol may exist as a graph node with no
             # WikiSymbol row, so the node carries the fields it has and the
             # rest are simply absent rather than faked.
-            sym = sym_matches[0] if sym_matches else graph_symbol  # type: ignore[possibly-undefined]
+            sym = sym_match.rows[0] if sym_match.rows else graph_symbol
             docs["name"] = sym.name
             docs["kind"] = sym.kind
             docs["file_path"] = sym.file_path
@@ -826,17 +908,40 @@ async def _resolve_one_target(
                 sorted(best_rank, key=lambda p: (-best_rank[p], p)), exclude_spec
             )[:_MAX_USED_BY]
             # Candidates
-            if len(sym_matches) > 1:  # type: ignore[possibly-undefined]
+            if len(sym_match.rows) > 1:
                 docs["candidates"] = filter_dicts_by_key(
                     [
                         {"name": m.name, "kind": m.kind, "file_path": m.file_path}
-                        for m in sym_matches[1:5]  # type: ignore[possibly-undefined]
+                        for m in sym_match.rows[1:5]
                     ],
                     "file_path",
                     exclude_spec,
                 )
 
         result_data["docs"] = docs
+
+    # --- Ambiguity -------------------------------------------------------
+    # A name matching several symbols is a real answer the card cannot carry:
+    # the card describes one of them, and reading it as *the* answer is how an
+    # agent ends up editing the wrong ``__init__``. Say so, and hand back every
+    # match with the exact id that pins it, so the follow-up call is a pick and
+    # not another guess. ``docs.candidates`` above stays as it was — the same
+    # facts, minus the ids and the status a consumer can branch on.
+    if len(sym_match.rows) > 1:
+        listed = filter_dicts_by_key(sym_match.candidates(), "file", exclude_spec)
+        result_data["status"] = sym_match.status
+        result_data["match_count"] = len(sym_match.rows)
+        result_data["candidates"] = listed[:MAX_AMBIGUITY_CANDIDATES]
+        result_data["note"] = (
+            f"{len(sym_match.rows)} symbols match {target!r}; this card describes "
+            f"{sym_match.rows[0].symbol_id!r}. Pick one from candidates and pass "
+            "its symbol_id to get_context or get_symbol."
+        )
+        if sym_match.truncated or len(listed) > MAX_AMBIGUITY_CANDIDATES:
+            result_data["note"] += (
+                f" Only the first {MAX_AMBIGUITY_CANDIDATES} are listed — the name is too"
+                " common to enumerate; qualify it (Class.method) or pass a path."
+            )
 
     # --- Triage signals (always on) ---------------------------------------
     # Two single-bit-ish pointers the agent uses to decide its next move:
@@ -904,6 +1009,18 @@ async def _resolve_one_target(
                 result_data["decision_records_hint"] = (
                     "Decisions touch this file. Call get_why(targets=[...]) for rationale."
                 )
+
+    # --- Test linkage (always on, files and symbols) -----------------------
+    # ``tested`` / ``guarding_tests`` answer "what would catch me if I broke
+    # this", which is the question that follows every hotspot and fix_history
+    # bit above. It is on by default and not behind ``include=["health"]``
+    # because the *other* tool that answers it — get_risk's ``test_gap`` — is
+    # always on too, and the two contradicting each other is precisely what
+    # this replaced: both now read `_test_linkage`, so the same file gets the
+    # same answer whichever tool the agent happens to call.
+    if target_type in ("file", "symbol") and file_path_for_git:
+        linkage = await resolve_test_linkage(session, repo_id, file_path_for_git)
+        result_data.update(linkage.as_payload())
 
     # --- Ownership ---
     if include is None or "ownership" in include:
