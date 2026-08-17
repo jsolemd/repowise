@@ -361,6 +361,152 @@ async def test_the_served_score_agrees_with_the_served_order(tmp_path):
     assert scores[0] > scores[1]
 
 
+# ---------------------------------------------------------------------------
+# Identifiers carried inside prose
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("query", "expected"),
+    [
+        # snake_case, in all the casings it is written in
+        ("fix the failing merged_with case", ["merged_with"]),
+        ("where is HTTP_CALLS built", ["HTTP_CALLS"]),
+        ("what sets _private_helper", ["_private_helper"]),
+        # camelCase and CamelCase
+        ("how does parseConfig read the file", ["parseConfig"]),
+        ("where is HostHeaderClient constructed", ["HostHeaderClient"]),
+        # dotted and ::-qualified
+        ("what does Class.method return", ["Class.method"]),
+        ("trace atlas::refresh through the run", ["atlas::refresh"]),
+        # several at once, deduplicated, in the order written
+        (
+            "does parseConfig call merged_with or parseConfig again",
+            ["parseConfig", "merged_with"],
+        ),
+    ],
+)
+def test_identifier_shaped_tokens_are_extracted_from_prose(query, expected):
+    from repowise.core.source_search.coordinator import _embedded_identifiers
+
+    assert _embedded_identifiers(query) == expected
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        # Plain English, including words a looser rule would claim.
+        "how does the vault refresh skip unchanged files",
+        "why is the coverage baseline rejected",
+        "Obsidian vault notes written atomically for the Windows watcher",
+        "route a clicked WSL file link to the right editor",
+        # Sentence punctuation is not a qualified name, and neither are initials.
+        "what happens next. the run continues",
+        "the U.S. tax year boundary",
+        # An acronym is one token, not a camel hump.
+        "call the PostgREST endpoint",
+    ],
+)
+def test_plain_prose_names_no_identifier(query):
+    from repowise.core.source_search.coordinator import _embedded_identifiers
+
+    assert _embedded_identifiers(query) == []
+
+
+async def test_an_identifier_inside_prose_promotes_its_definition(tmp_path):
+    coordinator = _coordinator(
+        tmp_path,
+        source_dense=[
+            _hit("other", "src/other.py", 0.90),
+            _hit("merged_with", "src/target.py", 0.10),
+        ],
+    )
+    response = await coordinator.search("fix the failing merged_with case", limit=5)
+    assert _files(response) == ["src/target.py", "src/other.py"]
+    assert response["results"][0]["evidence"]["exact_name"] is True
+    assert response["results"][1]["evidence"]["exact_name"] is False
+
+
+async def test_the_embedded_arm_names_itself_in_the_owner_reason(tmp_path):
+    coordinator = _coordinator(
+        tmp_path,
+        source_dense=[
+            _hit("other", "src/other.py", 0.90),
+            _hit("merged_with", "src/target.py", 0.10),
+        ],
+    )
+    response = await coordinator.search("fix the failing merged_with case", limit=5)
+    assert response["selected_owner"] == {
+        "file": "src/target.py",
+        "reason": "embedded identifier match",
+    }
+    assert response["confidence"] == "confident"
+
+
+async def test_the_embedded_arm_does_not_promote_on_mere_mention(tmp_path):
+    """Half a subsystem mentions any given helper; only a name match is evidence."""
+    coordinator = _coordinator(
+        tmp_path,
+        source_dense=[
+            _hit("other", "src/other.py", 0.90, snippet="calls merged_with(row)"),
+            _hit("unrelated", "src/far.py", 0.10),
+        ],
+    )
+    response = await coordinator.search("fix the failing merged_with case", limit=5)
+    assert _files(response) == ["src/other.py", "src/far.py"]
+    assert all(item["evidence"]["exact_name"] is False for item in response["results"])
+
+
+async def test_a_whole_query_identifier_still_takes_the_stronger_router(tmp_path):
+    """The two routers are exclusive, and the bare-identifier one keeps its tiers."""
+    coordinator = _coordinator(
+        tmp_path,
+        source_dense=[
+            _hit("other", "src/other.py", 0.90),
+            _hit("mentions", "src/near.py", 0.50, snippet="calls merged_with(row)"),
+            _hit("merged_with", "src/target.py", 0.10),
+        ],
+    )
+    response = await coordinator.search("merged_with", limit=5)
+    # Name match, then the containment tier the embedded arm deliberately lacks.
+    assert _files(response) == ["src/target.py", "src/near.py", "src/other.py"]
+    assert response["selected_owner"]["reason"] == "exact name match"
+
+
+async def test_an_embedded_identifier_matches_a_wiki_symbol_page(tmp_path):
+    """A page's name is its title; the symbol comes off the page id instead."""
+    coordinator = _coordinator(
+        tmp_path,
+        wiki_dense=[
+            _PageHit("file_page:src/other.py", "src/other.py", 0.90),
+            _PageHit(
+                "symbol_spotlight:src/target.py::pkg.mod.merged_with",
+                "src/target.py::pkg.mod.merged_with",
+                0.10,
+                page_type="symbol_spotlight",
+                title="Symbol: pkg.mod.merged_with",
+            ),
+        ],
+    )
+    response = await coordinator.search("fix the failing merged_with case", limit=5)
+    assert _files(response) == ["src/target.py", "src/other.py"]
+    assert response["results"][0]["evidence"]["exact_name"] is True
+
+
+async def test_a_short_trailing_segment_is_not_a_name(tmp_path):
+    """``refresh.py`` must not make every symbol called ``py`` an exact match."""
+    coordinator = _coordinator(
+        tmp_path,
+        source_dense=[
+            _hit("other", "src/other.py", 0.90),
+            _hit("py", "src/py.py", 0.10),
+        ],
+    )
+    response = await coordinator.search("fix the refresh.py fingerprint check", limit=5)
+    assert _files(response) == ["src/other.py", "src/py.py"]
+    assert all(item["evidence"]["exact_name"] is False for item in response["results"])
+
+
 async def test_the_router_matches_the_last_dotted_segment(tmp_path):
     """``Class.method`` and a stored ``Class::method`` are one name."""
     coordinator = _coordinator(
@@ -386,17 +532,18 @@ async def test_the_router_is_case_insensitive(tmp_path):
     assert _files(response) == ["src/target.py", "src/other.py"]
 
 
-async def test_a_phrase_is_not_routed_as_an_identifier(tmp_path):
-    """Two words are a topic. Fusion order stands."""
+async def test_prose_naming_no_identifier_leaves_the_fusion_alone(tmp_path):
+    """Plain words are a topic. Neither router fires; fusion order stands."""
     coordinator = _coordinator(
         tmp_path,
         source_dense=[
             _hit("other", "src/other.py", 0.9),
-            _hit("merged_with", "src/target.py", 0.1),
+            _hit("target", "src/target.py", 0.1),
         ],
     )
-    response = await coordinator.search("merged_with rows", limit=5)
+    response = await coordinator.search("how the vault refresh skips work", limit=5)
     assert _files(response) == ["src/other.py", "src/target.py"]
+    assert all(item["evidence"]["exact_name"] is False for item in response["results"])
 
 
 # ---------------------------------------------------------------------------

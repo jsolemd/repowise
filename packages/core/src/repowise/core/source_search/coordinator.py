@@ -63,10 +63,13 @@ __all__ = [
     "AGREEMENT_LEXICAL_DEPTH",
     "CONFIDENT_DENSE_COSINE",
     "DENSE_WEIGHT",
+    "EXACT_VIA_EMBEDDED",
+    "EXACT_VIA_QUERY",
     "LANE_SOURCE",
     "LANE_WIKI",
     "LEG_FETCH",
     "LEXICAL_WEIGHT",
+    "MIN_TAIL_CHARS",
     "NO_MATCH_DENSE_COSINE",
     "OWNER_SCORE_BAND",
     "RRF_K",
@@ -145,6 +148,36 @@ NO_MATCH = "no_match"
 #: long dotted path of a sentence's worth of words cannot present as a symbol.
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.:]{1,127}$")
 
+#: An identifier-shaped token carried *inside* a longer query. Three shapes, and
+#: the point of all three is that no plain English word can wear them: a word
+#: with an underscore in it, a word with an internal capital hump, or a dotted
+#: or ``::``-qualified name. Prose is therefore free to contain as many words as
+#: it likes without any of them presenting as a symbol.
+#:
+#: The snake and camel arms are ``tool_search._IDENT_TOKEN_RE``'s, with the camel
+#: arm widened to accept a lowercase first letter so ``parseConfig`` is found and
+#: not only ``ParseConfig``. The dotted arm is new here, and requires every
+#: segment to be at least two characters so that "e.g." and initials do not read
+#: as qualified names.
+_EMBEDDED_IDENTIFIER_RE = re.compile(
+    r"\b(?:"
+    r"_*[A-Za-z0-9]+_[A-Za-z0-9_]+"
+    r"|[A-Za-z][a-z0-9]*(?:[A-Z][a-z0-9]+)+"
+    r"|[A-Za-z_][A-Za-z0-9_]+(?:(?:::|\.)[A-Za-z_][A-Za-z0-9_]+)+"
+    r")\b"
+)
+
+#: Shortest trailing dotted segment allowed to stand in for a whole name. Two
+#: characters is a file extension or an initial far more often than it is a
+#: symbol, and matching every ``py`` in the corpus is noise, not evidence.
+MIN_TAIL_CHARS = 3
+
+#: How an item came by its exact-name evidence. The whole query *being* the
+#: identifier is a stronger claim than the query merely carrying it, and the two
+#: reorder by different rules, so the response says which one it was.
+EXACT_VIA_QUERY = "query"
+EXACT_VIA_EMBEDDED = "embedded"
+
 #: A query that names test material. On its own this is a query *about* tests,
 #: and demoting them would be answering a different question.
 _TEST_QUERY_RE = re.compile(r"\b(test|tests|testing|pytest|fixture|mock|spec)\b", re.IGNORECASE)
@@ -211,14 +244,28 @@ class _Item:
     kind: str
     snippet: str
     source: str
+    #: The bare symbol name to match an identifier against, when the item has
+    #: one. Separate from *name* because a wiki page's name is its title —
+    #: "Symbol: a.b.c.foo", "File: a/b.py" — which is a sentence, not a name,
+    #: and comparing an identifier against it can only ever fail. Taken
+    #: structurally from the page id rather than parsed out of the title, and
+    #: empty for a page that names no symbol.
+    match_name: str = ""
     start_line: int | None = None
     end_line: int | None = None
     is_test: bool = False
     dense_cosine: float | None = None
     dense_rank: int | None = None
     lexical_rank: int | None = None
-    exact_name: bool = False
+    #: "" when no identifier matched this item's name, else which router
+    #: matched it — see :data:`EXACT_VIA_QUERY` / :data:`EXACT_VIA_EMBEDDED`.
+    exact_via: str = ""
     fused_score: float = 0.0
+
+    @property
+    def exact_name(self) -> bool:
+        """Whether an identifier matched this item's name, however it was found."""
+        return bool(self.exact_via)
 
     def evidence(self) -> dict[str, Any]:
         return {
@@ -267,6 +314,23 @@ def _identifier_query(query: str) -> str | None:
     return stripped if _IDENTIFIER_RE.match(stripped) else None
 
 
+def _embedded_identifiers(query: str) -> list[str]:
+    """Identifier-shaped tokens *query* carries inside natural language.
+
+    Order-preserving and deduplicated, so a query that names one symbol twice
+    does not weight it twice. Empty for prose that names none, which is the
+    common case and the reason this is cheap to ask.
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+    for token in _EMBEDDED_IDENTIFIER_RE.findall(query):
+        folded = token.lower()
+        if folded not in seen:
+            seen.add(folded)
+            out.append(token)
+    return out
+
+
 def _norm_identifier(text: str) -> str:
     """Fold the separators that spell one name three ways.
 
@@ -275,6 +339,23 @@ def _norm_identifier(text: str) -> str:
     writes.
     """
     return text.strip().lower().replace("::", ".")
+
+
+def _name_matchers(identifier: str) -> set[str]:
+    """Every normalised name *identifier* should be considered a match for.
+
+    The identifier itself, plus its last dotted segment — an agent writing
+    ``Class.method`` is asking after ``method``, which is what the symbol index
+    stores. The segment is dropped when it is shorter than
+    :data:`MIN_TAIL_CHARS`: ``refresh.py`` would otherwise ask every symbol
+    named ``py`` to present itself as an exact match.
+    """
+    normalised = _norm_identifier(identifier)
+    matchers = {normalised}
+    tail = normalised.rsplit(".", 1)[-1]
+    if len(tail) >= MIN_TAIL_CHARS:
+        matchers.add(tail)
+    return matchers
 
 
 def _page_file(page_type: str, target_path: str) -> str:
@@ -555,6 +636,7 @@ class SourceSearchCoordinator:
             lane=LANE_SOURCE,
             file=file_path,
             name=name,
+            match_name=name,
             kind=getattr(record, "kind", ""),
             snippet=getattr(record, "snippet", ""),
             source=getattr(record, "source", "") or SOURCE_SYMBOL,
@@ -567,12 +649,19 @@ class SourceSearchCoordinator:
     def _wiki_item(hit: Any, key: str) -> _Item | None:
         """A wiki page as a candidate. Its ``kind`` is the page type."""
         page_type = getattr(hit, "page_type", "") or ""
-        file_path = _page_file(page_type, getattr(hit, "target_path", "") or "")
+        target_path = getattr(hit, "target_path", "") or ""
+        file_path = _page_file(page_type, target_path)
+        # A symbol spotlight's page id is ``file.py::Symbol``, so the symbol is
+        # recoverable from the id itself. Read from there rather than from the
+        # title, which is prose ("Symbol: a.b.c.foo") and would need parsing
+        # that a retitling could silently break.
+        _, sep, symbol = target_path.partition("::")
         return _Item(
             key=key,
             lane=LANE_WIKI,
             file=file_path,
             name=getattr(hit, "title", "") or "",
+            match_name=symbol.rsplit(".", 1)[-1] if sep else "",
             kind=page_type,
             snippet=getattr(hit, "snippet", "") or "",
             source=SOURCE_WIKI_PAGE,
@@ -591,7 +680,9 @@ class SourceSearchCoordinator:
             ranked.sort(key=lambda item: item.is_test)
         identifier = _identifier_query(query)
         if identifier:
-            ranked = self._route_exact(identifier, ranked)
+            return self._route_exact(identifier, ranked)
+        if embedded := _embedded_identifiers(query):
+            return self._route_embedded(embedded, ranked)
         return ranked
 
     @staticmethod
@@ -603,15 +694,14 @@ class SourceSearchCoordinator:
         definition — so the name match is applied as an ordering over what
         fusion returned rather than as a separate search.
         """
-        wanted = _norm_identifier(identifier)
-        tail = wanted.rsplit(".", 1)[-1]
+        wanted = _name_matchers(identifier)
         literal = identifier.lower()
 
         buckets: list[tuple[int, _Item]] = []
         for item in ranked:
-            name = _norm_identifier(item.name)
-            if name and name in (wanted, tail):
-                item.exact_name = True
+            name = _norm_identifier(item.match_name)
+            if name and name in wanted:
+                item.exact_via = EXACT_VIA_QUERY
                 buckets.append((0, item))
             elif literal in item.snippet.lower() or literal in item.file.lower():
                 buckets.append((1, item))
@@ -619,6 +709,38 @@ class SourceSearchCoordinator:
                 buckets.append((2, item))
         buckets.sort(key=lambda pair: pair[0])
         return [item for _, item in buckets]
+
+    @staticmethod
+    def _route_embedded(identifiers: Sequence[str], ranked: list[_Item]) -> list[_Item]:
+        """Definitions of an identifier the query *mentions*, ahead of the rest.
+
+        Deliberately weaker than :meth:`_route_exact`, in one specific way: it
+        has no "mentions the literal somewhere" tier. When the whole query is
+        one identifier, containment is the second-best evidence there is,
+        because there is nothing else to go on. When the query is a sentence
+        that happens to name a symbol, the sentence is carrying most of the
+        intent and containment is nearly free — half the files in a subsystem
+        mention any given helper — so promoting on it would let a weak signal
+        overrule the fusion. A name match is not free, and that is the one this
+        keeps.
+
+        The partition is stable, so the fused order, the test demotion and
+        everything else that ranked these items survives inside both tiers.
+        """
+        wanted: set[str] = set()
+        for identifier in identifiers:
+            wanted |= _name_matchers(identifier)
+
+        matched: list[_Item] = []
+        rest: list[_Item] = []
+        for item in ranked:
+            name = _norm_identifier(item.match_name)
+            if name and name in wanted:
+                item.exact_via = EXACT_VIA_EMBEDDED
+                matched.append(item)
+            else:
+                rest.append(item)
+        return matched + rest
 
     @staticmethod
     def _dedupe_by_file(ranked: Sequence[_Item]) -> list[_Item]:
@@ -664,8 +786,10 @@ class SourceSearchCoordinator:
             enumerate(band), key=lambda pair: _owner_sort_key(pair[1], pair[0], wants_tests)
         )[1]
 
-        if winner.exact_name:
+        if winner.exact_via == EXACT_VIA_QUERY:
             reason = "exact name match"
+        elif winner.exact_via == EXACT_VIA_EMBEDDED:
+            reason = "embedded identifier match"
         elif winner.dense_rank is not None and winner.lexical_rank is not None:
             reason = "dense+lexical agreement"
         elif winner.dense_rank is not None:
