@@ -156,9 +156,39 @@ describe("groupSearchResults — sections", () => {
     );
   });
 
-  it("rebuilds a page id the envelope dropped, for a file-backed page type", () => {
-    // The hybrid host serves no page_id and overwrites the page's own
-    // target_path with the file. For a file_page the id is still recoverable.
+  it("never rebuilds a page id from the kind and the file", () => {
+    // The dangerous case, and the reason there is no fallback at all:
+    // `symbol_spotlight:a/b.py::Foo` would rebuild as `symbol_spotlight:a/b.py`
+    // — not a 404, but a real page about the whole file. The reader would be
+    // handed the wrong document with nothing to show for it. Falling back to
+    // the file page is honest: it is where the page's subject lives.
+    const { groups } = groupSearchResults({
+      envelope: normalizeSearchResponse(
+        envelopeBody({
+          results: [
+            {
+              file: "a/b.py",
+              target_path: "a/b.py",
+              name: "Symbol: a.b.Foo",
+              kind: "symbol_spotlight",
+              source: "wiki_page",
+              snippet: "",
+              relevance_score: 0.01,
+              evidence: { dense_cosine: 0.5, lexical_rank: null, exact_name: false, lane: "wiki" },
+            },
+          ],
+        }),
+      ),
+      linkPrefix: PREFIX,
+    });
+
+    const href = groups[0]?.entries[0]?.href;
+    expect(href).not.toContain("symbol_spotlight");
+    expect(href).not.toContain("docs?page=");
+    expect(href).toBe("/repos/r1/files/a/b.py");
+  });
+
+  it("opens a file-backed page at its file when the server sent no id", () => {
     const { groups } = groupSearchResults({
       envelope: normalizeSearchResponse(
         envelopeBody({
@@ -171,7 +201,6 @@ describe("groupSearchResults — sections", () => {
               source: "wiki_page",
               snippet: "",
               relevance_score: 0.01,
-              evidence: { dense_cosine: 0.5, lexical_rank: null, exact_name: false, lane: "wiki" },
             },
           ],
         }),
@@ -180,10 +209,10 @@ describe("groupSearchResults — sections", () => {
     });
 
     expect(groups[0]?.id).toBe("docs");
-    expect(groups[0]?.entries[0]?.href).toBe("/repos/r1/docs?page=file_page%3Aa%2Fb.py");
+    expect(groups[0]?.entries[0]?.href).toBe("/repos/r1/files/a/b.py");
   });
 
-  it("prefers a page_id the server sent over a rebuilt one", () => {
+  it("opens by the page_id the server sent", () => {
     const { groups } = groupSearchResults({
       envelope: normalizeSearchResponse(
         envelopeBody({
@@ -204,6 +233,36 @@ describe("groupSearchResults — sections", () => {
     });
 
     expect(groups[0]?.entries[0]?.href).toContain("symbol_spotlight%3Aa%2Fb.py%3A%3AKlass.method");
+  });
+
+  it("opens a page that names no file, on the id alone", () => {
+    // The hybrid host serves `page_id` on every wiki-lane result and leaves
+    // `file` empty for the page types that document no single file. The id is
+    // the whole identity, and it is enough.
+    const { groups } = groupSearchResults({
+      envelope: normalizeSearchResponse(
+        envelopeBody({
+          results: [
+            {
+              file: "",
+              target_path: "",
+              page_id: "module_page:codeatlas/code_search",
+              name: "Code Search",
+              kind: "module_page",
+              source: "wiki_page",
+              snippet: "",
+              relevance_score: 0.01,
+            },
+          ],
+        }),
+      ),
+      linkPrefix: PREFIX,
+    });
+
+    expect(groups[0]?.entries[0]).toMatchObject({
+      label: "Code Search",
+      href: "/repos/r1/docs?page=module_page%3Acodeatlas%2Fcode_search",
+    });
   });
 
   it("drops a wiki hit that carries no way to open it", () => {

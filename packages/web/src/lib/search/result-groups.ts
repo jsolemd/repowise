@@ -72,14 +72,6 @@ const GROUP_HEADING: Record<SearchGroupId, string> = {
   decisions: "Decisions",
 };
 
-/** Page types that document one file, so their hit can open that file. */
-const FILE_BACKED_PAGE_TYPES: ReadonlySet<string> = new Set([
-  "file_page",
-  "symbol_spotlight",
-  "api_contract",
-  "infra_page",
-]);
-
 /** Which section a hit belongs in.
  *
  *  Read off the lane rather than the kind: the source index holds code and the
@@ -98,21 +90,6 @@ function dirname(path: string): string {
 }
 
 /**
- * The wiki page id behind a hit, if one can be had.
- *
- * The hybrid host does not serve `page_id`; for the page types whose target is
- * a file it can be rebuilt from the type and the path, the same way
- * `chat/source-citations.tsx` rebuilds it. For the rest — a module page, the
- * repo overview — the id is genuinely unavailable, and a guess would open the
- * docs reader on a page that does not exist.
- */
-function pageIdOf(hit: SearchHit): string | undefined {
-  if (hit.page_id) return hit.page_id;
-  if (hit.file && FILE_BACKED_PAGE_TYPES.has(hit.kind)) return `${hit.kind}:${hit.file}`;
-  return undefined;
-}
-
-/**
  * Where a hit opens.
  *
  * Code opens the file, never a symbol page: a symbol's id carries its parent
@@ -120,15 +97,18 @@ function pageIdOf(hit: SearchHit): string | undefined {
  * constructed symbol URL 404s for every method in the index. The line bounds
  * ride on the entry instead, which is what tells the reader where to look.
  *
- * Documentation opens the docs reader when the page is identifiable, and falls
- * back to the file it documents when it is not.
+ * Documentation opens the page the server named, and otherwise the file the
+ * page documents. A page id is never rebuilt from the type and the path.
+ * `symbol_spotlight:a/b.py::Foo` would rebuild as `symbol_spotlight:a/b.py`,
+ * which is not a 404 — it is a real page about something else, so the reader
+ * gets the wrong document and nothing anywhere says so. A page whose id the
+ * server withheld is better left unopenable than opened at a guess.
  */
 function hrefOf(hit: SearchHit, linkPrefix: string): string | undefined {
   if (groupOf(hit) === "code") {
     return hit.file ? fileEntityPath(linkPrefix, hit.file) : undefined;
   }
-  const pageId = pageIdOf(hit);
-  if (pageId) return docsPagePath(linkPrefix, pageId);
+  if (hit.page_id) return docsPagePath(linkPrefix, hit.page_id);
   return hit.file ? fileEntityPath(linkPrefix, hit.file) : undefined;
 }
 

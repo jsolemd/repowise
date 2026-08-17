@@ -133,6 +133,11 @@ function hitFromPageRow(row: SearchResultResponse): SearchHit {
  * Page types whose `target_path` is a repo-relative file. Mirrors
  * `_FILE_BACKED_PAGE_TYPES` in `core/source_search/coordinator.py` — the two
  * answer the same question about the same rows and have to agree.
+ *
+ * This reads a file *out of* a page's target. It is not the inverse: a page id
+ * is never rebuilt from a type and a file, because `symbol_spotlight:a/b.py`
+ * is a real page about the whole file rather than a miss you would notice.
+ * Rows here carry their own `page_id`, so nothing needs to.
  */
 const PAGE_TYPES_BACKED_BY_A_FILE: ReadonlySet<string> = new Set([
   "file_page",
