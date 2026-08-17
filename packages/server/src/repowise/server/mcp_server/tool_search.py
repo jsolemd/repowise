@@ -16,6 +16,7 @@ from repowise.core.persistence.models import (
 )
 from repowise.core.providers.embedding import store_has_semantic_vectors
 from repowise.core.registry import mcp_tool_registry as mcp
+from repowise.core.source_search import source_search_enabled
 from repowise.core.test_paths import is_test_path, is_test_related_path
 from repowise.server.mcp_server._answer_pipeline import _RRF_K, _RRF_SCORE_SCALE
 from repowise.server.mcp_server._helpers import (
@@ -36,6 +37,7 @@ from repowise.server.mcp_server.tool_search_symbols import (
     search_paths_single,
     search_symbols_single,
 )
+from repowise.server.source_search_wiring import mcp_coordinator
 
 # Minimum relevance score below which results are dropped. Prevents
 # returning semantically unrelated pages when the corpus has no real match.
@@ -1002,6 +1004,16 @@ async def search_codebase(
     """
     grep_hint = _grep_hint_for(query)
     resolved_mode = _resolve_mode(query, mode)
+
+    # Source+wiki hybrid retrieval, behind REPOWISE_SOURCE_SEARCH and off by
+    # default. Path queries stay on the stock resolver: a path is a filename
+    # lookup, not a retrieval, and fusing it against a corpus can only blur it.
+    if source_search_enabled() and resolved_mode != "path":
+        coordinator = await mcp_coordinator()
+        if coordinator is not None:
+            return await coordinator.search(
+                query, limit=limit, mode=resolved_mode, base_meta=_build_meta()
+            )
 
     # An unknown kind used to take the same ``return False`` as a kind that is
     # simply inapplicable, so a typo and a real empty result looked identical.

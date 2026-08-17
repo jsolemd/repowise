@@ -10,14 +10,17 @@ from __future__ import annotations
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, Query, Request
+from fastapi.responses import JSONResponse
 
 from repowise.core.providers.embedding import store_has_semantic_vectors
+from repowise.core.source_search import source_search_enabled
 from repowise.server.deps import (
     get_fts,
     get_vector_store,
     verify_api_key,
 )
 from repowise.server.schemas import SearchResultResponse
+from repowise.server.source_search_wiring import rest_coordinator
 
 router = APIRouter(
     prefix="/api/search",
@@ -55,7 +58,7 @@ async def search(
     ),
     fts=Depends(get_fts),
     vector_store=Depends(get_vector_store),
-) -> list[SearchResultResponse]:
+) -> list[SearchResultResponse] | JSONResponse:
     """Search wiki pages by semantic similarity or full-text match.
 
     Behavior matrix:
@@ -65,6 +68,16 @@ async def search(
       - Workspace mode without ``repo_id``: fans out across every loaded
         repo's index and merges results by score.
     """
+    # Source+wiki hybrid retrieval, behind REPOWISE_SOURCE_SEARCH and off by
+    # default. Semantic only: ``fulltext`` is a request for one specific index,
+    # and answering it with a fusion would be answering a different question.
+    # Returned as a Response so the richer envelope (owner, confidence,
+    # evidence) reaches the caller instead of being trimmed to the page schema.
+    if source_search_enabled() and search_type != "fulltext":
+        coordinator = await rest_coordinator(request.app.state)
+        if coordinator is not None:
+            return JSONResponse(await coordinator.search(query, limit=limit, mode="hybrid"))
+
     # A keyless index has no semantic vectors, so a semantic request is served
     # lexically rather than refused. Returning nothing would read as "not in the
     # codebase"; returning that store's nearest neighbours would be worse still,
