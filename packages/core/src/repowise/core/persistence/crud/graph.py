@@ -841,6 +841,14 @@ async def get_top_entry_points(
 
     Scores are stored inside ``community_meta_json``. Since the count of
     symbol nodes is typically < 5000, an in-memory filter is acceptable.
+
+    Ordered by score, then by ``node_id``. The score alone is not a total
+    order — two symbols routinely tie — and the ``SELECT`` above has no
+    ``ORDER BY``, so a tied pair would come back in whatever order the rows
+    happened to arrive and could swap between identical calls. Every caller
+    that hands these out under a stable identifier inherits that: the MCP
+    flows tool mints a handle per entry point, and a handle is only worth
+    having if the list carrying it is reproducible.
     """
     result = await session.execute(
         select(GraphNode).where(
@@ -860,7 +868,7 @@ async def get_top_entry_points(
         if score is not None and score >= min_score:
             scored.append((score, node))
 
-    scored.sort(key=lambda x: x[0], reverse=True)
+    scored.sort(key=lambda item: (-item[0], item[1].node_id))
     return [node for _, node in scored[:limit]]
 
 
