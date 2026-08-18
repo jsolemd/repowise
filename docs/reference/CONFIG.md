@@ -417,6 +417,15 @@ Dismissals are sticky: `repowise decision dismiss` keeps the record as a
 a confirmed (`active`) decision is never walked back to `proposed` by a
 re-extraction.
 
+Set `REPOWISE_DECISIONS_JOURNAL` to a repository-relative JSONL path when an
+external, git-tracked decision journal is the authority instead. For example,
+`REPOWISE_DECISIONS_JOURNAL=.codeatlas/decisions.jsonl` projects that file into
+RepoWise's database and decision UI on each read. Confirmed CLI/API additions,
+confirmations, supersessions, and file-anchor edits update the journal first;
+machine-extracted proposals and statuses the journal cannot represent are
+explicitly disabled. The setting is off when unset. Absolute paths and paths
+containing `..` are rejected.
+
 ### The `refactoring:` block
 
 Controls the refactoring-intelligence layer: the structured Extract Class /
@@ -712,6 +721,7 @@ The `.repowise/.env` file is gitignored automatically.
 | `REPOWISE_API_URL` | Frontend only; backend URL for the web UI (default: `http://localhost:7337`) |
 | `REPOWISE_API_KEY` | Bearer token required by clients calling the server API. Without it the server answers local callers only, and refuses any request from another host with 403 |
 | `REPOWISE_CONFIG_DIR` | Override where repowise looks for its config directory |
+| `REPOWISE_DECISIONS_JOURNAL` | Repository-relative path to an external canonical decisions JSONL file. Presence enables journal-backed write-through and projection; unset keeps the native database-backed behavior |
 | `REPOWISE_GITHUB_WEBHOOK_SECRET` | Secret for verifying GitHub webhook signatures |
 | `REPOWISE_GITLAB_WEBHOOK_TOKEN` | Token for verifying GitLab webhook requests |
 

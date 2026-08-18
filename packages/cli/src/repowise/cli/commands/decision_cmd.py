@@ -27,6 +27,18 @@ from repowise.core.precedent.currency import describe_decision_currency
 _SOURCE_CHOICES: tuple[str, ...] = (*LISTABLE_SOURCES, "all")
 
 
+def _journal_mode_enabled() -> bool:
+    from repowise.core.analysis.decisions.journal import (
+        DecisionJournalError,
+        decisions_journal_path,
+    )
+
+    try:
+        return decisions_journal_path() is not None
+    except DecisionJournalError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
 def _resolve_decision_repo(path: str | None, fmt: str = "table"):
     """Resolve the repo path for decision subcommands.
 
@@ -141,6 +153,13 @@ def decision_add(
     repo_path = _resolve_decision_repo(path, fmt)
     ensure_repowise_dir(repo_path)
 
+    journal_mode = _journal_mode_enabled()
+    if journal_mode and non_interactive:
+        raise click.ClickException(
+            "Non-interactive decision add creates an unreviewed proposal and is disabled "
+            "in curated journal mode; use the interactive confirmed path"
+        )
+
     status = "proposed" if non_interactive else "active"
     alternatives_list = list(alternatives)
     consequences_list = list(consequences)
@@ -176,6 +195,26 @@ def decision_add(
         )
         tags_list = [t.strip() for t in tags_raw.split(",") if t.strip()]
 
+    if journal_mode:
+        unsupported: list[str] = []
+        if context:
+            unsupported.append("context")
+        if alternatives_list:
+            unsupported.append("alternatives")
+        if consequences_list:
+            unsupported.append("consequences")
+        if tags_list:
+            unsupported.append("tags")
+        if unsupported:
+            raise click.ClickException(
+                "Decision journal mode cannot losslessly store fields: " + ", ".join(unsupported)
+            )
+        if not (rationale or "").strip() or not affected_files:
+            raise click.ClickException(
+                "Decision journal mode requires a rationale (the why) and at least "
+                "one affected file anchor"
+            )
+
     async def _persist() -> str:
         from repowise.core.persistence import (
             create_engine,
@@ -193,22 +232,36 @@ def decision_add(
 
         async with get_session(sf) as session:
             repo = await upsert_repository(session, name=repo_path.name, local_path=str(repo_path))
-            rec = await upsert_decision(
-                session,
-                repository_id=repo.id,
-                title=title,
-                status=status,
-                context=context or "",
-                decision=decision_text,
-                rationale=rationale or "",
-                alternatives=alternatives_list,
-                consequences=consequences_list,
-                affected_files=affected_files,
-                affected_modules=[],
-                tags=tags_list,
-                source="cli",
-                confidence=1.0,
-            )
+            if journal_mode:
+                from repowise.core.analysis.decisions.journal_projection import (
+                    record_journal_decision,
+                )
+
+                rec = await record_journal_decision(
+                    session,
+                    repo.id,
+                    title=title,
+                    decision=decision_text,
+                    why=rationale or "",
+                    anchors=[{"file": file, "symbol": None} for file in affected_files],
+                )
+            else:
+                rec = await upsert_decision(
+                    session,
+                    repository_id=repo.id,
+                    title=title,
+                    status=status,
+                    context=context or "",
+                    decision=decision_text,
+                    rationale=rationale or "",
+                    alternatives=alternatives_list,
+                    consequences=consequences_list,
+                    affected_files=affected_files,
+                    affected_modules=[],
+                    tags=tags_list,
+                    source="cli",
+                    confidence=1.0,
+                )
             decision_id = rec.id
 
         await engine.dispose()
@@ -280,6 +333,12 @@ def decision_list(
 
         async with get_session(sf) as session:
             repo = await upsert_repository(session, name=repo_path.name, local_path=str(repo_path))
+            if _journal_mode_enabled():
+                from repowise.core.analysis.decisions.journal_projection import (
+                    refresh_decision_journal,
+                )
+
+                await refresh_decision_journal(session, repo.id, repo_root=repo_path)
             decisions = await list_decisions(
                 session,
                 repo.id,
@@ -372,6 +431,7 @@ def decision_list(
 def decision_show(decision_id: str, path: str | None, fmt: str) -> None:
     """Show full details of a decision record."""
     repo_path = _resolve_decision_repo(path, fmt)
+    journal_mode = _journal_mode_enabled()
 
     async def _query():
         from repowise.core.persistence import (
@@ -388,6 +448,16 @@ def decision_show(decision_id: str, path: str | None, fmt: str) -> None:
         sf = create_session_factory(engine)
 
         async with get_session(sf) as session:
+            if journal_mode:
+                from repowise.core.analysis.decisions.journal_projection import (
+                    refresh_decision_journal,
+                )
+                from repowise.core.persistence import upsert_repository
+
+                repo = await upsert_repository(
+                    session, name=repo_path.name, local_path=str(repo_path)
+                )
+                await refresh_decision_journal(session, repo.id, repo_root=repo_path)
             full_id = await _resolve_decision_id(session, decision_id)
             rec = await get_decision(session, full_id) if full_id else None
 
@@ -499,6 +569,7 @@ def decision_show(decision_id: str, path: str | None, fmt: str) -> None:
 def decision_confirm(decision_id: str, path: str | None) -> None:
     """Confirm a proposed decision (set status to active)."""
     repo_path = _resolve_decision_repo(path)
+    journal_mode = _journal_mode_enabled()
 
     async def _update():
         from repowise.core.persistence import (
@@ -515,8 +586,25 @@ def decision_confirm(decision_id: str, path: str | None) -> None:
         sf = create_session_factory(engine)
 
         async with get_session(sf) as session:
+            journal_repo_id: str | None = None
+            if journal_mode:
+                from repowise.core.analysis.decisions.journal_projection import (
+                    confirm_journal_decision,
+                    refresh_decision_journal,
+                )
+                from repowise.core.persistence import upsert_repository
+
+                repo = await upsert_repository(
+                    session, name=repo_path.name, local_path=str(repo_path)
+                )
+                journal_repo_id = repo.id
+                await refresh_decision_journal(session, repo.id, repo_root=repo_path)
             full_id = await _resolve_decision_id(session, decision_id)
-            rec = await update_decision_status(session, full_id, "active") if full_id else None
+            if full_id and journal_mode:
+                assert journal_repo_id is not None
+                rec = await confirm_journal_decision(session, journal_repo_id, full_id)
+            else:
+                rec = await update_decision_status(session, full_id, "active") if full_id else None
 
         await engine.dispose()
         return rec
@@ -539,6 +627,12 @@ def decision_confirm(decision_id: str, path: str | None) -> None:
 def decision_dismiss(decision_id: str, path: str | None) -> None:
     """Dismiss a proposed decision (kept as a tombstone; never re-proposed)."""
     repo_path = _resolve_decision_repo(path)
+
+    if _journal_mode_enabled():
+        raise click.ClickException(
+            "Dismiss is disabled in decision journal mode because the canonical "
+            "format has no dismissed status"
+        )
 
     if not click.confirm(f"Dismiss decision {decision_id[:8]}?"):
         console.print("[yellow]Cancelled.[/yellow]")
@@ -587,6 +681,12 @@ def decision_dismiss(decision_id: str, path: str | None) -> None:
 def decision_deprecate(decision_id: str, path: str | None, superseded_by: str | None) -> None:
     """Deprecate an active decision."""
     repo_path = _resolve_decision_repo(path)
+
+    if _journal_mode_enabled():
+        raise click.ClickException(
+            "Deprecate is disabled in decision journal mode; record or select a "
+            "successor and use canonical supersession instead"
+        )
 
     async def _update():
         from repowise.core.persistence import (
@@ -651,12 +751,21 @@ def decision_health(path: str | None, fmt: str) -> None:
 
         async with get_session(sf) as session:
             repo = await upsert_repository(session, name=repo_path.name, local_path=str(repo_path))
+            journal_health = None
+            if _journal_mode_enabled():
+                from repowise.core.analysis.decisions.journal_projection import (
+                    refresh_decision_journal,
+                )
+
+                journal_health = await refresh_decision_journal(
+                    session, repo.id, repo_root=repo_path
+                )
             health = await get_decision_health_summary(session, repo.id)
 
         await engine.dispose()
-        return health
+        return health, journal_health
 
-    health = run_async(_query())
+    health, journal_health = run_async(_query())
     summary = health["summary"]
 
     if fmt == "json":
@@ -675,11 +784,21 @@ def decision_health(path: str | None, fmt: str) -> None:
                     {"id": d.id, "title": d.title, "source": d.source}
                     for d in health["proposed_awaiting_review"]
                 ],
+                "journal": journal_health.to_dict() if journal_health is not None else None,
             }
         )
         return
 
     console.print("[bold]Decision Health[/bold]\n")
+
+    if journal_health is not None:
+        console.print(
+            "[dim]Journal:[/dim] "
+            f"{journal_health.path}  "
+            f"{journal_health.projected_count} projected  "
+            f"sha256:{journal_health.content_hash[:12]}  "
+            f"lock={'available' if journal_health.lock_acquirable else 'busy'}\n"
+        )
 
     # Summary stats
     stats_table = Table(show_header=False, box=None)

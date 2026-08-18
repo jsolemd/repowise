@@ -51,6 +51,7 @@ __all__ = [
 # the session/adr swap, so ``MAX_SOURCE_RANK`` stays 9 and no other source's
 # confidence moves.
 SOURCE_RANK: dict[str, int] = {
+    "journal": 9,  # git-reviewed canonical record, projected into the SQL store
     "cli": 9,  # human-authored manual entry — most authoritative
     "session": 8,  # a user's own words in a transcript, corroborated by them
     "adr": 7,  # architecture decision records (structured, intentional)

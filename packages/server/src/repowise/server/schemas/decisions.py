@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from datetime import datetime
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from repowise.core.analysis.decisions.scope import derive_decision_scope
 
@@ -18,6 +18,14 @@ class EvidencePreview(BaseModel):
     verification: str
     evidence_file: str | None = None
     evidence_line: int | None = None
+
+
+class DecisionAnchorResponse(BaseModel):
+    """One file/symbol anchor retained from a canonical decision journal."""
+
+    file: str
+    symbol: str | None = None
+    file_sha: str | None = None
 
 
 class DecisionRecordResponse(BaseModel):
@@ -37,6 +45,7 @@ class DecisionRecordResponse(BaseModel):
     evidence_commits: list[str]
     evidence_file: str | None
     evidence_line: int | None
+    anchors: list[DecisionAnchorResponse] = Field(default_factory=list)
     confidence: float
     staleness_score: float
     verification: str = "unverified"
@@ -44,7 +53,9 @@ class DecisionRecordResponse(BaseModel):
     # record has no code linkage at all. Computed at serialization time from
     # the linkage fields, so old records get it too.
     scope: str | None = None
+    supersedes: str | None = None
     superseded_by: str | None
+    confirmed_at: datetime | None = None
     last_code_change: datetime | None
     created_at: datetime
     updated_at: datetime
@@ -59,6 +70,8 @@ class DecisionRecordResponse(BaseModel):
     def from_orm(cls, obj: object) -> DecisionRecordResponse:
         affected_files = json.loads(obj.affected_files_json)  # type: ignore[attr-defined]
         affected_modules = json.loads(obj.affected_modules_json)  # type: ignore[attr-defined]
+        source = obj.source  # type: ignore[attr-defined]
+        stored_decision = obj.decision or ""  # type: ignore[attr-defined]
         return cls(
             id=obj.id,  # type: ignore[attr-defined]
             repository_id=obj.repository_id,  # type: ignore[attr-defined]
@@ -71,17 +84,20 @@ class DecisionRecordResponse(BaseModel):
             # (the model's canonical one-line summary, always present) so no read
             # surface emits a body-less decision. New records get this at write
             # time in the harvest path; this covers pre-fix stored records.
-            decision=(obj.decision or "").strip() or obj.title,  # type: ignore[attr-defined]
+            decision=(
+                stored_decision if source == "journal" else stored_decision.strip() or obj.title  # type: ignore[attr-defined]
+            ),
             rationale=obj.rationale,  # type: ignore[attr-defined]
             alternatives=json.loads(obj.alternatives_json),  # type: ignore[attr-defined]
             consequences=json.loads(obj.consequences_json),  # type: ignore[attr-defined]
             affected_files=affected_files,
             affected_modules=affected_modules,
             tags=json.loads(obj.tags_json),  # type: ignore[attr-defined]
-            source=obj.source,  # type: ignore[attr-defined]
+            source=source,
             evidence_commits=json.loads(obj.evidence_commits_json),  # type: ignore[attr-defined]
             evidence_file=obj.evidence_file,  # type: ignore[attr-defined]
             evidence_line=obj.evidence_line,  # type: ignore[attr-defined]
+            anchors=json.loads(obj.anchors_json or "[]"),  # type: ignore[attr-defined]
             confidence=obj.confidence,  # type: ignore[attr-defined]
             staleness_score=obj.staleness_score,  # type: ignore[attr-defined]
             verification=obj.verification,  # type: ignore[attr-defined]
@@ -90,7 +106,9 @@ class DecisionRecordResponse(BaseModel):
                 affected_modules,
                 evidence_file=obj.evidence_file,  # type: ignore[attr-defined]
             ),
+            supersedes=obj.supersedes,  # type: ignore[attr-defined]
             superseded_by=obj.superseded_by,  # type: ignore[attr-defined]
+            confirmed_at=obj.confirmed_at,  # type: ignore[attr-defined]
             last_code_change=obj.last_code_change,  # type: ignore[attr-defined]
             created_at=obj.created_at,  # type: ignore[attr-defined]
             updated_at=obj.updated_at,  # type: ignore[attr-defined]

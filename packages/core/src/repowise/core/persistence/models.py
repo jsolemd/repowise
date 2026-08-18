@@ -859,6 +859,11 @@ class DecisionRecord(Base):
     evidence_line: Mapped[int | None] = mapped_column(Integer, nullable=True)
     confidence: Mapped[float] = mapped_column(Float, nullable=False, default=1.0)
 
+    # Ordered, lossless anchors for a git-tracked decision journal. The
+    # existing ``affected_files_json`` remains the query-friendly projection;
+    # this retains each anchor's optional symbol and file-content SHA.
+    anchors_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+
     # Verification (anti-hallucination gate, Phase 1D). Aggregate over the
     # decision's evidence rows: "exact" if any headline field is a verbatim
     # quote of its source span, "fuzzy" if only token-overlap matched,
@@ -872,7 +877,9 @@ class DecisionRecord(Base):
         DateTime(timezone=True), nullable=True
     )
     staleness_score: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    supersedes: Mapped[str | None] = mapped_column(String(32), nullable=True)
     superseded_by: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_now_utc

@@ -95,6 +95,13 @@ SUPERSEDE_AUTOFLIP_CONFIDENCE = 0.85
 # changed file, with an LLM verdict — and is not gated by this flag.
 SEMANTIC_SUPERSESSION_ENABLED = False
 
+
+def _journal_mode_enabled() -> bool:
+    from repowise.core.analysis.decisions.journal import decisions_journal_path
+
+    return decisions_journal_path() is not None
+
+
 # ---------------------------------------------------------------------------
 # Evolution signals (Pass-1 pattern scan) + contradiction heuristics
 # ---------------------------------------------------------------------------
@@ -342,6 +349,8 @@ async def detect_supersessions_and_conflicts(
     switch covers every caller, present and future.
     """
     summary = {"supersedes": 0, "conflicts": 0, "flipped": 0}
+    if _journal_mode_enabled():
+        return summary
     if not SEMANTIC_SUPERSESSION_ENABLED:
         return summary
     if not touched_ids or vector_store is None:
@@ -669,6 +678,8 @@ async def run_update_evolution(
         "amended": 0,
         "reaffirmed": 0,
     }
+    if _journal_mode_enabled():
+        return result
     if not changed_files:
         return result
 

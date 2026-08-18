@@ -48,6 +48,25 @@ _VALID_DECISION_STATUSES = frozenset(
 _PROTECTED_STATUSES = frozenset({"active", "deprecated", "superseded", "dismissed"})
 
 
+def _journal_mode_enabled() -> bool:
+    from repowise.core.analysis.decisions.journal import decisions_journal_path
+
+    return decisions_journal_path() is not None
+
+
+def _reject_sqlite_only_mutation(action: str) -> None:
+    if not _journal_mode_enabled():
+        return
+    from repowise.core.analysis.decisions.journal import (
+        DecisionJournalMutationDisabledError,
+    )
+
+    raise DecisionJournalMutationDisabledError(
+        f"{action} is disabled while REPOWISE_DECISIONS_JOURNAL is configured; "
+        "write the canonical journal first and refresh its projection"
+    )
+
+
 def _merge_status(existing: str, incoming: str) -> str:
     """Resolve a re-extracted status against the stored one.
 
@@ -89,6 +108,7 @@ async def upsert_decision(
 
     Dedup key: ``(repository_id, title, source, evidence_file)``.
     """
+    _reject_sqlite_only_mutation("upsert_decision")
     # Normalise text fields — LLM extractors may return explicit None
     rationale = rationale or ""
     context = context or ""
@@ -282,6 +302,7 @@ async def update_decision_metadata(
     Each argument left as ``None`` is preserved. Pass an empty list to clear.
     Returns the updated record, or ``None`` if the id was not found.
     """
+    _reject_sqlite_only_mutation("update_decision_metadata")
     rec = await session.get(DecisionRecord, decision_id)
     if rec is None:
         return None
@@ -305,6 +326,7 @@ async def update_decision_status(
 
     Raises ValueError for invalid statuses. Returns None if not found.
     """
+    _reject_sqlite_only_mutation("update_decision_status")
     if status not in _VALID_DECISION_STATUSES:
         raise ValueError(
             f"Unknown decision status {status!r}. Valid values: {sorted(_VALID_DECISION_STATUSES)}"
@@ -337,6 +359,7 @@ async def update_decision_by_id(
 
     Returns None if the decision is not found.
     """
+    _reject_sqlite_only_mutation("update_decision_by_id")
     rec = await session.get(DecisionRecord, decision_id)
     if rec is None:
         return None
@@ -371,6 +394,7 @@ async def update_decision_by_id(
 
 async def delete_decision(session: AsyncSession, decision_id: str) -> bool:
     """Delete a decision record. Returns True if deleted, False if not found."""
+    _reject_sqlite_only_mutation("delete_decision")
     rec = await session.get(DecisionRecord, decision_id)
     if rec is None:
         return False
@@ -614,6 +638,9 @@ async def unretire_auto_superseded(session: AsyncSession) -> int:
     Idempotent — once repaired the edges are gone, so the next scan matches
     nothing. Returns the number of records restored.
     """
+    if _journal_mode_enabled():
+        return 0
+
     auto_edges = (
         (
             await session.execute(
@@ -712,6 +739,23 @@ async def bulk_upsert_decisions(
     a caller can run the Phase-3 supersession/conflict detection over just the
     records that changed.
     """
+    if _journal_mode_enabled():
+        from repowise.core.analysis.decisions.journal_projection import (
+            refresh_decision_journal,
+        )
+
+        await refresh_decision_journal(
+            session,
+            repository_id,
+            vector_store=vector_store,
+        )
+        structlog.get_logger(__name__).info(
+            "decisions.journal_machine_candidates_disabled",
+            repository_id=repository_id,
+            candidate_count=len(decisions),
+        )
+        return []
+
     # Group incoming decisions by normalized title.
     groups: dict[str, list[dict]] = {}
     for d in decisions:
@@ -992,6 +1036,9 @@ async def purge_proposed_decisions_by_source(
     explicitly rather than trusting the FK cascade, which on SQLite depends on
     the ``foreign_keys`` pragma. Returns the number of records deleted.
     """
+    if _journal_mode_enabled():
+        return 0
+
     result = await session.execute(
         select(DecisionRecord.id).where(
             DecisionRecord.repository_id == repository_id,
@@ -1075,10 +1122,17 @@ async def recompute_decision_staleness(
     keeps the single-repair-path rule — the one this repo already learned when
     an alembic migration and a runtime repair disagreed about confidence.
     """
+    if _journal_mode_enabled():
+        from repowise.core.analysis.decisions.journal_projection import refresh_decision_journal
+
+        await refresh_decision_journal(session, repository_id)
+    journal_source = "journal"
+
     result = await session.execute(
         select(DecisionRecord).where(
             DecisionRecord.repository_id == repository_id,
             DecisionRecord.status.in_(["active", "proposed"]),
+            DecisionRecord.source != journal_source,
         )
     )
     decisions = list(result.scalars().all())

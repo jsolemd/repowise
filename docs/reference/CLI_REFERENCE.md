@@ -919,12 +919,18 @@ repowise decision health [PATH]         # health dashboard
 | Flag | Description |
 |------|-------------|
 | `--status` | `active`, `proposed`, `deprecated`, `superseded`, `all` |
-| `--source` | `adr`, `cli`, `comment`, `commit`, `git_archaeology`, `inline_marker`, `llm_inferred`, `pr`, `session`, `all` |
+| `--source` | `adr`, `cli`, `comment`, `commit`, `git_archaeology`, `inline_marker`, `journal`, `llm_inferred`, `pr`, `session`, `all` |
 | `--proposed` | Shortcut for `--status proposed` |
 | `--stale-only` | Only stale decisions |
 | `--format` | `table` (default) or `json` |
 
 `--format json` is also available on `decision show` and `decision health`. In JSON, `decision list` emits full ids rather than the table's 8-character prefixes, and `show` / `health` skip the caps the human output applies to keep a panel readable.
+
+When `REPOWISE_DECISIONS_JOURNAL` names a repository-relative JSONL file,
+`decision list`, `show`, and `health` refresh their database projection from
+that file. Interactive `add` and `confirm` write through to it. Proposal-only
+non-interactive adds, `dismiss`, and `deprecate` exit with an explicit error
+because the canonical journal format has no equivalent state.
 
 ---
 

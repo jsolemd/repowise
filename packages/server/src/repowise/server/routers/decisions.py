@@ -2,10 +2,22 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from repowise.core.analysis.decisions.journal import (
+    DecisionJournalError,
+    decisions_journal_path,
+)
+from repowise.core.analysis.decisions.journal_projection import (
+    DecisionJournalHealth,
+    confirm_journal_decision,
+    record_journal_decision,
+    refresh_decision_journal,
+    replace_journal_anchor_files,
+    supersede_journal_decision,
+)
 from repowise.core.persistence import crud, decision_graph
 from repowise.core.persistence.models import DecisionEvidence
 from repowise.server.deps import get_db_session, verify_api_key
@@ -22,11 +34,45 @@ from repowise.server.schemas import (
     DecisionStatusUpdate,
 )
 from repowise.server.schemas.decisions import EvidencePreview
+from repowise.server.search_helpers import resolve_repo_vector_store
 
 router = APIRouter(
     tags=["decisions"],
     dependencies=[Depends(verify_api_key)],
 )
+
+
+def _journal_enabled() -> bool:
+    try:
+        return decisions_journal_path() is not None
+    except DecisionJournalError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+async def _journal_vector_store(request: Request, repo_id: str, *, create: bool) -> object | None:
+    """Resolve the repo-specific vector store without misrouting workspace repos."""
+
+    primary_id = getattr(request.app.state, "primary_vector_repo_id", None)
+    workspace_sessions = getattr(request.app.state, "workspace_sessions", None)
+    if primary_id == repo_id or (primary_id is None and not workspace_sessions):
+        return getattr(request.app.state, "vector_store", None)
+    return await resolve_repo_vector_store(request.app.state, repo_id, create=create)
+
+
+async def _refresh_journal(
+    request: Request,
+    session: AsyncSession,
+    repo_id: str,
+    *,
+    create_vector_store: bool = False,
+) -> DecisionJournalHealth | None:
+    if not _journal_enabled():
+        return None
+    try:
+        vector_store = await _journal_vector_store(request, repo_id, create=create_vector_store)
+        return await refresh_decision_journal(session, repo_id, vector_store=vector_store)
+    except DecisionJournalError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @router.get(
@@ -35,6 +81,7 @@ router = APIRouter(
 )
 async def list_decisions(
     repo_id: str,
+    request: Request,
     status: str | None = Query(None, description="Filter by status"),
     source: str | None = Query(None, description="Filter by source"),
     tag: str | None = Query(None, description="Filter by tag"),
@@ -59,6 +106,7 @@ async def list_decisions(
     decision under the unreviewed proposals the indexer had just mined, so
     page one was entirely machine guesses.
     """
+    await _refresh_journal(request, session, repo_id)
     decisions = await crud.list_decisions(
         session,
         repo_id,
@@ -110,9 +158,11 @@ async def list_decisions(
 )
 async def decision_health(
     repo_id: str,
+    request: Request,
     session: AsyncSession = Depends(get_db_session),
 ) -> dict:
     """Get decision health summary: stale, proposed, ungoverned hotspots."""
+    journal_health = await _refresh_journal(request, session, repo_id)
     summary = await crud.get_decision_health_summary(session, repo_id)
     return {
         "summary": summary["summary"],
@@ -121,6 +171,7 @@ async def decision_health(
             DecisionRecordResponse.from_orm(d) for d in summary["proposed_awaiting_review"]
         ],
         "ungoverned_hotspots": summary["ungoverned_hotspots"],
+        "journal": journal_health.to_dict() if journal_health is not None else None,
     }
 
 
@@ -130,6 +181,7 @@ async def decision_health(
 )
 async def decision_counts(
     repo_id: str,
+    request: Request,
     source: str | None = Query(None, description="Filter by source"),
     tag: str | None = Query(None, description="Filter by tag"),
     module: str | None = Query(None, description="Filter by module path"),
@@ -142,6 +194,7 @@ async def decision_counts(
     declaration order, so a literal sub-path below it would be swallowed by
     the parameterised route and "counts" would be looked up as a decision id.
     """
+    await _refresh_journal(request, session, repo_id)
     counts = await crud.count_decisions_by_status(
         session,
         repo_id,
@@ -165,6 +218,7 @@ async def decision_counts(
 )
 async def get_decision_graph(
     repo_id: str,
+    request: Request,
     limit: int = Query(200, ge=1, le=500),
     session: AsyncSession = Depends(get_db_session),
 ) -> DecisionGraphResponse:
@@ -174,6 +228,7 @@ async def get_decision_graph(
     proposed statuses. Decision→decision typed edges and decision→code links are
     returned without an additional cap (they scale with the node set).
     """
+    await _refresh_journal(request, session, repo_id)
     # Fetch decisions ordered by staleness (most relevant first): active, then
     # superseded/proposed, then deprecated. Use list_decisions without status
     # filter so we get all statuses, capped.
@@ -219,9 +274,11 @@ async def get_decision_graph(
 async def get_decision(
     repo_id: str,
     decision_id: str,
+    request: Request,
     session: AsyncSession = Depends(get_db_session),
 ) -> DecisionRecordResponse:
     """Get a single decision record by ID."""
+    await _refresh_journal(request, session, repo_id)
     rec = await crud.get_decision(session, decision_id)
     if rec is None or rec.repository_id != repo_id:
         raise HTTPException(status_code=404, detail="Decision not found")
@@ -234,6 +291,7 @@ async def get_decision(
 async def list_decision_evidence(
     repo_id: str,
     decision_id: str,
+    request: Request,
     session: AsyncSession = Depends(get_db_session),
 ) -> dict:
     """Return provenance evidence rows for a single decision record.
@@ -243,6 +301,7 @@ async def list_decision_evidence(
     badge (``exact`` | ``fuzzy`` | ``unverified``). 404 if the decision does not
     exist or belongs to a different repository.
     """
+    await _refresh_journal(request, session, repo_id)
     rec = await crud.get_decision(session, decision_id)
     if rec is None or rec.repository_id != repo_id:
         raise HTTPException(status_code=404, detail="Decision not found")
@@ -256,6 +315,7 @@ async def list_decision_evidence(
 async def get_decision_lineage(
     repo_id: str,
     decision_id: str,
+    request: Request,
     session: AsyncSession = Depends(get_db_session),
 ) -> dict:
     """Return the lineage chain for a decision (root → … → current).
@@ -264,6 +324,7 @@ async def get_decision_lineage(
     UI can render a timeline. An isolated decision returns a single-entry chain.
     404 if the decision does not exist or belongs to a different repository.
     """
+    await _refresh_journal(request, session, repo_id)
     rec = await crud.get_decision(session, decision_id)
     if rec is None or rec.repository_id != repo_id:
         raise HTTPException(status_code=404, detail="Decision not found")
@@ -279,9 +340,54 @@ async def get_decision_lineage(
 async def create_decision(
     repo_id: str,
     body: DecisionCreate,
+    request: Request,
     session: AsyncSession = Depends(get_db_session),
 ) -> DecisionRecordResponse:
     """Create a new decision record (e.g. from CLI capture via API)."""
+    if _journal_enabled():
+        await _refresh_journal(request, session, repo_id, create_vector_store=True)
+        unsupported = []
+        if body.context:
+            unsupported.append("context")
+        if body.alternatives:
+            unsupported.append("alternatives")
+        if body.consequences:
+            unsupported.append("consequences")
+        if body.affected_modules:
+            unsupported.append("affected_modules")
+        if body.tags:
+            unsupported.append("tags")
+        if unsupported:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Decision journal mode cannot losslessly store fields: "
+                    + ", ".join(unsupported)
+                ),
+            )
+        if not body.rationale.strip() or not body.affected_files:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Decision journal mode requires rationale (the why) and at least "
+                    "one affected file anchor"
+                ),
+            )
+        try:
+            vector_store = await _journal_vector_store(request, repo_id, create=True)
+            rec = await record_journal_decision(
+                session,
+                repo_id,
+                title=body.title,
+                decision=body.decision,
+                why=body.rationale,
+                anchors=[{"file": file, "symbol": None} for file in body.affected_files],
+                vector_store=vector_store,
+            )
+        except DecisionJournalError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return DecisionRecordResponse.from_orm(rec)
+
     rec = await crud.upsert_decision(
         session,
         repository_id=repo_id,
@@ -309,6 +415,7 @@ async def patch_decision(
     repo_id: str,
     decision_id: str,
     body: DecisionStatusUpdate,
+    request: Request,
     session: AsyncSession = Depends(get_db_session),
 ) -> DecisionRecordResponse:
     """Update a decision record.
@@ -317,9 +424,78 @@ async def patch_decision(
     governance edits (``affected_modules``, ``affected_files``). Any field
     left as ``None`` in the body is preserved.
     """
+    await _refresh_journal(request, session, repo_id, create_vector_store=_journal_enabled())
     rec = await crud.get_decision(session, decision_id)
     if rec is None or rec.repository_id != repo_id:
         raise HTTPException(status_code=404, detail="Decision not found")
+
+    if _journal_enabled():
+        if rec.source != "journal":
+            raise HTTPException(
+                status_code=409,
+                detail="Only journal-projected decisions are mutable in journal mode",
+            )
+        if body.affected_modules:
+            raise HTTPException(
+                status_code=409,
+                detail="Decision journal mode does not support affected_modules",
+            )
+        if body.status is not None and body.affected_files is not None:
+            raise HTTPException(
+                status_code=409,
+                detail="Change status and affected_files in separate journal mutations",
+            )
+        try:
+            vector_store = await _journal_vector_store(request, repo_id, create=True)
+            if body.status == "active":
+                if body.superseded_by is not None:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="superseded_by requires status='superseded'",
+                    )
+                rec = await confirm_journal_decision(
+                    session,
+                    repo_id,
+                    decision_id,
+                    vector_store=vector_store,
+                )
+            elif body.status == "superseded":
+                if body.superseded_by is None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Journal supersession requires superseded_by",
+                    )
+                rec = await supersede_journal_decision(
+                    session,
+                    repo_id,
+                    decision_id,
+                    superseded_by=body.superseded_by,
+                    vector_store=vector_store,
+                )
+            elif body.status is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"Status {body.status!r} has no canonical journal representation; "
+                        "only confirm (active) and supersede are enabled"
+                    ),
+                )
+            elif body.superseded_by is not None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="superseded_by requires status='superseded'",
+                )
+            if body.affected_files is not None:
+                rec = await replace_journal_anchor_files(
+                    session,
+                    repo_id,
+                    decision_id,
+                    body.affected_files,
+                    vector_store=vector_store,
+                )
+        except DecisionJournalError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return DecisionRecordResponse.from_orm(rec)
 
     if body.status is not None:
         try:
