@@ -12,6 +12,17 @@ import type { SearchResultResponse } from "./types";
  */
 export type SearchConfidence = "confident" | "caution" | "no_match";
 
+/** One retrieval leg that could not be read, and what it raised.
+ *
+ *  Diagnostic rather than reader prose — `error`/`detail` come off an
+ *  exception. Worth surfacing anyway: it is the only thing that distinguishes
+ *  "this index is broken" from "your query is unusual". */
+export interface SearchLegFailure {
+  leg: string;
+  error: string;
+  detail: string;
+}
+
 /** Why one hit ranked where it did. Present only on the classified shape. */
 export interface SearchEvidence {
   /** Cosine against the query embedding, or null when only lexical hit it. */
@@ -85,6 +96,26 @@ export interface SearchEnvelope {
   note?: string;
   /** The commit the index was built from, when the server named one. */
   indexed_commit?: string;
+  /**
+   * At least one retrieval leg could not be read, so the results are partial.
+   *
+   * The server pins `confidence` to `caution` whenever this is set, which means
+   * a caution on a degraded response is caused by the failure and not by weak
+   * evidence. Anything explaining the caution has to say which.
+   */
+  degraded?: boolean;
+  /** Which legs failed and what they raised, as one line. */
+  degraded_reason?: string;
+  failed_legs?: SearchLegFailure[];
+  /**
+   * Every leg failed: this response read no corpus at all.
+   *
+   * Deliberately not modelled as an empty result set. Zero results is a claim
+   * about the repository — "nothing here matches" — and a search that read
+   * nothing cannot make it. A consumer that renders this as an empty state is
+   * asserting an absence the server explicitly refused to assert.
+   */
+  unavailable?: { code: string; message: string };
 }
 
 const CONFIDENCE_VALUES: readonly string[] = ["confident", "caution", "no_match"];
@@ -210,6 +241,12 @@ export function normalizeSearchResponse(raw: unknown): SearchEnvelope {
   const meta = body._meta as Record<string, unknown> | undefined;
   const sourceMeta = meta?.source_search as Record<string, unknown> | undefined;
   const indexedCommit = asString(sourceMeta?.indexed_commit);
+  const degraded = sourceMeta?.degraded === true;
+  const degradedReason = asString(sourceMeta?.degraded_reason);
+  const failedLegs = asFailedLegs(sourceMeta?.failed_legs);
+  // A healthy response carries none of these keys, so their presence is the
+  // signal — there is no "everything is fine" value to check against.
+  const failure = body.status === "error" ? (body.error as Record<string, unknown>) : undefined;
 
   return {
     results: rows.map((row) => hitFromEnvelopeRow(row as Record<string, unknown>)),
@@ -224,7 +261,30 @@ export function normalizeSearchResponse(raw: unknown): SearchEnvelope {
     ...(mode ? { mode } : {}),
     ...(note ? { note } : {}),
     ...(indexedCommit ? { indexed_commit: indexedCommit } : {}),
+    ...(degraded ? { degraded: true } : {}),
+    ...(degradedReason ? { degraded_reason: degradedReason } : {}),
+    ...(failedLegs.length > 0 ? { failed_legs: failedLegs } : {}),
+    ...(failure
+      ? {
+          unavailable: {
+            code: asString(failure.code) || "source_search_unavailable",
+            message: asString(failure.message),
+          },
+        }
+      : {}),
   };
+}
+
+function asFailedLegs(value: unknown): SearchLegFailure[] {
+  if (!Array.isArray(value)) return [];
+  return value.map((raw) => {
+    const leg = raw as Record<string, unknown>;
+    return {
+      leg: asString(leg.leg),
+      error: asString(leg.error),
+      detail: asString(leg.detail),
+    };
+  });
 }
 
 /**

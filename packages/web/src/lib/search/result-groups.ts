@@ -62,6 +62,24 @@ export interface GroupedSearchResults {
   emptyMessage?: string;
   /** The one file the server would open, when it named one. */
   ownerFile?: string;
+  /**
+   * Part of the corpus could not be read, so these results are partial.
+   *
+   * The server pins `confidence` to `caution` whenever this is true, so a
+   * degraded answer must explain itself as a failure rather than as weak
+   * matching — the usual caution copy would name the wrong cause.
+   */
+  degraded?: boolean;
+  /** Which legs failed, verbatim from the server. */
+  degradedReason?: string;
+  /**
+   * The search broke: it read no corpus at all.
+   *
+   * Set instead of `emptyMessage`, never alongside it. An empty result set is
+   * a claim about the repository and a failed search cannot make one, so the
+   * two states must not share a rendering.
+   */
+  failureMessage?: string;
   /** Whether anything at all is renderable. */
   isEmpty: boolean;
 }
@@ -222,8 +240,12 @@ export function groupSearchResults({
   // would hand the reader a wrong destination under a caveat they did not
   // read. The note goes out instead of the rows, not above them.
   const isNoMatch = envelope.confidence === "no_match";
+  // Read first, because a failed search also arrives carrying `degraded` and a
+  // `caution` confidence. Both would otherwise describe it as a weak answer,
+  // and it is not a weak answer — it is not an answer.
+  const broke = envelope.unavailable !== undefined;
 
-  if (!isNoMatch) {
+  if (!isNoMatch && !broke) {
     for (const hit of envelope.results) {
       const entry = entryOf(hit, linkPrefix);
       if (entry) buckets[groupOf(hit)].push(entry);
@@ -237,7 +259,15 @@ export function groupSearchResults({
   return {
     groups,
     ...(envelope.confidence ? { confidence: envelope.confidence } : {}),
-    ...(isNoMatch ? { emptyMessage: noMatchMessage(envelope.indexed_commit) } : {}),
+    // Never both. `emptyMessage` says the repository holds nothing matching;
+    // `failureMessage` says we did not get to look. Only one can be true.
+    ...(broke
+      ? { failureMessage: failureMessageFor(envelope) }
+      : isNoMatch
+        ? { emptyMessage: noMatchMessage(envelope.indexed_commit) }
+        : {}),
+    ...(envelope.degraded ? { degraded: true } : {}),
+    ...(envelope.degraded_reason ? { degradedReason: envelope.degraded_reason } : {}),
     ...(envelope.selected_owner?.file ? { ownerFile: envelope.selected_owner.file } : {}),
     isEmpty: groups.length === 0,
   };
@@ -254,6 +284,20 @@ function noMatchMessage(indexedCommit: string | undefined): string {
   const base = "Nothing in the index matches that.";
   if (!indexedCommit) return `${base} It covers this repository as it was last indexed.`;
   return `${base} It covers this repository at commit ${indexedCommit.slice(0, 7)}.`;
+}
+
+/**
+ * What a broken search says to a reader.
+ *
+ * The first sentence is the load-bearing one, and it is the opposite of an
+ * empty state: nothing was searched, so this says nothing about the code. The
+ * cause follows because it is the only thing that distinguishes an outage
+ * worth reporting from a query worth rephrasing.
+ */
+function failureMessageFor(envelope: SearchEnvelope): string {
+  const base = "Search is unavailable — nothing was searched, so this is not a statement about the repository.";
+  const cause = envelope.degraded_reason || envelope.unavailable?.message;
+  return cause ? `${base} ${cause}` : base;
 }
 
 /** `src/a.py:164-218`, or `src/a.py:164`, or "" when the hit spans no lines. */

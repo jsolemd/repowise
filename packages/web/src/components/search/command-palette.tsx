@@ -4,7 +4,7 @@ import { useEffect, useState, useCallback, useMemo } from "react";
 import { usePathname, useRouter } from "next/navigation";
 import { Command } from "cmdk";
 import useSWR from "swr";
-import { Search, LayoutDashboard, Settings, BookOpen, FileCode, Layers, Link2, GitMerge, MessageSquare, BookText, Lightbulb } from "lucide-react";
+import { Search, LayoutDashboard, Settings, BookOpen, FileCode, Layers, Link2, GitMerge, MessageSquare, BookText, Lightbulb, AlertTriangle } from "lucide-react";
 import { useSearch } from "@/lib/hooks/use-search";
 import { paletteFilter, preRankedKeywords } from "./palette-filter";
 import {
@@ -40,7 +40,7 @@ export function CommandPalette({ repos, workspace }: CommandPaletteProps) {
   const router = useRouter();
   const pathname = usePathname();
 
-  const { envelope, isLoading } = useSearch(query, { limit: 8 });
+  const { envelope, error: searchError, isLoading } = useSearch(query, { limit: 8 });
 
   // Active repo: from the URL when inside one, else the only repo.
   const activeRepo = useMemo(() => {
@@ -102,8 +102,21 @@ export function CommandPalette({ repos, workspace }: CommandPaletteProps) {
 
   // Only when the server said so. The stock search host classifies nothing,
   // and rendering its silence as a verdict would be inventing one.
-  const lowConfidence = grouped.confidence === "caution";
+  //
+  // `degraded` outranks the plain caution: the server pins caution whenever a
+  // lane failed, so on a degraded answer the usual "no exact match, closest by
+  // meaning" would name a cause that is not the cause.
   const noMatch = grouped.confidence === "no_match";
+  const degraded = grouped.degraded === true;
+  const lowConfidence = grouped.confidence === "caution" && !degraded;
+  // A request that never arrived is the same lie as a search that read no
+  // corpus, one layer down: SWR hands back no data, the palette renders no
+  // rows, and an outage looks like "nothing matches". Both land in the same
+  // failure state rather than in the empty one.
+  const unavailable = grouped.failureMessage !== undefined || searchError !== undefined;
+  const failureDetail =
+    grouped.degradedReason ??
+    (searchError instanceof Error ? searchError.message : undefined);
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
@@ -175,6 +188,48 @@ export function CommandPalette({ repos, workspace }: CommandPaletteProps) {
             <p className="px-5 py-6 text-center text-sm leading-relaxed text-[var(--color-text-tertiary)] [text-wrap:pretty]">
               {grouped.emptyMessage}
             </p>
+          )}
+
+          {/* A search that broke. Deliberately unlike the empty state above:
+              that one is a finding about the repository and this one is the
+              absence of a finding, and a reader who cannot tell them apart
+              will read an outage as an answer. */}
+          {unavailable && (
+            <div
+              role="alert"
+              className="mx-3 my-3 rounded-md border border-[color-mix(in_srgb,var(--color-error)_28%,transparent)] bg-[var(--color-error-muted)] px-4 py-3"
+            >
+              <p className="flex items-center gap-2 text-sm font-medium text-[var(--color-text-primary)]">
+                <AlertTriangle className="h-4 w-4 shrink-0 text-[var(--color-error)]" />
+                Search is unavailable
+              </p>
+              <p className="mt-1 text-xs leading-relaxed text-[var(--color-text-secondary)] [text-wrap:pretty]">
+                Nothing was searched, so this is not a statement about the repository.
+              </p>
+              {failureDetail && (
+                <p className="mt-1.5 font-mono text-[11px] leading-relaxed text-[var(--color-text-tertiary)] break-words">
+                  {failureDetail}
+                </p>
+              )}
+            </div>
+          )}
+
+          {/* Partial results. The rows below are real, and the ones a failed
+              lane would have contributed are simply missing — which is exactly
+              the state that looked like a healthy empty answer for 21 minutes,
+              so it gets a banner rather than a footnote. */}
+          {degraded && !unavailable && (
+            <div className="mx-3 my-2 rounded-md border border-[var(--color-border-default)] bg-[var(--color-bg-elevated)] px-3 py-2">
+              <p className="flex items-center gap-2 text-xs font-medium text-[var(--color-text-secondary)]">
+                <AlertTriangle className="h-3.5 w-3.5 shrink-0 text-[var(--color-warning)]" />
+                Partial results — a search lane failed
+              </p>
+              {grouped.degradedReason && (
+                <p className="mt-1 font-mono text-[11px] leading-relaxed text-[var(--color-text-tertiary)] break-words">
+                  {grouped.degradedReason}
+                </p>
+              )}
+            </div>
           )}
 
           {/* Quick-ask — always available when a repo is in scope */}

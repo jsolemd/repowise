@@ -521,6 +521,182 @@ describe("groupSearchResults — confidence", () => {
   });
 });
 
+/**
+ * A store that cannot be read must not reach the reader as a thin answer. The
+ * incident this guards is real: for 21 minutes both source legs raised on
+ * every query while the envelope kept reporting `confident` over an index it
+ * advertised as 7,721 chunks and served none of.
+ */
+describe("groupSearchResults — a lane that failed", () => {
+  function degradedBody(overrides: Record<string, unknown> = {}) {
+    return envelopeBody({
+      confidence: "caution",
+      _meta: {
+        source_search: {
+          indexed_commit: "8d1e42e9e7d07029f48d834189c47eaf9f6cd0e8",
+          degraded: true,
+          degraded_reason:
+            "dense failed (RuntimeError: lance error: No field named valid_from)",
+          failed_legs: [
+            {
+              leg: "dense",
+              error: "RuntimeError",
+              detail: "lance error: No field named valid_from",
+            },
+          ],
+        },
+      },
+      ...overrides,
+    });
+  }
+
+  it("carries the degradation and names the legs that failed", () => {
+    const envelope = normalizeSearchResponse(degradedBody());
+
+    expect(envelope.degraded).toBe(true);
+    expect(envelope.failed_legs).toEqual([
+      { leg: "dense", error: "RuntimeError", detail: "lance error: No field named valid_from" },
+    ]);
+
+    const grouped = groupSearchResults({ envelope, linkPrefix: PREFIX });
+    expect(grouped.degraded).toBe(true);
+    expect(grouped.degradedReason).toContain("dense failed");
+  });
+
+  it("still renders the results a surviving lane returned", () => {
+    // Partial is not empty. The rows that did come back are real answers and
+    // dropping them would trade one wrong story for another.
+    const { groups } = groupSearchResults({
+      envelope: normalizeSearchResponse(degradedBody()),
+      linkPrefix: PREFIX,
+    });
+    expect(groups[0]?.entries[0]?.label).toBe("reconcile_project_files");
+  });
+
+  it("does not read as a plain empty state", () => {
+    const grouped = groupSearchResults({
+      envelope: normalizeSearchResponse(degradedBody()),
+      linkPrefix: PREFIX,
+    });
+    expect(grouped.emptyMessage).toBeUndefined();
+    expect(grouped.failureMessage).toBeUndefined();
+  });
+
+  it("says nothing about degradation on a healthy response", () => {
+    const grouped = groupSearchResults({
+      envelope: normalizeSearchResponse(envelopeBody()),
+      linkPrefix: PREFIX,
+    });
+    expect(grouped.degraded).toBeUndefined();
+    expect(grouped.degradedReason).toBeUndefined();
+    expect(grouped.failureMessage).toBeUndefined();
+  });
+});
+
+describe("groupSearchResults — a search that broke", () => {
+  function brokenBody() {
+    return {
+      results: [],
+      candidates: [],
+      selected_owner: null,
+      confidence: "caution",
+      mode: "hybrid",
+      status: "error",
+      error: {
+        code: "source_search_unavailable",
+        message:
+          "Every retrieval leg failed, so this search read no corpus. Cause: dense failed",
+        failed_legs: [{ leg: "dense", error: "RuntimeError", detail: "no field" }],
+      },
+      _meta: {
+        source_search: {
+          degraded: true,
+          degraded_reason: "dense failed (RuntimeError: no field); lexical failed (OSError: locked)",
+          failed_legs: [
+            { leg: "dense", error: "RuntimeError", detail: "no field" },
+            { leg: "lexical", error: "OSError", detail: "locked" },
+          ],
+        },
+      },
+    };
+  }
+
+  it("reads the failure off the envelope", () => {
+    const envelope = normalizeSearchResponse(brokenBody());
+    expect(envelope.unavailable?.code).toBe("source_search_unavailable");
+    expect(envelope.failed_legs).toHaveLength(2);
+  });
+
+  it("is a failure state, never an empty one", () => {
+    // The distinction the whole contract exists for: an empty result set is a
+    // claim about the repository, and a search that read nothing cannot make
+    // it. These two fields are mutually exclusive by construction.
+    const grouped = groupSearchResults({
+      envelope: normalizeSearchResponse(brokenBody()),
+      linkPrefix: PREFIX,
+    });
+
+    expect(grouped.failureMessage).toBeDefined();
+    expect(grouped.emptyMessage).toBeUndefined();
+    expect(grouped.failureMessage).toContain("not a statement about the repository");
+    expect(grouped.failureMessage).toContain("dense failed");
+  });
+
+  it("renders no result rows", () => {
+    const grouped = groupSearchResults({
+      envelope: normalizeSearchResponse(brokenBody()),
+      linkPrefix: PREFIX,
+    });
+    expect(grouped.groups).toEqual([]);
+    expect(grouped.isEmpty).toBe(true);
+  });
+
+  it("drops rows even if a broken response somehow carried some", () => {
+    // Belt and braces: the contract says results are empty here, but the
+    // adapter must not depend on the server for that — the whole point is that
+    // this response's rows cannot be evidence.
+    const body = { ...brokenBody(), results: [
+      { file: "a/b.py", name: "x", kind: "function", source: "symbol", snippet: "", relevance_score: 1 },
+    ] };
+    const grouped = groupSearchResults({
+      envelope: normalizeSearchResponse(body),
+      linkPrefix: PREFIX,
+    });
+    expect(grouped.groups).toEqual([]);
+  });
+
+  it("still offers decisions, which no search lane touched", () => {
+    const grouped = groupSearchResults({
+      envelope: normalizeSearchResponse(brokenBody()),
+      decisions: [makeDecision("d1", "Pin the driver")],
+      linkPrefix: PREFIX,
+    });
+    expect(grouped.groups.map((g) => g.id)).toEqual(["decisions"]);
+  });
+
+  it("outranks the caution the server pinned alongside it", () => {
+    // A broken search arrives carrying `degraded` and `caution` too. Rendering
+    // it as a low-confidence answer would describe an outage as a weak result.
+    const grouped = groupSearchResults({
+      envelope: normalizeSearchResponse(brokenBody()),
+      linkPrefix: PREFIX,
+    });
+    expect(grouped.confidence).toBe("caution");
+    expect(grouped.degraded).toBe(true);
+    expect(grouped.failureMessage).toBeDefined();
+  });
+});
+
+describe("owner", () => {
+  it("reports the owner the server chose", () => {
+    const grouped = groupSearchResults({
+      envelope: normalizeSearchResponse(envelopeBody()),
+      linkPrefix: PREFIX,
+    });
+    expect(grouped.ownerFile).toBe("codeatlas/code_search/neo4j/writer_mutations.py");
+  });
+});
+
 function makeDecision(
   id: string,
   title: string,
