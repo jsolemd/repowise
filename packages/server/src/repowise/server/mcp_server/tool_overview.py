@@ -61,6 +61,7 @@ from repowise.server.mcp_server._helpers import (
     is_excluded,
 )
 from repowise.server.mcp_server._meta import build_meta as _build_meta
+from repowise.server.mcp_server._repo_stats import build_repo_stats
 
 # Leading markdown-header boilerplate on module page content ("## Overview").
 _MD_HEADER_RE = re.compile(r"^\s*#{1,6}\s+.*$", re.MULTILINE)
@@ -959,6 +960,7 @@ async def get_overview(repo: str | None = None, include: list[str] | None = None
         title = _resolve_title(overview_page, repository)
         code_health = await _build_code_health(session, repository)
         key_decisions_section = await _build_key_decisions(session, repository, exclude_spec)
+        repo_stats = await build_repo_stats(session, repository)
 
         full_content = overview_page.content if overview_page else "No overview generated yet."
         want_full_content = "content" in set(include or [])
@@ -967,6 +969,9 @@ async def get_overview(repo: str | None = None, include: list[str] | None = None
         result = {
             "title": title,
             "content_md": content_md,
+            # Size and shape first: the questions an agent asks before it can
+            # judge anything else in this response.
+            "repo_stats": repo_stats,
             "code_health": code_health,
             "key_modules": [
                 {
