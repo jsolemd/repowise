@@ -155,9 +155,9 @@ async def build_source_index(
     if previous is not None and previous.recipe_fingerprint == fingerprint:
         stored = await store.stored_vectors()
         reusable = {
-            chunk_id: entry.vector
-            for chunk_id, entry in stored.items()
-            if len(entry.vector) == embedder_identity.dims
+            entry.content_hash: entry.vector
+            for entry in stored.values()
+            if entry.content_hash and len(entry.vector) == embedder_identity.dims
         }
 
     # The manifest is the completion marker, so it is cleared before anything
@@ -173,7 +173,14 @@ async def build_source_index(
 
     await store.drop()
     embed_started = time.perf_counter()
-    embedded, reused = await _embed_and_store(store, embedder, chunks, reusable, batch_size)
+    embedded, reused = await _embed_and_store(
+        store,
+        embedder,
+        chunks,
+        reusable,
+        batch_size,
+        document_prefix=embedder_identity.document_prefix,
+    )
     embed_seconds = time.perf_counter() - embed_started
     await store.close()
 
@@ -414,6 +421,8 @@ async def _embed_and_store(
     chunks: Sequence[SourceChunk],
     reusable: dict[str, list[float]],
     batch_size: int,
+    *,
+    document_prefix: str = "",
 ) -> tuple[int, int]:
     """Embed what changed, reuse what did not, write everything. Returns (embedded, reused)."""
     embedded = 0
@@ -422,19 +431,21 @@ async def _embed_and_store(
     buffered: list[tuple[SourceChunk, list[float]]] = []
     for start in range(0, len(chunks), batch_size):
         batch = chunks[start : start + batch_size]
-        pending = [chunk for chunk in batch if chunk.chunk_id not in reusable]
+        pending = [chunk for chunk in batch if chunk.content_hash not in reusable]
         vectors: dict[str, list[float]] = {}
         if pending:
-            fresh = await _embed_with_retry(embedder, [chunk.text for chunk in pending])
+            fresh = await _embed_with_retry(
+                embedder, [f"{document_prefix}{chunk.text}" for chunk in pending]
+            )
             vectors = {
-                chunk.chunk_id: [float(v) for v in vector]
+                chunk.content_hash: [float(v) for v in vector]
                 for chunk, vector in zip(pending, fresh, strict=True)
             }
             embedded += len(pending)
         for chunk in batch:
-            vector = vectors.get(chunk.chunk_id)
+            vector = vectors.get(chunk.content_hash)
             if vector is None:
-                vector = reusable[chunk.chunk_id]
+                vector = reusable[chunk.content_hash]
                 reused += 1
             buffered.append((chunk, vector))
         if len(buffered) >= _LANCE_WRITE_BATCH:

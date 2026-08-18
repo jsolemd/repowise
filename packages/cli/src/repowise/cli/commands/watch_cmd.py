@@ -34,6 +34,11 @@ _SELF_WRITTEN_FILES: frozenset[str] = frozenset({"CLAUDE.md", "AGENTS.md", ".mcp
 #: blocked by the traversal blocklist :func:`is_candidate_source_path` reads.
 _SELF_WRITTEN_DIRS: frozenset[str] = frozenset({".claude", ".codex", ".cursor", ".gemini"})
 
+# The source lane publishes after the ordinary debounce.  Repository-wide
+# graph/wiki/health work waits for a longer quiet period and coalesces all
+# intervening saves, keeping it out of the agent's save-to-searchable path.
+_SOURCE_SLOW_QUIET_SECONDS = 8.0
+
 
 def _event_paths(event: object, repo_path: Path) -> set[str]:
     """The watchable repo-relative paths a filesystem event touched.
@@ -48,6 +53,20 @@ def _event_paths(event: object, repo_path: Path) -> set[str]:
     unguarded ``relative_to`` here used to take watchdog's dispatcher thread
     down with it, leaving ``watch`` apparently running but permanently deaf.
     """
+    # watchdog also emits opened/closed-without-write events. Indexing reads
+    # the saved file, so treating those as edits creates a feedback loop where
+    # each fast update schedules the next one. Synthetic test events and older
+    # backends may omit ``event_type``; preserve their historical path.
+    event_type = getattr(event, "event_type", None)
+    if event_type is not None and event_type not in {
+        "closed",
+        "created",
+        "deleted",
+        "modified",
+        "moved",
+    }:
+        return set()
+
     found: set[str] = set()
     for attr in ("src_path", "dest_path"):
         raw = getattr(event, attr, None)
@@ -118,6 +137,7 @@ def _watch_single_repo(
     from watchdog.observers import Observer
 
     from repowise.cli.commands.update_cmd.command import run_update
+    from repowise.core.source_search import source_search_enabled
 
     ensure_repowise_dir(repo_path)
 
@@ -129,20 +149,27 @@ def _watch_single_repo(
     # one started on top of it.
     update_lock = threading.Lock()
     timer: threading.Timer | None = None
+    source_fast_enabled = source_search_enabled()
+    slow_paths: set[str] = set()
+    fast_captured_paths: set[str] = set()
+    slow_timer: threading.Timer | None = None
+    slow_epoch = 0
 
-    def _on_trigger() -> None:
-        nonlocal timer
-        with update_lock:
-            with lock:
-                paths = set(changed_paths)
-                changed_paths.clear()
-                timer = None
+    def _run_update(paths: set[str], *, source_captured: set[str] | None = None) -> None:
+        if not paths:
+            return
 
-            if not paths:
-                return
+        console.print(f"[cyan]Detected {len(paths)} changed file(s), updating...[/cyan]")
+        try:
+            if source_captured:
+                from repowise.core.source_search.outbox import suppress_incremental_paths
 
-            console.print(f"[cyan]Detected {len(paths)} changed file(s), updating...[/cyan]")
-            try:
+                context = suppress_incremental_paths(source_captured)
+            else:
+                from contextlib import nullcontext
+
+                context = nullcontext()
+            with context:
                 run_update(
                     path=str(repo_path),
                     provider_name=provider_name,
@@ -160,14 +187,103 @@ def _watch_single_repo(
                     # in the working tree, and nothing has been committed.
                     include_working_tree=True,
                 )
-            except Exception as e:
-                console.print(f"[red]Update failed: {e}[/red]")
-            finally:
-                _release_own_update_lock(repo_path)
+        except Exception as e:
+            console.print(f"[red]Update failed: {e}[/red]")
+        finally:
+            _release_own_update_lock(repo_path)
+
+    def _run_source_fast_path(paths: set[str]) -> bool:
+        """Capture *paths* durably, then make their generation searchable."""
+
+        from repowise.core.source_search.fast_update import capture_source_changes
+
+        capture = run_async(capture_source_changes(repo_path, paths))
+        try:
+            from repowise.cli.source_search_runtime import reconcile_configured_source_index
+
+            outcome = run_async(reconcile_configured_source_index(repo_path))
+        except Exception as exc:
+            # Capture already committed.  The queue/status surface is the
+            # durable retry signal, so the heavy lane must not duplicate it.
+            console.print(f"[yellow]Source search reconcile deferred: {exc}[/yellow]")
+        else:
+            if outcome is not None and outcome.status == "busy":
+                console.print("[yellow]Source search update already running[/yellow]")
+            elif outcome is not None:
+                console.print(
+                    f"[green]Source searchable:[/green] {len(capture.paths)} file(s) "
+                    f"in {outcome.total_seconds:.3f}s"
+                )
+        return True
+
+    def _on_slow_trigger(epoch: int) -> None:
+        nonlocal slow_timer
+        # Do not wait behind an active heavy update only to run a timer that a
+        # newer save has already superseded.
+        with lock:
+            if epoch != slow_epoch:
+                return
+        with update_lock:
+            with lock:
+                if epoch != slow_epoch:
+                    return
+                paths = set(slow_paths)
+                captured = fast_captured_paths & paths
+                slow_paths.difference_update(paths)
+                fast_captured_paths.difference_update(paths)
+                slow_timer = None
+            _run_update(paths, source_captured=captured)
+
+    def _schedule_slow_update() -> None:
+        nonlocal slow_timer, slow_epoch
+        with lock:
+            slow_epoch += 1
+            epoch = slow_epoch
+            if slow_timer is not None:
+                slow_timer.cancel()
+            slow_timer = threading.Timer(
+                _SOURCE_SLOW_QUIET_SECONDS,
+                _on_slow_trigger,
+                args=(epoch,),
+            )
+            slow_timer.daemon = True
+            slow_timer.start()
+
+    def _on_trigger() -> None:
+        nonlocal timer
+        with lock:
+            paths = set(changed_paths)
+            changed_paths.clear()
+            timer = None
+
+        if not paths:
+            return
+
+        if not source_fast_enabled:
+            # Feature-off behaviour stays byte-for-byte in spirit: one
+            # debounced, serial update and no extra parsing or timers.
+            with update_lock:
+                _run_update(paths)
+            return
+
+        console.print(f"[cyan]Detected {len(paths)} saved file(s), indexing source...[/cyan]")
+        captured = False
+        try:
+            captured = _run_source_fast_path(paths)
+        except Exception as e:
+            console.print(f"[red]Source fast update failed: {e}[/red]")
+
+        with lock:
+            slow_paths.update(paths)
+            if captured:
+                fast_captured_paths.update(paths)
+            else:
+                fast_captured_paths.difference_update(paths)
+        _schedule_slow_update()
 
     class RepowiseHandler(FileSystemEventHandler):
         def on_any_event(self, event):
-            nonlocal timer
+            nonlocal slow_epoch, slow_timer, timer
             if event.is_directory:
                 return
             watched = _event_paths(event, repo_path)
@@ -178,6 +294,10 @@ def _watch_single_repo(
                 changed_paths.update(watched)
                 if timer is not None:
                     timer.cancel()
+                if source_fast_enabled and slow_timer is not None:
+                    slow_timer.cancel()
+                    slow_timer = None
+                    slow_epoch += 1
                 timer = threading.Timer(debounce_ms / 1000.0, _on_trigger)
                 timer.daemon = True
                 timer.start()
@@ -259,6 +379,28 @@ def _watch_workspace(
                             include_working_tree=True,
                         )
                     )
+                    from repowise.cli.source_search_runtime import (
+                        reconcile_configured_source_index,
+                    )
+
+                    source_entry = current_config.get_repo(alias)
+                    if source_entry is not None:
+                        try:
+                            source_outcome = run_async(
+                                reconcile_configured_source_index(
+                                    (ws_root / source_entry.path).resolve()
+                                )
+                            )
+                        except Exception as exc:
+                            console.print(
+                                f"  [yellow]{alias}: source search reconcile deferred: "
+                                f"{exc}[/yellow]"
+                            )
+                        else:
+                            if source_outcome is not None and source_outcome.status == "busy":
+                                console.print(
+                                    f"  [yellow]{alias}: source search update already running[/yellow]"
+                                )
                     for r in results:
                         if r.error:
                             console.print(f"  [red]{alias}: {r.error}[/red]")

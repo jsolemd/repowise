@@ -185,6 +185,20 @@ async def persist_result(result: Any, repo_path: Path, progress: Any | None = No
                 getattr(result, "authoritative_page_types", None),
                 getattr(result, "preserved_page_ids", None),
             )
+            # The resume controller already committed the symbol phase, so it
+            # bypasses persist_pipeline_result's source-search hook. Capture a
+            # full reconcile here, in the final authoritative transaction.
+            from repowise.core.source_search import source_search_enabled
+
+            if source_search_enabled():
+                from repowise.core.source_search.outbox import enqueue_full_update
+
+                await enqueue_full_update(
+                    session,
+                    repo.id,
+                    repo_path,
+                    parsed_files=result.parsed_files,
+                )
         else:
             swept_page_ids = await persist_pipeline_result(result, session, repo.id)
 
@@ -234,6 +248,21 @@ async def persist_result(result: Any, repo_path: Path, progress: Any | None = No
             store = getattr(result, "vector_store", None)
             if store is not None:
                 await store.delete_many(swept_page_ids)
+
+    # The source outbox committed with the symbols above. Drain it only now,
+    # so a crash cannot publish code derived from a SQL transaction that later
+    # rolls back. Reuse the run's actual embedder when available; this matters
+    # before a first init has written its provider pin to config.yaml.
+    try:
+        from repowise.cli.source_search_runtime import reconcile_configured_source_index
+
+        wiki_store = getattr(result, "vector_store", None)
+        await reconcile_configured_source_index(
+            repo_path,
+            embedder=getattr(wiki_store, "_embedder", None),
+        )
+    except Exception as exc:
+        logger.warning("source_index_reconcile_deferred", error=str(exc))
 
     # FTS deletes/indexing run outside the session: the FTS index lives in the
     # *same* SQLite file as the session, so touching it while the session still

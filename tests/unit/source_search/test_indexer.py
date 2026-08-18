@@ -231,6 +231,19 @@ async def test_edited_source_is_re_embedded_and_the_rest_is_not(repo):
     assert counter.texts == 1
 
 
+async def test_same_symbol_id_with_changed_body_is_re_embedded(repo):
+    """Reuse follows text, not the stable symbol id."""
+
+    await _build(repo)
+    app = repo / "src" / "app.py"
+    app.write_text(_APP.replace("return os.path.exists(path)", "return not os.path.exists(path)"))
+    counter = _CountingEmbedder()
+    second = await _build(repo, embedder=counter)
+    assert second.embedded == 1
+    assert second.reused == 3
+    assert counter.texts == 1
+
+
 async def test_a_changed_recipe_forfeits_reuse(repo):
     """Vectors from another embedder must not be carried into this index."""
     await _build(repo)

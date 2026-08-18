@@ -400,6 +400,13 @@ def _persist_index_only_update(
             failed_steps=failed_steps,
         )
     )
+    try:
+        from repowise.cli.source_search_runtime import reconcile_configured_source_index
+
+        run_async(reconcile_configured_source_index(repo_path))
+    except Exception as exc:
+        degraded.append(f"Source search reconcile: {exc}")
+        console.print(f"[yellow]Source search reconcile deferred: {exc}[/yellow]")
     from repowise.cli.helpers import config_fingerprint
 
     from .command import _current_renderer_fingerprint
@@ -651,6 +658,7 @@ async def _persist_full_update_async(
     tombstoned_page_ids: list[str] = []
     # Same contract, for rows of a page that has been retired outright.
     swept_page_ids: list[str] = []
+    source_symbol_error: str | None = None
     try:
         await init_db(engine)
         sf = create_session_factory(engine)
@@ -920,6 +928,7 @@ async def _persist_full_update_async(
                 )
             except Exception as exc:
                 _skip("Symbol persist", exc)
+                source_symbol_error = str(exc)
 
             # Refresh graph_edges for the changed files (delete-then-insert of
             # each file's outgoing edges). Without this, adjacency fossilizes at
@@ -989,6 +998,33 @@ async def _persist_full_update_async(
                 total_pages = int(count_result.scalar_one())
             except Exception as exc:
                 _skip("Page count", exc)
+
+            # This docs-mode writer duplicates the core incremental symbol
+            # path, so it must duplicate the transactional source outbox hook.
+            from repowise.core.source_search import source_search_enabled
+
+            if source_search_enabled():
+                from repowise.core.source_search.outbox import enqueue_incremental_update
+
+                await enqueue_incremental_update(
+                    session,
+                    repo_id,
+                    repo_path,
+                    file_diffs=file_diffs,
+                    parsed_files=parsed_files,
+                    upstream_ready=source_symbol_error is None,
+                    upstream_error=source_symbol_error,
+                )
+
+        try:
+            from repowise.cli.source_search_runtime import reconcile_configured_source_index
+
+            await reconcile_configured_source_index(
+                repo_path,
+                embedder=getattr(decision_vector_store, "_embedder", None),
+            )
+        except Exception as exc:
+            _skip("Source search reconcile", exc)
 
         # FTS outside the transaction — rebuildable, and its writer manages
         # its own connection state.

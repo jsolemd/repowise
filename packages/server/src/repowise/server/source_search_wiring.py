@@ -31,15 +31,74 @@ log = logging.getLogger(__name__)
 #: queries do not both open the FTS sidecar.
 _mcp_coordinator: Any = None
 _mcp_lock = asyncio.Lock()
-_mcp_attempted = False
+_mcp_generation: tuple[Any, ...] | None = None
 
 #: Where the REST app caches its own instance.
 _REST_ATTR = "source_search_coordinator"
+_REST_GENERATION_ATTR = "source_search_generation"
+_rest_lock = asyncio.Lock()
 
 #: How long a caller waits for the MCP server's background vector-store load.
 #: Bounded and short: the coordinator can be rebuilt on the next query, and a
 #: search that blocks on startup is the failure mode this guards against.
 _READY_TIMEOUT = 10.0
+
+
+class _StatusCoordinator:
+    """Add live queue health without changing the ranking coordinator."""
+
+    def __init__(self, inner: Any, repo: Path, source_vectors: Any, source_fts: Any) -> None:
+        self._inner = inner
+        self._repo = repo
+        self._source_vectors = source_vectors
+        self._source_fts = source_fts
+
+    async def search(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        response = await self._inner.search(*args, **kwargs)
+        try:
+            from repowise.core.source_search.status import inspect_source_index
+
+            status = await inspect_source_index(self._repo, verify_stores=False)
+            meta = response.setdefault("_meta", {}).setdefault("source_search", {})
+            meta.update(
+                {
+                    "status": status.state,
+                    "generation_id": status.generation_id,
+                    "generation_sequence": status.generation_sequence,
+                    "pending_updates": status.pending_updates,
+                    "blocked_updates": status.blocked_updates,
+                    "building_updates": status.building_updates,
+                    "ready_updates": status.ready_updates,
+                    "stale_files": len(status.stale_files),
+                }
+            )
+            if status.last_error:
+                meta["last_error"] = status.last_error
+            if status.degraded:
+                meta["degraded"] = True
+                meta.setdefault("degraded_reason", status.last_error or status.state)
+        except Exception:
+            log.debug("source-search: status enrichment failed", exc_info=True)
+        return response
+
+    async def close(self) -> None:
+        await self._source_vectors.close()
+        self._source_fts.close()
+
+
+def _manifest_key(repo_path: Path | str) -> tuple[Any, ...] | None:
+    from repowise.core.source_search.manifest import default_manifest_path, read_manifest
+
+    manifest = read_manifest(default_manifest_path(repo_path))
+    if manifest is None:
+        return None
+    return (
+        manifest.generation_id,
+        manifest.generation_sequence,
+        manifest.recipe_fingerprint,
+        manifest.lance_table,
+        manifest.fts_path,
+    )
 
 
 def _build(repo_path: Path | str, wiki_vectors: Any, wiki_fts: Any) -> Any:
@@ -51,14 +110,19 @@ def _build(repo_path: Path | str, wiki_vectors: Any, wiki_fts: Any) -> Any:
     """
     from repowise.core.providers.embedding import store_has_semantic_vectors
     from repowise.core.source_search.coordinator import SourceSearchCoordinator
-    from repowise.core.source_search.fts import SourceFTSIndex, default_fts_path
-    from repowise.core.source_search.manifest import default_manifest_path
+    from repowise.core.source_search.fts import SourceFTSIndex
+    from repowise.core.source_search.generation import GenerationRef
+    from repowise.core.source_search.manifest import default_manifest_path, read_manifest
     from repowise.core.source_search.vector_store import SourceChunkVectorStore
 
     repo = Path(repo_path)
-    fts_path = default_fts_path(repo)
-    if not default_manifest_path(repo).exists() or not fts_path.exists():
+    manifest = read_manifest(default_manifest_path(repo))
+    if manifest is None:
         log.debug("source-search: no source index at %s", repo)
+        return None
+    fts_path = repo / manifest.fts_path
+    if not fts_path.is_file():
+        log.warning("source-search: active FTS generation is missing at %s", fts_path)
         return None
 
     embedder = getattr(wiki_vectors, "_embedder", None)
@@ -67,23 +131,42 @@ def _build(repo_path: Path | str, wiki_vectors: Any, wiki_fts: Any) -> Any:
         # one — the widths differ, and where they do not the vectors are noise.
         log.debug("source-search: no semantic embedder available, staying on the stock path")
         return None
+    if int(getattr(embedder, "dimensions", 0) or 0) != manifest.embedder.dims:
+        log.warning(
+            "source-search: configured embedder width does not match active generation "
+            "(%s != %s)",
+            getattr(embedder, "dimensions", None),
+            manifest.embedder.dims,
+        )
+        return None
+
+    generation = GenerationRef(manifest.generation_id, manifest.generation_sequence)
 
     try:
-        source_fts = SourceFTSIndex(fts_path)
+        source_fts = SourceFTSIndex(fts_path, generation=generation)
     except Exception:
         log.debug("source-search: could not open the FTS sidecar", exc_info=True)
         return None
 
-    return SourceSearchCoordinator(
+    try:
+        source_vectors = SourceChunkVectorStore(
+            str(repo / ".repowise" / "lancedb"),
+            embedder=embedder,
+            table_name=manifest.lance_table,
+            generation=generation,
+        )
+    except Exception:
+        source_fts.close()
+        raise
+    coordinator = SourceSearchCoordinator(
         repo_path=repo,
         embedder=embedder,
-        source_vectors=SourceChunkVectorStore(
-            str(repo / ".repowise" / "lancedb"), embedder=embedder
-        ),
+        source_vectors=source_vectors,
         source_fts=source_fts,
         wiki_vectors=wiki_vectors,
         wiki_fts=wiki_fts,
     )
+    return _StatusCoordinator(coordinator, repo, source_vectors, source_fts)
 
 
 async def mcp_coordinator() -> Any:
@@ -96,14 +179,18 @@ async def mcp_coordinator() -> Any:
     itself, which the lifespan sets, and treats its absence as "nothing to wait
     for" rather than as "wait".
     """
-    global _mcp_coordinator, _mcp_attempted
+    global _mcp_coordinator, _mcp_generation
 
     from repowise.server.mcp_server import _state
 
-    if _mcp_attempted:
+    repo_path = _state._repo_path
+    generation = _manifest_key(repo_path) if repo_path else None
+    if _mcp_coordinator is not None and generation == _mcp_generation:
         return _mcp_coordinator
     async with _mcp_lock:
-        if _mcp_attempted:
+        repo_path = _state._repo_path
+        generation = _manifest_key(repo_path) if repo_path else None
+        if _mcp_coordinator is not None and generation == _mcp_generation:
             return _mcp_coordinator
         ready = _state._vector_store_ready
         if ready is not None:
@@ -114,28 +201,43 @@ async def mcp_coordinator() -> Any:
                 return None
         repo_path = _state._repo_path
         if not repo_path:
-            _mcp_attempted = True
             return None
+        old = _mcp_coordinator
+        _mcp_coordinator = None
+        _mcp_generation = None
+        if old is not None:
+            await old.close()
         try:
             _mcp_coordinator = _build(repo_path, _state._vector_store, _state._fts)
         except Exception:
             log.debug("source-search: MCP coordinator construction failed", exc_info=True)
             _mcp_coordinator = None
-        _mcp_attempted = True
+        if _mcp_coordinator is not None:
+            _mcp_generation = generation
         return _mcp_coordinator
 
 
 async def rest_coordinator(app_state: Any) -> Any:
-    """The REST app's coordinator, built once and cached on ``app.state``."""
-    existing = getattr(app_state, _REST_ATTR, None)
-    if existing is not None:
-        return existing
-    if getattr(app_state, f"{_REST_ATTR}_attempted", False):
-        return None
-
+    """The REST coordinator, reopened when the manifest generation changes."""
     repo_path = _repo_root_from_db_url(getattr(app_state, "db_url", "") or "")
-    coordinator = None
-    if repo_path is not None:
+    generation = _manifest_key(repo_path) if repo_path is not None else None
+    existing = getattr(app_state, _REST_ATTR, None)
+    if existing is not None and generation == getattr(app_state, _REST_GENERATION_ATTR, None):
+        return existing
+
+    async with _rest_lock:
+        existing = getattr(app_state, _REST_ATTR, None)
+        if existing is not None and generation == getattr(
+            app_state, _REST_GENERATION_ATTR, None
+        ):
+            return existing
+        if existing is not None:
+            await existing.close()
+        coordinator = None
+        if repo_path is None:
+            setattr(app_state, _REST_ATTR, None)
+            setattr(app_state, _REST_GENERATION_ATTR, None)
+            return None
         try:
             coordinator = _build(
                 repo_path,
@@ -144,9 +246,9 @@ async def rest_coordinator(app_state: Any) -> Any:
             )
         except Exception:
             log.debug("source-search: REST coordinator construction failed", exc_info=True)
-    setattr(app_state, _REST_ATTR, coordinator)
-    setattr(app_state, f"{_REST_ATTR}_attempted", True)
-    return coordinator
+        setattr(app_state, _REST_ATTR, coordinator)
+        setattr(app_state, _REST_GENERATION_ATTR, generation if coordinator is not None else None)
+        return coordinator
 
 
 def _repo_root_from_db_url(db_url: str) -> Path | None:
@@ -169,6 +271,6 @@ def _repo_root_from_db_url(db_url: str) -> Path | None:
 
 def reset_for_tests() -> None:
     """Forget the MCP process cache. Only tests have a reason to."""
-    global _mcp_coordinator, _mcp_attempted
+    global _mcp_coordinator, _mcp_generation
     _mcp_coordinator = None
-    _mcp_attempted = False
+    _mcp_generation = None

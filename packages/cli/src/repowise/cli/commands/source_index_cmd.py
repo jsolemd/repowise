@@ -90,10 +90,13 @@ def _log_progress_to_stderr() -> None:
 async def _run(repo_path, embedder_name: str, batch_size: int | None) -> None:
     from pathlib import Path
 
-    from repowise.cli.providers.embedders import build_embedder, resolve_embedder_for_repo
-    from repowise.core.providers.embedding.base import KeylessEmbedder
-    from repowise.core.source_search.indexer import EMBED_BATCH_SIZE, build_source_index
-    from repowise.core.source_search.manifest import EmbedderIdentity
+    from repowise.cli.providers.embedders import resolve_embedder_for_repo
+    from repowise.cli.source_search_runtime import (
+        SourceSearchUnavailableError,
+        reconcile_configured_source_index,
+    )
+    from repowise.core.source_search.indexer import EMBED_BATCH_SIZE
+    from repowise.core.source_search.manifest import default_manifest_path, read_manifest
 
     requested = embedder_name
     if embedder_name == "auto":
@@ -101,37 +104,37 @@ async def _run(repo_path, embedder_name: str, batch_size: int | None) -> None:
         # it is what this index should be built with too.
         embedder_name = resolve_embedder_for_repo(repo_path)
 
-    embedder = build_embedder(embedder_name, repo_path)
-    if isinstance(embedder, KeylessEmbedder) and requested != "mock":
-        # An 8-wide keyless vector is distinct per text and not discriminative
-        # (see ``providers.embedding.base``), so an index built on it would
-        # rank by noise while looking like it worked.
+    try:
+        result = await reconcile_configured_source_index(
+            Path(repo_path),
+            embedder_name=embedder_name,
+            force_full=True,
+            batch_size=batch_size or EMBED_BATCH_SIZE,
+            allow_keyless=requested == "mock",
+        )
+    except SourceSearchUnavailableError as exc:
         raise click.ClickException(
             "No real embedder is configured. Set an embedder key, configure Ollama, "
-            "or pass --embedder mock to build a deterministic test index."
-        )
+            "or pass --embedder mock to build a deterministic test index. "
+            f"({exc})"
+        ) from exc
+    if result is None:  # The command checked the same dynamic flag above.
+        raise click.ClickException("Source search was disabled before reconciliation started.")
 
-    identity = EmbedderIdentity(
-        provider=embedder_name,
-        model=_model_name(embedder),
-        dims=int(embedder.dimensions),
-    )
-
-    result = await build_source_index(
-        Path(repo_path),
-        embedder=embedder,
-        embedder_identity=identity,
-        batch_size=batch_size or EMBED_BATCH_SIZE,
-    )
+    manifest_path = default_manifest_path(repo_path)
+    manifest = read_manifest(manifest_path)
+    if manifest is None:
+        raise click.ClickException("Source-index publication completed without a manifest.")
+    identity = manifest.embedder
 
     emit_json(
         {
             "repo": str(repo_path),
             "chunks": {
-                "symbol": result.symbol_chunks,
-                "file_window": result.file_window_chunks,
-                "total": result.symbol_chunks + result.file_window_chunks,
-                "files_covered": result.files_covered,
+                "symbol": manifest.symbol_chunks,
+                "file_window": manifest.file_window_chunks,
+                "total": manifest.symbol_chunks + manifest.file_window_chunks,
+                "files_covered": manifest.files_covered,
             },
             "embedding": {
                 "provider": identity.provider,
@@ -146,28 +149,18 @@ async def _run(repo_path, embedder_name: str, batch_size: int | None) -> None:
                 "write_fts": result.write_seconds,
                 "total": result.total_seconds,
             },
-            "indexed_commit": result.indexed_commit,
-            "corpus_hash": result.corpus_hash,
-            "recipe_fingerprint": result.recipe_fingerprint,
+            "indexed_commit": manifest.indexed_commit,
+            "corpus_hash": manifest.corpus_hash,
+            "recipe_fingerprint": manifest.recipe_fingerprint,
+            "generation": {
+                "id": manifest.generation_id,
+                "sequence": manifest.generation_sequence,
+                "status": result.status,
+            },
             "paths": {
-                "manifest": result.manifest_path,
-                "lancedb": result.lancedb_path,
-                "fts": result.fts_path,
+                "manifest": str(manifest_path),
+                "lancedb": str(Path(repo_path) / ".repowise" / "lancedb"),
+                "fts": str(Path(repo_path) / manifest.fts_path),
             },
         }
     )
-
-
-def _model_name(embedder: object) -> str:
-    """The embedder's model identifier, or its class name when it has none.
-
-    ``Embedder`` is a structural protocol with no model attribute, and the
-    concrete classes spell it privately. The name goes into the recipe
-    fingerprint, so falling back to the class is what keeps a mock index from
-    claiming the same fingerprint as a real one.
-    """
-    for attribute in ("_model", "model", "_model_name"):
-        value = getattr(embedder, attribute, None)
-        if isinstance(value, str) and value:
-            return value
-    return type(embedder).__name__

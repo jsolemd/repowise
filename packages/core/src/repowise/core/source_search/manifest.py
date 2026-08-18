@@ -20,7 +20,7 @@ import json
 import os
 import tempfile
 from collections.abc import Iterable
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -32,7 +32,9 @@ __all__ = [
     "EmbedderIdentity",
     "SourceIndexManifest",
     "corpus_hash",
+    "corpus_hash_entries",
     "default_manifest_path",
+    "identify_embedder",
     "read_manifest",
     "recipe_fingerprint",
     "write_manifest",
@@ -48,11 +50,49 @@ def default_manifest_path(repo_path: Path | str) -> Path:
 
 @dataclass(frozen=True, slots=True)
 class EmbedderIdentity:
-    """Which embedder produced the vectors, and how wide they are."""
+    """Everything about the embedding adapter that changes vector meaning."""
 
     provider: str
     model: str
     dims: int
+    document_prefix: str = ""
+    query_prefix: str = ""
+
+
+def identify_embedder(
+    embedder: Any,
+    *,
+    provider: str | None = None,
+    document_prefix: str = "",
+    query_prefix: str = "",
+) -> EmbedderIdentity:
+    """Describe the concrete adapter that will produce source vectors.
+
+    Provider/model are runtime facts, not configuration aspirations.  The
+    fallback inference is used by hosts that already own an embedder object
+    (server jobs and resumed CLI runs) and therefore should not construct a
+    second adapter merely to fingerprint the first one.
+    """
+
+    resolved_provider = (provider or "").strip().lower()
+    if not resolved_provider:
+        module_leaf = type(embedder).__module__.rsplit(".", 1)[-1].lower()
+        resolved_provider = (
+            "mock" if type(embedder).__name__ in {"MockEmbedder", "KeylessEmbedder"} else module_leaf
+        )
+    model = ""
+    for attribute in ("_model", "model", "_model_name"):
+        value = getattr(embedder, attribute, None)
+        if isinstance(value, str) and value:
+            model = value
+            break
+    return EmbedderIdentity(
+        provider=resolved_provider,
+        model=model or type(embedder).__name__,
+        dims=int(embedder.dimensions),
+        document_prefix=document_prefix,
+        query_prefix=query_prefix,
+    )
 
 
 def recipe_fingerprint(embedder: EmbedderIdentity) -> str:
@@ -64,12 +104,20 @@ def recipe_fingerprint(embedder: EmbedderIdentity) -> str:
     adding a knob cannot silently reorder the ones already there and
     invalidate every index in the field for no reason.
     """
+    # Symbol text is sliced at parser-produced bounds.  A query/extractor
+    # change can therefore change the corpus even when every source byte and
+    # chunking constant stayed fixed; the parser build belongs in the recipe.
+    from repowise.core.ingestion.parse_cache import parser_fingerprint
+
     parts = [
         *recipe_parameters(),
         *tokenizer_parameters(),
+        ("parser_fingerprint", parser_fingerprint()),
         ("embedder_provider", embedder.provider),
         ("embedder_model", embedder.model),
         ("embedder_dims", str(embedder.dims)),
+        ("embedder_document_prefix", embedder.document_prefix),
+        ("embedder_query_prefix", embedder.query_prefix),
     ]
     digest = hashlib.sha256()
     for name, value in parts:
@@ -84,7 +132,13 @@ def corpus_hash(chunks: Iterable[SourceChunk]) -> str:
     enumerated — which is what makes "did anything change?" answerable without
     depending on filesystem or database ordering.
     """
-    lines = sorted(f"{chunk.chunk_id}\x00{chunk.content_hash}" for chunk in chunks)
+    return corpus_hash_entries((chunk.chunk_id, chunk.content_hash) for chunk in chunks)
+
+
+def corpus_hash_entries(entries: Iterable[tuple[str, str]]) -> str:
+    """Hash ``(chunk_id, content_hash)`` pairs from an already-persisted corpus."""
+
+    lines = sorted(f"{chunk_id}\x00{content_hash}" for chunk_id, content_hash in entries)
     digest = hashlib.sha256()
     for line in lines:
         digest.update(line.encode("utf-8"))
@@ -104,6 +158,11 @@ class SourceIndexManifest:
     indexed_commit: str | None
     built_at: str
     embedder: EmbedderIdentity
+    generation_id: str = "legacy"
+    generation_sequence: int = 0
+    lance_table: str = "source_chunks"
+    fts_path: str = ".repowise/source_search/source_fts.db"
+    stale_files: dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -127,7 +186,19 @@ class SourceIndexManifest:
                 provider=str(embedder.get("provider") or ""),
                 model=str(embedder.get("model") or ""),
                 dims=int(embedder.get("dims") or 0),
+                document_prefix=str(embedder.get("document_prefix") or ""),
+                query_prefix=str(embedder.get("query_prefix") or ""),
             ),
+            generation_id=str(raw.get("generation_id") or "legacy"),
+            generation_sequence=int(raw.get("generation_sequence") or 0),
+            lance_table=str(raw.get("lance_table") or "source_chunks"),
+            fts_path=str(raw.get("fts_path") or ".repowise/source_search/source_fts.db"),
+            stale_files={
+                str(path): str(reason)
+                for path, reason in (raw.get("stale_files") or {}).items()
+            }
+            if isinstance(raw.get("stale_files") or {}, dict)
+            else {},
         )
 
 
@@ -147,6 +218,19 @@ def write_manifest(path: Path | str, manifest: SourceIndexManifest) -> None:
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(tmp_name, target)
+        # ``fsync`` above makes the bytes durable; syncing the containing
+        # directory makes the rename itself durable.  Without both, a power
+        # loss may resurrect the prior publication pointer even though every
+        # derived-store transaction for the new generation committed.
+        try:
+            directory_fd = os.open(target.parent, os.O_RDONLY)
+        except OSError:
+            directory_fd = None
+        if directory_fd is not None:
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
     except BaseException:
         Path(tmp_name).unlink(missing_ok=True)
         raise

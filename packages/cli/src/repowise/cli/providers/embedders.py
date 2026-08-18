@@ -12,6 +12,20 @@ from repowise.cli.providers.keys import embedder_key_env_vars, resolve_embedder_
 def _embedder_kwargs(embedder_name: str, repo_path: Any = None) -> dict[str, Any]:
     kwargs: dict[str, Any] = {}
     model = os.environ.get("REPOWISE_EMBEDDING_MODEL")
+    if model is None and repo_path is not None:
+        # ``init`` persists the model that wrote the vectors. Commands that
+        # later update those vectors must honour that pin even when they were
+        # launched from a fresh shell with no model environment variable.
+        try:
+            from pathlib import Path
+
+            from repowise.cli.helpers import load_config
+
+            pinned_model = load_config(Path(repo_path)).get("embedding_model")
+            if isinstance(pinned_model, str) and pinned_model.strip():
+                model = pinned_model.strip()
+        except Exception:
+            pass
     if embedder_name == "ollama":
         model = os.environ.get("OLLAMA_EMBEDDING_MODEL") or model
         base_url = os.environ.get("OLLAMA_BASE_URL")

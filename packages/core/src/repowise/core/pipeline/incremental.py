@@ -1224,6 +1224,7 @@ async def persist_incremental_index(
     tombstoned_page_ids: list[str] = []
     # Same contract, for rows of a page that has been retired outright.
     swept_page_ids: list[str] = []
+    source_symbol_error: str | None = None
     try:
         await init_db(engine)
         sf = create_session_factory(engine)
@@ -1354,6 +1355,7 @@ async def persist_incremental_index(
                 await persist_incremental_symbols(session, repo_id, parsed_files, changed_paths)
             except Exception as exc:
                 _skip("Symbol persist", exc, range_scoped=True)
+                source_symbol_error = str(exc)
 
             # Refresh graph_edges for the changed files. The full-init path was
             # historically the only writer of edges, so adjacency froze at the
@@ -1472,6 +1474,25 @@ async def persist_incremental_index(
                         degraded.append(refusal)
             except Exception as exc:
                 _skip("Deleted-file prune", exc)
+
+            # The source-index queue must commit atomically with the symbol
+            # mutation it describes. A failed symbol step produces a durable
+            # blocked row rather than letting the derived stores publish from
+            # stale bounds; a later healthy update forces a full heal.
+            from repowise.core.source_search import source_search_enabled
+
+            if source_search_enabled():
+                from repowise.core.source_search.outbox import enqueue_incremental_update
+
+                await enqueue_incremental_update(
+                    session,
+                    repo_id,
+                    repo_path,
+                    file_diffs=file_diffs,
+                    parsed_files=parsed_files,
+                    upstream_ready=source_symbol_error is None,
+                    upstream_error=source_symbol_error,
+                )
 
         # After the session closes: on SQLite the full-text index shares the
         # database file, so writing to it while the session holds a write lock

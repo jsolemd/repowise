@@ -223,6 +223,23 @@ def _workspace_update(
         )
     )
 
+    # Each member committed its own transactional source outbox. Drain those
+    # queues after the parallel SQL updates complete; one unavailable backend
+    # leaves only that repository pending and cannot hide sibling successes.
+    from repowise.cli.source_search_runtime import reconcile_configured_source_indexes
+
+    updated_paths = [
+        (ws_root / entry.path).resolve()
+        for entry in ws_config.repos
+        if any(result.updated and result.alias == entry.alias for result in results)
+    ]
+    source_outcomes = run_async(reconcile_configured_source_indexes(updated_paths))
+    for repo_path, outcome in source_outcomes.items():
+        if isinstance(outcome, Exception):
+            console.print(
+                f"  [yellow]{repo_path.name}: source search reconcile deferred: {outcome}[/yellow]"
+            )
+
     # Backfill the distill rewrite-hook verdict for members that were just
     # indexed for the first time (e.g. added with --no-index) \u2014 they would
     # otherwise default to enabled despite a workspace-wide decline at init.
@@ -333,6 +350,20 @@ def _workspace_docs_update(
             )
         )
         changed_aliases.extend(r.alias for r in core_results if r.updated)
+        from repowise.cli.source_search_runtime import reconcile_configured_source_indexes
+
+        core_paths = [
+            (ws_root / entry.path).resolve()
+            for entry in ws_config.repos
+            if any(result.updated and result.alias == entry.alias for result in core_results)
+        ]
+        source_outcomes = run_async(reconcile_configured_source_indexes(core_paths))
+        for repo_path, source_outcome in source_outcomes.items():
+            if isinstance(source_outcome, Exception):
+                console.print(
+                    f"  [yellow]{repo_path.name}: source search reconcile deferred: "
+                    f"{source_outcome}[/yellow]"
+                )
 
     # --- Docs members: full single-repo docs update, one at a time ---------
     for entry in ws_config.repos:

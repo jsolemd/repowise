@@ -32,7 +32,38 @@ async def health_check(request: Request) -> HealthResponse:
         db_status = "error"
 
     status = "healthy" if db_status == "ok" else "degraded"
-    return HealthResponse(status=status, db=db_status, version=__version__)
+    source_payload = None
+    try:
+        from repowise.core.source_search import source_search_enabled
+
+        if source_search_enabled():
+            from repowise.core.source_search.status import inspect_source_index
+            from repowise.server.source_search_wiring import _repo_root_from_db_url
+
+            repo_path = _repo_root_from_db_url(getattr(request.app.state, "db_url", "") or "")
+            if repo_path is not None:
+                wiki_vectors = getattr(request.app.state, "vector_store", None)
+                source_health = await inspect_source_index(
+                    repo_path,
+                    embedder=getattr(wiki_vectors, "_embedder", None),
+                    db_url=getattr(request.app.state, "db_url", None),
+                )
+                source_payload = source_health.to_dict()
+                if source_health.state != "current":
+                    status = "degraded"
+    except Exception as exc:
+        source_payload = {
+            "state": "inconsistent",
+            "degraded": True,
+            "integrity_errors": [str(exc)],
+        }
+        status = "degraded"
+    return HealthResponse(
+        status=status,
+        db=db_status,
+        version=__version__,
+        source_search=source_payload,
+    )
 
 
 @router.get("/metrics")

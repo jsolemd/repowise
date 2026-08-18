@@ -618,6 +618,9 @@ def _run_index_for_repo(
             commit_depth=int(commit_limit) if commit_limit else 500,
             exclude_patterns=exclude_patterns,
         )
+        from repowise.cli.source_search_runtime import reconcile_configured_source_index
+
+        await reconcile_configured_source_index(repo_path)
         return result.file_count, result.symbol_count, 0
 
     try:

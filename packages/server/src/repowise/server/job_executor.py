@@ -525,6 +525,24 @@ async def execute_job(
             if swept_page_ids and vector_store is not None:
                 await vector_store.delete_many(swept_page_ids)
 
+        # Source rows were queued in the same transaction as their symbol
+        # bounds. Publish the derived FTS/Lance generation only after that
+        # transaction has committed.
+        try:
+            from repowise.server.source_search_lifecycle import (
+                reconcile_server_source_index,
+            )
+
+            await reconcile_server_source_index(
+                Path(repo_path),
+                embedder=getattr(vector_store, "_embedder", None),
+            )
+        except Exception as exc:
+            logger.warning(
+                "source_index_reconcile_deferred",
+                extra={"repo": str(repo_path), "error": str(exc)},
+            )
+
         # FTS deletes/indexing run after the session closes: the FTS index can
         # share the SQLite file with the session, so writing it while the
         # session holds a write lock raises "database is locked". The swept-id

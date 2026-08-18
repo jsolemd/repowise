@@ -484,14 +484,81 @@ def _run_repo_checks(
         except Exception as exc:
             checks.append(_check("Coordinator drift", True, f"Could not check: {exc}"))
 
-    # 11. Distill — config block, omission store, rewrite hook (advisory)
+    # 11. Source retrieval publication: queue state plus independent FTS/Lance
+    # parity. Unlike the wiki coordinator drift above, this store publishes by
+    # generation, so a single aggregate count is not enough to prove readers
+    # are looking at the same snapshot.
+    try:
+        from repowise.core.source_search import source_search_enabled
+        from repowise.core.source_search.manifest import default_manifest_path
+
+        source_manifest_exists = default_manifest_path(repo_path).is_file()
+        if source_search_enabled():
+
+            async def _check_source_index():
+                from repowise.cli.providers.embedders import (
+                    build_embedder,
+                    resolve_embedder_for_repo,
+                )
+                from repowise.core.providers.embedding.base import KeylessEmbedder
+                from repowise.core.source_search.status import inspect_source_index
+
+                embedder_name = resolve_embedder_for_repo(repo_path)
+                embedder = build_embedder(embedder_name, repo_path)
+                unavailable = isinstance(embedder, KeylessEmbedder)
+                status = await inspect_source_index(
+                    repo_path,
+                    embedder=None if unavailable else embedder,
+                )
+                return status, unavailable
+
+            source_status, source_embedder_unavailable = run_async(_check_source_index())
+            counts = (
+                f"chunks={source_status.expected_chunks}, "
+                f"FTS={source_status.fts_chunks if source_status.fts_chunks is not None else '—'}, "
+                f"Lance={source_status.vector_chunks if source_status.vector_chunks is not None else '—'}"
+            )
+            queue = (
+                f"pending={source_status.pending_updates}, "
+                f"building={source_status.building_updates}, "
+                f"ready={source_status.ready_updates}, blocked={source_status.blocked_updates}"
+            )
+            detail = (
+                f"{source_status.state}; generation={source_status.generation_sequence}; "
+                f"{counts}; {queue}; stale_files={len(source_status.stale_files)}"
+            )
+            if source_embedder_unavailable:
+                detail += "; semantic embedder unavailable"
+            if source_status.last_error:
+                detail += f"; last_error={source_status.last_error}"
+            if source_status.integrity_errors:
+                detail += "; " + "; ".join(source_status.integrity_errors)
+            checks.append(
+                _check(
+                    "Source search",
+                    source_status.state == "current" and not source_embedder_unavailable,
+                    detail,
+                )
+            )
+        elif source_manifest_exists:
+            checks.append(
+                _check(
+                    "Source search",
+                    True,
+                    "disabled by REPOWISE_SOURCE_SEARCH (stored generation retained)",
+                )
+            )
+    except Exception as exc:
+        checks.append(_check("Source search", False, f"Could not check: {exc}"))
+
+    # 12. Distill — config block, omission store, rewrite hook (advisory)
     checks.extend(_distill_checks(repo_path))
 
-    # 12. Claude Code MCP registration: wedged-path detection
+    # 13. Claude Code MCP registration: wedged-path detection
     registration_check, registration_wedged = _claude_registration_check()
     checks.append(registration_check)
 
-    # 13. Per-agent health, reported by each agent's own descriptor
+    # 14. Per-agent health, reported by each agent's own descriptor
     agent_checks, agents_need_refresh = _agent_target_checks()
     checks.extend(agent_checks)
 

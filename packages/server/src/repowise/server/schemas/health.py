@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from pydantic import BaseModel
 
 
@@ -9,6 +11,7 @@ class HealthResponse(BaseModel):
     status: str
     db: str
     version: str
+    source_search: dict[str, Any] | None = None
 
 
 class CoordinatorHealthResponse(BaseModel):

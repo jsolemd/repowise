@@ -417,6 +417,25 @@ def _changed_file_symbols(
         path = pf.file_info.path
         if path not in changed:
             continue
+        # A watch-triggered rebuild parses the whole repository before it
+        # opens its persistence transaction.  A later save may already have
+        # advanced this path through the source fast lane by the time the
+        # slower graph/health rebuild reaches here.  Never let that older
+        # parse overwrite the newer symbol bounds.  Tests and synthetic
+        # callers that do not carry a real absolute path/hash retain the
+        # historical behaviour.
+        expected_hash = str(getattr(pf, "content_hash", "") or "")
+        abs_path = str(getattr(pf.file_info, "abs_path", "") or "")
+        if expected_hash and abs_path:
+            try:
+                from repowise.core.ingestion.models import compute_content_hash
+
+                actual_hash = compute_content_hash(Path(abs_path).read_bytes())
+            except OSError:
+                continue
+            if actual_hash != expected_hash:
+                logger.info("incremental_symbol_stale_parse_skipped", path=path)
+                continue
         reconcile_paths.append(path)
         for sym in pf.symbols:
             if not getattr(sym, "file_path", None):
@@ -1837,6 +1856,20 @@ async def persist_pipeline_result(
     from .page_tree_sync import rebuild_page_tree
 
     await rebuild_page_tree(session, repo_id)
+
+    # Source retrieval is a derived store, but its work request is not: record
+    # the authoritative full snapshot in this same transaction as the symbol
+    # rows it will consume.  The reconciler runs only after the caller commits.
+    from repowise.core.source_search import source_search_enabled
+
+    if source_search_enabled():
+        from repowise.core.source_search.outbox import enqueue_full_update
+
+        await enqueue_full_update(
+            session,
+            repo_id,
+            parsed_files=result.parsed_files,
+        )
 
     logger.info(
         "pipeline_result_persisted",

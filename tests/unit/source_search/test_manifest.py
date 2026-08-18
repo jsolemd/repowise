@@ -149,16 +149,27 @@ def test_the_written_document_carries_every_field(tmp_path):
     write_manifest(path, _manifest())
     raw = json.loads(path.read_text())
     assert set(raw) == {
-        "recipe_fingerprint",
+        "built_at",
         "corpus_hash",
-        "symbol_chunks",
+        "embedder",
         "file_window_chunks",
         "files_covered",
+        "fts_path",
+        "generation_id",
+        "generation_sequence",
         "indexed_commit",
-        "built_at",
-        "embedder",
+        "lance_table",
+        "recipe_fingerprint",
+        "stale_files",
+        "symbol_chunks",
     }
-    assert raw["embedder"] == {"provider": "ollama", "model": "embeddinggemma", "dims": 768}
+    assert raw["embedder"] == {
+        "provider": "ollama",
+        "model": "embeddinggemma",
+        "dims": 768,
+        "document_prefix": "",
+        "query_prefix": "",
+    }
 
 
 def test_writing_leaves_no_temporary_file_behind(tmp_path):

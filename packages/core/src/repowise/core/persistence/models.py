@@ -94,6 +94,47 @@ class Repository(Base):
     )
 
 
+class SourceIndexUpdate(Base):
+    """Transactional outbox + generation ledger for source-search updates.
+
+    The wiki-symbol transaction is the authority for changed source bounds.  A
+    row is inserted in that same transaction; only after it commits may the
+    independent FTS/Lance reconciler consume the change set.  ``sequence`` is
+    also the visibility epoch carried by both derived stores.
+    """
+
+    __tablename__ = "source_index_updates"
+
+    sequence: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    generation_id: Mapped[str] = mapped_column(String(32), nullable=False, unique=True)
+    repository_id: Mapped[str] = mapped_column(
+        String(32), ForeignKey("repositories.id", ondelete="CASCADE"), nullable=False
+    )
+    parent_generation_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    mode: Mapped[str] = mapped_column(String(16), nullable=False, default="incremental")
+    state: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
+    dedupe_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    parser_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    change_set_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    artifact_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    upstream_ready: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_now_utc
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_now_utc, onupdate=_now_utc
+    )
+    ready_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("repository_id", "dedupe_key", name="uq_source_index_update_dedupe"),
+        Index("ix_source_index_updates_repo_state", "repository_id", "state", "sequence"),
+    )
+
+
 class GenerationJob(Base):
     __tablename__ = "generation_jobs"
 

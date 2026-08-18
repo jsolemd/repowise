@@ -6,6 +6,7 @@ import os
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import click
 import pytest
@@ -207,6 +208,43 @@ class TestSingleRepoTrigger:
 
         assert calls[0]["index_only"] is True
 
+    def test_source_lane_publishes_before_the_coalesced_heavy_update(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        from repowise.cli import source_search_runtime
+        from repowise.core.source_search import SOURCE_SEARCH_ENV, fast_update
+
+        events: list[str] = []
+
+        async def _capture(_repo, paths):
+            events.append("capture")
+            return SimpleNamespace(paths=tuple(sorted(paths)))
+
+        async def _reconcile(_repo):
+            events.append("publish")
+            return SimpleNamespace(status="published", total_seconds=0.01)
+
+        monkeypatch.setenv(SOURCE_SEARCH_ENV, "1")
+        monkeypatch.setattr(watch_cmd, "_SOURCE_SLOW_QUIET_SECONDS", 0.05)
+        monkeypatch.setattr(fast_update, "capture_source_changes", _capture)
+        monkeypatch.setattr(
+            source_search_runtime,
+            "reconcile_configured_source_index",
+            _reconcile,
+        )
+
+        original = watch_cmd._release_own_update_lock
+
+        def _release(repo):
+            events.append("heavy")
+            original(repo)
+
+        monkeypatch.setattr(watch_cmd, "_release_own_update_lock", _release)
+        calls = self._fire(monkeypatch, tmp_path)
+
+        assert len(calls) == 1
+        assert events[:3] == ["capture", "publish", "heavy"]
+
 
 class TestReleaseOwnUpdateLock:
     """``run_update`` only gives the single-flight lock back at process exit.
@@ -261,6 +299,13 @@ class TestEventPaths:
         event = self._Event(str(tmp_path / "src" / "app.py"))
 
         assert watch_cmd._event_paths(event, tmp_path) == {str(Path("src") / "app.py")}
+
+    @pytest.mark.parametrize("event_type", ["opened", "closed_no_write"])
+    def test_read_only_file_events_do_not_retrigger_indexing(self, tmp_path, event_type) -> None:
+        event = self._Event(str(tmp_path / "src" / "app.py"))
+        event.event_type = event_type
+
+        assert watch_cmd._event_paths(event, tmp_path) == set()
 
     def test_an_atomic_save_is_seen_through_its_destination(self, tmp_path) -> None:
         # JetBrains IDEs, Vim and many Windows editors save by writing a temp

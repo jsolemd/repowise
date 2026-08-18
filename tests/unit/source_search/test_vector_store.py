@@ -6,6 +6,7 @@ import pytest
 
 from repowise.core.providers.embedding.base import MockEmbedder
 from repowise.core.source_search.chunks import SymbolRecord, build_symbol_chunk
+from repowise.core.source_search.generation import GenerationRef
 from repowise.core.source_search.vector_store import (
     STORED_SNIPPET_CHARS,
     SourceChunkVectorStore,
@@ -198,3 +199,22 @@ async def test_the_page_store_is_untouched(tmp_path):
     await store.close()
 
     assert await pages.list_page_ids() == {"page-1"}
+
+
+async def test_nonlegacy_manifest_cannot_read_a_legacy_table(tmp_path):
+    """A torn manifest/table migration is an integrity error, never 'current'."""
+
+    pytest.importorskip("lancedb")
+    embedder = MockEmbedder()
+    legacy = await _store(tmp_path, embedder)
+    await legacy.upsert(await _embed(embedder, [_chunk("alpha")]))
+    await legacy.close()
+
+    torn = SourceChunkVectorStore(
+        str(tmp_path / "lancedb"),
+        embedder=embedder,
+        generation=GenerationRef("not-legacy", 1),
+    )
+    with pytest.raises(RuntimeError, match="non-legacy source manifest"):
+        await torn.count()
+    await torn.close()

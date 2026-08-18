@@ -36,6 +36,7 @@ __all__ = [
     "iter_file_windows",
     "language_for_path",
     "looks_binary",
+    "parser_eligible",
     "recipe_parameters",
     "window_eligible",
 ]
@@ -235,6 +236,18 @@ def language_for_path(rel_path: str) -> str:
     by_ext, by_name = _language_lookup()
     tag = by_name.get(name) or by_ext.get(PurePosixPath(name).suffix.lower())
     return tag or ""
+
+
+def parser_eligible(rel_path: str) -> bool:
+    """Whether *rel_path* is expected to produce a parser result.
+
+    This distinguishes a code parse failure from an intentionally unparsed
+    operational format.  Both may be window-eligible, but only the latter may
+    replace an existing source generation from raw bytes; a failed code parse
+    must retain the last known-good symbol chunks and disclose staleness.
+    """
+
+    return language_for_path(rel_path) in _code_language_tags()
 
 
 def _is_window_text_format(rel_path: str) -> bool:

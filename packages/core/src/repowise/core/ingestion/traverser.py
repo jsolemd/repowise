@@ -585,7 +585,35 @@ class FileTraverser:
         else:
             self.stats.skipped_source_files_truncated = True
 
-    def _build_file_info(self, abs_path: Path) -> FileInfo | None:
+    def file_info_for_path(
+        self,
+        relative_path: str | Path,
+        *,
+        resolve_entry_point: bool = True,
+    ) -> FileInfo | None:
+        """Describe one known path without walking the whole repository.
+
+        Incremental consumers already know which paths changed. They may also
+        skip entry-point resolution when they need parser metadata only; that
+        avoids the repo-wide console-script scan the first entry-point lookup
+        can trigger.
+        """
+
+        candidate = (self.repo_root / relative_path).resolve()
+        try:
+            candidate.relative_to(self.repo_root)
+        except ValueError:
+            return None
+        if not candidate.is_file():
+            return None
+        return self._build_file_info(candidate, resolve_entry_point=resolve_entry_point)
+
+    def _build_file_info(
+        self,
+        abs_path: Path,
+        *,
+        resolve_entry_point: bool = True,
+    ) -> FileInfo | None:
         try:
             stat = abs_path.stat()
         except OSError:
@@ -693,8 +721,16 @@ class FileTraverser:
             is_test=is_test_related_path(rel_str, language),
             is_config=_is_config_file(language),
             is_api_contract=_is_api_contract(abs_path, language),
-            is_entry_point=_is_entry_point(
-                rel_str, filename, abs_path, language, self._console_script_modules
+            is_entry_point=(
+                _is_entry_point(
+                    rel_str,
+                    filename,
+                    abs_path,
+                    language,
+                    self._console_script_modules,
+                )
+                if resolve_entry_point
+                else False
             ),
         )
 
