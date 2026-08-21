@@ -38,6 +38,8 @@ from repowise.core.source_search.manifest import (
 )
 from repowise.core.source_search.outbox import (
     PENDING,
+    PUBLISHED,
+    READY,
     SourceChange,
     SourceUpdateRecord,
     enqueue_incremental_update,
@@ -402,6 +404,65 @@ async def test_rest_reader_reopens_on_manifest_flip_and_reports_live_status(life
 
     await second.close()
     state.source_search_coordinator = None
+
+
+async def test_manifest_publication_precedes_outbox_bookkeeping(lifecycle_repo):
+    repo = lifecycle_repo
+    previous = read_manifest(default_manifest_path(repo))
+    assert previous is not None
+    (repo / "src" / "app.py").write_text(_APP_V2)
+    await _capture(repo, path="src/app.py")
+    counter = _CountingEmbedder()
+
+    def crash_after_manifest(boundary: str) -> None:
+        if boundary == "after_manifest":
+            raise _Crash(boundary)
+
+    with pytest.raises(_Crash):
+        await reconcile_source_index(
+            repo,
+            embedder=counter,
+            embedder_identity=_IDENTITY,
+            failure_injector=crash_after_manifest,
+        )
+
+    published = read_manifest(default_manifest_path(repo))
+    assert published is not None
+    assert published.generation_sequence == previous.generation_sequence + 1
+    rows = await _updates(repo)
+    assert rows[-1].generation_id == published.generation_id
+    assert rows[-1].state == READY
+    with _fts(repo, published) as fts:
+        assert fts.query("newnebula")
+        assert not fts.query("oldquasar")
+    store = _vector(repo, published)
+    assert await store.count() == published.symbol_chunks + published.file_window_chunks
+    await store.close()
+
+    # The manifest is the sole reader-publication pointer. Its generation is
+    # current even during the brief, separately committed ledger bookkeeping
+    # interval; the same-sequence READY row is not outstanding work.
+    status = await inspect_source_index(repo, embedder=MockEmbedder())
+    assert status.state == "current"
+    assert status.generation_id == published.generation_id
+    assert status.ready_updates == 0
+
+    embedded_before_recovery = counter.texts
+    recovered = await reconcile_source_index(
+        repo,
+        embedder=counter,
+        embedder_identity=_IDENTITY,
+    )
+    assert recovered.status == "current"
+    assert recovered.generation_id == published.generation_id
+    assert recovered.generation_sequence == published.generation_sequence
+    assert recovered.embedded == 0
+    assert counter.texts == embedded_before_recovery
+    assert (await _updates(repo))[-1].state == PUBLISHED
+
+    repeated = await reconcile_source_index(repo, embedder=counter, embedder_identity=_IDENTITY)
+    assert repeated.status == "current"
+    assert repeated.generation_id == published.generation_id
 
 
 async def test_status_distinguishes_pending_from_degraded_work(lifecycle_repo):
