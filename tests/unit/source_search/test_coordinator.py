@@ -1269,6 +1269,78 @@ async def test_complete_subject_concepts_on_one_owner_can_be_confident(tmp_path)
     assert response["confidence"] == "confident"
 
 
+async def test_a_file_named_for_the_queried_role_owns_that_role(tmp_path):
+    """`page.tsx` beats a component that merely reads more like the word "page".
+
+    Measured on SoleMD.Graph: "which page renders the map view" selected
+    WikiPageView.tsx over app/map/page.tsx, with the right answer already
+    retrieved at rank 2. Dense and lexical evidence cannot express this — by
+    every textual measure WikiPageView looks *more* like "page" than page.tsx
+    does — so it has to be an owner-selection rule.
+    """
+    named = _hit("Page", "app/map/page.tsx", 0.61)
+    lookalike = _hit("WikiPageView", "features/wiki/WikiPageView.tsx", 0.62)
+    coordinator = _coordinator(
+        tmp_path,
+        source_dense=[lookalike, named],
+        source_lexical=[
+            _FTSHit(lookalike.chunk_id, lookalike.file_path),
+            _FTSHit(named.chunk_id, named.file_path),
+        ],
+        source_term_files={"page": {"app/map/page.tsx", "features/wiki/WikiPageView.tsx"}},
+    )
+
+    response = await coordinator.search("which page renders the map view", limit=5)
+
+    assert response["selected_owner"]["file"] == "app/map/page.tsx"
+
+
+async def test_the_role_rule_is_inert_when_the_query_names_no_role(tmp_path):
+    """Most queries name no role, and those must be decided exactly as before."""
+    a = _hit("renderMap", "features/map/render.ts", 0.62)
+    b = _hit("Page", "app/map/page.tsx", 0.61)
+    coordinator = _coordinator(
+        tmp_path,
+        source_dense=[a, b],
+        source_lexical=[_FTSHit(a.chunk_id, a.file_path), _FTSHit(b.chunk_id, b.file_path)],
+        source_term_files={"render": {"features/map/render.ts"}},
+    )
+
+    response = await coordinator.search("what renders the map", limit=5)
+
+    assert response["selected_owner"]["file"] == "features/map/render.ts"
+
+
+async def test_the_role_rule_is_inert_when_no_candidate_carries_the_role_name(tmp_path):
+    """A repo with no file named for the role is unaffected rather than distorted."""
+    a = _hit("handleSearch", "server/search.ts", 0.62)
+    b = _hit("SearchBox", "ui/SearchBox.tsx", 0.61)
+    coordinator = _coordinator(
+        tmp_path,
+        source_dense=[a, b],
+        source_lexical=[_FTSHit(a.chunk_id, a.file_path), _FTSHit(b.chunk_id, b.file_path)],
+        source_term_files={"search": {"server/search.ts", "ui/SearchBox.tsx"}},
+    )
+
+    response = await coordinator.search("which page runs the search", limit=5)
+
+    assert response["selected_owner"]["file"] == "server/search.ts"
+
+
+def test_the_role_stem_strips_every_extension():
+    """`route.test.ts` is still named for the role `route`.
+
+    Whether a test file may own the answer is the test-demotion stage's
+    decision, not something to smuggle in by leaving `.test` on the stem.
+    """
+    from repowise.core.source_search.coordinator import _basename_stem
+
+    assert _basename_stem("app/api/x/route.ts") == "route"
+    assert _basename_stem("app/api/x/route.test.ts") == "route"
+    assert _basename_stem("Page.TSX") == "page"
+    assert _basename_stem("noslash") == "noslash"
+
+
 async def test_a_concept_supplied_only_by_the_filename_cannot_make_a_symbol_confident(
     tmp_path,
 ):

@@ -621,6 +621,9 @@ class QueryIntent:
     docs: bool
     operational: bool
     implementation: bool
+    #: Role nouns a file could be *named* after — see :func:`_role_words`.
+    #: Empty for the overwhelming majority of queries, which is the point.
+    role_words: frozenset[str] = frozenset()
 
     @property
     def exact_artifact(self) -> bool:
@@ -744,6 +747,55 @@ def _is_test_query(query: str) -> bool:
     return _query_intent(query).wants_tests
 
 
+def _role_words(query: str) -> frozenset[str]:
+    """Bare nouns in *query* that a file can be named after.
+
+    Some codebases put a file's role in its name rather than its contents: a
+    Next.js route group holds `page.tsx` and `layout.tsx`, migrations sit under
+    numbered files, `conftest.py` is pytest's role file. Asked "which *page*
+    renders the map view", the file literally named `page` is a better owner
+    than a component that merely discusses pages, and nothing in dense or
+    lexical evidence expresses that — `WikiPageView.tsx` looks more like the
+    word "page" than `page.tsx` does.
+
+    Deliberately *not* a framework map. Mapping "endpoint" onto `route.ts` or
+    `api/` would encode Next.js conventions and is the long-tail query boost the
+    program has already rejected. The rule here is narrower and true of any
+    codebase: **a candidate whose filename is exactly the role the query named
+    is a strong owner for that role.** A repo with no such file is unaffected,
+    because nothing matches.
+    """
+
+    return frozenset(token for token in tokenize(query) if token in _NAMEABLE_ROLES)
+
+
+#: Role nouns common enough to be filenames across ecosystems. Kept small and
+#: literal on purpose: every entry must be a word that real files are *named*,
+#: not a word that describes what code does.
+_NAMEABLE_ROLES = frozenset(
+    {
+        "page",
+        "layout",
+        "route",
+        "index",
+        "middleware",
+        "schema",
+        "migration",
+        "migrations",
+        "conftest",
+        "settings",
+        "config",
+        "types",
+        "constants",
+        "client",
+        "server",
+        "worker",
+        "main",
+        "cli",
+    }
+)
+
+
 def _query_intent(query: str) -> QueryIntent:
     """Parse *query* once for every ranking and owner-policy consumer."""
 
@@ -760,6 +812,7 @@ def _query_intent(query: str) -> QueryIntent:
         docs=docs,
         operational=operational,
         implementation=(repair or bool(_IMPLEMENTATION_QUERY_RE.search(query))) and not docs,
+        role_words=_role_words(query),
     )
 
 
@@ -1560,6 +1613,23 @@ class SourceSearchCoordinator:
                     ],
                 )
 
+        # 4b. A file named for the role the query asked about owns that role.
+        # Measured need: on Graph, "which page renders the map view" selected
+        # WikiPageView.tsx over app/map/page.tsx, and "which page renders the
+        # graph view" selected (dashboard)/layout.tsx over
+        # (dashboard)/graph/page.tsx — in both, the right answer was already
+        # retrieved at rank 2-3 and lost owner selection to a neighbour that
+        # merely reads more like the word.  Bounded to the fused band like every
+        # other stage, and inert unless a candidate's basename stem *is* one of
+        # the query's role words, so a repo without such files never sees it.
+        if intent.role_words and not intent.docs:
+            role_named = [
+                item
+                for item in candidates
+                if item.file and _basename_stem(item.file) in intent.role_words
+            ]
+            narrow("role-named file", role_named)
+
         # 5. Generated prose corroborates implementation; it does not own an
         # implementation-shaped request.  Explicit docs/wiki intent opts out.
         if intent.implementation and not intent.docs:
@@ -2006,6 +2076,19 @@ def _target_parts(value: str) -> tuple[str, str]:
     while path.startswith("./"):
         path = path[2:]
     return path.casefold(), _norm_identifier(symbol) if separator else ""
+
+
+def _basename_stem(path: str) -> str:
+    """The filename without directories or extensions, lowercased.
+
+    ``apps/web/app/map/page.tsx`` -> ``page``.  Every extension is stripped, not
+    just the last, so ``route.test.ts`` reduces to ``route`` rather than
+    ``route.test`` — a test file named for a role is still named for that role,
+    and the existing test-demotion stage is what decides whether tests may own.
+    """
+
+    tail = path.rsplit("/", 1)[-1]
+    return tail.split(".", 1)[0].casefold()
 
 
 def _declaration_carries_subject(item: _Item) -> bool:
