@@ -39,6 +39,7 @@ from repowise.cli.helpers import (
     write_update_pending,
 )
 from repowise.core.docs_mode import docs_mode_state_fields, resolve_docs_mode
+from repowise.core.generative_policy import NO_GENERATIVE_ENV, generative_calls_disabled
 from repowise.core.reasoning import REASONING_MODES
 
 from .incremental import (
@@ -597,6 +598,24 @@ def run_update(
                 "--full is single-repo only. Run it inside a specific repo "
                 "(or pass --no-workspace / --repo <alias>)."
             )
+        policy_paths = [target.ws_root] if target.ws_root is not None else []
+        if target.ws_root is not None and target.ws_config is not None:
+            policy_paths.extend(
+                (target.ws_root / entry.path).resolve()
+                for entry in target.ws_config.repos
+                if target.repo_filter is None or entry.alias == target.repo_filter
+            )
+        hard_no_generative = any(
+            generative_calls_disabled(policy_path)
+            for policy_path in policy_paths
+            if policy_path is not None
+        )
+        if hard_no_generative and not index_only and docs_flag is not False:
+            raise click.UsageError(
+                f"{NO_GENERATIVE_ENV}=1 requires --index-only or --no-docs; "
+                "model-written workspace updates cannot run under the hard "
+                "no-generative policy."
+            )
         try:
             _workspace_update(
                 target,
@@ -631,6 +650,18 @@ def run_update(
     # --- Single-repo path from here on. ---
     repo_path = target.repo_path
     assert repo_path is not None  # single mode always sets repo_path
+
+    # Repo-local dotenv is a supported deployment-policy source. Load it
+    # before worktree seeding or the --full fast path so neither can delegate
+    # into provider setup before the hard no-generative policy is visible.
+    from repowise.cli.ui import load_dotenv
+
+    load_dotenv(repo_path)
+    hard_no_generative = generative_calls_disabled(repo_path)
+    if hard_no_generative and full:
+        raise click.UsageError(
+            f"{NO_GENERATIVE_ENV}=1 forbids --full; use --index-only or --no-docs."
+        )
 
     # An unindexed linked worktree seeds itself from its base checkout before
     # updating, so post-commit hooks and agents running `update` in a fresh
@@ -697,14 +728,15 @@ def run_update(
     # balloon to MBs over time.
     rotate_update_log_if_needed(repo_path)
 
-    # Load saved API keys from .repowise/.env (won't overwrite existing env vars)
-    from repowise.cli.ui import load_dotenv
-
-    load_dotenv(repo_path)
     state = load_state(repo_path)
     resolved_index_only = _resolve_index_only_mode(
         index_only=index_only, docs_flag=docs_flag, state=state
     )
+    if hard_no_generative and not resolved_index_only:
+        raise click.UsageError(
+            f"{NO_GENERATIVE_ENV}=1 requires --index-only or --no-docs; "
+            "model-written updates cannot run under the hard no-generative policy."
+        )
     base_ref = since or (
         state.get("last_sync_commit")
         if resolved_index_only

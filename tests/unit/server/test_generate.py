@@ -225,6 +225,28 @@ async def test_generate_endpoint_409_when_job_active(client: AsyncClient, app) -
 
 
 @pytest.mark.asyncio
+async def test_generate_endpoint_hard_policy_rejects_before_job_creation(
+    client: AsyncClient, monkeypatch
+) -> None:
+    repo = await create_test_repo(client)
+    monkeypatch.setenv("REPOWISE_TOOLS_NO_GENERATIVE", "1")
+
+    with (
+        patch("repowise.server.routers.repos._launch_job_task") as launch,
+        patch(
+            "repowise.server.routers.repos.crud.upsert_generation_job",
+            new_callable=AsyncMock,
+        ) as create_job,
+    ):
+        resp = await client.post(f"/api/repos/{repo['id']}/generate", json={})
+
+    assert resp.status_code == 409
+    assert "REPOWISE_TOOLS_NO_GENERATIVE=1" in resp.json()["detail"]
+    launch.assert_not_called()
+    create_job.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_generate_estimate_no_pages(client: AsyncClient) -> None:
     """A repo with no wiki pages returns a zero estimate, not a crash."""
     repo = await create_test_repo(client)
@@ -241,6 +263,31 @@ async def test_generate_estimate_no_pages(client: AsyncClient) -> None:
     assert body["total_pages"] == 0
     assert body["estimate"] is None
     assert body["provider"]["error"] is not None
+
+
+@pytest.mark.asyncio
+async def test_generate_estimate_hard_policy_never_resolves_provider(
+    client: AsyncClient, monkeypatch
+) -> None:
+    repo = await create_test_repo(client)
+    monkeypatch.setenv("REPOWISE_TOOLS_NO_GENERATIVE", "1")
+
+    with patch(
+        "repowise.server.provider_config.get_chat_provider_instance",
+        side_effect=AssertionError("provider resolution must remain unreachable"),
+    ) as resolve_provider:
+        resp = await client.post(
+            f"/api/repos/{repo['id']}/generate/estimate",
+            json={"selection": {"kind": "unwritten"}},
+        )
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["estimate"] is None
+    assert body["provider"]["name"] is None
+    assert body["provider"]["model"] is None
+    assert "REPOWISE_TOOLS_NO_GENERATIVE=1" in body["provider"]["error"]
+    resolve_provider.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

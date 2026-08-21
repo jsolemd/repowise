@@ -38,6 +38,7 @@ async def _seed_repo_and_job(
     repo_path,
     *,
     settings: dict | None = None,
+    mode: str = "full_resync",
 ) -> str:
     """Insert a repo (with settings) + a pending full_resync job; return job_id."""
     async with session_factory() as session:
@@ -50,10 +51,117 @@ async def _seed_repo_and_job(
         job = await upsert_generation_job(
             session,
             repository_id=repo.id,
-            config={"mode": "full_resync"},
+            config={"mode": mode},
         )
         await session.commit()
-        return job.id
+    return job.id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("policy_source", ["process", "repo", "workspace"])
+async def test_hard_policy_prevents_sync_provider_and_incremental_regen(
+    session_factory,
+    tmp_path,
+    monkeypatch,
+    policy_source,
+):
+    """Server sync cannot reuse a client after the core pipeline boundary."""
+    from repowise.core.generative_policy import NO_GENERATIVE_ENV
+
+    repo_path = tmp_path
+    if policy_source == "workspace":
+        from repowise.core.workspace.config import RepoEntry, WorkspaceConfig
+
+        workspace_root = tmp_path / "workspace"
+        repo_path = workspace_root / "repo"
+        repo_path.mkdir(parents=True)
+        WorkspaceConfig(
+            version=1,
+            repos=[RepoEntry(alias="repo", path="repo", is_primary=True)],
+        ).save(workspace_root)
+        env_dir = workspace_root / ".repowise"
+        env_dir.mkdir()
+        (env_dir / ".env").write_text(
+            f"{NO_GENERATIVE_ENV}=true\n",
+            encoding="utf-8",
+        )
+
+    (repo_path / ".git").mkdir()
+    monkeypatch.setenv(NO_GENERATIVE_ENV, "1" if policy_source == "process" else "0")
+    if policy_source == "repo":
+        env_dir = repo_path / ".repowise"
+        env_dir.mkdir()
+        (env_dir / ".env").write_text(
+            f"{NO_GENERATIVE_ENV}=true\n",
+            encoding="utf-8",
+        )
+
+    job_id = await _seed_repo_and_job(session_factory, repo_path, mode="sync")
+    app_state = SimpleNamespace(session_factory=session_factory, fts=None, vector_store=None)
+    provider = MagicMock(return_value=MagicMock())
+    pipeline = AsyncMock(return_value=_fake_result())
+    regen = AsyncMock(side_effect=AssertionError("hard policy reached page regeneration"))
+
+    with (
+        patch("repowise.server.job_executor.run_pipeline", pipeline),
+        patch("repowise.server.job_executor.persist_pipeline_result", AsyncMock(return_value=[])),
+        patch("repowise.server.job_executor._incremental_page_regen", regen),
+        patch(
+            "repowise.server.provider_config.get_chat_provider_instance",
+            provider,
+        ),
+        patch(
+            "repowise.server.search_helpers.resolve_repo_vector_store",
+            AsyncMock(return_value=None),
+        ),
+    ):
+        await execute_job(job_id, app_state)
+
+    provider.assert_not_called()
+    regen.assert_not_awaited()
+    pipeline.assert_awaited_once()
+    assert pipeline.await_args.kwargs["llm_client"] is None
+    assert pipeline.await_args.kwargs["generate_docs"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["generate", "single_page"])
+async def test_hard_policy_rejects_explicit_server_generation(
+    session_factory,
+    tmp_path,
+    monkeypatch,
+    mode,
+):
+    """Explicit generation modes fail before provider lookup or dispatch."""
+    from repowise.core.generative_policy import NO_GENERATIVE_ENV
+    from repowise.core.persistence import crud
+    from repowise.core.persistence.database import get_session
+
+    monkeypatch.setenv(NO_GENERATIVE_ENV, "1")
+    job_id = await _seed_repo_and_job(session_factory, tmp_path, mode=mode)
+    app_state = SimpleNamespace(session_factory=session_factory, fts=None, vector_store=None)
+    provider = MagicMock(return_value=MagicMock())
+    generate = AsyncMock()
+
+    with (
+        patch("repowise.server.job_executor._run_generate_job", generate),
+        patch(
+            "repowise.server.provider_config.get_chat_provider_instance",
+            provider,
+        ),
+        patch(
+            "repowise.server.search_helpers.resolve_repo_vector_store",
+            AsyncMock(return_value=None),
+        ),
+    ):
+        await execute_job(job_id, app_state)
+
+    provider.assert_not_called()
+    generate.assert_not_awaited()
+    async with get_session(session_factory) as session:
+        job = await crud.get_generation_job(session, job_id)
+        assert job.status == "failed"
+        assert NO_GENERATIVE_ENV in (job.error_message or "")
 
 
 @pytest.mark.asyncio
@@ -696,4 +804,3 @@ async def test_execute_job_dispatches_generate_mode(session_factory, tmp_path):
         await execute_job(job_id, app_state)
 
     run_generate_mock.assert_awaited_once()
-

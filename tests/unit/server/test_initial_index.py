@@ -183,6 +183,41 @@ async def test_preflight_surfaces_provider_failure(client: AsyncClient, tmp_path
     assert data["estimate"] is None
 
 
+@pytest.mark.asyncio
+async def test_preflight_hard_policy_never_resolves_or_calls_provider(
+    client: AsyncClient, tmp_path, monkeypatch
+) -> None:
+    repo_dir = _make_fake_repo(tmp_path)
+    created = await client.post(
+        "/api/repos",
+        json={"name": "fresh-repo", "local_path": str(repo_dir), "index": False},
+    )
+    repo_id = created.json()["id"]
+    monkeypatch.setenv("REPOWISE_TOOLS_NO_GENERATIVE", "1")
+
+    fake_provider = SimpleNamespace(
+        provider_name="forbidden",
+        model_name="forbidden-model",
+        generate=AsyncMock(return_value="OK"),
+    )
+    with patch(
+        "repowise.server.provider_config.get_chat_provider_instance",
+        return_value=fake_provider,
+    ) as resolve_provider:
+        resp = await client.post(f"/api/repos/{repo_id}/preflight")
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["provider"]["ok"] is False
+    assert data["provider"]["name"] is None
+    assert data["provider"]["model"] is None
+    assert "REPOWISE_TOOLS_NO_GENERATIVE=1" in data["provider"]["error"]
+    assert data["file_count"] >= 2
+    assert data["estimate"] is None
+    resolve_provider.assert_not_called()
+    fake_provider.generate.assert_not_awaited()
+
+
 # ---------------------------------------------------------------------------
 # Cancellation
 # ---------------------------------------------------------------------------

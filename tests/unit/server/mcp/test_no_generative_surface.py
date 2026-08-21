@@ -11,6 +11,7 @@ thing being proven is what a client sees, not what a helper returns.
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 import pytest
 
@@ -156,6 +157,68 @@ async def test_flag_on_defeats_every_override(monkeypatch, rebind, repo, overrid
     # The rest of the surface is untouched — this is a two-tool exclusion, not
     # a lockdown mode.
     assert "search_codebase" in await _served(mcp)
+
+
+@pytest.mark.asyncio
+async def test_repo_policy_outranks_falsy_process_value(monkeypatch, rebind, repo):
+    """A prior falsy dotenv merge cannot mask the repo's hard policy."""
+    monkeypatch.setenv(NO_GENERATIVE_ENV, "0")
+    (Path(repo) / ".repowise" / ".env").write_text(
+        f"{NO_GENERATIVE_ENV}=true\n",
+        encoding="utf-8",
+    )
+    mcp = rebind()
+
+    enabled = apply_tool_selection(mcp, repo_path=repo, override="all")
+    assert not (GENERATIVE_TOOL_NAMES & enabled)
+    assert not (GENERATIVE_TOOL_NAMES & await _served(mcp))
+    listed = {row["name"] for row in describe_tool_surface(repo)["tools"]}
+    assert not (GENERATIVE_TOOL_NAMES & listed)
+
+
+@pytest.mark.asyncio
+async def test_workspace_member_policy_outranks_falsy_root(monkeypatch, rebind, tmp_path):
+    """A workspace tool surface is bounded by every repo it can target."""
+    from repowise.core.workspace.config import RepoEntry, WorkspaceConfig
+
+    root = tmp_path / "workspace"
+    member = root / "member"
+    (root / ".repowise").mkdir(parents=True)
+    (member / ".repowise").mkdir(parents=True)
+    WorkspaceConfig(
+        version=1,
+        repos=[RepoEntry(alias="member", path="member", is_primary=True)],
+    ).save(root)
+    (root / ".repowise" / ".env").write_text(
+        f"{NO_GENERATIVE_ENV}=0\n",
+        encoding="utf-8",
+    )
+    (member / ".repowise" / ".env").write_text(
+        f"{NO_GENERATIVE_ENV}=true\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(NO_GENERATIVE_ENV, "0")
+    mcp = rebind()
+
+    enabled = apply_tool_selection(mcp, repo_path=str(root), override="all")
+    assert not (GENERATIVE_TOOL_NAMES & enabled)
+    assert not (GENERATIVE_TOOL_NAMES & await _served(mcp))
+    listed = {row["name"] for row in describe_tool_surface(str(root))["tools"]}
+    assert not (GENERATIVE_TOOL_NAMES & listed)
+
+
+@pytest.mark.asyncio
+async def test_unreadable_workspace_policy_scope_fails_closed(monkeypatch, rebind, tmp_path):
+    """A malformed workspace cannot silently omit member hard policies."""
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / ".repowise-workspace.yaml").write_text("repos: [\n", encoding="utf-8")
+    monkeypatch.setenv(NO_GENERATIVE_ENV, "0")
+    mcp = rebind()
+
+    enabled = apply_tool_selection(mcp, repo_path=str(root), override="all")
+    assert not (GENERATIVE_TOOL_NAMES & enabled)
+    assert not (GENERATIVE_TOOL_NAMES & await _served(mcp))
 
 
 @pytest.mark.asyncio

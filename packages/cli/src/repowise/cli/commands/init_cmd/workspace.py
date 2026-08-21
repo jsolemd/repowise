@@ -17,6 +17,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import click
 from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 
 from repowise.cli._setup import setup_logging_silence
@@ -66,6 +67,12 @@ from repowise.cli.ui import (
 )
 from repowise.core.docs_mode import docs_mode_state_fields
 from repowise.core.generation.styles import DEFAULT_STYLE
+from repowise.core.generative_policy import (
+    NO_GENERATIVE_ENV,
+    NO_GENERATIVE_INDEX_MARKER,
+    NO_GENERATIVE_INIT_COMPLETE_MARKER,
+    generative_calls_disabled,
+)
 
 from ._interactive import offer_distill_rewrite_hook, offer_hook_install
 from .generation import (
@@ -581,6 +588,7 @@ def _workspace_init(
     wiki_style: str = DEFAULT_STYLE,
     language: str | None = None,
     run_mode: str = "standard",
+    hard_no_generative: bool = False,
 ) -> None:
     """Multi-repo workspace initialization.
 
@@ -624,6 +632,12 @@ def _workspace_init(
     # Determine root path (for provider resolution + dotenv)
     primary_repo = next((r for r in selected if r.alias == primary_alias), selected[0])
     load_dotenv(primary_repo.path)
+    hard_no_generative = hard_no_generative or generative_calls_disabled(primary_repo.path)
+    if hard_no_generative and not index_only:
+        raise click.UsageError(
+            f"{NO_GENERATIVE_ENV}=1 requires --no-prose or --mode fast; "
+            "prose generation cannot be enabled under the hard no-generative policy."
+        )
 
     # Step 2b: Mode selection + provider setup
     # When running interactively with no explicit flags, present the mode menu.
@@ -842,3 +856,6 @@ def _workspace_init(
         no_editor_setup=not editor_setup,
     )
     console.print()
+    if hard_no_generative:
+        console.print(NO_GENERATIVE_INIT_COMPLETE_MARKER)
+        console.print(NO_GENERATIVE_INDEX_MARKER)

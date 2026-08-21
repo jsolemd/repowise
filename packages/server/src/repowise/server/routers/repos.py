@@ -18,6 +18,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from repowise.core.docs_mode import resolve_docs_mode
+from repowise.core.generative_policy import NO_GENERATIVE_ENV, generative_calls_disabled
 from repowise.core.persistence import crud
 from repowise.core.persistence.database import get_session
 from repowise.core.persistence.models import (
@@ -43,6 +44,10 @@ from repowise.server.schemas import (
 )
 
 logger = logging.getLogger(__name__)
+
+_NO_GENERATIVE_PROVIDER_ERROR = (
+    f"Generative provider checks disabled by deployment policy: {NO_GENERATIVE_ENV}=1"
+)
 
 router = APIRouter(
     prefix="/api/repos",
@@ -886,6 +891,11 @@ async def generate_pages(
     repo = await crud.get_repository(session, repo_id)
     if repo is None:
         raise HTTPException(status_code=404, detail="Repository not found")
+    if generative_calls_disabled(repo.local_path):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Generative jobs disabled by deployment policy: {NO_GENERATIVE_ENV}=1",
+        )
 
     _validate_generate_selection(body.selection)
     _validate_generate_style(body.style)
@@ -944,14 +954,17 @@ async def generate_estimate(
     provider_name: str | None = None
     model_name: str | None = None
     provider_error: str | None = None
-    try:
-        from repowise.server.provider_config import get_chat_provider_instance
+    if generative_calls_disabled(repo_path):
+        provider_error = _NO_GENERATIVE_PROVIDER_ERROR
+    else:
+        try:
+            from repowise.server.provider_config import get_chat_provider_instance
 
-        llm_client = get_chat_provider_instance(repo_path=str(repo_path))
-        provider_name = getattr(llm_client, "provider_name", None)
-        model_name = getattr(llm_client, "model_name", None)
-    except Exception as exc:
-        provider_error = str(exc)
+            llm_client = get_chat_provider_instance(repo_path=str(repo_path))
+            provider_name = getattr(llm_client, "provider_name", None)
+            model_name = getattr(llm_client, "model_name", None)
+        except Exception as exc:
+            provider_error = str(exc)
 
     session_factory = _resolve_repo_session_factory(request.app.state, repo_id)
     state = _load_state(repo_path)
@@ -1091,14 +1104,17 @@ async def preflight_index(
     model_name: str | None = None
     provider_error: str | None = None
     llm_client = None
-    try:
-        from repowise.server.provider_config import get_chat_provider_instance
+    if generative_calls_disabled(repo_path):
+        provider_error = _NO_GENERATIVE_PROVIDER_ERROR
+    else:
+        try:
+            from repowise.server.provider_config import get_chat_provider_instance
 
-        llm_client = get_chat_provider_instance(repo_path=repo_path)
-        provider_name = getattr(llm_client, "provider_name", None)
-        model_name = getattr(llm_client, "model_name", None)
-    except Exception as exc:
-        provider_error = str(exc)
+            llm_client = get_chat_provider_instance(repo_path=repo_path)
+            provider_name = getattr(llm_client, "provider_name", None)
+            model_name = getattr(llm_client, "model_name", None)
+        except Exception as exc:
+            provider_error = str(exc)
 
     if llm_client is not None:
         try:

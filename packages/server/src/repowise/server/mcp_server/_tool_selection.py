@@ -28,11 +28,14 @@ override.
 from __future__ import annotations
 
 import logging
-import os
 from collections.abc import Iterable, Sequence
 from pathlib import Path
 from typing import Any
 
+from repowise.core.generative_policy import (
+    NO_GENERATIVE_ENV,
+    generative_calls_disabled,
+)
 from repowise.core.registry import ToolEntry, mcp_tool_registry
 
 _log = logging.getLogger("repowise.mcp")
@@ -62,6 +65,7 @@ _LEAN_WORKSPACE_EXTRAS = frozenset({"list_repos"})
 # tool modules.
 GENERATIVE_TOOL_NAMES = frozenset({"get_answer", "generate_refactoring_code"})
 
+
 # Hard exclusion switch for the tools above. Deployments exist that must be
 # able to *demonstrate* the server never generates — no API key to leak, no
 # model output in the audit trail, an agent host that supplies its own model —
@@ -69,20 +73,48 @@ GENERATIVE_TOOL_NAMES = frozenset({"get_answer", "generate_refactoring_code"})
 # editable by whoever the deployment is being defended against. With this set,
 # the two tools are removed from the served surface at bind time and cannot be
 # selected back in by any profile, delta or explicit allowlist.
-NO_GENERATIVE_ENV = "REPOWISE_TOOLS_NO_GENERATIVE"
-
-
-def no_generative_tools_enabled() -> bool:
+def no_generative_tools_enabled(repo_path: Path | str | None = None) -> bool:
     """Whether the generative tools are hard-excluded from the surface.
 
     Off by default; on for ``1``/``true``/``yes``/``on`` (case-insensitive).
-    Read at the call site, not at import, so a test or an embedding process can
-    set it after this module is loaded.
+    A workspace server serves every member, so a truthy policy in any member is
+    also authoritative. Read at the call site, not at import, so a test or an
+    embedding process can set it after this module is loaded.
     """
-    return os.environ.get(NO_GENERATIVE_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+    if generative_calls_disabled(repo_path):
+        return True
+    if repo_path is None:
+        return False
+
+    try:
+        from repowise.core.workspace import WorkspaceConfig, find_workspace_root
+
+        workspace_root = find_workspace_root(Path(repo_path))
+        if workspace_root is None:
+            return False
+        config = WorkspaceConfig.load(workspace_root)
+    except Exception:
+        # Once a workspace config exists, failing to enumerate its members must
+        # remove the generative surface rather than silently omit a member's
+        # hard policy from the decision.
+        _log.warning(
+            "Could not resolve workspace members for the hard no-generative policy; failing closed",
+            exc_info=True,
+        )
+        return True
+
+    return any(
+        generative_calls_disabled(path)
+        for path in (workspace_root, *config.repo_paths(workspace_root))
+    )
 
 
-def _strip_generative(enabled: set[str], *, tokens: Sequence[str] | None) -> set[str]:
+def _strip_generative(
+    enabled: set[str],
+    *,
+    tokens: Sequence[str] | None,
+    repo_path: Path | str | None = None,
+) -> set[str]:
     """Remove the generative tools from a resolved selection when excluded.
 
     Runs after every profile/delta/allowlist path, which is what makes the
@@ -91,7 +123,7 @@ def _strip_generative(enabled: set[str], *, tokens: Sequence[str] | None) -> set
     warning per name, because that is a real conflict between two operator
     intents and silently winning it would look like the config was ignored.
     """
-    if not no_generative_tools_enabled():
+    if not no_generative_tools_enabled(repo_path):
         return enabled
     named = {t.lstrip("+-").strip() for t in (tokens or ())}
     for name in sorted(enabled & GENERATIVE_TOOL_NAMES & named):
@@ -187,6 +219,7 @@ def resolve_enabled_tools(
     *,
     is_workspace: bool,
     override: str | Sequence[str] | None = None,
+    repo_path: Path | str | None = None,
 ) -> set[str]:
     """Return the set of tool names a server should expose.
 
@@ -205,7 +238,7 @@ def resolve_enabled_tools(
     """
     tokens = _normalize_override(override)
     enabled = _resolve_selection(entries, is_workspace=is_workspace, tokens=tokens)
-    return _strip_generative(enabled, tokens=tokens)
+    return _strip_generative(enabled, tokens=tokens, repo_path=repo_path)
 
 
 def _resolve_selection(
@@ -310,6 +343,7 @@ def apply_tool_selection(
         mcp_tool_registry.entries(),
         is_workspace=_is_workspace(repo_path),
         override=override,
+        repo_path=repo_path,
     )
 
     manager = getattr(mcp, "_tool_manager", None)
@@ -366,10 +400,10 @@ def describe_tool_surface(repo_path: str | None) -> dict[str, Any]:
     override = _read_config_override(repo_path)
 
     default_surface = resolve_enabled_tools(
-        entries, is_workspace=is_workspace, override=None
+        entries, is_workspace=is_workspace, override=None, repo_path=repo_path
     )
     enabled = resolve_enabled_tools(
-        entries, is_workspace=is_workspace, override=override
+        entries, is_workspace=is_workspace, override=override, repo_path=repo_path
     )
 
     tools = [
@@ -381,7 +415,7 @@ def describe_tool_surface(repo_path: str | None) -> dict[str, Any]:
             "enabled": e.name in enabled,
         }
         for e in sorted(entries, key=lambda e: e.name)
-        if not (no_generative_tools_enabled() and e.name in GENERATIVE_TOOL_NAMES)
+        if not (no_generative_tools_enabled(repo_path) and e.name in GENERATIVE_TOOL_NAMES)
     ]
     return {
         "is_workspace": is_workspace,

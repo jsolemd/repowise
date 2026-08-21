@@ -78,6 +78,12 @@ from repowise.core.analysis.health import HEALTH_ANALYZER_VERSION
 from repowise.core.docs_mode import docs_mode_state_fields, resolve_docs_mode
 from repowise.core.generation.languages import SUPPORTED_LANGUAGES
 from repowise.core.generation.styles import DEFAULT_STYLE, list_styles, resolve_style
+from repowise.core.generative_policy import (
+    NO_GENERATIVE_ENV,
+    NO_GENERATIVE_INDEX_MARKER,
+    NO_GENERATIVE_INIT_COMPLETE_MARKER,
+    generative_calls_disabled,
+)
 from repowise.core.reasoning import REASONING_MODES
 
 from ._interactive import offer_distill_rewrite_hook, offer_hook_install
@@ -772,6 +778,12 @@ def init_command(
     # the git tier to ESSENTIAL.
     if run_mode == "fast":
         index_only = True
+    hard_no_generative = generative_calls_disabled()
+    if hard_no_generative and not index_only:
+        raise click.UsageError(
+            f"{NO_GENERATIVE_ENV}=1 requires --no-prose or --mode fast; "
+            "prose generation cannot be enabled under the hard no-generative policy."
+        )
     start = time.monotonic()
     repo_path = resolve_repo_path(path)
 
@@ -786,6 +798,18 @@ def init_command(
     from repowise.core.workspace import scan_for_repos
 
     scan = scan_for_repos(repo_path, include_submodules=include_submodules)
+
+    # Check only the hard-policy key across the target and every discovered
+    # repository before seeding can delegate and return.  Do not merge their
+    # full dotenv files here: first-writer-wins credential loading would let a
+    # container/root value shadow the eventual primary repository.
+    policy_paths = {repo_path, *(repo.path for repo in scan.repos)}
+    hard_no_generative = any(generative_calls_disabled(path) for path in policy_paths)
+    if hard_no_generative and not index_only:
+        raise click.UsageError(
+            f"{NO_GENERATIVE_ENV}=1 requires --no-prose or --mode fast; "
+            "prose generation cannot be enabled under the hard no-generative policy."
+        )
 
     # ---- Worktree seeding ----
     # Explicit --seed-from wins. Otherwise, an unindexed linked worktree
@@ -850,6 +874,12 @@ def init_command(
                 verbose=verbose,
                 progress=progress,
             )
+            if hard_no_generative:
+                # Delegated update is the successful completion boundary for
+                # a seeded init, so it must emit the same terminal witnesses
+                # as the cold-init path below.
+                console.print(NO_GENERATIVE_INIT_COMPLETE_MARKER)
+                console.print(NO_GENERATIVE_INDEX_MARKER)
             return
     if len(scan.repos) > 1 and not no_workspace:
         _workspace_init(
@@ -884,6 +914,7 @@ def init_command(
             wiki_style=resolve_style(wiki_style).name,
             language=language_opt,
             run_mode=run_mode,
+            hard_no_generative=hard_no_generative,
         )
         return
 
@@ -905,6 +936,14 @@ def init_command(
     run_mode = effective_run_mode_for_resume(repo_path, run_mode, resume)
     if run_mode == "fast":
         index_only = True
+    # Repo-local dotenv is a supported policy source. Re-read after loading it;
+    # the pre-scan snapshot above deliberately cannot see this file yet.
+    hard_no_generative = generative_calls_disabled(repo_path)
+    if hard_no_generative and not index_only:
+        raise click.UsageError(
+            f"{NO_GENERATIVE_ENV}=1 requires --no-prose or --mode fast; "
+            "prose generation cannot be enabled under the hard no-generative policy."
+        )
 
     # ---- Interactive mode (TTY, no explicit flags) ----
     # --yes forces non-interactive even on a TTY (mirrors the workspace path),
@@ -1135,23 +1174,24 @@ def init_command(
     no_provider = False
 
     if index_only:
-        try:
-            if (
-                provider_name
-                or (sys.stdin.isatty() is False)
-                or any(
-                    os.environ.get(k)
-                    for k in (
-                        "GEMINI_API_KEY",
-                        "GOOGLE_API_KEY",
-                        "OPENAI_API_KEY",
-                        "ANTHROPIC_API_KEY",
+        if not hard_no_generative:
+            try:
+                if (
+                    provider_name
+                    or (sys.stdin.isatty() is False)
+                    or any(
+                        os.environ.get(k)
+                        for k in (
+                            "GEMINI_API_KEY",
+                            "GOOGLE_API_KEY",
+                            "OPENAI_API_KEY",
+                            "ANTHROPIC_API_KEY",
+                        )
                     )
-                )
-            ):
-                decision_provider = resolve_provider(provider_name, model, repo_path)
-        except Exception:
-            pass
+                ):
+                    decision_provider = resolve_provider(provider_name, model, repo_path)
+            except Exception:
+                pass
 
         has_provider = decision_provider is not None
         if is_interactive:
@@ -1688,3 +1728,9 @@ def init_command(
         setup=_setup_outcome,
         files_written=files_written,
     )
+    if hard_no_generative:
+        # These exact unstyled lines are evaluator witnesses. Keep them terminal:
+        # absence means init did not complete, and any later output is a
+        # contract violation rather than something the evaluator may ignore.
+        console.print(NO_GENERATIVE_INIT_COMPLETE_MARKER)
+        console.print(NO_GENERATIVE_INDEX_MARKER)

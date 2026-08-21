@@ -23,6 +23,7 @@ from repowise.core.cancellation import (
     set_active_token,
 )
 from repowise.core.docs_mode import DocsMode, docs_mode_state_fields, resolve_docs_mode
+from repowise.core.generative_policy import NO_GENERATIVE_ENV, generative_calls_disabled
 from repowise.core.persistence.crud import (
     get_generation_job,
     get_repository,
@@ -389,7 +390,10 @@ async def execute_job(
         # ---- Resolve LLM provider -----------------------------------------
         llm_client = None
         docs_skip_reason: str | None = None
-        if not is_index_only:
+        hard_no_generative = generative_calls_disabled(repo_path)
+        if hard_no_generative:
+            docs_skip_reason = f"generative jobs disabled: {NO_GENERATIVE_ENV}=1"
+        elif not is_index_only:
             try:
                 from repowise.server.provider_config import get_chat_provider_instance
 

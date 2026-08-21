@@ -23,6 +23,7 @@ from typing import Any
 
 import structlog
 
+from repowise.core.generative_policy import generative_calls_disabled
 from repowise.core.pipeline.modes import OrchestratorMode
 from repowise.core.pipeline.progress import (
     STAGE_ANALYSIS,
@@ -266,6 +267,12 @@ async def run_pipeline(
     # reads ``generate_docs`` / the git tier, not ``mode``.
     git_tier = mode.git_tier
     generate_docs = generate_docs and mode.allows_doc_generation
+    if generative_calls_disabled(repo_path):
+        # The environment policy is a hard boundary, not a CLI convention.
+        # Null the provider even when a caller already constructed and injected
+        # one so indexing, decision analysis, and page generation cannot reach
+        # a generative backend through a programmatic pipeline call.
+        llm_client = None
 
     # Wrap the incoming progress callback so registered pipeline hooks fire
     # around each phase transition. Zero-op when no hooks are registered.
