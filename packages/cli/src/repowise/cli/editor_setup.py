@@ -377,6 +377,8 @@ def refresh_editor_project_files(
 ) -> None:
     """Refresh editor-managed project files without rewriting common MCP config."""
 
+    if is_editor_setup_disabled():
+        return
     resolved_options = options or EditorSetupOptions()
     for integration in _resolve_integrations(integrations):
         integration.refresh_project_files(console_obj, repo_path, resolved_options)

@@ -664,8 +664,12 @@ def test_claude_project_setup_writes_root_mcp_and_claude_md(
     ]
 
 
-def test_refresh_editor_project_files_delegates_to_integrations(tmp_path: Path) -> None:
+def test_refresh_editor_project_files_delegates_to_integrations(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
     calls: list[tuple[str, Path, frozenset[str]]] = []
+    monkeypatch.delenv("REPOWISE_SKIP_EDITOR_SETUP", raising=False)
 
     class FakeIntegration:
         # ``InstallLifecycle`` declares this, and the checklist reads it to
@@ -688,6 +692,37 @@ def test_refresh_editor_project_files_delegates_to_integrations(tmp_path: Path) 
     )
 
     assert calls == [("refresh", tmp_path, frozenset({"skip"}))]
+
+
+def test_refresh_editor_project_files_honors_skip_environment(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    """Headless updates must not mutate tracked editor project files."""
+
+    editor_file = tmp_path / ".vscode" / "mcp.json"
+    editor_file.parent.mkdir(parents=True)
+    editor_file.write_text('{"existing": true}\n', encoding="utf-8")
+    before = editor_file.read_bytes()
+
+    class FakeIntegration:
+        integration_id = "fake"
+
+        def refresh_project_files(
+            self,
+            console_obj: object,
+            repo_path: Path,
+            options: EditorSetupOptions,
+        ) -> None:
+            raise AssertionError("editor refresh must be disabled by the environment")
+
+    monkeypatch.setenv("REPOWISE_SKIP_EDITOR_SETUP", "1")
+    refresh_editor_project_files(
+        _silent_console(),
+        tmp_path,
+        integrations=(FakeIntegration(),),  # type: ignore[arg-type]
+    )
+    assert editor_file.read_bytes() == before
 
 
 def _write_settings(path: Path, entry: dict) -> None:

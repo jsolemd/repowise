@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -352,6 +353,39 @@ async def test_fast_capture_replaces_a_tracked_excluded_file_window(lifecycle_re
     assert second.status == "current"
     assert second.generation_id == current.generation_id
 
+    # A restarted watcher has lost its in-memory fast-path set. Re-observing
+    # the same dirty tracked window must still be a durable no-op before an
+    # outbox sequence is allocated.
+    row_count = len(await _updates(repo))
+    await capture_source_changes(repo, [path])
+    assert len(await _updates(repo)) == row_count
+    replay = await reconcile_source_index(
+        repo,
+        embedder=MockEmbedder(),
+        embedder_identity=_IDENTITY,
+    )
+    replay_manifest = read_manifest(default_manifest_path(repo))
+    assert replay.status == "current"
+    assert replay_manifest is not None
+    assert replay_manifest.generation_id == current.generation_id
+    assert replay_manifest.generation_sequence == current.generation_sequence
+
+    # A real byte change at the same path remains observable and advances once.
+    (repo / path).write_text("service: finalquasar\n")
+    await capture_source_changes(repo, [path])
+    assert len(await _updates(repo)) == row_count + 1
+    changed = await reconcile_source_index(
+        repo,
+        embedder=MockEmbedder(),
+        embedder_identity=_IDENTITY,
+    )
+    changed_manifest = read_manifest(default_manifest_path(repo))
+    assert changed.status == "published"
+    assert changed_manifest is not None
+    assert changed_manifest.generation_sequence == current.generation_sequence + 1
+    with _fts(repo, changed_manifest) as fts:
+        assert {hit.file_path for hit in fts.query("finalquasar")} == {path}
+
 
 async def test_concurrent_reconciler_returns_busy_without_touching_generation(lifecycle_repo):
     repo = lifecycle_repo
@@ -463,6 +497,61 @@ async def test_manifest_publication_precedes_outbox_bookkeeping(lifecycle_repo):
     repeated = await reconcile_source_index(repo, embedder=counter, embedder_identity=_IDENTITY)
     assert repeated.status == "current"
     assert repeated.generation_id == published.generation_id
+
+
+async def test_coalesced_ready_replay_after_manifest_crash_is_a_noop(lifecycle_repo):
+    repo = lifecycle_repo
+    previous = read_manifest(default_manifest_path(repo))
+    assert previous is not None
+    (repo / "src" / "app.py").write_text(_APP_V2)
+    await _capture(repo, path="src/app.py")
+    (repo / "infra" / "service.yaml").write_text("service: coalescednebula\n")
+    await capture_source_changes(repo, ["infra/service.yaml"])
+    pending = await _updates(repo)
+    assert [row.state for row in pending[-2:]] == [PENDING, PENDING]
+    counter = _CountingEmbedder()
+
+    def crash_after_manifest(boundary: str) -> None:
+        if boundary == "after_manifest":
+            raise _Crash(boundary)
+
+    with pytest.raises(_Crash):
+        await reconcile_source_index(
+            repo,
+            embedder=counter,
+            embedder_identity=_IDENTITY,
+            failure_injector=crash_after_manifest,
+        )
+
+    published = read_manifest(default_manifest_path(repo))
+    assert published is not None
+    assert published.generation_sequence == previous.generation_sequence + 2
+    rows = await _updates(repo)
+    assert [row.state for row in rows[-2:]] == [READY, READY]
+    assert all(row.artifact_json for row in rows[-2:])
+    assert all(json.loads(row.artifact_json) == published.to_dict() for row in rows[-2:])
+    row_count = len(rows)
+    embedded_before_recovery = counter.texts
+
+    # A restarted capture can replay either member of the coalesced generation
+    # before relational bookkeeping is healed. The active artifact proves that
+    # both READY rows are already visible through the manifest.
+    await _capture(repo, path="src/app.py")
+    assert len(await _updates(repo)) == row_count
+
+    recovered = await reconcile_source_index(
+        repo,
+        embedder=counter,
+        embedder_identity=_IDENTITY,
+    )
+    recovered_manifest = read_manifest(default_manifest_path(repo))
+    assert recovered.status == "current"
+    assert recovered_manifest == published
+    assert recovered.generation_id == published.generation_id
+    assert recovered.generation_sequence == published.generation_sequence
+    assert recovered.embedded == 0
+    assert counter.texts == embedded_before_recovery
+    assert [row.state for row in (await _updates(repo))[-2:]] == [PUBLISHED, PUBLISHED]
 
 
 async def test_status_distinguishes_pending_from_degraded_work(lifecycle_repo):
