@@ -1269,6 +1269,78 @@ async def test_complete_subject_concepts_on_one_owner_can_be_confident(tmp_path)
     assert response["confidence"] == "confident"
 
 
+async def test_a_concept_supplied_only_by_the_filename_cannot_make_a_symbol_confident(
+    tmp_path,
+):
+    """A thin symbol inherits its file's name, and that is not evidence about it.
+
+    Every chunk opens with ``# File: <path>`` and a dotted qualified name that
+    restates the path, so a two-line helper in ``…cashflow_chart_controller.js``
+    matches ``cashflow`` while containing nothing of the sort.  Before A3 the
+    corpus had no chunks thin enough for that header to outweigh a body; A3 added
+    544 local symbols and one of them was confidently named the owner of an
+    absent subject on exactly this evidence.  Retrieval may still rank it — a
+    cashflow file is a fair guess for a cashflow query — but the confident claim
+    is about the chunk, and the chunk cannot show it.
+    """
+    owner = _hit("line", "src/cashflow_chart_controller.js", 0.60)
+    coordinator = _coordinator(
+        tmp_path,
+        source_dense=[owner],
+        source_lexical=[_FTSHit(owner.chunk_id, owner.file_path)],
+        source_term_files={"cashflow": {"src/cashflow_chart_controller.js"}},
+    )
+
+    response = await coordinator.search("cashflow", limit=5)
+
+    evidence = response["results"][0]["evidence"]
+    assert evidence["concept_coverage"] == 1.0, "ranking still believes the filename"
+    assert evidence["content_concept_coverage"] == 0.0, "the chunk itself carries nothing"
+    assert response["confidence"] == "caution"
+
+
+async def test_a_file_window_may_be_confident_from_its_own_path(tmp_path):
+    """A file window *is* its file, so its path is the subject, not an accident.
+
+    The guard above must not cost the operational-coverage family, where the
+    answer genuinely is "that file" and the filename is how such a file declares
+    itself.
+    """
+    owner = _hit(
+        "compose.tailnet.yaml",
+        "infra/compose.tailnet.yaml",
+        0.60,
+        source="file_window",
+    )
+    coordinator = _coordinator(
+        tmp_path,
+        source_dense=[owner],
+        source_lexical=[_FTSHit(owner.chunk_id, owner.file_path)],
+        source_term_files={"tailnet": {"infra/compose.tailnet.yaml"}},
+    )
+
+    response = await coordinator.search("tailnet", limit=5)
+
+    assert response["results"][0]["evidence"]["content_concept_coverage"] == 1.0
+    assert response["confidence"] == "confident"
+
+
+async def test_a_symbol_named_for_its_concept_keeps_its_confidence(tmp_path):
+    """The guard tests where the concept lives, not whether the path mentions it."""
+    owner = _hit("cashflow_projection", "src/cashflow.py", 0.60)
+    coordinator = _coordinator(
+        tmp_path,
+        source_dense=[owner],
+        source_lexical=[_FTSHit(owner.chunk_id, owner.file_path)],
+        source_term_files={"cashflow": {"src/cashflow.py"}},
+    )
+
+    response = await coordinator.search("cashflow", limit=5)
+
+    assert response["results"][0]["evidence"]["content_concept_coverage"] == 1.0
+    assert response["confidence"] == "confident"
+
+
 async def test_a_different_candidates_strong_cosine_cannot_make_the_owner_confident(tmp_path):
     """The file named as owner must carry the evidence behind the claim."""
     coordinator = _coordinator(
@@ -1418,6 +1490,7 @@ async def test_the_envelope_carries_every_contract_key(tmp_path):
         "exact_name",
         "lane",
         "concept_coverage",
+        "content_concept_coverage",
         "corpus_file_count",
         "same_path_corroborated",
         "concepts",
@@ -1808,6 +1881,7 @@ async def test_every_query_writes_one_event(tmp_path):
         "exact_name": False,
         "lane": "source",
         "concept_coverage": 1.0,
+        "content_concept_coverage": 1.0,
         "corpus_file_count": 1,
         "same_path_corroborated": False,
         "concepts": [
@@ -1815,6 +1889,7 @@ async def test_every_query_writes_one_event(tmp_path):
                 "token": "alpha",
                 "document_frequency": 1,
                 "matched": True,
+                "content_carried": True,
             }
         ],
     }

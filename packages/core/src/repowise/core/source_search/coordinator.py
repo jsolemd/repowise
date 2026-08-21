@@ -523,12 +523,25 @@ class _ConceptEvidence:
     document_frequency: int
     weight: float
     matched: bool
+    #: Whether the candidate carries this concept in something other than its
+    #: own file path.  A chunk's indexed text opens with ``# File: <path>`` and
+    #: a dotted qualified name that restates that same path, so every chunk in
+    #: ``…/solemd_retirement_cashflow_chart_controller.js`` matches the token
+    #: ``cashflow`` no matter what it contains.  Harmless while chunks were fat
+    #: enough for their bodies to outweigh that header; decisive once A3 added
+    #: two-line local symbols, where the repeated path is most of the token
+    #: stream and BM25 is effectively scoring the filename.  Ranking may still
+    #: use the permissive match — a cashflow file *is* a reasonable hit for a
+    #: cashflow query — but a confident ownership claim may not, because the
+    #: path is a fact about the file and the claim is about this chunk.
+    content_carried: bool
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "token": self.token,
             "document_frequency": self.document_frequency,
             "matched": self.matched,
+            "content_carried": self.content_carried,
         }
 
 
@@ -557,6 +570,24 @@ class _CandidateEvidence:
         matched = sum(concept.weight for concept in self.concepts if concept.matched)
         return matched / total
 
+    @property
+    def content_concept_coverage(self) -> float:
+        """Coverage counting only concepts the candidate carries itself.
+
+        The confidence gate reads this rather than :attr:`concept_coverage`.
+        Retrieval is allowed to believe a filename; a confident ownership claim
+        has to be able to point at the chunk.
+        """
+        total = sum(concept.weight for concept in self.concepts)
+        if total <= 0:
+            return 0.0
+        matched = sum(
+            concept.weight
+            for concept in self.concepts
+            if concept.matched and concept.content_carried
+        )
+        return matched / total
+
     def to_dict(self, *, lane: str) -> dict[str, Any]:
         return {
             "dense_cosine": (
@@ -566,6 +597,7 @@ class _CandidateEvidence:
             "exact_name": self.exact_name,
             "lane": lane,
             "concept_coverage": round(self.concept_coverage, 4),
+            "content_concept_coverage": round(self.content_concept_coverage, 4),
             "corpus_file_count": self.corpus_file_count,
             "same_path_corroborated": self.same_path_corroborated,
             "concepts": [concept.to_dict() for concept in self.concepts],
@@ -1276,17 +1308,32 @@ class SourceSearchCoordinator:
 
         for item in ranked:
             own_tokens = set(tokenize(" ".join((item.file, item.match_name, item.snippet))))
+            # Split out what the candidate's own path supplies.  A file window
+            # *is* its file, so for one of those the path is the subject rather
+            # than an accident of location; for a symbol chunk it is neither.
+            path_tokens = set(tokenize(item.file))
+            # ``match_name`` only, never falling back to ``name``.  A wiki
+            # page's name is its title — "File: a/b/cashflow_controller.js" —
+            # which restates the path just as the chunk header does, so the
+            # fallback would hand the path straight back as though the
+            # candidate had earned it.
+            name_tokens = set(tokenize(item.match_name))
+            file_level = item.source == SOURCE_FILE_WINDOW
             concepts: list[_ConceptEvidence] = []
             for token, files in concept_files.items():
                 document_frequency = len(files)
                 weight = math.log((corpus_file_count + 1) / (document_frequency + 1)) + 1.0
                 matched = (bool(item.file) and item.file in files) or token in own_tokens
+                content_carried = matched and (
+                    file_level or token not in path_tokens or token in name_tokens
+                )
                 concepts.append(
                     _ConceptEvidence(
                         token=token,
                         document_frequency=document_frequency,
                         weight=weight,
                         matched=matched,
+                        content_carried=content_carried,
                     )
                 )
             item.evidence_profile = _CandidateEvidence(
@@ -1632,7 +1679,18 @@ class SourceSearchCoordinator:
         lexical_agreement = (
             profile.lexical_rank is not None and profile.lexical_rank <= AGREEMENT_LEXICAL_DEPTH
         )
-        complete_subject = profile.concept_coverage >= CONFIDENT_CONCEPT_COVERAGE
+        # A filename may corroborate a subject the candidate already carries; it
+        # may not *be* the subject.  Coverage keeps its permissive reading, so a
+        # file honestly named for its topic still counts — ``identity.py`` is
+        # real evidence about identity.  What is refused is a candidate whose
+        # entire case is its path: a two-line helper in a richly-named file, or
+        # that file's wiki page, matching every concept it was asked about while
+        # containing none of them.  Requiring one concept to be carried by the
+        # candidate itself separates the two without punishing the first.
+        complete_subject = (
+            profile.concept_coverage >= CONFIDENT_CONCEPT_COVERAGE
+            and profile.content_concept_coverage > 0.0
+        )
         if complete_subject and lexical_agreement and owner_dense >= CONFIDENT_DENSE_COSINE:
             return CONFIDENT
         if (
