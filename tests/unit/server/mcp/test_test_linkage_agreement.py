@@ -38,6 +38,7 @@ async def test_context_and_risk_agree_on_every_shared_file(setup_mcp, health_dat
         dossier = risk["targets"][path]
         assert card["tested"] is not dossier["test_gap"], path
         assert card.get("guarding_tests") == dossier.get("guarding_tests"), path
+        assert card.get("possible_tests") == dossier.get("possible_tests"), path
         assert card["test_linkage_basis"] == dossier["test_linkage_basis"], path
 
 
@@ -117,6 +118,9 @@ async def test_naming_rung_matches_the_basename_not_a_substring(setup_mcp, popul
     linkage = await resolve_test_linkage(session, populated_db, UNTESTED)
     assert linkage.basis == "naming"
     assert linkage.tests == ["tests/test_middleware.py"]
+    assert linkage.tested is False
+    assert linkage.as_payload()["possible_tests"] == ["tests/test_middleware.py"]
+    assert "guarding_tests" not in linkage.as_payload()
 
 
 @pytest.mark.asyncio
@@ -141,6 +145,34 @@ async def test_coverage_outranks_the_graph(setup_mcp, populated_db, session):
     linkage = await resolve_test_linkage(session, populated_db, SERVICE)
     assert linkage.basis == "coverage"
     assert linkage.tests == ["tests/test_coverage_proven.py"]
+
+
+@pytest.mark.asyncio
+async def test_naming_only_evidence_does_not_clear_the_risk_gap(setup_mcp, populated_db, session):
+    from repowise.core.persistence.models import GraphNode
+    from repowise.server.mcp_server import get_context, get_risk
+
+    session.add(
+        GraphNode(
+            id="gn-possible-middleware",
+            repository_id=populated_db,
+            node_id="tests/test_middleware.py",
+            node_type="file",
+            language="python",
+            is_test=True,
+        )
+    )
+    await session.flush()
+
+    card = (await get_context([UNTESTED]))["targets"][UNTESTED]
+    dossier = (await get_risk([UNTESTED]))["targets"][UNTESTED]
+
+    assert card["tested"] is False
+    assert dossier["test_gap"] is True
+    assert card["possible_tests"] == ["tests/test_middleware.py"]
+    assert dossier["possible_tests"] == card["possible_tests"]
+    assert "guarding_tests" not in card
+    assert "guarding_tests" not in dossier
 
 
 @pytest.mark.parametrize(
@@ -186,3 +218,47 @@ async def test_naming_rung_pairs_a_go_style_test(setup_mcp, populated_db, sessio
     linkage = await resolve_test_linkage(session, populated_db, UNTESTED)
     assert linkage.basis == "naming"
     assert linkage.tests == ["internal/middleware_test.go"]
+    assert linkage.tested is False
+
+
+@pytest.mark.asyncio
+async def test_naming_rung_suppresses_cross_package_stem_collisions(
+    setup_mcp, populated_db, session
+):
+    from repowise.core.persistence.models import GraphNode
+
+    session.add_all(
+        [
+            GraphNode(
+                id="gn-concept-graph",
+                repository_id=populated_db,
+                node_id="conceptatlas/atlas/graph.py",
+                node_type="file",
+                language="python",
+                is_test=False,
+            ),
+            GraphNode(
+                id="gn-code-graph",
+                repository_id=populated_db,
+                node_id="codeatlas/doc_search/graph.py",
+                node_type="file",
+                language="python",
+                is_test=False,
+            ),
+            GraphNode(
+                id="gn-code-test-graph",
+                repository_id=populated_db,
+                node_id="codeatlas/tests/doc_search/test_graph.py",
+                node_type="file",
+                language="python",
+                is_test=True,
+            ),
+        ]
+    )
+    await session.flush()
+
+    linkage = await resolve_test_linkage(session, populated_db, "conceptatlas/atlas/graph.py")
+
+    assert linkage.basis == "none"
+    assert linkage.tested is False
+    assert "possible_tests" not in linkage.as_payload()

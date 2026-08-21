@@ -269,15 +269,18 @@ half does, the reply is that file's card with `resolved_to` naming the file and
 a `note` saying which symbol was not found. The file's symbol list is where the
 correct id is, so this is a partial answer rather than a dead end.
 
-**Test linkage.** Every file and symbol card carries `tested` (bool),
-`test_linkage_basis`, and — when something does guard it — `guarding_tests`
-(up to 10 paths) with `guarding_test_count`. `get_risk`'s `test_gap` is the
-negation of the same `tested`, read from the same resolver, so the two tools
-cannot disagree about a file. The basis says how strong the claim is:
+**Test linkage.** Every file and symbol card carries `tested` (bool) and
+`test_linkage_basis`. Authoritative `coverage` or `graph` evidence adds
+`guarding_tests` (up to 10 paths) with `guarding_test_count`; naming-only
+conventions instead add `possible_tests` / `possible_test_count` and leave
+`tested: false`. `get_risk`'s `test_gap` is the negation of the same `tested`,
+read from the same resolver, so the two tools cannot disagree about a file.
+The basis says how strong the claim is:
 `coverage` (a coverage run proved these tests execute the file), `graph`
 (these test files import it), `naming` (nothing references it, but a
-conventionally-named test file exists — a convention, not evidence), `self`
-(the file is itself test material), or `none`. The `health` block's
+conventionally-named test file exists and no same-stem source collision makes
+attribution ambiguous — possible evidence, never a cleared gap), `self` (the
+file is itself test material), or `none`. The `health` block's
 `has_test_file` is a *different* question — the index-time paired-filename
 heuristic that feeds the health score — and carries a note when it diverges
 from the linkage.
@@ -286,7 +289,9 @@ from the linkage.
 an exact `match_count`, and up to 20 `candidates`
 (`symbol_id`/`file`/`name`/`qualified_name`/`kind`/`start_line`). The card
 still describes the first match and the `note` says which, so the reply is
-usable, but nothing is presented as *the* answer.
+usable, but nothing is presented as *the* answer. Requested symbol-specific
+`callers`/`callees`/`metrics`/`community`/`health`/`skeleton` blocks are omitted
+until one candidate is selected; `enrichment_omitted` names those blocks.
 
 **A path that does not exist** returns `status: "not_found"` with
 `suggestions`: files under the target if it looked like a directory, then a
@@ -339,17 +344,21 @@ When several indexed symbols match the target (overloads, re-exports,
 conditional definitions, or a leaf name that is simply common) the response has
 `status: "ambiguous"`, `ambiguous: true`, an exact `match_count`, and a
 `candidates` list — none is silently chosen. Each candidate carries
-`symbol_id`, `file`, `name`, `qualified_name`, `kind`, and `start_line`; with
-four or fewer matches it also carries the body, and above that a `fetch_with`
-id to re-call with instead (a bare `__init__` matches 123 symbols on a real
-index, and 123 bodies answer nothing). At most 20 are listed; `match_count` is
-always the true total. For an omission ref: the stored content plus provenance
+`symbol_id`, `file`, `name`, `qualified_name`, `kind`, and `start_line`.
+Path-less name queries carry bodies with four or fewer matches and otherwise
+carry `fetch_with`; at most 20 name candidates are materialized (a bare
+`__init__` matches 123 symbols on a real index, and 123 bodies answer nothing).
+Path-qualified overload sets retain the legacy envelope: every candidate is
+represented, with bodies until the byte budget and `not_rendered` range reads
+beyond it. In both forms `match_count` is the exact eligible total, independent
+of the candidate cap. For an omission ref: the stored content plus provenance
 (`source`, `created_at`, `original_tokens`).
 
 **Resolution order.** Path-qualified rungs first — exact `symbol_id`, then
 `(file, qualified_name)`, then `(file, name)`, then a file-path suffix match so
 a remembered filename (`answer.py::get_answer`) resolves. If the target names a
-file (it contains a `/` or its first segment ends in a source-file extension)
+file (it contains a `/` or its first segment ends in an extension or special
+filename recognized by the language registry)
 resolution stops there: `nope/wrong.py::alpha` returns retryable `suggestions`
 rather than an `alpha` from some other file, because the caller asserted a path
 and meant it. Otherwise the whole target is retried as a name: exact
@@ -359,13 +368,17 @@ leaf segment alone. Only if all of that comes back empty is the ladder walked
 again case-insensitively, so an exact match always outranks a case-folded one
 in languages where `Foo` and `foo` are two symbols.
 
-**Batching.** Pass a list to fetch several targets in one round trip. The
-reply becomes `{"results": [...], "count", "resolved_count"}` — one entry per
-target, in request order, each the same shape a single-target call returns,
-plus the `target` string it came from. Per-item `_meta` is folded into the
-envelope's. A single target returns the flat shape, unchanged. Over 20 targets,
-the first 20 are served and the rest are named in `not_served` rather than the
-call failing.
+**Batching.** Pass a list to fetch several targets in one round trip. The reply
+becomes `{"results": [...], "count", "resolved_count", "ambiguous_count"}` —
+one entry per target, in request order, each the same shape a single-target
+call returns, plus the `target` string it came from. `resolved_count` counts
+only uniquely resolved successes; ambiguity is counted separately. Per-item
+`_meta` is folded into one outer envelope whose freshness is evaluated over the
+union of canonical served files. When target-scoped checks identify changed
+files, `_meta.stale_targets` lists them compactly beside the any-target
+`stale_warning`; `replaced_tokens` is summed. A single target returns the flat
+shape, unchanged. Over 20 targets, the first 20 are served and the rest are
+named in `not_served` rather than the call failing.
 
 With `depth` above 1 the response also carries `callee_bodies`: the symbols
 this one calls, transitively, each with its `depth` (hops from the root), its
@@ -485,9 +498,10 @@ Modification risk assessment for files or a set of changed files.
 
 Test-gap analysis is the same resolver `get_context` reports from, so the two
 tools always agree about a file: `test_gap` is the negation of `tested`, and
-the payload carries the `test_linkage_basis` and the `guarding_tests` the
-verdict rests on. See [Test linkage](#get_context) under `get_context` for
-what each basis claims.
+the payload carries the `test_linkage_basis` plus authoritative
+`guarding_tests` or naming-only `possible_tests`. Naming alone leaves
+`test_gap: true`. See [Test linkage](#get_context) under `get_context` for what
+each basis claims.
 
 > **Scales.** Ratios derived from ownership or percentile columns are 0-1 (`hotspot_score`, `owner_pct`, `recent_owner_pct`); coverage and gap fields are 0-100 (`coverage_pct`, `branch_coverage_pct`, `share_of_repo_gap_pct`, `change_entropy_pct`, `churn_percentile`). The `_pct` suffix alone does not tell you which — check this table. Every emitted float is rounded to 4 significant digits.
 

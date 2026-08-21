@@ -222,3 +222,38 @@ async def test_budget_overflow_lists_unrendered_with_fetch_range(
     [skipped] = result["not_rendered"]
     assert skipped["fetch_with"] == "pkg/dup.py:5-6"
     assert "not_rendered" in result["note"]
+
+
+@pytest.mark.asyncio
+async def test_path_qualified_overloads_keep_all_candidates_and_bodies(
+    setup_mcp, repo_on_disk, session
+):
+    from sqlalchemy import select
+
+    from repowise.core.persistence.models import Repository, WikiSymbol
+    from repowise.server.mcp_server import get_symbol
+
+    repo = (await session.execute(select(Repository))).scalars().first()
+    for i in range(21):
+        session.add(
+            WikiSymbol(
+                id=f"many-overload-{i}",
+                repository_id=repo.id,
+                file_path="pkg/dup.py",
+                symbol_id=f"pkg/dup.py::dup#{i}",
+                name="dup",
+                qualified_name="dup",
+                kind="function",
+                signature="def dup(x)",
+                start_line=2,
+                end_line=3,
+                language="python",
+            )
+        )
+    await session.flush()
+
+    result = await get_symbol("pkg/dup.py::dup")
+
+    assert result["match_count"] == 21
+    assert len(result["candidates"]) == 21
+    assert all("source" in candidate for candidate in result["candidates"])

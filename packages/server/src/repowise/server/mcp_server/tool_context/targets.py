@@ -404,26 +404,42 @@ async def _resolve_one_target(
             # the other, in whichever separator style the caller wrote it, and
             # a name an agent read off a call site resolves without a path it
             # does not have yet.
-            sym_match = await resolve_symbol_match(session, repo_id, target)
+            sym_match = await resolve_symbol_match(
+                session,
+                repo_id,
+                target,
+                eligible=lambda row: not is_excluded(row.file_path, exclude_spec),
+            )
             if not sym_match.rows and "::" not in target:
                 # Exploratory substring rung, get_context only. The ladder
                 # above matches whole names; a caller browsing for "auth"
                 # wants AuthService, and get_context is the tool where that
                 # guess is cheap (a card, not a body). Never for a qualified
                 # id: no name column contains "path::Class.method".
-                res = await session.execute(
+                stmt = (
                     select(WikiSymbol)
                     .where(
                         WikiSymbol.repository_id == repo_id,
                         WikiSymbol.name.ilike(f"%{escape_like(target)}%", escape=LIKE_ESCAPE),
                     )
                     .order_by(WikiSymbol.file_path, WikiSymbol.start_line, WikiSymbol.symbol_id)
-                    .limit(10)
+                    .execution_options(yield_per=128)
                 )
-                substring_rows = list(res.scalars().all())
-                if substring_rows:
+                stream = await session.stream_scalars(stmt)
+                substring_rows: list[WikiSymbol] = []
+                substring_total = 0
+                async for row in stream:
+                    if is_excluded(row.file_path, exclude_spec):
+                        continue
+                    substring_total += 1
+                    if len(substring_rows) < MAX_AMBIGUITY_CANDIDATES:
+                        substring_rows.append(row)
+                if substring_total:
                     sym_match = SymbolMatch(
-                        query=target, rows=substring_rows, rung="name_substring"
+                        query=target,
+                        rows=substring_rows,
+                        rung="name_substring",
+                        total_count=substring_total,
                     )
             if sym_match.rows:
                 target_type = "symbol"
@@ -908,7 +924,7 @@ async def _resolve_one_target(
                 sorted(best_rank, key=lambda p: (-best_rank[p], p)), exclude_spec
             )[:_MAX_USED_BY]
             # Candidates
-            if len(sym_match.rows) > 1:
+            if sym_match.status == "ambiguous":
                 docs["candidates"] = filter_dicts_by_key(
                     [
                         {"name": m.name, "kind": m.kind, "file_path": m.file_path}
@@ -923,21 +939,21 @@ async def _resolve_one_target(
     # --- Ambiguity -------------------------------------------------------
     # A name matching several symbols is a real answer the card cannot carry:
     # the card describes one of them, and reading it as *the* answer is how an
-    # agent ends up editing the wrong ``__init__``. Say so, and hand back every
-    # match with the exact id that pins it, so the follow-up call is a pick and
-    # not another guess. ``docs.candidates`` above stays as it was — the same
-    # facts, minus the ids and the status a consumer can branch on.
-    if len(sym_match.rows) > 1:
-        listed = filter_dicts_by_key(sym_match.candidates(), "file", exclude_spec)
+    # agent ends up editing the wrong ``__init__``. Say so, report the exact
+    # eligible total, and hand back a bounded set of ids that pin a follow-up
+    # call. ``docs.candidates`` above stays as it was — the same facts, minus
+    # the ids and the status a consumer can branch on.
+    if sym_match.status == "ambiguous":
+        listed = sym_match.candidates()
         result_data["status"] = sym_match.status
-        result_data["match_count"] = len(sym_match.rows)
+        result_data["match_count"] = sym_match.total_count
         result_data["candidates"] = listed[:MAX_AMBIGUITY_CANDIDATES]
         result_data["note"] = (
-            f"{len(sym_match.rows)} symbols match {target!r}; this card describes "
+            f"{sym_match.total_count} symbols match {target!r}; this card describes "
             f"{sym_match.rows[0].symbol_id!r}. Pick one from candidates and pass "
             "its symbol_id to get_context or get_symbol."
         )
-        if sym_match.truncated or len(listed) > MAX_AMBIGUITY_CANDIDATES:
+        if sym_match.total_count > MAX_AMBIGUITY_CANDIDATES:
             result_data["note"] += (
                 f" Only the first {MAX_AMBIGUITY_CANDIDATES} are listed — the name is too"
                 " common to enumerate; qualify it (Class.method) or pass a path."
@@ -1012,8 +1028,8 @@ async def _resolve_one_target(
 
     # --- Test linkage (always on, files and symbols) -----------------------
     # ``tested`` / ``guarding_tests`` answer "what would catch me if I broke
-    # this", which is the question that follows every hotspot and fix_history
-    # bit above. It is on by default and not behind ``include=["health"]``
+    # this"; naming-only ``possible_tests`` remain explicitly unproven. The
+    # block is on by default and not behind ``include=["health"]``
     # because the *other* tool that answers it — get_risk's ``test_gap`` — is
     # always on too, and the two contradicting each other is precisely what
     # this replaced: both now read `_test_linkage`, so the same file gets the
@@ -1211,6 +1227,34 @@ async def _resolve_one_target(
                         "why": (file_tour_step.description or "")[:200],
                     }
 
+    # A target matching several symbols has no single graph node or enclosing
+    # file. Keep the useful base card above, but never dress row zero's graph,
+    # health, or source skeleton up as if it answered the ambiguous query.
+    unique_enrichments = {
+        "callers",
+        "callees",
+        "metrics",
+        "community",
+        "health",
+        "skeleton",
+    }
+    if target_type == "symbol" and sym_match.status == "ambiguous":
+        omitted = sorted((include or set()).intersection(unique_enrichments))
+        if omitted:
+            result_data["enrichment_omitted"] = omitted
+            result_data["note"] += (
+                " Target-specific enrichment was omitted because it cannot be "
+                "attributed until one candidate is selected."
+            )
+        return result_data
+
+    enrichment_target = target
+    if target_type == "symbol":
+        if sym_match.rows:
+            enrichment_target = sym_match.rows[0].symbol_id
+        elif graph_symbol is not None:
+            enrichment_target = graph_symbol.node_id
+
     # --- Callers / Callees (replaces get_callers_callees) ---
     want_callers = bool(include and "callers" in include)
     want_callees = bool(include and "callees" in include)
@@ -1218,7 +1262,7 @@ async def _resolve_one_target(
         await _resolve_call_graph(
             session,
             repository,
-            target,
+            enrichment_target,
             target_type,
             result_data,
             want_callers=want_callers,
@@ -1228,22 +1272,27 @@ async def _resolve_one_target(
 
     # --- Metrics (replaces get_graph_metrics) ---
     if include and "metrics" in include:
-        await _resolve_metrics(session, repository, target, result_data)
+        await _resolve_metrics(session, repository, enrichment_target, result_data)
 
     # --- Community (replaces get_community) ---
     if include and "community" in include:
         await _resolve_community(
-            session, repository, target, result_data, exclude_spec=exclude_spec
+            session, repository, enrichment_target, result_data, exclude_spec=exclude_spec
         )
 
     # --- Code health (Phase 2) ---
     if include and "health" in include:
-        await _resolve_health(session, repository, target, target_type, result_data)
+        await _resolve_health(session, repository, enrichment_target, target_type, result_data)
 
     # --- Skeleton (distill) — opt-in only, see the module note ---
     if want_skeleton:
         await _resolve_skeleton(
-            session, repository, target, target_type, result_data, repo_root=repo_root
+            session,
+            repository,
+            enrichment_target,
+            target_type,
+            result_data,
+            repo_root=repo_root,
         )
 
     return result_data

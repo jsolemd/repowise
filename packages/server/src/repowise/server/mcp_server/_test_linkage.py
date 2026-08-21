@@ -20,8 +20,8 @@ both tools answer from it:
   3. ``graph``    — these test files import it (the graph's ``tested_by``
                     relation, derived here from the import edges the
                     knowledge-graph export labels the same way).
-  4. ``naming``   — no test references it, but a file named for it exists.
-                    A convention, not evidence, and labelled as such.
+  4. ``naming``   — no test references it, but an unambiguous file named for
+                    it exists. Possible evidence only: it never clears a gap.
   5. ``none``     — nothing found.
 
 The basis travels with the answer, because "12 tests import this" and "a file
@@ -40,9 +40,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from repowise.core.ingestion.models import NON_DEPENDENCY_EDGE_TYPES
 from repowise.core.persistence.models import GraphEdge, GraphNode
 
-#: Cap on the test files named in a payload. The count is always exact; the
-#: list is a run-list, and a hundred paths is not one.
-MAX_GUARDING_TESTS = 10
+#: Cap on definitive or possible test paths named in a payload. The count is
+#: always exact; the list is a run-list, and a hundred paths is not one.
+MAX_TEST_LINKS = 10
 
 
 @dataclass(frozen=True)
@@ -50,24 +50,28 @@ class TestLinkage:
     """What guards *file_path*, and on what evidence."""
 
     file_path: str
-    #: Test files that guard this one, sorted, capped at MAX_GUARDING_TESTS.
+    #: Guarding or possible test files, sorted and capped at MAX_TEST_LINKS.
     tests: list[str] = field(default_factory=list)
-    #: Total guarding tests found, before the cap.
+    #: Total linked test paths found, before the cap.
     total: int = 0
     #: ``self`` | ``coverage`` | ``graph`` | ``naming`` | ``none``.
     basis: str = "none"
 
     @property
     def tested(self) -> bool:
-        """Whether anything tests this file. ``test_gap`` is the negation."""
-        return self.basis != "none"
+        """Whether authoritative evidence proves this file is tested."""
+        return self.basis in {"self", "coverage", "graph"}
 
     def as_payload(self) -> dict:
         """The additive block both tools attach to a file's card."""
         out: dict = {"tested": self.tested, "test_linkage_basis": self.basis}
         if self.tests:
-            out["guarding_tests"] = self.tests
-            out["guarding_test_count"] = self.total
+            if self.tested:
+                out["guarding_tests"] = self.tests
+                out["guarding_test_count"] = self.total
+            else:
+                out["possible_tests"] = self.tests
+                out["possible_test_count"] = self.total
         return out
 
 
@@ -188,7 +192,32 @@ async def _named_tests(session: AsyncSession, repo_id: str, file_path: str) -> l
     stem = posixpath.splitext(posixpath.basename(file_path.replace("\\", "/")))[0]
     if not stem:
         return []
-    return sorted(set((await _tests_by_subject(session, repo_id)).get(stem.lower(), [])))
+    tests = sorted(set((await _tests_by_subject(session, repo_id)).get(stem.lower(), [])))
+    if not tests:
+        return []
+
+    # A basename convention cannot attribute ``test_graph.py`` when several
+    # unrelated source trees contain ``graph.py``. Suppress the candidate
+    # rather than making a package-affinity guess: naming evidence is already
+    # weaker than a graph/coverage edge, and a false guard is the costly error.
+    source_res = await session.execute(
+        select(GraphNode.node_id).where(
+            GraphNode.repository_id == repo_id,
+            GraphNode.node_type == "file",
+            GraphNode.is_test.is_not(True),
+        )
+    )
+    normalized_target = file_path.replace("\\", "/")
+    same_stem_sources = {
+        node_id.replace("\\", "/")
+        for (node_id,) in source_res.all()
+        if node_id
+        and posixpath.splitext(posixpath.basename(node_id.replace("\\", "/")))[0].lower()
+        == stem.lower()
+    }
+    if any(source != normalized_target for source in same_stem_sources):
+        return []
+    return tests
 
 
 async def resolve_test_linkage(session: AsyncSession, repo_id: str, file_path: str) -> TestLinkage:
@@ -213,7 +242,7 @@ async def resolve_test_linkage(session: AsyncSession, repo_id: str, file_path: s
         if tests:
             return TestLinkage(
                 file_path=file_path,
-                tests=tests[:MAX_GUARDING_TESTS],
+                tests=tests[:MAX_TEST_LINKS],
                 total=len(tests),
                 basis=basis,
             )

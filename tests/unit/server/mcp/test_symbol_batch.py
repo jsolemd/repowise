@@ -135,6 +135,8 @@ async def test_batch_carries_ambiguity_per_item(setup_mcp, repo_on_disk, batch_s
 
     result = await get_symbol(["beta", "alpha"])
 
+    assert result["resolved_count"] == 1
+    assert result["ambiguous_count"] == 1
     assert result["results"][0]["symbol_id"] == "pkg/batch.py::beta"
     assert result["results"][1]["status"] == "ambiguous"
     assert result["results"][1]["match_count"] == 2
@@ -174,3 +176,70 @@ async def test_empty_list_is_the_missing_argument_error(setup_mcp, repo_on_disk)
     result = await get_symbol([])
 
     assert "symbol_id is required" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_one_item_batch_preserves_single_call_freshness(
+    setup_mcp, repo_on_disk, batch_symbols
+):
+    from repowise.server.mcp_server import get_symbol
+
+    target = "pkg/batch.py::alpha"
+    single = await get_symbol(target)
+    batch = await get_symbol([target])
+    freshness_keys = {
+        "index_age_days",
+        "indexed_commit",
+        "live_head",
+        "index_behind",
+        "stale_warning",
+    }
+
+    assert {key: value for key, value in batch["_meta"].items() if key in freshness_keys} == {
+        key: value for key, value in single["_meta"].items() if key in freshness_keys
+    }
+    assert all("_meta" not in item for item in batch["results"])
+
+
+@pytest.mark.asyncio
+async def test_batch_rebuilds_freshness_over_canonical_files_and_names_stale_targets(
+    setup_mcp, repo_on_disk, batch_symbols, session, monkeypatch
+):
+    import repowise.server.mcp_server._meta as meta_mod
+    from repowise.server.mcp_server import get_symbol
+
+    other_path = repo_on_disk / "pkg" / "other.py"
+    other_path.write_text('def delta():\n    return "d"\n')
+    repo = (await session.execute(select(Repository))).scalars().first()
+    repo.head_commit = "a" * 40
+    session.add(
+        WikiSymbol(
+            id="batch-other",
+            repository_id=repo.id,
+            file_path="pkg/other.py",
+            symbol_id="pkg/other.py::delta",
+            name="delta",
+            qualified_name="pkg.other.delta",
+            kind="function",
+            signature="def delta()",
+            start_line=1,
+            end_line=2,
+            language="python",
+        )
+    )
+    await session.flush()
+    monkeypatch.setattr(meta_mod, "resolve_indexed_commit", lambda *_: "a" * 40)
+    monkeypatch.setattr(meta_mod, "read_live_head", lambda *_: "b" * 40)
+    monkeypatch.setattr(
+        meta_mod,
+        "_changed_files_between",
+        lambda *_: frozenset({"pkg/batch.py"}),
+    )
+
+    result = await get_symbol(["alpha", "delta"])
+
+    assert result["resolved_count"] == 2
+    assert result["ambiguous_count"] == 0
+    assert result["_meta"]["stale_warning"].startswith("A file this response serves changed")
+    assert result["_meta"]["stale_targets"] == ["pkg/batch.py"]
+    assert all("_meta" not in item for item in result["results"])

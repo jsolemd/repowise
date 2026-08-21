@@ -218,6 +218,7 @@ async def test_test_gap_pattern_treats_an_underscore_as_a_literal(session, repo_
     tested when nothing tests it, in the directive block reviewers read first.
     """
     from repowise.core.persistence.models import GraphNode
+    from repowise.server.mcp_server._test_linkage import resolve_test_linkage
     from repowise.server.mcp_server.tool_risk.assessment import _check_test_gap
 
     session.add(
@@ -246,4 +247,9 @@ async def test_test_gap_pattern_treats_an_underscore_as_a_literal(session, repo_
         )
     )
     await session.flush()
-    assert await _check_test_gap(session, repo_id, "src/my_module.py") is False
+    # A correctly named file is possible evidence, not proof: naming alone
+    # must not clear the risk gap. It still proves the underscore was treated
+    # literally because only the real candidate is surfaced.
+    linkage = await resolve_test_linkage(session, repo_id, "src/my_module.py")
+    assert await _check_test_gap(session, repo_id, "src/my_module.py") is True
+    assert linkage.as_payload()["possible_tests"] == ["tests/test_my_module.py"]

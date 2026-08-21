@@ -28,7 +28,8 @@ match, the whole target is retried as a path-less name: an exact qualified
 name, a qualified tail (``Class.method``), a bare name, and finally the same
 ladder case-folded. A total miss returns ``suggestions`` (real path-qualified
 ids) instead of a bare "not found", and a target matching several symbols
-returns ``status: "ambiguous"`` with every match rather than a picked one.
+returns ``status: "ambiguous"`` with an exact total and candidates rather than
+a picked one.
 
 A list of targets is served in one call as ``{"results": [...]}``, request
 order preserved; the reply to a single target is unchanged.
@@ -148,6 +149,19 @@ _MAX_CALLEE_BODY_LINES = 150
 # response is large enough that the agent is really asking for the file, and
 # ``get_context(include=["skeleton"])`` answers that in one call instead.
 _MAX_BATCH_TARGETS = 20
+
+# Path-qualified ambiguity existed before name lookup did. Preserve that
+# public envelope: overload bodies remain available regardless of how many
+# rows share the exact/path-qualified id. The candidate-only cap belongs to
+# the newly accepted path-less name forms.
+_PATH_QUALIFIED_RUNGS = frozenset({"symbol_id", "file_qualified_name", "file_name", "path_suffix"})
+
+# Repository freshness fields that justify rebuilding the batch envelope with
+# a Repository row. Omission-only batches deliberately carry none of these,
+# matching their single-call shape.
+_FRESHNESS_META_KEYS = frozenset(
+    {"index_age_days", "indexed_commit", "live_head", "index_behind", "stale_warning"}
+)
 
 
 async def _expand_callees(
@@ -577,8 +591,9 @@ async def _render_ambiguous(
     candidates: list[dict] = []
     not_rendered: list[dict] = []
     remaining = _AMBIGUITY_CHAR_BUDGET
-    listed = rows[:MAX_AMBIGUITY_CANDIDATES]
-    with_bodies = len(rows) <= _MAX_AMBIGUITY_BODIES
+    path_qualified = match.rung in _PATH_QUALIFIED_RUNGS
+    listed = rows if path_qualified else rows[:MAX_AMBIGUITY_CANDIDATES]
+    with_bodies = path_qualified or match.total_count <= _MAX_AMBIGUITY_BODIES
 
     for i, row in enumerate(listed):
         entry: dict[str, Any] = {
@@ -622,13 +637,14 @@ async def _render_ambiguous(
 
     if with_bodies:
         note = (
-            f"{len(rows)} symbols match this id (overloads, re-exports, or "
-            "conditional definitions). All candidate bodies are included — "
-            "none was silently chosen; pick by signature and line range."
+            f"{match.total_count} symbols match this id (overloads, re-exports, or "
+            "conditional definitions). Candidate bodies are included where source "
+            "is available and the response budget permits; none was silently chosen. "
+            "Pick by signature and line range."
         )
     else:
         note = (
-            f"{len(rows)} symbols match {symbol_id!r} — too many to serve bodies for, "
+            f"{match.total_count} symbols match {symbol_id!r} — too many to serve bodies for, "
             "and none was chosen for you. Call get_symbol again with the "
             "``fetch_with`` id of the one you meant, or qualify the name "
             "(Class.method) to narrow it here."
@@ -637,7 +653,7 @@ async def _render_ambiguous(
         "symbol_id": symbol_id,
         "status": match.status,
         "ambiguous": True,
-        "match_count": len(rows),
+        "match_count": match.total_count,
         "candidates": candidates,
         "note": note,
         "_meta": _build_meta(
@@ -648,7 +664,7 @@ async def _render_ambiguous(
     }
     if match.rung:
         response["resolution"] = match.rung
-    if len(rows) > len(listed) or match.truncated:
+    if match.total_count > len(listed):
         response["note"] += f" Only the first {len(listed)} of them are listed."
     if not_rendered:
         response["not_rendered"] = not_rendered
@@ -686,9 +702,11 @@ async def get_symbol(
     line-numbered format; treat it as an already-performed Read. ``verified:
     true`` = bounds checked against the live file, no follow-up Read needed;
     ``bounds: "approximate"`` = the symbol moved and re-location failed.
-    ``status: "ambiguous"`` = several symbols match, all in ``candidates``,
-    none chosen for you. ``truncated`` brings a ``continuation`` token: the
-    range read that fetches the rest, passed straight back here.
+    ``status: "ambiguous"`` = several symbols match, with exact
+    ``match_count`` and bounded candidates, none chosen for you. Path-qualified
+    overloads retain all candidate bodies subject to the byte budget.
+    ``truncated`` brings a ``continuation`` token: the range read that fetches
+    the rest, passed straight back here.
 
     Args:
         symbol_id: one target, or a list of up to 20 for one round trip
@@ -741,6 +759,32 @@ def _normalize_targets(raw: str | list[str] | None) -> tuple[list[str], list[str
     return cleaned[:_MAX_BATCH_TARGETS], cleaned[_MAX_BATCH_TARGETS:]
 
 
+def _canonical_served_file_targets(item: dict[str, Any]) -> set[str]:
+    """Canonical file paths represented by one successful item response.
+
+    A resolved/range/live-grep result has one top-level ``file``. Ambiguity
+    responses carry their files on candidate rows, including rows whose bodies
+    exceeded the byte budget. Errors are not served file content and therefore
+    do not widen the batch freshness scope.
+    """
+    paths: set[str] = set()
+    if item.get("error") is None:
+        file_path = item.get("file")
+        if isinstance(file_path, str) and file_path:
+            paths.add(file_path)
+        for key in ("candidates", "not_rendered"):
+            entries = item.get(key)
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                candidate_file = entry.get("file")
+                if isinstance(candidate_file, str) and candidate_file:
+                    paths.add(candidate_file)
+    return paths
+
+
 async def _serve_batch(
     targets: list[str],
     over_cap: list[str],
@@ -752,28 +796,60 @@ async def _serve_batch(
 ) -> dict:
     """Serve a list of targets in request order, one response.
 
-    Per-item ``_meta`` is folded into the envelope's: repeating the same
-    freshness and embedder block 20 times is pure duplication in the agent's
-    context, and the only per-item field worth keeping is the declared
-    counterfactual, which sums.
+    Per-item ``_meta`` is folded into one truthful envelope: repository
+    freshness is rebuilt over the union of canonical served files, target-
+    scoped warnings contribute ``stale_targets``, and counterfactual tokens
+    sum. Repeating the same freshness/embedder block per item is pure context
+    duplication.
     """
     results: list[dict] = []
+    item_metas: list[dict[str, Any]] = []
+    served_files: set[str] = set()
+    stale_targets: set[str] = set()
     replaced = 0
     for target in targets:
         item = await _serve_symbol(target, context_lines, query, depth, ctx, t0)
+        item_files = _canonical_served_file_targets(item)
+        served_files.update(item_files)
         meta = item.pop("_meta", None)
         if isinstance(meta, dict):
+            item_metas.append(meta)
             declared = meta.get("replaced_tokens")
             if isinstance(declared, int):
                 replaced += declared
+            warning = meta.get("stale_warning")
+            if (
+                isinstance(warning, str)
+                and warning.startswith("A file this response serves changed")
+                and len(item_files) == 1
+            ):
+                stale_targets.update(item_files)
         item.setdefault("target", target)
         results.append(item)
 
+    repository = None
+    if any(_FRESHNESS_META_KEYS.intersection(meta) for meta in item_metas):
+        async with get_session(ctx.session_factory) as session:
+            repository = await _get_repo(session)
+    outer_meta = _build_meta(
+        timing_ms=(time.perf_counter() - t0) * 1000,
+        repository=repository,
+        targets=sorted(served_files) if served_files else None,
+    )
+    if stale_targets and "stale_warning" in outer_meta:
+        outer_meta["stale_targets"] = sorted(stale_targets)
+
+    ambiguous_count = sum(1 for result in results if result.get("status") == "ambiguous")
     response: dict[str, Any] = {
         "results": results,
         "count": len(results),
-        "resolved_count": sum(1 for r in results if r.get("error") is None),
-        "_meta": _build_meta(timing_ms=(time.perf_counter() - t0) * 1000),
+        "resolved_count": sum(
+            1
+            for result in results
+            if result.get("error") is None and result.get("status") != "ambiguous"
+        ),
+        "ambiguous_count": ambiguous_count,
+        "_meta": outer_meta,
     }
     if over_cap:
         # Serve what fits and say what did not, rather than rejecting the call:
@@ -826,12 +902,17 @@ async def _serve_symbol(
     # more of the chain, and the useful reply is the deepest walk we will do.
     depth = max(1, min(_MAX_CALLEE_DEPTH, depth))
 
+    exclude_spec = _get_exclude_spec(ctx.path)
     async with get_session(ctx.session_factory) as session:
         repository = await _get_repo(session)
-        match = await resolve_symbol_match(session, repository.id, symbol_id)
+        match = await resolve_symbol_match(
+            session,
+            repository.id,
+            symbol_id,
+            eligible=lambda row: not is_excluded(row.file_path, exclude_spec),
+        )
 
-    exclude_spec = _get_exclude_spec(ctx.path)
-    rows = [r for r in match.rows if not is_excluded(r.file_path, exclude_spec)]
+    rows = match.rows
     if not rows:
         # Dead-end recovery: constants/imports/aliases between indexed
         # symbols miss the index but live in the file — grep the live file
@@ -898,7 +979,7 @@ async def _serve_symbol(
             ),
         }
 
-    if len(rows) > 1:
+    if match.status == "ambiguous":
         return await _render_ambiguous(rows, symbol_id, ctx, repository, t0, context_lines, match)
 
     row = rows[0]

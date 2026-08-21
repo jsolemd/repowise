@@ -469,9 +469,7 @@ async def _resolve_metrics(
             # Degree is "how connected is this symbol", so it stays over every
             # use edge type even though `callers` narrowed to calls. Matching
             # `routers/graph/intelligence.py`, which reports the same number.
-            _SYMBOL_USE_EDGE_TYPES
-            if node.node_type == "symbol"
-            else _FILE_DEPENDENCY_EDGE_TYPES
+            _SYMBOL_USE_EDGE_TYPES if node.node_type == "symbol" else _FILE_DEPENDENCY_EDGE_TYPES
         ),
     )
 
@@ -650,7 +648,7 @@ async def _resolve_health(
         health["has_test_file_note"] = (
             f"has_test_file is the paired-filename heuristic behind the health score; "
             f"the file's actual test linkage is tested={linkage.tested} "
-            f"(basis={linkage.basis}) — see the card's guarding_tests."
+            f"(basis={linkage.basis}) — see the card's test-linkage fields."
         )
     if coverage_row is not None:
         health["coverage"] = {

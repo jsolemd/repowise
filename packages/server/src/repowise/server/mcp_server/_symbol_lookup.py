@@ -16,8 +16,9 @@ Three target forms are accepted, in the order an agent tends to have them:
 Forms 2 and 3 are the ones the agent has *before* it has talked to the index,
 so refusing them costs a round trip (and an agent that gets "not found" for a
 name it can see in the source stops trusting the tool). They resolve through
-the same ladder, and a query matching several symbols returns every match:
-the caller decides, and nothing is silently picked for it.
+the same ladder, and a query matching several symbols returns an exact total
+plus a bounded candidate sample: the caller decides, and nothing is silently
+picked for it.
 
 Separator normalisation is the load-bearing part. Languages disagree about
 what goes between the segments of a qualified name. Python and TypeScript
@@ -31,12 +32,13 @@ matched as given, since ``.`` and ``/`` are meaningful inside them.
 
 from __future__ import annotations
 
-import re
+import posixpath
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from sqlalchemy import or_, select
 
+from repowise.core.ingestion.languages.registry import REGISTRY
 from repowise.core.persistence.models import WikiSymbol
 from repowise.core.persistence.sql import LIKE_ESCAPE, escape_like
 
@@ -55,10 +57,11 @@ NAME_MATCH_LIMIT = 200
 #: Shared so get_symbol and get_context list the same ambiguity the same way.
 MAX_AMBIGUITY_CANDIDATES = 20
 
-#: A trailing source-file extension. Lowercase by convention in every language
-#: repowise indexes, which is what separates ``mod.py`` (a path) from ``Foo.Bar``
-#: (a nested scope) in the segment before ``::``.
-_FILE_EXTENSION_RE = re.compile(r"\.[a-z0-9]{1,6}$")
+#: File syntax comes from the same registry that decides what RepoWise indexes.
+#: A length-based regex classified dotted module scopes such as ``infra.zotero``
+#: as files merely because ``zotero`` was six letters long.
+_INDEXED_EXTENSIONS = frozenset(ext.casefold() for ext in REGISTRY.all_extensions())
+_SPECIAL_FILENAMES = frozenset(REGISTRY.all_special_filenames())
 
 
 def asserts_file_path(target: str) -> bool:
@@ -73,7 +76,11 @@ def asserts_file_path(target: str) -> bool:
     head, sep, _ = target.partition("::")
     if not sep:
         return False
-    return "/" in head or "\\" in head or bool(_FILE_EXTENSION_RE.search(head))
+    if "/" in head or "\\" in head:
+        return True
+    filename = posixpath.basename(head.replace("\\", "/"))
+    _stem, extension = posixpath.splitext(filename)
+    return extension.casefold() in _INDEXED_EXTENSIONS or filename in _SPECIAL_FILENAMES
 
 
 def parse_symbol_id(symbol_id: str) -> tuple[str | None, str | None]:
@@ -189,15 +196,44 @@ def order_name_candidates(rows: list[WikiSymbol]) -> list[WikiSymbol]:
     return sorted(rows, key=lambda r: (r.file_path or "", r.start_line or 0, r.symbol_id or ""))
 
 
-async def _match_name_rung(session, repo_id: str, condition, limit: int) -> list[WikiSymbol]:
-    """Run one rung of the name ladder and return its rows."""
-    res = await session.execute(
+SymbolEligibility = Callable[[WikiSymbol], bool]
+
+
+async def _match_name_rung(
+    session,
+    repo_id: str,
+    condition,
+    limit: int,
+    *,
+    is_exact: SymbolEligibility | None = None,
+    eligible: SymbolEligibility | None = None,
+) -> tuple[list[WikiSymbol], int]:
+    """Return a capped row sample and the exact eligible total for one rung.
+
+    Case validation and runtime exclusions are Python predicates, so a SQL
+    ``COUNT`` would count a different population. Stream the narrowed query in
+    deterministic chunks, retain only the display sample, and count every row
+    that can actually be served. This keeps truthful totals without loading a
+    common name's complete ORM result into memory.
+    """
+    stmt = (
         select(WikiSymbol)
         .where(WikiSymbol.repository_id == repo_id, condition)
         .order_by(WikiSymbol.file_path, WikiSymbol.start_line, WikiSymbol.symbol_id)
-        .limit(limit)
+        .execution_options(yield_per=256)
     )
-    return list(res.scalars().all())
+    stream = await session.stream_scalars(stmt)
+    rows: list[WikiSymbol] = []
+    total = 0
+    async for row in stream:
+        if is_exact is not None and not is_exact(row):
+            continue
+        if eligible is not None and not eligible(row):
+            continue
+        total += 1
+        if len(rows) < limit:
+            rows.append(row)
+    return rows, total
 
 
 def _eq(column, value: str, *, ignore_case: bool):
@@ -289,8 +325,9 @@ async def resolve_name_rows(
     query: str,
     *,
     limit: int = NAME_MATCH_LIMIT,
-) -> tuple[list[WikiSymbol], str | None]:
-    """Resolve a path-less name query. Returns ``(rows, rung)``.
+    eligible: SymbolEligibility | None = None,
+) -> tuple[list[WikiSymbol], str | None, int]:
+    """Resolve a path-less name query. Returns ``(rows, rung, total)``.
 
     Walks :func:`_name_rungs` case-sensitively and returns the first rung that
     produced rows. Only when the whole ladder comes back empty is it walked
@@ -307,25 +344,33 @@ async def resolve_name_rows(
     them was asked for.
     """
     if not query:
-        return [], None
+        return [], None, 0
     for ignore_case in (False, True):
         for rung, condition, is_exact in _name_rungs(query, ignore_case=ignore_case):
-            rows = await _match_name_rung(session, repo_id, condition, limit)
-            if not ignore_case:
-                rows = [r for r in rows if is_exact(r)]
-            if rows:
-                return order_name_candidates(rows), (f"{rung}_ci" if ignore_case else rung)
-    return [], None
+            rows, total = await _match_name_rung(
+                session,
+                repo_id,
+                condition,
+                limit,
+                is_exact=None if ignore_case else is_exact,
+                eligible=eligible,
+            )
+            if total:
+                return (
+                    order_name_candidates(rows),
+                    f"{rung}_ci" if ignore_case else rung,
+                    total,
+                )
+    return [], None, 0
 
 
 @dataclass(frozen=True)
 class SymbolMatch:
     """The outcome of resolving one symbol target, with how it was reached.
 
-    ``rows`` is every symbol the winning rung matched — never pre-collapsed to
-    one. ``status`` is what the caller reports: a lookup matching several
-    symbols is ``"ambiguous"``, and answering it with a single body would be a
-    guess dressed as an answer.
+    ``rows`` is the bounded, materialized candidate sample. ``total_count`` is
+    the exact eligible population of the winning rung, independent of that
+    cap. ``status`` therefore never mistakes a capped result for the total.
     """
 
     query: str
@@ -336,18 +381,29 @@ class SymbolMatch:
     #: reached only by case-folding, which is worth reporting: an agent that
     #: asked for ``helper`` and got ``HELPER`` should be told why.
     rung: str | None = None
-    #: True when the winning rung matched more rows than the cap allowed.
-    truncated: bool = False
+    #: Exact eligible matches in the winning rung, before the display cap.
+    total_count: int = 0
+
+    def __post_init__(self) -> None:
+        # Ad-hoc callers (the get_context substring fallback) can omit the
+        # field when their complete result is already materialized.
+        if self.total_count < len(self.rows):
+            object.__setattr__(self, "total_count", len(self.rows))
+
+    @property
+    def truncated(self) -> bool:
+        """Whether the exact population is larger than ``rows``."""
+        return self.total_count > len(self.rows)
 
     @property
     def status(self) -> str:
         """``resolved`` | ``ambiguous`` | ``not_found`` — what the tool reports."""
-        if not self.rows:
+        if not self.total_count:
             return "not_found"
-        return "ambiguous" if len(self.rows) > 1 else "resolved"
+        return "ambiguous" if self.total_count > 1 else "resolved"
 
     def candidates(self) -> list[dict]:
-        """The structured ambiguity payload: one metadata entry per match."""
+        """Structured metadata for each materialized candidate."""
         return [
             {
                 "symbol_id": r.symbol_id,
@@ -367,6 +423,7 @@ async def resolve_symbol_match(
     target: str,
     *,
     limit: int = NAME_MATCH_LIMIT,
+    eligible: SymbolEligibility | None = None,
 ) -> SymbolMatch:
     """Resolve *target* in any accepted form and report how it resolved.
 
@@ -377,29 +434,30 @@ async def resolve_symbol_match(
     file path, which resolves nothing, and the name ladder then matches the
     qualified tail.
     """
-    rows, rung = await _resolve_path_qualified(session, repo_id, target)
+    rows, rung = await _resolve_path_qualified(session, repo_id, target, eligible=eligible)
     if rows or asserts_file_path(target):
-        return SymbolMatch(query=target, rows=rows, rung=rung)
+        return SymbolMatch(query=target, rows=rows, rung=rung, total_count=len(rows))
 
-    name_rows, name_rung = await resolve_name_rows(session, repo_id, target, limit=limit)
+    name_rows, name_rung, total_count = await resolve_name_rows(
+        session, repo_id, target, limit=limit, eligible=eligible
+    )
     return SymbolMatch(
         query=target,
         rows=name_rows,
         rung=name_rung,
-        truncated=len(name_rows) >= limit,
+        total_count=total_count,
     )
 
 
 async def resolve_symbol_rows(session, repo_id: str, symbol_id: str) -> list[WikiSymbol]:
     """Look up a symbol by id, qualified name, or bare name.
 
-    Returns every row the first matching lookup stage produced, best match
-    first (see :func:`order_candidates`); ``[]`` when nothing matched. A
+    Returns the bounded row sample from the first matching lookup stage, best
+    match first (see :func:`order_candidates`); ``[]`` when nothing matched. A
     multi-row result means the target is genuinely ambiguous — overloads,
     re-exports, conditional defs, or simply a common leaf name — and the
     caller decides how to present that rather than having a guess made for it.
-    :func:`resolve_symbol_match` is the same ladder with the rung and the
-    ambiguity status attached.
+    Use :func:`resolve_symbol_match` when the exact total/status is required.
 
     Language-agnostic: the qualified-name portion of the target is normalized
     across ``.``, ``::`` and ``/`` separators before matching, so callers can
@@ -411,7 +469,11 @@ async def resolve_symbol_rows(session, repo_id: str, symbol_id: str) -> list[Wik
 
 
 async def _resolve_path_qualified(
-    session, repo_id: str, symbol_id: str
+    session,
+    repo_id: str,
+    symbol_id: str,
+    *,
+    eligible: SymbolEligibility | None = None,
 ) -> tuple[list[WikiSymbol], str | None]:
     """The path-qualified half of the ladder. Returns ``(rows, rung)``."""
     file_path, name = parse_symbol_id(symbol_id)
@@ -423,7 +485,7 @@ async def _resolve_path_qualified(
             WikiSymbol.symbol_id.in_(symbol_id_variants(symbol_id)),
         )
     )
-    rows = list(res.scalars().all())
+    rows = [r for r in res.scalars().all() if eligible is None or eligible(r)]
     if rows:
         return order_candidates(rows, file_path), "symbol_id"
 
@@ -441,7 +503,7 @@ async def _resolve_path_qualified(
                 WikiSymbol.qualified_name.in_(variants),
             )
         )
-        rows = list(res.scalars().all())
+        rows = [r for r in res.scalars().all() if eligible is None or eligible(r)]
         if rows:
             return order_candidates(rows, file_path), "file_qualified_name"
 
@@ -453,7 +515,7 @@ async def _resolve_path_qualified(
                 WikiSymbol.name == bare_name(name),
             )
         )
-        rows = list(res.scalars().all())
+        rows = [r for r in res.scalars().all() if eligible is None or eligible(r)]
         if rows:
             return order_candidates(rows, file_path), "file_name"
 
@@ -474,7 +536,7 @@ async def _resolve_path_qualified(
                 ),
             )
         )
-        rows = list(res.scalars().all())
+        rows = [r for r in res.scalars().all() if eligible is None or eligible(r)]
         if rows:
             return order_candidates(rows, file_path), "path_suffix"
 

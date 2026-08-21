@@ -367,8 +367,9 @@ async def _assess_one_target(
 
     Enriches each result with:
     - test_gap: bool — True when nothing tests this file (see _test_linkage).
-    - tested / test_linkage_basis / guarding_tests: the evidence test_gap was
-      derived from — the same block get_context reports, from the same source.
+    - tested / test_linkage_basis and guarding_tests or possible_tests: the
+      evidence test_gap was derived from — the same block get_context reports,
+      from the same source. Naming-only possibilities never clear the gap.
     - security_signals: list of {kind, severity, snippet} from security_findings.
     """
     repo_id = repository.id

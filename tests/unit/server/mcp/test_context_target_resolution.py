@@ -95,6 +95,44 @@ async def test_ambiguous_name_is_labelled_not_silently_picked(setup_mcp, session
     assert "candidates" in card["note"]
 
 
+@pytest.mark.parametrize("count", [10, 11, 20, 21])
+@pytest.mark.asyncio
+async def test_substring_ambiguity_materializes_the_documented_candidate_cap(
+    setup_mcp, session, count
+):
+    from repowise.server.mcp_server import get_context
+    from repowise.server.mcp_server._symbol_lookup import MAX_AMBIGUITY_CANDIDATES
+
+    for index in range(count):
+        session.add(
+            WikiSymbol(
+                id=f"substring-boundary-{count}-{index}",
+                repository_id="repo1",
+                file_path=f"src/generated/needle_{index}.py",
+                symbol_id=f"src/generated/needle_{index}.py::needle_match_{index}",
+                name=f"needle_match_{index}",
+                qualified_name=f"generated.needle_match_{index}",
+                kind="function",
+                signature=f"def needle_match_{index}()",
+                start_line=1,
+                end_line=2,
+                language="python",
+            )
+        )
+    await session.flush()
+
+    card = (await get_context(["needle_match"]))["targets"]["needle_match"]
+
+    listed = min(count, MAX_AMBIGUITY_CANDIDATES)
+    assert card["status"] == "ambiguous"
+    assert card["match_count"] == count
+    assert len(card["candidates"]) == listed
+    if count > MAX_AMBIGUITY_CANDIDATES:
+        assert f"Only the first {listed} are listed" in card["note"]
+    else:
+        assert "Only the first" not in card["note"]
+
+
 @pytest.mark.asyncio
 async def test_unambiguous_target_carries_no_ambiguity_keys(setup_mcp):
     from repowise.server.mcp_server import get_context
@@ -167,3 +205,144 @@ async def test_module_targets_keep_their_opt_in_blocks(setup_mcp, session):
     assert "Use JWT for authentication" in card["decision_records"]
     # No file behind a module, so no test-linkage claim is made either way.
     assert "tested" not in card
+
+
+@pytest.mark.asyncio
+async def test_symbol_enrichments_use_the_canonical_resolved_target(
+    setup_mcp, health_data, session, tmp_path, monkeypatch
+):
+    import repowise.server.mcp_server as mcp_mod
+    from repowise.core.persistence.models import GraphEdge, GraphNode
+    from repowise.server.mcp_server import get_context
+
+    source_lines = ["# filler" for _ in range(100)]
+    source_lines[9] = "class AuthService:"
+    source_lines[19] = "    async def login(self, username, password):"
+    source_lines[20] = "        return username"
+    source_path = tmp_path / "src" / "auth" / "service.py"
+    source_path.parent.mkdir(parents=True)
+    source_path.write_text("\n".join(source_lines) + "\n")
+    monkeypatch.setattr(mcp_mod, "_repo_path", str(tmp_path))
+
+    canonical = "src/auth/service.py::login"
+    caller = "src/auth/caller.py::invoke"
+    callee = "src/auth/token.py::issue"
+    for node_id, name, file_path in (
+        (canonical, "login", "src/auth/service.py"),
+        (caller, "invoke", "src/auth/caller.py"),
+        (callee, "issue", "src/auth/token.py"),
+    ):
+        session.add(
+            GraphNode(
+                id=f"enrich-{name}",
+                repository_id="repo1",
+                node_id=node_id,
+                node_type="symbol",
+                language="python",
+                kind="method",
+                name=name,
+                qualified_name=name,
+                file_path=file_path,
+                start_line=20,
+                end_line=21,
+                pagerank=0.7,
+                betweenness=0.2,
+                community_id=1,
+            )
+        )
+    session.add_all(
+        [
+            GraphEdge(
+                id="enrich-caller-edge",
+                repository_id="repo1",
+                source_node_id=caller,
+                target_node_id=canonical,
+                edge_type="calls",
+                confidence=1.0,
+            ),
+            GraphEdge(
+                id="enrich-callee-edge",
+                repository_id="repo1",
+                source_node_id=canonical,
+                target_node_id=callee,
+                edge_type="calls",
+                confidence=1.0,
+            ),
+        ]
+    )
+    await session.flush()
+
+    include = ["callers", "callees", "metrics", "community", "health", "skeleton"]
+    spellings = [
+        canonical,
+        "AuthService.login",
+        "login",
+        "auth.service::AuthService::login",
+    ]
+    cards = {
+        target: (await get_context([target], include=include))["targets"][target]
+        for target in spellings
+    }
+
+    for target in spellings[1:]:
+        for key in include:
+            assert cards[target][key] == cards[canonical][key], (target, key)
+    assert cards[canonical]["callers"]
+    assert cards[canonical]["callees"]
+    assert cards[canonical]["metrics"] is not None
+    assert cards[canonical]["community"] is not None
+    assert cards[canonical]["health"] is not None
+    assert cards[canonical]["skeleton"]["tokens"] > 0
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_symbol_omits_unique_target_enrichment(setup_mcp, session):
+    from repowise.server.mcp_server import get_context
+
+    await _add_second_login(session)
+    requested = ["callers", "callees", "metrics", "community", "health", "skeleton"]
+    card = (await get_context(["login"], include=["docs", *requested]))["targets"]["login"]
+
+    assert card["status"] == "ambiguous"
+    assert card["docs"]["name"] == "login"
+    assert card["enrichment_omitted"] == sorted(requested)
+    assert all(key not in card for key in requested)
+    assert "cannot be attributed" in card["note"]
+
+
+@pytest.mark.asyncio
+async def test_context_symbol_lookup_filters_exclusions_before_selecting_a_card(
+    setup_mcp, session, tmp_path, monkeypatch
+):
+    import repowise.server.mcp_server as mcp_mod
+    from repowise.server.mcp_server import get_context
+
+    config_dir = tmp_path / ".repowise"
+    config_dir.mkdir()
+    (config_dir / "config.yaml").write_text("exclude_patterns:\n  - src/db/\n")
+    monkeypatch.setattr(mcp_mod, "_repo_path", str(tmp_path))
+    await _add_second_login(session)
+    session.add(
+        WikiSymbol(
+            id="sym-db-only",
+            repository_id="repo1",
+            file_path="src/db/models.py",
+            symbol_id="src/db/models.py::db_only",
+            name="db_only",
+            qualified_name="db.models.User.db_only",
+            kind="method",
+            signature="def db_only(self)",
+            start_line=30,
+            end_line=31,
+            language="python",
+        )
+    )
+    await session.flush()
+
+    visible = (await get_context(["login"]))["targets"]["login"]
+    excluded = (await get_context(["db.models.User.db_only"]))["targets"]["db.models.User.db_only"]
+
+    assert visible.get("status") != "ambiguous"
+    assert visible["docs"]["file_path"] == "src/auth/service.py"
+    assert "error" in excluded
+    assert "src/db/models.py" not in str(excluded)

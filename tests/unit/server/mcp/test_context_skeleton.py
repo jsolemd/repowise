@@ -92,12 +92,12 @@ async def test_skeleton_verifies_drifted_bounds(setup_mcp, tmp_path, monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_skeleton_requires_file_target(setup_mcp, tmp_path, monkeypatch):
+async def test_skeleton_rejects_module_without_a_single_file(setup_mcp, tmp_path, monkeypatch):
     from repowise.server.mcp_server import _state, get_context
 
     monkeypatch.setattr(_state, "_repo_path", str(tmp_path))
-    result = await get_context(["AuthService"], include=["skeleton"])
-    sk = result["targets"]["AuthService"]["skeleton"]
+    result = await get_context(["src/auth"], include=["skeleton"])
+    sk = result["targets"]["src/auth"]["skeleton"]
     assert "file target" in sk["error"]
 
 

@@ -112,6 +112,7 @@ async def test_qualified_name_resolves_in_every_separator_style(setup_mcp, repo_
         "Gatekeeper::signin",
         "Gatekeeper/signin",
         "pkg.auth.Gatekeeper.signin",
+        "pkg.auth::Gatekeeper::signin",
     ):
         result = await get_symbol(target)
         assert result.get("error") is None, target
@@ -280,3 +281,150 @@ async def test_qualified_suffix_is_case_sensitive_before_it_is_forgiving(
     folded = await get_symbol("GATEKEEPER.Signin")
     assert folded["status"] == "ambiguous"
     assert folded["resolution"].endswith("_ci")
+
+
+@pytest.mark.parametrize("count", [199, 200, 201])
+@pytest.mark.asyncio
+async def test_name_match_total_is_exact_at_the_materialization_cap(session, repo_id, count):
+    from repowise.server.mcp_server._symbol_lookup import (
+        NAME_MATCH_LIMIT,
+        resolve_symbol_match,
+    )
+
+    for i in range(count):
+        session.add(
+            WikiSymbol(
+                id=f"crowded-{count}-{i}",
+                repository_id=repo_id,
+                file_path=f"pkg/crowded_{i}.py",
+                symbol_id=f"pkg/crowded_{i}.py::crowded",
+                name="crowded",
+                qualified_name="crowded",
+                kind="function",
+                signature="def crowded()",
+                start_line=1,
+                end_line=1,
+                language="python",
+            )
+        )
+    await session.flush()
+
+    match = await resolve_symbol_match(session, repo_id, "crowded")
+
+    assert match.total_count == count
+    assert len(match.rows) == min(count, NAME_MATCH_LIMIT)
+    assert match.truncated is (count > NAME_MATCH_LIMIT)
+
+
+@pytest.mark.asyncio
+async def test_exact_case_total_excludes_case_folded_spillover_past_cap(session, repo_id):
+    from repowise.server.mcp_server._symbol_lookup import resolve_symbol_match
+
+    for i in range(26):
+        exact = i < 21
+        name = "crowded" if exact else "CROWDED"
+        session.add(
+            WikiSymbol(
+                id=f"case-count-{i}",
+                repository_id=repo_id,
+                file_path=f"pkg/case_{i}.py",
+                symbol_id=f"pkg/case_{i}.py::{name}",
+                name=name,
+                qualified_name=name,
+                kind="function",
+                signature=f"def {name}()",
+                start_line=1,
+                end_line=1,
+                language="python",
+            )
+        )
+    await session.flush()
+
+    exact = await resolve_symbol_match(session, repo_id, "crowded", limit=20)
+    folded = await resolve_symbol_match(session, repo_id, "CrOwDeD", limit=20)
+
+    assert exact.total_count == 21
+    assert len(exact.rows) == 20
+    assert exact.rung == "name"
+    assert folded.total_count == 26
+    assert len(folded.rows) == 20
+    assert folded.rung == "name_ci"
+
+
+@pytest.mark.asyncio
+async def test_exclusions_apply_before_total_and_cap(session, repo_id):
+    from repowise.server.mcp_server._symbol_lookup import resolve_symbol_match
+
+    for i in range(21):
+        session.add(
+            WikiSymbol(
+                id=f"eligible-count-{i}",
+                repository_id=repo_id,
+                file_path=f"{'excluded' if i == 0 else 'visible'}/item_{i}.py",
+                symbol_id=f"pkg/item_{i}.py::bounded",
+                name="bounded",
+                qualified_name="bounded",
+                kind="function",
+                signature="def bounded()",
+                start_line=1,
+                end_line=1,
+                language="python",
+            )
+        )
+    await session.flush()
+
+    match = await resolve_symbol_match(
+        session,
+        repo_id,
+        "bounded",
+        limit=20,
+        eligible=lambda row: not row.file_path.startswith("excluded/"),
+    )
+
+    assert match.total_count == 20
+    assert len(match.rows) == 20
+    assert match.truncated is False
+    assert all(not row.file_path.startswith("excluded/") for row in match.rows)
+
+
+@pytest.mark.parametrize(
+    ("target", "expected"),
+    [
+        ("pkg.api::handler", False),
+        ("infra.zotero::service::reconcile::ALL_PIPELINE_TAGS", False),
+        ("module.py::handler", True),
+        ("module.PY::handler", True),
+        ("Dockerfile::handler", True),
+        (r"pkg\\module.py::handler", True),
+    ],
+)
+def test_file_assertion_uses_registered_file_syntax(target, expected):
+    from repowise.server.mcp_server._symbol_lookup import asserts_file_path
+
+    assert asserts_file_path(target) is expected
+
+
+@pytest.mark.asyncio
+async def test_exclusions_apply_before_name_disambiguation(setup_mcp, repo_on_disk, session):
+    from repowise.server.mcp_server import get_symbol
+
+    config_dir = repo_on_disk / ".repowise"
+    config_dir.mkdir()
+    (config_dir / "config.yaml").write_text("exclude_patterns:\n  - pkg/admin.py\n")
+    admin_only = {
+        **ADMIN_SIGNIN,
+        "id": "admin-only",
+        "symbol_id": "pkg/admin.py::admin_only",
+        "name": "admin_only",
+        "qualified_name": "pkg.admin.admin_only",
+        "signature": "def admin_only()",
+    }
+    await _seed(session, [GATE_SIGNIN, ADMIN_SIGNIN, admin_only])
+
+    visible = await get_symbol("signin")
+    excluded = await get_symbol("pkg.admin.admin_only")
+
+    assert visible.get("status") != "ambiguous"
+    assert visible["symbol_id"] == GATE_SIGNIN["symbol_id"]
+    assert "error" in excluded
+    assert "pkg/admin.py" not in str(excluded)
