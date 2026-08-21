@@ -56,7 +56,17 @@ export const WORKSPACE_NAV: NavItem[] = [
   { label: "Co-Changes", href: "/workspace/co-changes", icon: GitMerge },
 ];
 
-export function repoNavGroups(repoId: string): NavGroup[] {
+/** Nav shaping that depends on what the deployment permits, not on the route. */
+export interface NavOptions {
+  /** Drop every generative destination. The server refuses those routes under
+   *  the hard no-generative policy, so navigating to one only reaches a notice. */
+  generativeDisabled?: boolean;
+}
+
+export function repoNavGroups(
+  repoId: string,
+  options: NavOptions = {},
+): NavGroup[] {
   const base = `/repos/${repoId}`;
   return [
     {
@@ -78,9 +88,15 @@ export function repoNavGroups(repoId: string): NavGroup[] {
         { label: "Decisions", href: `${base}/decisions`, icon: Lightbulb },
       ],
     },
-    {
-      items: [{ label: "Chat", href: `${base}/chat`, icon: MessageSquare }],
-    },
+    ...(options.generativeDisabled
+      ? []
+      : [
+          {
+            items: [
+              { label: "Chat", href: `${base}/chat`, icon: MessageSquare },
+            ],
+          },
+        ]),
     {
       label: "Settings",
       items: [
@@ -93,8 +109,11 @@ export function repoNavGroups(repoId: string): NavGroup[] {
 }
 
 /** Flat repo nav list (command palette, breadcrumb fallbacks, …). */
-export function repoNavItems(repoId: string): NavItem[] {
-  return repoNavGroups(repoId).flatMap((g) => g.items);
+export function repoNavItems(
+  repoId: string,
+  options: NavOptions = {},
+): NavItem[] {
+  return repoNavGroups(repoId, options).flatMap((g) => g.items);
 }
 
 export function isNavItemActive(item: NavItem, pathname: string): boolean {

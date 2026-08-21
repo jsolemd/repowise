@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
+from repowise.core.generative_policy import NO_GENERATIVE_ENV, generative_calls_disabled
 from repowise.core.persistence import crud
 from repowise.core.persistence.database import get_session
 from repowise.server.deps import resolve_session_factory, verify_api_key
@@ -116,6 +117,19 @@ async def validate_provider(
     rather than raising, so the UI renders a clean error state.
     """
     repo_path = await _repo_path_for(request, repo_id)
+
+    # The probe is a real ``generate`` round-trip, so the hard policy has to
+    # stop it here rather than let it be the one generative call that escapes.
+    # Reported through the existing ``{ok, error}`` shape, not as a status
+    # code: this endpoint's contract is that the UI always gets a renderable
+    # result, and a policy refusal is a result.
+    if generative_calls_disabled(repo_path):
+        return {
+            "ok": False,
+            "provider": provider_id,
+            "model": None,
+            "error": f"Disabled by deployment policy: {NO_GENERATIVE_ENV}=1",
+        }
 
     provider_name: str | None = None
     model_name: str | None = None

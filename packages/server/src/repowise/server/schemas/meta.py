@@ -23,6 +23,23 @@ class VersionResponse(BaseModel):
     reindex_command: str | None = None
 
 
+class DeploymentPolicyResponse(BaseModel):
+    """What this deployment forbids, so the UI never offers a refused action.
+
+    Deliberately cheap and free of index or provider work: the dashboard's root
+    layout fetches it server-side on every render, and an affordance that
+    appears and then disappears is worse than one that was never drawn.
+    """
+
+    #: True when the hard no-generative policy is in force. Every surface that
+    #: would reach a generative provider is refused server-side; the dashboard
+    #: reads this to avoid rendering those affordances at all.
+    generative_disabled: bool
+    #: The env var whose truthiness produced the answer, so an operator seeing
+    #: a missing feature can find the switch without reading the source.
+    generative_policy_source: str
+
+
 class ChangelogSectionModel(BaseModel):
     name: str
     items: list[str]

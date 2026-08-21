@@ -2,10 +2,68 @@
 // Health
 // ---------------------------------------------------------------------------
 
+/**
+ * What the source-search lane knows about its own freshness.
+ *
+ * Mirrors `SourceIndexStatus.to_dict()`. Present only when the source lane is
+ * enabled; `null` means the server is running without it, which is a different
+ * fact from an unhealthy lane and must be rendered differently.
+ */
+export interface SourceSearchHealth {
+  /** `current` | `stale` | `building` | `inconsistent` | `absent`. */
+  state: string;
+  degraded: boolean;
+  generation_id: string | null;
+  generation_sequence: number | null;
+  /** The commit the published generation was built from. */
+  indexed_commit: string | null;
+  /** Chunks the manifest says should exist, and what each store actually holds.
+   *  Three numbers that must agree; when they do not, that is the finding. */
+  expected_chunks: number | null;
+  fts_chunks: number | null;
+  vector_chunks: number | null;
+  /** Outbox queue depths after the active generation. */
+  pending_updates: number;
+  ready_updates: number;
+  building_updates: number;
+  blocked_updates: number;
+  /** Files whose last parse failed; their previous docs are still served. */
+  stale_files: Record<string, string>;
+  recipe_fingerprint: string | null;
+  fts_path: string | null;
+  lance_table: string | null;
+  integrity_errors: string[];
+  last_error: string | null;
+
+  // Identity and coverage detail. Optional because the server grew these
+  // fields after the block above; a dashboard talking to an older server gets
+  // the shorter payload and must render without them rather than showing
+  // "undefined" where a count belongs.
+  /** Chunks by lane: parsed symbols, and bounded windows over files the parser
+   *  does not cover. Their sum is `expected_chunks`. */
+  symbol_chunks?: number | null;
+  file_window_chunks?: number | null;
+  /** Distinct files represented in the published generation. */
+  files_covered?: number | null;
+  built_at?: string | null;
+  published_at?: string | null;
+  /** `ok` | `missing` | `unreadable`. A manifest that cannot be read is a
+   *  different fact from one that was never written. */
+  manifest_state?: string | null;
+  manifest_error?: string | null;
+  parser_fingerprint?: string | null;
+  embedder?: {
+    provider: string | null;
+    model: string | null;
+    dims: number | null;
+  } | null;
+}
+
 export interface HealthResponse {
   status: string;
   db: string;
   version: string;
+  source_search?: SourceSearchHealth | null;
 }
 
 // ---------------------------------------------------------------------------

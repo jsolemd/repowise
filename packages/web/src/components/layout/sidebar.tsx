@@ -26,6 +26,7 @@ import { ThemeToggle } from "@repowise-dev/ui/shared/theme-toggle";
 import { AddRepoDialog } from "@/components/repos/add-repo-dialog";
 import { VersionFooter } from "./version-footer";
 import { FeedbackButton } from "./feedback-button";
+import { useGenerativeDisabled } from "./deployment-policy-provider";
 import type { RepoResponse, WorkspaceResponse } from "@/lib/api/types";
 
 interface SidebarProps {
@@ -36,6 +37,7 @@ interface SidebarProps {
 
 export function Sidebar({ repos = [], activeRepoId, workspace }: SidebarProps) {
   const isWorkspace = workspace?.is_workspace ?? false;
+  const generativeDisabled = useGenerativeDisabled();
   const pathname = usePathname();
   const derivedActiveRepoId = React.useMemo(() => {
     if (activeRepoId) return activeRepoId;
@@ -202,7 +204,7 @@ export function Sidebar({ repos = [], activeRepoId, workspace }: SidebarProps) {
                 {repos.map((repo) => {
                   const isExpanded = expandedRepos.has(repo.id);
                   const isActive = derivedActiveRepoId === repo.id;
-                  const navGroups = repoNavGroups(repo.id);
+                  const navGroups = repoNavGroups(repo.id, { generativeDisabled });
                   // The server flags never-indexed repos (workspace members
                   // and plain registrations alike) with "needs_index";
                   // synthetic workspace entries additionally have "ws:" ids.

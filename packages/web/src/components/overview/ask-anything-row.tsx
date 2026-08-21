@@ -3,6 +3,8 @@
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { ArrowRight, Sparkles } from "lucide-react";
+import { OverviewSection } from "@repowise-dev/ui/overview";
+import { useGenerativeDisabled } from "@/components/layout/deployment-policy-provider";
 
 const PLACEHOLDER = "How does the incremental pipeline decide what to re-index?";
 
@@ -29,6 +31,7 @@ const SUGGESTIONS = [
  */
 export function AskAnythingRow({ repoId }: { repoId: string }) {
   const router = useRouter();
+  const generativeDisabled = useGenerativeDisabled();
   const [question, setQuestion] = useState("");
 
   function ask(q: string) {
@@ -36,6 +39,10 @@ export function AskAnythingRow({ repoId }: { repoId: string }) {
     if (!trimmed) return;
     router.push(`/repos/${repoId}/chat?q=${encodeURIComponent(trimmed)}`);
   }
+
+  // The one row on the overview that calls a model. Under the hard policy it
+  // has nowhere to go, so it does not appear rather than appearing and failing.
+  if (generativeDisabled) return null;
 
   return (
     <div className="flex flex-col gap-2.5">
@@ -91,5 +98,24 @@ export function AskAnythingRow({ repoId }: { repoId: string }) {
         ))}
       </div>
     </div>
+  );
+}
+
+/**
+ * The row plus the heading that exists only because the row does.
+ *
+ * The overview page used to supply the "Ask this codebase" section itself, so
+ * hiding the control under the hard no-generative policy left the heading
+ * behind with nothing under it. A heading is part of the affordance, not part
+ * of the page, so it lives here and disappears with it.
+ */
+export function AskAnythingSection({ repoId }: { repoId: string }) {
+  const generativeDisabled = useGenerativeDisabled();
+  if (generativeDisabled) return null;
+
+  return (
+    <OverviewSection title="Ask this codebase">
+      <AskAnythingRow repoId={repoId} />
+    </OverviewSection>
   );
 }

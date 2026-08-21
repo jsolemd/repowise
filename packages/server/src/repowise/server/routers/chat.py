@@ -10,6 +10,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Request
 from starlette.responses import StreamingResponse
 
+from repowise.core.generative_policy import NO_GENERATIVE_ENV, generative_calls_disabled
 from repowise.core.persistence import crud
 from repowise.core.persistence.database import get_session
 from repowise.core.providers.llm.base import ChatProvider, ProviderError
@@ -113,6 +114,16 @@ async def chat_messages(repo_id: str, body: ChatRequest, request: Request):
 
     # Resolve repo
     repo_name, repo_path = await _get_repo_info(factory, repo_id)
+
+    # Chat is the last surface that reaches a generative provider, and it sends
+    # repo content to reach it. Under the hard policy that is exactly the egress
+    # the deployment forbade, so refuse before resolving a provider. 409 and the
+    # env var by name, matching ``POST /api/repos/{id}/generate``.
+    if generative_calls_disabled(repo_path):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Chat disabled by deployment policy: {NO_GENERATIVE_ENV}=1",
+        )
     # In workspace mode the MCP tools address repos by alias, not by the id
     # in this URL, so resolve it once and scope every tool call to it.
     repo_alias = _workspace_alias(request, repo_path, repo_name)

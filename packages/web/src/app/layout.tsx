@@ -13,7 +13,10 @@ import { CommandPalette } from "@/components/search/command-palette";
 import { ContextDrawerShell } from "@/components/layout/context-drawer-provider";
 import { SWRProvider } from "@/components/layout/swr-provider";
 import { UpgradeBanner } from "@/components/layout/upgrade-banner";
+import { DeploymentPolicyProvider } from "@/components/layout/deployment-policy-provider";
 import { listRepos } from "@/lib/api/repos";
+import { getDeploymentPolicy } from "@/lib/api/meta";
+import type { DeploymentPolicy } from "@/lib/api/meta";
 import { getWorkspace } from "@/lib/api/workspace";
 import type { WorkspaceResponse } from "@/lib/api/types";
 import "@/styles/globals.css";
@@ -34,17 +37,22 @@ export default async function RootLayout({
 }: {
   children: React.ReactNode;
 }) {
-  // Fetch repos + workspace info server-side for the sidebar.
+  // Fetch repos + workspace info server-side for the sidebar, and the
+  // deployment policy alongside them so a forbidden affordance is never drawn
+  // and then withdrawn a moment later.
   // Gracefully fall back to empty/null if the API is unavailable.
   let repos: Awaited<ReturnType<typeof listRepos>> = [];
   let workspace: WorkspaceResponse | null = null;
+  let policy: DeploymentPolicy | null = null;
   try {
-    const [reposResult, wsResult] = await Promise.allSettled([
+    const [reposResult, wsResult, policyResult] = await Promise.allSettled([
       listRepos(),
       getWorkspace(),
+      getDeploymentPolicy(),
     ]);
     if (reposResult.status === "fulfilled") repos = reposResult.value;
     if (wsResult.status === "fulfilled") workspace = wsResult.value;
+    if (policyResult.status === "fulfilled") policy = policyResult.value;
   } catch {
     // API not available — show empty sidebar
   }
@@ -65,6 +73,7 @@ export default async function RootLayout({
         </a>
         <NuqsAdapter>
         <SWRProvider>
+        <DeploymentPolicyProvider policy={policy}>
         <TooltipProvider delayDuration={300}>
           <Suspense fallback={null}>
             <ContextDrawerShell>
@@ -97,6 +106,7 @@ export default async function RootLayout({
             </ContextDrawerShell>
           </Suspense>
         </TooltipProvider>
+        </DeploymentPolicyProvider>
         </SWRProvider>
         </NuqsAdapter>
         <ThemedToaster />

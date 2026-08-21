@@ -7,7 +7,7 @@ import { getStatsHighlights } from "@/lib/api/stats";
 import { getCommitsPage } from "@/lib/api/git";
 import { FirstIndexExperience } from "@/components/repos/first-index-experience";
 import { QuickActionsWrapper } from "@/components/dashboard/quick-actions-wrapper";
-import { AskAnythingRow } from "@/components/overview/ask-anything-row";
+import { AskAnythingSection } from "@/components/overview/ask-anything-row";
 import {
   AttentionRows,
   ChangeLine,
@@ -451,9 +451,7 @@ export default async function OverviewPage({ params }: Props) {
         </OverviewSection>
       )}
 
-      <OverviewSection title="Ask this codebase">
-        <AskAnythingRow repoId={id} />
-      </OverviewSection>
+      <AskAnythingSection repoId={id} />
 
       <OverviewSection title="Explore this codebase">
         <ExploreList entries={explore} LinkComponent={Link} />

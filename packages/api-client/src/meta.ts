@@ -17,6 +17,18 @@ export interface MetaVersion {
   reindex_command: string | null;
 }
 
+/**
+ * What this deployment forbids. Cheap enough to fetch on every render, and
+ * fetched server-side, so a disabled affordance is never drawn and then removed.
+ */
+export interface DeploymentPolicy {
+  /** True when the hard no-generative policy is in force. Every surface that
+   *  would reach a generative provider is refused server-side. */
+  generative_disabled: boolean;
+  /** The env var that produced the answer, so a missing feature is findable. */
+  generative_policy_source: string;
+}
+
 export interface ChangelogSection {
   name: string;
   items: string[];
@@ -35,6 +47,15 @@ export interface ChangelogData {
 export async function getMetaVersion(repoId?: string): Promise<MetaVersion> {
   return apiGet<MetaVersion>(
     "/api/meta/version",
+    repoId ? { repo_id: repoId } : undefined,
+  );
+}
+
+export async function getDeploymentPolicy(
+  repoId?: string,
+): Promise<DeploymentPolicy> {
+  return apiGet<DeploymentPolicy>(
+    "/api/meta/policy",
     repoId ? { repo_id: repoId } : undefined,
   );
 }

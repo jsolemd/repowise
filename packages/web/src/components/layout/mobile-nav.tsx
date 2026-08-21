@@ -18,6 +18,7 @@ import { Separator } from "@repowise-dev/ui/ui/separator";
 import { AddRepoDialog } from "@/components/repos/add-repo-dialog";
 import { VersionFooter } from "./version-footer";
 import { FeedbackButton } from "./feedback-button";
+import { useGenerativeDisabled } from "./deployment-policy-provider";
 import { cn } from "@/lib/utils/cn";
 import {
   GLOBAL_NAV,
@@ -34,6 +35,7 @@ interface MobileNavProps {
 
 export function MobileNav({ repos = [], workspace }: MobileNavProps) {
   const isWorkspace = workspace?.is_workspace ?? false;
+  const generativeDisabled = useGenerativeDisabled();
   const [open, setOpen] = React.useState(false);
   const pathname = usePathname();
   const activeRepoId = React.useMemo(() => {
@@ -169,7 +171,7 @@ export function MobileNav({ repos = [], workspace }: MobileNavProps) {
                   <div className="space-y-0.5">
                     {repos.map((repo) => {
                       const isExpanded = expandedRepos.has(repo.id);
-                      const navGroups = repoNavGroups(repo.id);
+                      const navGroups = repoNavGroups(repo.id, { generativeDisabled });
                       return (
                         <div key={repo.id}>
                           <button

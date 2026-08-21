@@ -13,6 +13,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, Depends, Request
 
+from repowise.core.generative_policy import NO_GENERATIVE_ENV, generative_calls_disabled
 from repowise.core.persistence import crud
 from repowise.core.persistence.database import get_session
 from repowise.core.upgrade import UpgradeTier, assess
@@ -23,6 +24,7 @@ from repowise.server.schemas import (
     ChangelogEntryModel,
     ChangelogResponse,
     ChangelogSectionModel,
+    DeploymentPolicyResponse,
     VersionResponse,
 )
 
@@ -70,6 +72,43 @@ async def _attach_store_status(resp: VersionResponse, repo_id: str, request: Req
         resp.reindex_command = verdict.reindex_command
     except Exception:
         return
+
+
+@router.get("/policy", response_model=DeploymentPolicyResponse)
+async def get_deployment_policy(
+    request: Request, repo_id: str | None = None
+) -> DeploymentPolicyResponse:
+    """Report what this deployment forbids, cheaply enough to fetch per render.
+
+    Reads environment and repo/workspace dotenv policy only — no index, no
+    provider, no network. ``repo_id`` narrows the answer to that repo; without
+    it the answer still consults the server's primary repo, because the policy
+    may live in a repo's own ``.repowise/.env`` and answering "allowed" from
+    process environment alone would have the dashboard offer a chat the server
+    then refuses.
+    """
+    repo_path: str | None = None
+    if repo_id:
+        try:
+            factory = resolve_session_factory(request.app.state, repo_id)
+            async with get_session(factory) as session:
+                repo = await crud.get_repository(session, repo_id)
+            repo_path = repo.local_path if repo else None
+        except Exception:
+            repo_path = None
+    if repo_path is None:
+        try:
+            from repowise.server.source_search_wiring import _repo_root_from_db_url
+
+            primary = _repo_root_from_db_url(getattr(request.app.state, "db_url", "") or "")
+            repo_path = str(primary) if primary is not None else None
+        except Exception:
+            repo_path = None
+
+    return DeploymentPolicyResponse(
+        generative_disabled=generative_calls_disabled(repo_path),
+        generative_policy_source=NO_GENERATIVE_ENV,
+    )
 
 
 @router.get("/changelog", response_model=ChangelogResponse)

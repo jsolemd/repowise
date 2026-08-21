@@ -131,6 +131,7 @@ from .meta import (
     ChangelogEntryModel,
     ChangelogResponse,
     ChangelogSectionModel,
+    DeploymentPolicyResponse,
     VersionResponse,
 )
 from .ownership import (
@@ -284,6 +285,7 @@ __all__ = [
     "DecisionLineageEntry",
     "DecisionRecordResponse",
     "DecisionStatusUpdate",
+    "DeploymentPolicyResponse",
     "DirectRiskEntry",
     "DistillSavingsGroup",
     "DistillSavingsResponse",

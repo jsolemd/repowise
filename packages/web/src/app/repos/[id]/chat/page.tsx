@@ -1,7 +1,9 @@
 import type { Metadata } from "next";
 import { notFound } from "next/navigation";
 import { getRepo } from "@/lib/api/repos";
+import { getDeploymentPolicy } from "@/lib/api/meta";
 import { ChatInterface } from "@/components/chat/chat-interface";
+import { ChatDisabledNotice } from "@/components/chat/chat-disabled-notice";
 
 interface Props {
   params: Promise<{ id: string }>;
@@ -35,6 +37,24 @@ export default async function RepoChatPage({ params, searchParams }: Props) {
     repo = await getRepo(id);
   } catch {
     notFound();
+  }
+
+  // Asked per repo, not read from the layout's server-wide answer: a workspace
+  // can set the policy on one repo and not another, and the server refuses per
+  // repo, so the page has to agree with the route that would serve it.
+  try {
+    const policy = await getDeploymentPolicy(id);
+    if (policy.generative_disabled) {
+      return (
+        <ChatDisabledNotice
+          repoId={id}
+          policySource={policy.generative_policy_source}
+        />
+      );
+    }
+  } catch {
+    // Policy unknown — fall through and let the chat route answer for itself
+    // rather than hiding a working feature behind a failed lookup.
   }
 
   return (

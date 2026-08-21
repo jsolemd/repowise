@@ -19,6 +19,7 @@ import { fileEntityPath } from "@repowise-dev/ui/shared/entity";
 import { getFilesIndex } from "@/lib/api/files";
 import { listDecisions } from "@/lib/api/decisions";
 import { repoNavItems } from "@/components/layout/nav-items";
+import { useGenerativeDisabled } from "@/components/layout/deployment-policy-provider";
 import type { RepoResponse, WorkspaceResponse } from "@/lib/api/types";
 
 /** One icon per section, so the three read apart at a glance. */
@@ -35,6 +36,7 @@ interface CommandPaletteProps {
 
 export function CommandPalette({ repos, workspace }: CommandPaletteProps) {
   const isWorkspace = workspace?.is_workspace ?? false;
+  const generativeDisabled = useGenerativeDisabled();
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
   const router = useRouter();
@@ -50,8 +52,8 @@ export function CommandPalette({ repos, workspace }: CommandPaletteProps) {
   }, [pathname, repos]);
 
   const repoPages = useMemo(
-    () => (activeRepo ? repoNavItems(activeRepo.id) : []),
-    [activeRepo],
+    () => (activeRepo ? repoNavItems(activeRepo.id, { generativeDisabled }) : []),
+    [activeRepo, generativeDisabled],
   );
 
   // File jump — fetched lazily (only once the palette is open with a repo in
@@ -232,8 +234,11 @@ export function CommandPalette({ repos, workspace }: CommandPaletteProps) {
             </div>
           )}
 
-          {/* Quick-ask — always available when a repo is in scope */}
-          {activeRepo && (
+          {/* Quick-ask — available when a repo is in scope and this deployment
+              permits generative surfaces. Under the hard policy the row is not
+              rendered at all: the server refuses the chat route, so offering it
+              would only route the user to a 409. */}
+          {activeRepo && !generativeDisabled && (
             <Command.Group heading="Ask" className="px-2 pb-1">
               <Command.Item
                 value={`ask-repowise ${query}`}

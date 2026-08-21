@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import Link from "next/link";
 import { PageShell } from "@repowise-dev/ui/shared/page-shell";
 import { ConnectionSection } from "@/components/settings/connection-section";
+import { SearchIndexSection } from "@/components/settings/search-index-section";
 import { ProviderSection } from "@/components/settings/provider-section";
 import { WebhookSection } from "@/components/settings/webhook-section";
 import { McpSection } from "@/components/settings/mcp-section";
@@ -29,6 +30,7 @@ export default function SettingsPage() {
       className="max-w-3xl"
     >
       <ConnectionSection />
+      <SearchIndexSection />
       <ProviderSection />
       <DisplaySection />
       <McpSection />
