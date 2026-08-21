@@ -903,7 +903,15 @@ class DecisionRecord(Base):
     # Ordered, lossless anchors for a git-tracked decision journal. The
     # existing ``affected_files_json`` remains the query-friendly projection;
     # this retains each anchor's optional symbol and file-content SHA.
-    anchors_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    #
+    # ``server_default`` as well as ``default``, matching migration 0055 which
+    # already had it: a NOT NULL column whose only default is Python-side
+    # cannot be added by ``ALTER TABLE ADD COLUMN`` to a populated table, so the
+    # schema reconciler — the self-healing path for a store that migrations did
+    # not reach — could not add this column at all.
+    anchors_json: Mapped[str] = mapped_column(
+        Text, nullable=False, default="[]", server_default="[]"
+    )
 
     # Verification (anti-hallucination gate, Phase 1D). Aggregate over the
     # decision's evidence rows: "exact" if any headline field is a verbatim

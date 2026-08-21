@@ -327,5 +327,8 @@ def test_base_includes_all_models():
         "knowledge_graph_tour_steps",
         "kg_project_meta",
         "kg_node_meta",
+        # Source-search lifecycle ledger: the transactional outbox that records
+        # every index update and its generation.
+        "source_index_updates",
     }
     assert expected == table_names
