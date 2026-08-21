@@ -104,6 +104,7 @@ async def capture_source_changes(
         resolve_db_url,
     )
     from repowise.core.repo_config import load_repo_config
+    from repowise.core.source_search.chunks import window_eligible
     from repowise.core.source_search.outbox import enqueue_incremental_update
 
     repo = Path(repo_path).resolve()
@@ -124,6 +125,7 @@ async def capture_source_changes(
     diffs: list[Any] = []
     clear_paths: list[str] = []
     retained_stale = 0
+    tracked_paths: set[str] | None = None
 
     for path in paths:
         absolute = repo / path
@@ -143,6 +145,52 @@ async def capture_source_changes(
 
         info = traverser.file_info_for_path(path, resolve_entry_point=False)
         if info is None:
+            is_tracked_window = False
+            if window_eligible(path, indexed_symbols=0):
+                if tracked_paths is None:
+                    # The full source corpus deliberately owns operational
+                    # files through git rather than FileTraverser: shell/YAML
+                    # and config-excluded code commonly never reach the parser
+                    # lane. Reuse that one fail-loud corpus witness, and pay for
+                    # it only when a saved path actually needs the fallback.
+                    from repowise.core.source_search.indexer import _tracked_paths
+
+                    tracked_paths = set(_tracked_paths(repo))
+                is_tracked_window = path in tracked_paths
+
+            if is_tracked_window:
+                content_hash = _safe_hash(absolute)
+                if content_hash is None:
+                    # A window is authoritative from raw bytes. Without the
+                    # captured hash lifecycle could publish different bytes
+                    # than this SQL change recorded, so retain last-known-good
+                    # rows and disclose staleness just like a parser failure.
+                    retained_stale += 1
+                    diffs.append(
+                        SimpleNamespace(
+                            path=path,
+                            status="modified",
+                            old_path=None,
+                            new_parsed=None,
+                            parse_state="failed",
+                            content_hash=None,
+                        )
+                    )
+                    continue
+
+                clear_paths.append(path)
+                diffs.append(
+                    SimpleNamespace(
+                        path=path,
+                        status="modified",
+                        old_path=None,
+                        new_parsed=None,
+                        parse_state="window",
+                        content_hash=content_hash,
+                    )
+                )
+                continue
+
             clear_paths.append(path)
             diffs.append(
                 SimpleNamespace(

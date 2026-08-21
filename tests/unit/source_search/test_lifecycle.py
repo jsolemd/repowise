@@ -21,6 +21,7 @@ from repowise.core.persistence.database import (
 from repowise.core.persistence.models import Repository, SourceIndexUpdate, WikiSymbol
 from repowise.core.pipeline.persist import persist_incremental_symbols
 from repowise.core.providers.embedding.base import MockEmbedder
+from repowise.core.source_search.fast_update import capture_source_changes
 from repowise.core.source_search.fts import SourceFTSIndex
 from repowise.core.source_search.generation import GenerationRef
 from repowise.core.source_search.indexer import build_source_index
@@ -312,6 +313,42 @@ async def test_incremental_edit_is_atomically_visible_and_idempotent(lifecycle_r
     store = _vector(repo, current)
     assert await store.count() == current.symbol_chunks + current.file_window_chunks
     await store.close()
+
+
+async def test_fast_capture_replaces_a_tracked_excluded_file_window(lifecycle_repo):
+    repo = lifecycle_repo
+    old = read_manifest(default_manifest_path(repo))
+    assert old is not None
+    (repo / ".repowise" / "config.yaml").write_text('exclude_patterns:\n  - "**/*.yaml"\n')
+    path = "infra/service.yaml"
+    (repo / path).write_text("service: freshnebula\n")
+
+    capture = await capture_source_changes(repo, [path])
+    result = await reconcile_source_index(
+        repo, embedder=MockEmbedder(), embedder_identity=_IDENTITY
+    )
+
+    current = read_manifest(default_manifest_path(repo))
+    assert current is not None
+    assert capture.parsed == 0
+    assert result.status == "published"
+    assert current.generation_sequence == old.generation_sequence + 1
+    with _fts(repo, current) as fts:
+        fresh = fts.query("freshnebula")
+        assert {hit.file_path for hit in fresh} == {path}
+        assert all(hit.chunk_id.startswith(f"file:{path}:") for hit in fresh)
+        assert not [hit for hit in fts.query("durable_marker") if hit.file_path == path]
+
+    status = await inspect_source_index(repo, embedder=MockEmbedder())
+    assert status.state == "current"
+    assert status.stale_files == {}
+    assert status.fts_chunks == status.vector_chunks == status.expected_chunks
+
+    second = await reconcile_source_index(
+        repo, embedder=MockEmbedder(), embedder_identity=_IDENTITY
+    )
+    assert second.status == "current"
+    assert second.generation_id == current.generation_id
 
 
 async def test_concurrent_reconciler_returns_busy_without_touching_generation(lifecycle_repo):
