@@ -184,6 +184,18 @@ class CallResolver:
         # Global symbol index: {name: [symbol_ids]} — for Tier 3
         self._global_symbols: dict[str, list[str]] = defaultdict(list)
 
+        # Lexically scoped locals never enter any file/import/global table.
+        # They are resolved only by walking the caller's exact parent chain.
+        self._local_symbols: dict[str, dict[str, list[str]]] = defaultdict(
+            lambda: defaultdict(list)
+        )
+        self._local_types: dict[str, dict[str, list[str]]] = defaultdict(lambda: defaultdict(list))
+        self._local_members: dict[str, dict[str, list[str]]] = defaultdict(
+            lambda: defaultdict(list)
+        )
+        self._symbol_parents: dict[str, str | None] = {}
+        self._symbol_kinds: dict[str, str] = {}
+
         # C/C++ forward declaration → the definition it declares. Populated by
         # ``_build_indices``; applied to every resolved call so the edge lands
         # on the body rather than the header line that announced it.
@@ -599,6 +611,20 @@ class CallResolver:
             file_methods: dict[tuple[str, str], str] = {}
 
             for sym in parsed.symbols:
+                self._symbol_parents[sym.id] = sym.parent_symbol_id
+                self._symbol_kinds[sym.id] = sym.kind
+                if sym.visibility == "local":
+                    # A local without a proven exact owner is intentionally
+                    # unresolvable. The parser normally suppresses that shape;
+                    # this guard keeps hand-built/legacy ParsedFiles fail-safe.
+                    if sym.parent_symbol_id:
+                        self._local_symbols[sym.parent_symbol_id][sym.name].append(sym.id)
+                        if sym.kind in _TYPE_KINDS:
+                            self._local_types[sym.parent_symbol_id][sym.name].append(sym.id)
+                        if sym.kind == "method":
+                            self._local_members[sym.parent_symbol_id][sym.name].append(sym.id)
+                    continue
+
                 decl_key = (sym.parent_name, sym.name)
                 if sym.is_declaration:
                     declarations.append((path, sym.id, decl_key))
@@ -808,6 +834,9 @@ class CallResolver:
     ) -> ResolvedCall | None:
         """Resolve a free function call (no receiver)."""
         target_name = call.target_name
+        local = self._resolve_local_free(file_path, call, caller_id)
+        if local is not None:
+            return local
         # Every tier keys on the target name, so a name the repo declares
         # nowhere can only be matched under an import alias (2a below).
         declared = target_name in self._global_symbols
@@ -911,11 +940,15 @@ class CallResolver:
         method_name = call.target_name
         assert receiver_name is not None
 
+        local = self._resolve_local_member(file_path, call, caller_id)
+        if local is not None:
+            return local
+
         # Every strategy below ends in a lookup keyed on the method name, so a
         # name the repo declares nowhere cannot resolve. That is most member
         # calls — the callee is usually external — and this is the whole of
         # what those call sites now cost.
-        if method_name not in self._global_symbols:
+        if method_name not in self._global_symbols and method_name not in self._method_names():
             return None
 
         # A language may reach a receiver no import statement mentions: a Go
@@ -1012,6 +1045,83 @@ class CallResolver:
             if sym_id is not None:
                 return ResolvedCall(caller_id, sym_id, 0.90, call.line, "self_inherited")
 
+        return None
+
+    def _lexical_scopes(self, caller_id: str) -> tuple[str, ...]:
+        """Caller then exact lexical ancestors, nearest first."""
+        scopes: list[str] = []
+        seen: set[str] = set()
+        current: str | None = caller_id
+        while current is not None and current not in seen:
+            seen.add(current)
+            scopes.append(current)
+            current = self._symbol_parents.get(current)
+        return tuple(scopes)
+
+    def _resolve_local_free(
+        self,
+        file_path: str,
+        call: CallSite,
+        caller_id: str,
+    ) -> ResolvedCall | None:
+        """Resolve a bare name only through the caller's lexical chain."""
+        language = self._language_of(file_path)
+        for scope in self._lexical_scopes(caller_id):
+            candidates = self._local_symbols.get(scope, {}).get(call.target_name, ())
+            usable = [
+                candidate
+                for candidate in candidates
+                if candidate != caller_id
+                and not (
+                    self._symbol_kinds.get(scope) in _TYPE_KINDS
+                    and self._symbol_kinds.get(candidate) == "method"
+                    and language not in _IMPLICIT_RECEIVER_LANGUAGES
+                )
+            ]
+            if len(usable) == 1:
+                return ResolvedCall(caller_id, usable[0], 0.95, call.line, "same_file")
+            if len(usable) > 1:
+                return None
+        return None
+
+    def _resolve_local_member(
+        self,
+        file_path: str,
+        call: CallSite,
+        caller_id: str,
+    ) -> ResolvedCall | None:
+        """Resolve a local type/member without exposing it file- or repo-wide."""
+        receiver = call.receiver_name or ""
+        method = call.target_name
+        scopes = self._lexical_scopes(caller_id)
+
+        if receiver in {"self", "this"}:
+            for scope in scopes:
+                if self._symbol_kinds.get(scope) not in _TYPE_KINDS:
+                    continue
+                candidates = self._local_members.get(scope, {}).get(method, ())
+                usable = [candidate for candidate in candidates if candidate != caller_id]
+                if len(usable) == 1:
+                    return ResolvedCall(caller_id, usable[0], 0.95, call.line, "self_scope")
+                if len(usable) > 1:
+                    return None
+
+        for scope in scopes:
+            types = self._local_types.get(scope, {}).get(receiver, ())
+            if len(types) > 1:
+                return None
+            if not types:
+                continue
+            methods = self._local_members.get(types[0], {}).get(method, ())
+            if len(methods) == 1:
+                return ResolvedCall(
+                    caller_id,
+                    methods[0],
+                    0.93,
+                    call.line,
+                    "receiver_same_file",
+                )
+            return None
         return None
 
     def _language_of(self, file_path: str) -> str | None:
@@ -1149,6 +1259,21 @@ class CallResolver:
         """
         key = (type_name, call.target_name)
 
+        # A named type declared inside the caller's lexical chain shadows file,
+        # import, package, and repository declarations of the same simple name.
+        # Locals never enter those broader indices, so resolve the type and its
+        # member together while the exact owner chain is still available.
+        for scope in self._lexical_scopes(caller_id):
+            local_types = self._local_types.get(scope, {}).get(type_name, ())
+            if len(local_types) > 1:
+                return None
+            if not local_types:
+                continue
+            methods = self._local_members.get(local_types[0], {}).get(call.target_name, ())
+            if len(methods) == 1:
+                return methods[0], "same_file"
+            return None
+
         # An import statement binds the name outright, so it settles which type
         # this is before any scope search.
         bound = self._import_names.get(file_path, {}).get(type_name)
@@ -1273,7 +1398,13 @@ class CallResolver:
     def _method_names(self) -> frozenset[str]:
         """Every name declared as a method of some class, built once."""
         if self._method_name_set is None:
-            self._method_name_set = frozenset(method for _, method in self._global_methods)
+            names = {method for _, method in self._global_methods}
+            names.update(
+                method
+                for methods_by_name in self._local_members.values()
+                for method in methods_by_name
+            )
+            self._method_name_set = frozenset(names)
         return self._method_name_set
 
     def _externally_bound_names(self, file_path: str) -> frozenset[str]:

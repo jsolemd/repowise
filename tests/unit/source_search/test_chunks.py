@@ -71,6 +71,20 @@ def test_symbol_header_falls_back_to_the_bare_name():
     assert chunk.text.splitlines()[1] == "# function: parse_config"
 
 
+def test_local_symbol_chunk_keeps_its_full_lexical_identity():
+    chunk = build_symbol_chunk(
+        _symbol(
+            symbol_id="src/app.py::outer::LocalAdapter::run",
+            name="run",
+            qualified_name="app.outer.LocalAdapter.run",
+            kind="method",
+        ),
+        _FILE.splitlines(),
+    )
+    assert chunk.chunk_id == "src/app.py::outer::LocalAdapter::run"
+    assert chunk.text.splitlines()[1] == "# method: app.outer.LocalAdapter.run"
+
+
 def test_optional_parts_are_omitted_not_blanked():
     """A missing signature or docstring must not leave an empty line behind.
 

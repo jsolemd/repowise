@@ -74,6 +74,7 @@ def test_the_record_carries_the_evidence_not_the_prose(tmp_path):
         "result_count",
         "top",
         "selected_owner_file",
+        "selected_owner_evidence",
         "no_match",
     }
     assert record["top"][0] == {
@@ -83,6 +84,8 @@ def test_the_record_carries_the_evidence_not_the_prose(tmp_path):
         "lexical_rank": 3,
         "exact_name": False,
         "fused_score": 0.0134,
+        "concept_coverage": None,
+        "same_path_corroborated": None,
     }
     assert record["ts"].startswith("20")
 

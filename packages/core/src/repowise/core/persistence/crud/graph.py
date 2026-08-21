@@ -71,6 +71,7 @@ _NODE_FIELDS = (
     "end_line",
     "visibility",
     "signature",
+    "parent_name",
     "parent_symbol_id",
 )
 
@@ -488,6 +489,7 @@ async def get_all_graph_nodes(
             "end_line": row.end_line,
             "visibility": row.visibility,
             "signature": row.signature,
+            "parent_name": row.parent_name,
             "parent_symbol_id": row.parent_symbol_id,
         }
         for row in result.scalars().all()

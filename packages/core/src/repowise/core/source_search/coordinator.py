@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import re
 import time
 from collections.abc import Sequence
@@ -53,14 +54,15 @@ from typing import Any, Protocol
 
 from repowise.core.providers.embedding.base import Embedder
 
-from .chunks import SOURCE_FILE_WINDOW, SOURCE_SYMBOL
-from .fts import SourceFTSIndex
+from .chunks import SOURCE_FILE_WINDOW, SOURCE_SYMBOL, language_for_path, window_eligible
+from .fts import SourceFTSIndex, tokenize
 from .manifest import default_manifest_path, read_manifest
 from .query_log import QueryEvent, QueryLog, TopEntry, default_query_log_path
 from .vector_store import SourceChunkVectorStore
 
 __all__ = [
     "AGREEMENT_LEXICAL_DEPTH",
+    "CONFIDENT_CONCEPT_COVERAGE",
     "CONFIDENT_DENSE_COSINE",
     "DENSE_WEIGHT",
     "ERROR_ALL_LEGS_FAILED",
@@ -76,11 +78,13 @@ __all__ = [
     "LEXICAL_WEIGHT",
     "MIN_SUFFIX_SEGMENTS",
     "MIN_TAIL_CHARS",
+    "NO_MATCH_CONCEPT_COVERAGE",
     "NO_MATCH_DENSE_COSINE",
     "OWNER_SCORE_BAND",
     "RRF_K",
     "SOURCE_WIKI_PAGE",
     "LegFailure",
+    "QueryIntent",
     "SourceSearchCoordinator",
     "WikiFullTextSearch",
     "WikiVectorStore",
@@ -127,7 +131,8 @@ LEXICAL_WEIGHT = 0.3
 # of ten wrong answers as a good answer, and the absent-topic half of the dev
 # set exists to catch exactly that.
 
-#: At or above this cosine, one leg is enough.
+#: Dense floor for a prose owner that also carries complete concept and lexical
+#: evidence.  Dense is never sufficient by itself.
 CONFIDENT_DENSE_COSINE = 0.43
 
 #: Between this and :data:`CONFIDENT_DENSE_COSINE`, dense needs the lexical leg
@@ -136,6 +141,25 @@ AGREEMENT_DENSE_COSINE = 0.38
 
 #: How far into the lexical ranking that agreement may be found.
 AGREEMENT_LEXICAL_DEPTH = 10
+
+#: Minimum IDF-weighted share of informative query concepts that must occur in
+#: the selected owner file before prose can be called confident.
+CONFIDENT_CONCEPT_COVERAGE = 0.80
+
+#: Below this share, concept evidence cannot keep an otherwise weak result from
+#: being an honest no-match.
+NO_MATCH_CONCEPT_COVERAGE = 0.50
+
+#: Terms appearing in more of the indexed file universe than this are context,
+#: not discriminating subject evidence.  Intent/grammar words are removed
+#: separately; this catches corpus-specific common nouns without a repo-specific
+#: stop-word list.
+MAX_CONCEPT_FILE_FRACTION = 0.20
+
+#: A percentage is meaningful only on a real corpus.  Tiny fixtures and newly
+#: initialized repositories keep their terms; otherwise every one-file term is
+#: simultaneously "100% common" and the profile contains no evidence at all.
+MIN_FILES_FOR_FREQUENCY_FILTER = 20
 
 #: Below this cosine, with no exact name and nothing lexical, there is no
 #: answer here — say so rather than serving the nearest noise.
@@ -161,6 +185,10 @@ LEG_WIKI_LEXICAL = "wiki lexical"
 #: Not a lane of its own — it hydrates chunks the lexical leg found alone — so
 #: losing it degrades the evidence without losing the corpus.
 LEG_CHUNK_METADATA = "source chunk metadata"
+
+#: Corpus/file co-location evidence used only for confidence.  Losing it does
+#: not erase retrieval, but it makes a confident claim impossible.
+LEG_SOURCE_EVIDENCE = "source confidence evidence"
 
 RETRIEVAL_LEGS = frozenset({LEG_SOURCE_DENSE, LEG_WIKI_DENSE, LEG_SOURCE_LEXICAL, LEG_WIKI_LEXICAL})
 
@@ -246,6 +274,11 @@ _CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
 #: spaces the camel rule inserts.
 _SEGMENT_BREAK = re.compile(r"[^A-Za-z0-9]+")
 
+# Raw runs are retained long enough for a CamelCase service/identifier such as
+# ``CodeAtlas`` to contribute its path spelling (``codeatlas``).  The FTS
+# tokenizer's split parts are still used for ordinary words.
+_QUERY_TOKEN_RUN = re.compile(r"[A-Za-z0-9]+")
+
 #: How an item came by its exact-name evidence. The whole query *being* the
 #: identifier is a stronger claim than the query merely carrying it, and the two
 #: reorder by different rules, so the response says which one it was.
@@ -254,7 +287,10 @@ EXACT_VIA_EMBEDDED = "embedded"
 
 #: A query that names test material. On its own this is a query *about* tests,
 #: and demoting them would be answering a different question.
-_TEST_QUERY_RE = re.compile(r"\b(test|tests|testing|pytest|fixture|mock|spec)\b", re.IGNORECASE)
+_TEST_QUERY_RE = re.compile(
+    r"\b(test|tests|testing|pytest|fixture|fixtures|mock|mocks|spec|specs)\b",
+    re.IGNORECASE,
+)
 
 #: A query reporting something broken. Paired with a test word it flips the
 #: reading: "fix the failing route test" names a test as the *symptom* and asks
@@ -267,13 +303,192 @@ _REPAIR_QUERY_RE = re.compile(
     re.IGNORECASE,
 )
 
+#: A request for explanatory/generated prose rather than the implementation
+#: artifact itself.  This is intentionally explicit: ordinary "how does it
+#: work" behavior questions still ask for source ownership.
+_DOCS_QUERY_RE = re.compile(
+    r"\b(doc|docs|documentation|documented|wiki|readme|guide|overview|"
+    r"explain|explains|explained|explanation)\b",
+    re.IGNORECASE,
+)
+
+#: Operational artifacts are declarations in their own right.  These tokens
+#: keep a compose/YAML/shell/config window from losing to a nearby code symbol
+#: merely because only the latter has a language grammar.
+_OPERATIONAL_QUERY_RE = re.compile(
+    r"\b(compose|dockerfile|makefile|ya?ml|shell|bash|powershell|script|"
+    r"config|configuration|service|timer|healthcheck|health[ -]check|storage|file)\b",
+    re.IGNORECASE,
+)
+
+#: Query shapes that ask for the implementation owner.  Repair is carried as a
+#: separate typed bit and folded into this one by :func:`_query_intent`.
+_IMPLEMENTATION_QUERY_RE = re.compile(
+    r"\b(how|where|why|implement|implements|implemented|implementation|"
+    r"behavio[u]?r|behaves|source|code|logic|handler|function|class|method|"
+    r"define|defines|defined|definition|declaration|owner|owns)\b",
+    re.IGNORECASE,
+)
+
 #: Symbol kinds that define a thing rather than mention it. Preferred as owners
 #: when the fusion cannot separate two results on score.
 _DEFINITION_KINDS = frozenset({"class", "function", "method", "interface", "struct", "type"})
 
-#: Owner preference among chunk kinds: the lines themselves beat a window that
-#: merely contains them, which beats prose about them.
-_SOURCE_RANK = {SOURCE_SYMBOL: 0, SOURCE_FILE_WINDOW: 1, SOURCE_WIKI_PAGE: 2}
+# Query framing and generic programming nouns do not identify the subject.  A
+# corpus-frequency filter below removes repository-specific common terms; this
+# set removes language whose frequency can look deceptively low in source text
+# ("which", "where", "failing") despite carrying no ownership evidence.
+_INTENT_TOKENS = frozenset(
+    {
+        "about",
+        "actual",
+        "adapter",
+        "after",
+        "against",
+        "and",
+        "are",
+        "around",
+        "as",
+        "assembled",
+        "back",
+        "before",
+        "build",
+        "builds",
+        "behavior",
+        "behaviors",
+        "behaves",
+        "behaviour",
+        "behaviours",
+        "broken",
+        "by",
+        "code",
+        "collapse",
+        "collapsed",
+        "configure",
+        "configures",
+        "control",
+        "controls",
+        "cover",
+        "covers",
+        "debug",
+        "decide",
+        "decides",
+        "does",
+        "during",
+        "emit",
+        "emits",
+        "event",
+        "events",
+        "failing",
+        "fails",
+        "failure",
+        "file",
+        "files",
+        "find",
+        "filtering",
+        "fix",
+        "for",
+        "from",
+        "function",
+        "generate",
+        "generated",
+        "handler",
+        "how",
+        "in",
+        "implementation",
+        "implemented",
+        "index",
+        "indexed",
+        "indexing",
+        "integrate",
+        "integrates",
+        "inside",
+        "into",
+        "is",
+        "its",
+        "layer",
+        "leave",
+        "locate",
+        "mine",
+        "mines",
+        "module",
+        "normalize",
+        "of",
+        "old",
+        "on",
+        "one",
+        "or",
+        "onto",
+        "owner",
+        "owns",
+        "persist",
+        "persisted",
+        "persists",
+        "process",
+        "processes",
+        "pytest",
+        "regression",
+        "render",
+        "renders",
+        "replace",
+        "replaces",
+        "report",
+        "reports",
+        "represent",
+        "represents",
+        "resolve",
+        "resolves",
+        "restore",
+        "restored",
+        "return",
+        "returns",
+        "route",
+        "script",
+        "select",
+        "selects",
+        "service",
+        "shell",
+        "show",
+        "state",
+        "status",
+        "store",
+        "stores",
+        "switch",
+        "system",
+        "test",
+        "tested",
+        "testing",
+        "tests",
+        "that",
+        "the",
+        "their",
+        "them",
+        "this",
+        "through",
+        "to",
+        "under",
+        "update",
+        "updates",
+        "used",
+        "uses",
+        "using",
+        "very",
+        "what",
+        "when",
+        "where",
+        "whether",
+        "which",
+        "while",
+        "with",
+        "without",
+        "write",
+        "writer",
+        "writes",
+        "written",
+        "work",
+        "works",
+    }
+)
 
 #: Page types whose ``target_path`` is a repository-relative file. Every other
 #: type is named by a curated id that reads like a path and is not one — a
@@ -300,6 +515,96 @@ class WikiFullTextSearch(Protocol):
     async def search(self, query: str, limit: int = 10) -> list[Any]: ...
 
 
+@dataclass(frozen=True, slots=True)
+class _ConceptEvidence:
+    """One informative query concept, measured over the indexed file universe."""
+
+    token: str
+    document_frequency: int
+    weight: float
+    matched: bool
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "token": self.token,
+            "document_frequency": self.document_frequency,
+            "matched": self.matched,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class _CandidateEvidence:
+    """All confidence evidence bound to one candidate and its owner file."""
+
+    dense_cosine: float | None
+    dense_rank: int | None
+    lexical_rank: int | None
+    exact_via: str
+    suffix_match: bool
+    same_path_corroborated: bool
+    corpus_file_count: int
+    concepts: tuple[_ConceptEvidence, ...]
+
+    @property
+    def exact_name(self) -> bool:
+        return bool(self.exact_via)
+
+    @property
+    def concept_coverage(self) -> float:
+        total = sum(concept.weight for concept in self.concepts)
+        if total <= 0:
+            return 0.0
+        matched = sum(concept.weight for concept in self.concepts if concept.matched)
+        return matched / total
+
+    def to_dict(self, *, lane: str) -> dict[str, Any]:
+        return {
+            "dense_cosine": (
+                round(self.dense_cosine, 4) if self.dense_cosine is not None else None
+            ),
+            "lexical_rank": self.lexical_rank,
+            "exact_name": self.exact_name,
+            "lane": lane,
+            "concept_coverage": round(self.concept_coverage, 4),
+            "corpus_file_count": self.corpus_file_count,
+            "same_path_corroborated": self.same_path_corroborated,
+            "concepts": [concept.to_dict() for concept in self.concepts],
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class QueryIntent:
+    """One shared, typed reading of a source-search query.
+
+    Ranking and owner selection consume this same object.  Keeping intent in a
+    named value prevents the old failure mode where test demotion, exact routing,
+    and owner selection each re-parsed the sentence with subtly different rules.
+    """
+
+    identifier: str | None
+    embedded_identifiers: tuple[str, ...]
+    exact_target: str | None
+    wants_tests: bool
+    repair: bool
+    docs: bool
+    operational: bool
+    implementation: bool
+
+    @property
+    def exact_artifact(self) -> bool:
+        """Whether the complete query names a path or file-qualified symbol."""
+
+        return self.exact_target is not None
+
+    @property
+    def is_prose(self) -> bool:
+        """Whether semantic subject evidence, rather than any identifier, applies."""
+
+        return (
+            self.identifier is None and not self.embedded_identifiers and self.exact_target is None
+        )
+
+
 @dataclass(slots=True, eq=False)
 class _Item:
     """One candidate, carrying every signal that ranked it.
@@ -318,6 +623,9 @@ class _Item:
     kind: str
     snippet: str
     source: str
+    #: Stable source chunk id or wiki target id.  Kept separately from ``key``
+    #: so exact file-qualified ownership never has to parse a lane prefix.
+    target_id: str = ""
     #: The bare symbol name to match an identifier against, when the item has
     #: one. Separate from *name* because a wiki page's name is its title —
     #: "Symbol: a.b.c.foo", "File: a/b.py" — which is a sentence, not a name,
@@ -343,6 +651,7 @@ class _Item:
     #: Empty for a source chunk, which is identified by its file and lines.
     page_id: str = ""
     fused_score: float = 0.0
+    evidence_profile: _CandidateEvidence | None = None
 
     @property
     def exact_name(self) -> bool:
@@ -350,6 +659,8 @@ class _Item:
         return bool(self.exact_via)
 
     def evidence(self) -> dict[str, Any]:
+        if self.evidence_profile is not None:
+            return self.evidence_profile.to_dict(lane=self.lane)
         return {
             "dense_cosine": round(self.dense_cosine, 4) if self.dense_cosine is not None else None,
             "lexical_rank": self.lexical_rank,
@@ -398,7 +709,55 @@ def _is_test_query(query: str) -> bool:
     what it wants is the code under it — so the two signals together mean the
     opposite of the test signal alone.
     """
-    return bool(_TEST_QUERY_RE.search(query)) and not _REPAIR_QUERY_RE.search(query)
+    return _query_intent(query).wants_tests
+
+
+def _query_intent(query: str) -> QueryIntent:
+    """Parse *query* once for every ranking and owner-policy consumer."""
+
+    identifier = _identifier_query(query)
+    repair = bool(_REPAIR_QUERY_RE.search(query))
+    docs = bool(_DOCS_QUERY_RE.search(query))
+    operational = bool(_OPERATIONAL_QUERY_RE.search(query))
+    return QueryIntent(
+        identifier=identifier,
+        embedded_identifiers=tuple(_embedded_identifiers(query)) if identifier is None else (),
+        exact_target=_exact_target_query(query),
+        wants_tests=bool(_TEST_QUERY_RE.search(query)) and not repair,
+        repair=repair,
+        docs=docs,
+        operational=operational,
+        implementation=(repair or bool(_IMPLEMENTATION_QUERY_RE.search(query))) and not docs,
+    )
+
+
+def _exact_target_query(query: str) -> str | None:
+    """Return a normalized exact path/file-qualified ID, never a prose mention.
+
+    Exactness is deliberately whole-query-only.  A sentence containing
+    ``config.py`` has mentioned a filename-like word; it has not asserted that
+    file as the answer.  Both POSIX and Windows separators are accepted because
+    the stored corpus uses repository-relative POSIX paths on every platform.
+    """
+
+    stripped = query.strip()
+    if not stripped or any(character.isspace() for character in stripped):
+        return None
+    normalized = stripped.replace("\\", "/")
+    path, separator, symbol = normalized.partition("::")
+    while path.startswith("./"):
+        path = path[2:]
+    if not path or not _looks_like_source_path(path):
+        return None
+    return path + (f"::{symbol}" if separator and symbol else "")
+
+
+def _looks_like_source_path(value: str) -> bool:
+    """Whether a whole-query token has the shape of an indexed source path."""
+
+    if "/" in value:
+        return True
+    return bool(language_for_path(value)) or window_eligible(value, indexed_symbols=0)
 
 
 def _identifier_query(query: str) -> str | None:
@@ -446,6 +805,24 @@ def _segments(name: str) -> tuple[str, ...]:
     """
     spaced = _CAMEL_BOUNDARY.sub(" ", name.strip())
     return tuple(part.lower() for part in _SEGMENT_BREAK.split(spaced) if part)
+
+
+def _concept_tokens(query: str) -> tuple[str, ...]:
+    """Informative query concepts in the source index's own token language.
+
+    There is deliberately no second stemmer here.  Evidence normalized
+    differently from the corpus cannot establish that the corpus contains the
+    query subject.  Corpus-common terms are removed later, once their exact
+    active-generation document frequency is known.
+    """
+
+    concepts: list[str] = []
+    for raw in _QUERY_TOKEN_RUN.findall(query):
+        split = tokenize(raw)
+        has_camel_boundary = bool(_CAMEL_BOUNDARY.search(raw))
+        candidates = [raw.lower()] if has_camel_boundary and len(split) > 1 else split
+        concepts.extend(token for token in candidates if token not in _INTENT_TOKENS)
+    return tuple(dict.fromkeys(concepts))
 
 
 def _suffix_matches(identifier: Sequence[str], name: Sequence[str]) -> bool:
@@ -576,6 +953,7 @@ class SourceSearchCoordinator:
         self._wiki_fts = wiki_fts
         self._query_log = query_log or QueryLog(default_query_log_path(self.repo_path))
         self._manifest_meta: dict[str, Any] | None = None
+        self._path_token_files: dict[str, frozenset[str]] | None = None
 
     # -- public surface ---------------------------------------------------
 
@@ -595,7 +973,8 @@ class SourceSearchCoordinator:
         every other tool emits.
         """
         started = time.perf_counter()
-        items, lexical_files, failures = await self._retrieve(query)
+        intent = _query_intent(query)
+        items, failures = await self._retrieve(query)
         hard = [failure for failure in failures if failure.hard]
         if hard and _all_legs_lost(hard, self._attempted_legs()):
             # Nothing was read. An empty result set here would be a claim about
@@ -608,17 +987,23 @@ class SourceSearchCoordinator:
         source_files = {
             item.file for item in items.values() if item.lane == LANE_SOURCE and item.file
         }
-        ranked = self._rank(query, items)
+        ranked = self._rank(items, intent)
+        evidence_failure = None
+        if not any(failure.hard and failure.leg == LEG_SOURCE_LEXICAL for failure in failures):
+            evidence_failure = self._profile_candidates(query, ranked, source_files)
+        if evidence_failure is not None:
+            failures.append(evidence_failure)
+        hard = [failure for failure in failures if failure.hard]
         deduped = self._dedupe_by_file(ranked)
         window = deduped[:limit]
-        owner, reason = self._select_owner(window, wants_tests=_is_test_query(query))
+        owner, reason = self._select_owner(window, intent=intent)
         if owner is not None and deduped and deduped[0] is not owner:
             # The owner is the answer, so it leads the list the caller reads
             # and the candidate paths derived from it. Identity, not equality:
             # two results can hold identical fields and be different answers.
             deduped = [owner, *(item for item in deduped if item is not owner)]
             window = deduped[:limit]
-        confidence = self._classify(window, lexical_files, owner, source_files)
+        confidence = self._classify(window, owner, source_files)
         if hard:
             # Pinned, not capped. Capping alone would leave ``no_match``
             # untouched, and ``no_match`` is the one answer a half-read corpus
@@ -660,15 +1045,8 @@ class SourceSearchCoordinator:
             legs.add(LEG_WIKI_LEXICAL)
         return legs
 
-    async def _retrieve(self, query: str) -> tuple[dict[str, _Item], list[str], list[LegFailure]]:
-        """Both legs, fused. Returns the candidates, the lexical top files, and
-        every leg that did not answer.
-
-        The lexical top files come back separately because the confidence rule
-        asks a question the ranked items cannot answer on their own: whether a
-        file the dense leg likes was *also* found lexically, near the top,
-        independently of whether that file survived ranking.
-        """
+    async def _retrieve(self, query: str) -> tuple[dict[str, _Item], list[LegFailure]]:
+        """Both legs, fused. Returns candidates and every leg that did not answer."""
         dense_source, dense_wiki, dense_failures = await self._dense_legs(query)
         lexical_source, lexical_wiki, lexical_failures = await self._lexical_legs(query)
         failures = [*dense_failures, *lexical_failures]
@@ -686,14 +1064,11 @@ class SourceSearchCoordinator:
             item.dense_rank = rank
             item.dense_cosine = float(hit.score)
 
-        lexical_files: list[str] = []
         for rank, (lane, hit, key) in enumerate(_merge_lexical(lexical_source, lexical_wiki), 1):
             item = self._item_for(items, lane, hit, key, records)
             if item is None:
                 continue
             item.lexical_rank = rank
-            if rank <= AGREEMENT_LEXICAL_DEPTH and item.file:
-                lexical_files.append(item.file)
             # The lexical leg cuts its snippet around what matched; the dense
             # leg has no query text at the point its row was written and can
             # only serve the stored opener. Prefer the one that shows evidence.
@@ -703,7 +1078,7 @@ class SourceSearchCoordinator:
 
         for item in items.values():
             item.fused_score = _rrf(item.dense_rank, item.lexical_rank)
-        return items, lexical_files, failures
+        return items, failures
 
     async def _dense_legs(self, query: str) -> tuple[list[Any], list[Any], list[LegFailure]]:
         """Top-*LEG_FETCH* from each vector store, on one embedding of *query*.
@@ -814,6 +1189,7 @@ class SourceSearchCoordinator:
             lane=LANE_SOURCE,
             file=file_path,
             name=name,
+            target_id=str(getattr(hit, "chunk_id", "") or getattr(record, "chunk_id", "")),
             match_name=name,
             kind=getattr(record, "kind", ""),
             snippet=getattr(record, "snippet", ""),
@@ -839,6 +1215,7 @@ class SourceSearchCoordinator:
             lane=LANE_WIKI,
             file=file_path,
             name=getattr(hit, "title", "") or "",
+            target_id=target_path,
             match_name=symbol.rsplit(".", 1)[-1] if sep else "",
             kind=page_type,
             snippet=getattr(hit, "snippet", "") or "",
@@ -847,21 +1224,101 @@ class SourceSearchCoordinator:
             is_test=_is_test_related(file_path),
         )
 
+    # -- owner-bound evidence ---------------------------------------------
+
+    def _profile_candidates(
+        self,
+        query: str,
+        ranked: Sequence[_Item],
+        source_files: set[str],
+    ) -> LegFailure | None:
+        """Attach one immutable, co-located evidence profile to every item.
+
+        The source index answers two facts from the same active generation:
+        which files contain each query concept, and how rare that concept is
+        across the corpus.  A selected file must contain the complete subject
+        itself; evidence from different files is never pooled.  File-path
+        tokens join the indexed body/name evidence because operational owners
+        often declare themselves in their path rather than in an AST symbol.
+        """
+
+        raw_concepts = _concept_tokens(query)
+        try:
+            active_paths = self._source_fts.active_file_paths()
+            indexed_term_files = self._source_fts.term_file_evidence(raw_concepts)
+        except Exception as exc:
+            return _classify_failure(LEG_SOURCE_EVIDENCE, exc)
+
+        if self._path_token_files is None:
+            mutable: dict[str, set[str]] = {}
+            for path in active_paths:
+                for token in set(tokenize(path)):
+                    mutable.setdefault(token, set()).add(path)
+            self._path_token_files = {token: frozenset(paths) for token, paths in mutable.items()}
+
+        corpus_file_count = max(len(active_paths), 1)
+        concept_files: dict[str, frozenset[str]] = {}
+        for token in raw_concepts:
+            files = frozenset(
+                set(indexed_term_files.get(token, frozenset()))
+                | set(self._path_token_files.get(token, frozenset()))
+            )
+            if (
+                corpus_file_count < MIN_FILES_FOR_FREQUENCY_FILTER
+                or len(files) / corpus_file_count <= MAX_CONCEPT_FILE_FRACTION
+            ):
+                concept_files[token] = files
+
+        lanes_by_file: dict[str, set[str]] = {}
+        for item in ranked:
+            if item.file:
+                lanes_by_file.setdefault(item.file, set()).add(item.lane)
+
+        for item in ranked:
+            own_tokens = set(tokenize(" ".join((item.file, item.match_name, item.snippet))))
+            concepts: list[_ConceptEvidence] = []
+            for token, files in concept_files.items():
+                document_frequency = len(files)
+                weight = math.log((corpus_file_count + 1) / (document_frequency + 1)) + 1.0
+                matched = (bool(item.file) and item.file in files) or token in own_tokens
+                concepts.append(
+                    _ConceptEvidence(
+                        token=token,
+                        document_frequency=document_frequency,
+                        weight=weight,
+                        matched=matched,
+                    )
+                )
+            item.evidence_profile = _CandidateEvidence(
+                dense_cosine=item.dense_cosine,
+                dense_rank=item.dense_rank,
+                lexical_rank=item.lexical_rank,
+                exact_via=item.exact_via,
+                suffix_match=item.suffix_match,
+                same_path_corroborated=(
+                    bool(item.file)
+                    and item.file in source_files
+                    and len(lanes_by_file.get(item.file, set())) > 1
+                ),
+                corpus_file_count=corpus_file_count,
+                concepts=tuple(concepts),
+            )
+        return None
+
     # -- ranking ----------------------------------------------------------
 
-    def _rank(self, query: str, items: dict[str, _Item]) -> list[_Item]:
+    def _rank(self, items: dict[str, _Item], intent: QueryIntent) -> list[_Item]:
         """Fused order, then test demotion, then the exact-identifier router."""
         ranked = sorted(items.values(), key=_fused_sort_key)
-        if not _is_test_query(query):
+        if not intent.wants_tests and not intent.repair:
             # Stable, so the fused order survives inside each group. Demotion,
             # not removal: a test is rarely the best first read, and sometimes
             # it is the only place a behaviour is written down.
             ranked.sort(key=lambda item: item.is_test)
-        identifier = _identifier_query(query)
-        if identifier:
-            return self._route_exact(identifier, ranked)
-        if embedded := _embedded_identifiers(query):
-            return self._route_embedded(embedded, ranked)
+        if intent.identifier:
+            return self._route_exact(intent.identifier, ranked)
+        if intent.embedded_identifiers:
+            return self._route_embedded(intent.embedded_identifiers, ranked)
         return ranked
 
     @staticmethod
@@ -981,41 +1438,140 @@ class SourceSearchCoordinator:
     # -- owner and confidence ---------------------------------------------
 
     @staticmethod
-    def _select_owner(
-        window: Sequence[_Item], *, wants_tests: bool = False
-    ) -> tuple[_Item | None, str]:
-        """The result to open first, and a phrase naming the evidence for it.
+    def _select_owner(window: Sequence[_Item], *, intent: QueryIntent) -> tuple[_Item | None, str]:
+        """Select an owner through named, intent-bounded policy stages.
 
         Preference applies only inside :data:`OWNER_SCORE_BAND` of the best
         fused score. Outside it the fusion is making a claim the shape rules
         should not overturn: a wiki page that beat every chunk by a clear
         margin is the answer, whatever its shape.
 
-        *wants_tests* carries the same reading of the query the demotion uses.
-        Without it the policy would hand a test-focused query a non-test owner
-        it deliberately ranked below the test the caller asked for.
+        Stages are deliberately explicit rather than encoded in one tuple.  A
+        stage narrows only when its query shape applies and a matching candidate
+        exists.  Retrieval score then decides among the survivors; path, line,
+        and stable key are used only for a true score tie.
         """
         if not window:
             return None, ""
         best = window[0].fused_score
         floor = best * (1.0 - OWNER_SCORE_BAND)
         band = [item for item in window if item.fused_score >= floor] or [window[0]]
-        winner = min(
-            enumerate(band), key=lambda pair: _owner_sort_key(pair[1], pair[0], wants_tests)
-        )[1]
+        candidates = [item for item in band if item.file] or band
+        applied_rule = ""
 
-        if winner.exact_via == EXACT_VIA_QUERY:
-            reason = "exact name match"
-        elif winner.exact_via == EXACT_VIA_EMBEDDED:
-            reason = "embedded identifier match"
-        elif winner.suffix_match:
-            reason = "embedded identifier suffix match"
-        elif winner.dense_rank is not None and winner.lexical_rank is not None:
-            reason = "dense+lexical agreement"
-        elif winner.dense_rank is not None:
-            reason = "dense only"
-        else:
-            reason = "lexical only"
+        def narrow(rule: str, matching: Sequence[_Item]) -> None:
+            nonlocal candidates, applied_rule
+            selected = list(matching)
+            if not selected or len(selected) == len(candidates):
+                return
+            displaced_incumbent = candidates[0] not in selected
+            candidates = selected
+            if displaced_incumbent and not applied_rule:
+                applied_rule = rule
+
+        # 1. An exact artifact names its owner directly.  Whole-query matching
+        # is what keeps a filename-like word in prose from claiming this rule.
+        narrow(
+            "exact path/full-ID owner",
+            [item for item in candidates if _exact_owner_match(item, intent)],
+        )
+
+        # 2–3. Test material is the owner only when tests are the subject.  A
+        # repair query names a failing test as the observation site instead.
+        if intent.wants_tests:
+            narrow("explicit test owner", [item for item in candidates if item.is_test])
+        elif intent.repair:
+            narrow("symptom test demotion", [item for item in candidates if not item.is_test])
+
+        # 4. Complete subject evidence must be co-located on the proposed owner.
+        # A small relative advantage is not called "complete": the same 0.80
+        # floor that licenses confident prose is the minimum semantic boundary.
+        if intent.is_prose and not intent.wants_tests:
+            complete = [
+                item
+                for item in candidates
+                if item.evidence_profile is not None
+                and item.evidence_profile.concept_coverage >= CONFIDENT_CONCEPT_COVERAGE
+            ]
+            if complete:
+                best_coverage = max(
+                    item.evidence_profile.concept_coverage  # type: ignore[union-attr]
+                    for item in complete
+                )
+                narrow(
+                    "co-located subject completeness",
+                    [
+                        item
+                        for item in complete
+                        if item.evidence_profile is not None
+                        and math.isclose(
+                            item.evidence_profile.concept_coverage,
+                            best_coverage,
+                            rel_tol=0.0,
+                            abs_tol=1e-12,
+                        )
+                    ],
+                )
+
+        # 5. Generated prose corroborates implementation; it does not own an
+        # implementation-shaped request.  Explicit docs/wiki intent opts out.
+        if intent.implementation and not intent.docs:
+            narrow(
+                "source-owner bias",
+                [item for item in candidates if item.lane == LANE_SOURCE],
+            )
+
+        # 6. A declaration can own behavior only when it carries the subject.
+        # Operational artifacts, docs, and explicit tests each have a stronger
+        # query-specific owner class and deliberately bypass this stage.
+        declaration_shape = bool(intent.identifier or intent.embedded_identifiers) or (
+            intent.implementation and not intent.operational
+        )
+        if declaration_shape and not intent.docs and not intent.wants_tests:
+            if intent.identifier or intent.embedded_identifiers:
+                # A symbol spotlight is an exact declaration proxy even though
+                # its lane is generated prose.  Per-file dedupe may have kept it
+                # in place of the same file's source chunk; rejecting it here
+                # would discard the strongest name evidence before the later
+                # citation upgrade can put the owner back on source lines.
+                exact_declarations = [item for item in candidates if item.exact_name]
+                suffix_declarations = [item for item in candidates if item.suffix_match]
+            else:
+                exact_declarations = []
+                suffix_declarations = []
+            declarations = exact_declarations or suffix_declarations
+            if not declarations:
+                declarations = [
+                    item
+                    for item in candidates
+                    if item.source == SOURCE_SYMBOL
+                    and item.kind in _DEFINITION_KINDS
+                    and _declaration_carries_subject(item)
+                ]
+            narrow("declaration over usage", declarations)
+
+        # 7. A raw operational file is the declaration-equivalent owner for its
+        # own behavior.  A bare code identifier that happens to be named
+        # ``healthcheck`` is still a symbol lookup, not operational prose.
+        if intent.operational and intent.identifier is None and not intent.docs:
+            narrow(
+                "operational file preservation",
+                [item for item in candidates if item.source == SOURCE_FILE_WINDOW],
+            )
+
+        winner = _policy_tie_break(candidates)
+        if (
+            not applied_rule
+            and winner is not candidates[0]
+            and math.isclose(
+                winner.fused_score,
+                candidates[0].fused_score,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            )
+        ):
+            applied_rule = "deterministic tie"
+        reason = f"owner policy: {applied_rule}" if applied_rule else _owner_evidence_reason(winner)
 
         displaced = window[0]
         if displaced is not winner:
@@ -1025,33 +1581,68 @@ class SourceSearchCoordinator:
     @staticmethod
     def _classify(
         window: Sequence[_Item],
-        lexical_files: Sequence[str],
         owner: _Item | None,
         source_files: set[str],
     ) -> str:
-        """Confidence from absolute evidence only — never a normalised window."""
-        if not window:
+        """Confidence from the selected owner's own absolute evidence.
+
+        Evidence from another candidate cannot make *owner* trustworthy.  The
+        previous implementation pooled the best dense score, any exact-name
+        hit, and file-level lexical agreement across the whole result window.
+        That let one file win ownership on shape while a different file's
+        evidence silently granted it confidence.  This is a correctness bug,
+        not a threshold problem: the claim and the evidence must name the same
+        candidate.
+
+        The conservative ``no_match`` decision still considers the complete
+        window.  It is a claim that the corpus has no plausible answer, not a
+        claim about which candidate should own one.
+        """
+        if not window or owner is None:
             return NO_MATCH
+        profiles = [item.evidence_profile for item in window if item.evidence_profile is not None]
+        if owner.evidence_profile is None or len(profiles) != len(window):
+            # Retrieval succeeded but the co-location evidence did not.  That
+            # can support a candidate list, never a confident ownership claim
+            # or a corpus-wide absence.
+            return CAUTION
         cosines = [item.dense_cosine for item in window if item.dense_cosine is not None]
         best_dense = max(cosines) if cosines else 0.0
-        exact = any(item.exact_name for item in window)
-        any_lexical = any(item.lexical_rank is not None for item in window)
-        top_lexical = set(lexical_files[:AGREEMENT_LEXICAL_DEPTH])
-        agreement = any(
-            item.dense_cosine is not None
-            and item.dense_cosine >= AGREEMENT_DENSE_COSINE
-            and item.file
-            and item.file in top_lexical
-            for item in window
+        any_exact = any(profile.exact_name for profile in profiles)
+        best_coverage = max((profile.concept_coverage for profile in profiles), default=0.0)
+        meaningful_lexical = any(
+            profile.lexical_rank is not None
+            and profile.concept_coverage >= NO_MATCH_CONCEPT_COVERAGE
+            for profile in profiles
         )
+        profile = owner.evidence_profile
+        owner_dense = owner.dense_cosine or 0.0
 
-        if best_dense < NO_MATCH_DENSE_COSINE and not exact and not any_lexical:
+        if (
+            best_dense < NO_MATCH_DENSE_COSINE
+            and not any_exact
+            and best_coverage < NO_MATCH_CONCEPT_COVERAGE
+            and not meaningful_lexical
+        ):
             return NO_MATCH
-        if not (exact or best_dense >= CONFIDENT_DENSE_COSINE or agreement):
-            return CAUTION
         if _uncorroborated_page(source_files, owner):
             return CAUTION
-        return CONFIDENT
+        if profile.exact_name and owner.file:
+            return CONFIDENT
+        lexical_agreement = (
+            profile.lexical_rank is not None and profile.lexical_rank <= AGREEMENT_LEXICAL_DEPTH
+        )
+        complete_subject = profile.concept_coverage >= CONFIDENT_CONCEPT_COVERAGE
+        if complete_subject and lexical_agreement and owner_dense >= CONFIDENT_DENSE_COSINE:
+            return CONFIDENT
+        if (
+            complete_subject
+            and lexical_agreement
+            and owner_dense >= AGREEMENT_DENSE_COSINE
+            and profile.same_path_corroborated
+        ):
+            return CONFIDENT
+        return CAUTION
 
     # -- response ---------------------------------------------------------
 
@@ -1096,7 +1687,9 @@ class SourceSearchCoordinator:
         # what to open must be able to tell "nothing to open" from "the field
         # is missing on this response shape".
         response["selected_owner"] = (
-            {"file": owner.file, "reason": reason} if owner is not None and owner.file else None
+            {"file": owner.file, "reason": reason, "evidence": owner.evidence()}
+            if owner is not None and owner.file
+            else None
         )
         if confidence == NO_MATCH:
             response["note"] = (
@@ -1211,10 +1804,21 @@ class SourceSearchCoordinator:
                         lexical_rank=item.lexical_rank,
                         exact_name=item.exact_name,
                         fused_score=round(item.fused_score, 6),
+                        concept_coverage=(
+                            round(item.evidence_profile.concept_coverage, 4)
+                            if item.evidence_profile is not None
+                            else None
+                        ),
+                        same_path_corroborated=(
+                            item.evidence_profile.same_path_corroborated
+                            if item.evidence_profile is not None
+                            else None
+                        ),
                     )
                     for item in window
                 ],
                 selected_owner_file=owner.file if owner is not None else None,
+                selected_owner_evidence=owner.evidence() if owner is not None else None,
                 no_match=confidence == NO_MATCH,
             )
         )
@@ -1318,25 +1922,85 @@ def _fused_sort_key(item: _Item) -> tuple[float, int, int, str]:
     )
 
 
-def _owner_sort_key(item: _Item, position: int, wants_tests: bool) -> tuple[int, ...]:
-    """Owner preference: openable, name evidence, product code, shape, rank.
+def _exact_owner_match(item: _Item, intent: QueryIntent) -> bool:
+    """Whether *item* is the exact path/full-ID owner asserted by *intent*."""
 
-    Openability leads because the owner is a file to open. A page named by a
-    group key can be a perfectly good *result* and can never be the answer to
-    "what do I open", so it is passed over however well it ranked.
+    if intent.exact_target is not None:
+        query_path, query_symbol = _target_parts(intent.exact_target)
+        item_path, item_symbol = _target_parts(item.target_id)
+        normalized_file = item.file.replace("\\", "/").removeprefix("./").casefold()
+        if query_path != normalized_file and query_path != item_path:
+            return False
+        return not query_symbol or query_symbol == item_symbol
 
-    Name evidence is graded rather than boolean, so the owner agrees with the
-    order the routers produced: the name itself, then a boundary-aligned tail,
-    then no name evidence at all.
-    """
+    identifier = intent.identifier
+    if identifier is None or not ("." in identifier or "::" in identifier):
+        return False
+    _path, target_symbol = _target_parts(item.target_id)
+    return bool(target_symbol) and target_symbol == _norm_identifier(identifier)
+
+
+def _target_parts(value: str) -> tuple[str, str]:
+    """Normalize a stored/query path and optional qualified symbol separately."""
+
+    normalized = value.strip().replace("\\", "/")
+    path, separator, symbol = normalized.partition("::")
+    while path.startswith("./"):
+        path = path[2:]
+    return path.casefold(), _norm_identifier(symbol) if separator else ""
+
+
+def _declaration_carries_subject(item: _Item) -> bool:
+    """Whether a declaration has evidence for the subject it would own."""
+
+    if item.exact_name or item.suffix_match:
+        return True
     return (
-        0 if item.file else 1,
-        0 if item.exact_name else (1 if item.suffix_match else 2),
-        0 if wants_tests else (1 if item.is_test else 0),
-        _SOURCE_RANK.get(item.source, 3),
-        0 if item.kind in _DEFINITION_KINDS else 1,
-        position,
+        item.evidence_profile is not None
+        and item.evidence_profile.concept_coverage >= CONFIDENT_CONCEPT_COVERAGE
     )
+
+
+def _policy_tie_break(candidates: Sequence[_Item]) -> _Item:
+    """Keep semantic rank; path/line/key only for its true score ties.
+
+    The ranking immediately before owner selection already includes the exact
+    router and the generic non-test demotion.  Re-maximizing the raw fused score
+    here would silently undo both.  The first surviving candidate is therefore
+    the retrieval anchor; deterministic ordering applies only to peers carrying
+    that same score.
+    """
+
+    best_score = candidates[0].fused_score
+    tied = [
+        item
+        for item in candidates
+        if math.isclose(item.fused_score, best_score, rel_tol=0.0, abs_tol=1e-12)
+    ]
+    return min(
+        tied,
+        key=lambda item: (
+            item.file.casefold(),
+            item.start_line if item.start_line is not None else 1 << 30,
+            item.key,
+        ),
+    )
+
+
+def _owner_evidence_reason(item: _Item) -> str:
+    """Describe the evidence when no semantic owner rule displaced retrieval."""
+
+    if item.exact_via == EXACT_VIA_QUERY:
+        return "exact name match"
+    if item.exact_via == EXACT_VIA_EMBEDDED:
+        return "embedded identifier match"
+    if item.suffix_match:
+        return "embedded identifier suffix match"
+    if item.dense_rank is not None and item.lexical_rank is not None:
+        return "dense+lexical agreement"
+    if item.dense_rank is not None:
+        return "dense only"
+    return "lexical only"
 
 
 def _shows_lines_better(kept: _Item, candidate: _Item) -> bool:

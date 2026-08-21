@@ -153,6 +153,15 @@ class SourceFTSIndex:
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
         self._versioned = self._has_column(_TABLE, "row_key")
+        # Bound to one visible generation.  These caches are invalidated by
+        # every write method because tests and legacy callers may reuse one
+        # instance for a write followed by a read.
+        self._active_file_paths_cache: tuple[str, ...] | None = None
+        self._term_files_cache: dict[str, frozenset[str]] = {}
+
+    def _invalidate_read_caches(self) -> None:
+        self._active_file_paths_cache = None
+        self._term_files_cache.clear()
 
     def _has_column(self, table: str, column: str) -> bool:
         rows = self._conn.execute(f"PRAGMA table_info({table})").fetchall()
@@ -171,6 +180,7 @@ class SourceFTSIndex:
         )
         self._conn.commit()
         self._versioned = True
+        self._invalidate_read_caches()
 
     @staticmethod
     def _chunk_row(chunk: SourceChunk, generation: GenerationRef) -> tuple[str, ...]:
@@ -283,6 +293,7 @@ class SourceFTSIndex:
                     visible,
                 ),
             )
+        self._invalidate_read_caches()
         return len(rows)
 
     def rollback_generation(self, generation: GenerationRef) -> None:
@@ -307,6 +318,7 @@ class SourceFTSIndex:
                 f"DELETE FROM {_GENERATIONS} WHERE generation_id = ?",
                 (generation.generation_id,),
             )
+        self._invalidate_read_caches()
 
     def _delete_row_keys(self, row_keys: Sequence[str]) -> None:
         for start in range(0, len(row_keys), _IN_CHUNK):
@@ -336,6 +348,7 @@ class SourceFTSIndex:
                 )
                 deleted += max(cursor.rowcount, 0)
             self._conn.commit()
+            self._invalidate_read_caches()
             return deleted
 
         keys: list[str] = []
@@ -351,6 +364,7 @@ class SourceFTSIndex:
             )
         with self._conn:
             self._delete_row_keys(keys)
+        self._invalidate_read_caches()
         return len(keys)
 
     # -- verification and reading ---------------------------------------
@@ -428,6 +442,8 @@ class SourceFTSIndex:
     def active_file_paths(self) -> list[str]:
         """Distinct paths visible at this index's bound generation."""
 
+        if self._active_file_paths_cache is not None:
+            return list(self._active_file_paths_cache)
         if not self._versioned:
             rows = self._conn.execute(f"SELECT DISTINCT file_path FROM {_TABLE}").fetchall()
         else:
@@ -436,7 +452,46 @@ class SourceFTSIndex:
                 "WHERE valid_from <= ? AND valid_to > ?",
                 (self.generation.sequence, self.generation.sequence),
             ).fetchall()
-        return sorted(str(row[0]) for row in rows if row[0])
+        paths = tuple(sorted(str(row[0]) for row in rows if row[0]))
+        self._active_file_paths_cache = paths
+        return list(paths)
+
+    def term_file_evidence(self, terms: Sequence[str]) -> dict[str, frozenset[str]]:
+        """Active files whose indexed chunks contain each normalized *term*.
+
+        Confidence needs to know whether all of a query's concepts occur in
+        the proposed owner, not merely whether each concept occurs somewhere
+        in the result window.  Returning file sets makes both that co-location
+        test and corpus document frequency derive from one exact fact.
+
+        Inputs are normalized through :func:`tokenize` and only single tokens
+        are queried, so no caller-controlled FTS expression is executed.  The
+        cache is generation-bound and invalidated by every write operation.
+        """
+
+        token_stream: list[str] = []
+        for term in terms:
+            if isinstance(term, str):
+                token_stream.extend(tokenize(term))
+        normalized = list(dict.fromkeys(token_stream))
+        for term in normalized:
+            if term in self._term_files_cache:
+                continue
+            expression = f'"{term}"'
+            if self._versioned:
+                rows = self._conn.execute(
+                    f"SELECT DISTINCT v.file_path FROM {_TABLE} AS f "
+                    f"JOIN {_VERSIONS} AS v ON v.row_key = f.row_key "
+                    f"WHERE {_TABLE} MATCH ? AND v.valid_from <= ? AND v.valid_to > ?",
+                    (expression, self.generation.sequence, self.generation.sequence),
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    f"SELECT DISTINCT file_path FROM {_TABLE} WHERE {_TABLE} MATCH ?",
+                    (expression,),
+                ).fetchall()
+            self._term_files_cache[term] = frozenset(str(row[0]) for row in rows if row[0])
+        return {term: self._term_files_cache.get(term, frozenset()) for term in normalized}
 
     def count_for_files(self, file_paths: Sequence[str]) -> int:
         """Visible row count owned by *file_paths*."""

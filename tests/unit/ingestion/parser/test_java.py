@@ -107,6 +107,29 @@ class TestJavaParser:
         fi = _make_file_info("java_pkg/Calculator.java", "java")
         result = parser.parse_file(fi, FIELD_RECEIVER_SOURCE)
         for target in ("size", "reset"):
-            assert all(
-                c.receiver_name is None for c in result.calls if c.target_name == target
-            ), target
+            assert all(c.receiver_name is None for c in result.calls if c.target_name == target), (
+                target
+            )
+
+    def test_local_class_and_method_are_scoped_to_the_enclosing_method(
+        self, parser: ASTParser
+    ) -> None:
+        src = b"""public class Factory {
+    public void build() {
+        class LocalAdapter {
+            void run() {
+                helper();
+            }
+        }
+    }
+}
+"""
+        result = parser.parse_file(_make_file_info("java_pkg/Factory.java", "java"), src)
+        by_name = {symbol.name: symbol for symbol in result.symbols}
+        assert by_name["LocalAdapter"].visibility == "local"
+        assert by_name["LocalAdapter"].id == "java_pkg/Factory.java::Factory::build::LocalAdapter"
+        assert by_name["LocalAdapter"].parent_symbol_id == "java_pkg/Factory.java::Factory::build"
+        assert by_name["run"].visibility == "local"
+        assert by_name["run"].parent_symbol_id == by_name["LocalAdapter"].id
+        call = next(call for call in result.calls if call.target_name == "helper")
+        assert call.caller_symbol_id == by_name["run"].id

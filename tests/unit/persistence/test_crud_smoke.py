@@ -103,9 +103,24 @@ async def test_batch_upsert_graph_edges_updates_existing(async_session):
 @pytest.mark.asyncio
 async def test_batch_upsert_symbols_updates_existing(async_session):
     repo = await insert_repo(async_session)
-    await batch_upsert_symbols(async_session, repo.id, [_Sym("m.py", "f", signature="()")])
     await batch_upsert_symbols(
-        async_session, repo.id, [_Sym("m.py", "f", signature="(x)", kind="method")]
+        async_session,
+        repo.id,
+        [_Sym("m.py", "f", signature="()", parent_name="Old", parent_symbol_id="m.py::Old")],
+    )
+    await batch_upsert_symbols(
+        async_session,
+        repo.id,
+        [
+            _Sym(
+                "m.py",
+                "f",
+                signature="(x)",
+                kind="method",
+                parent_name="Owner",
+                parent_symbol_id="m.py::Owner",
+            )
+        ],
     )
     result = await async_session.execute(
         select(WikiSymbol).where(WikiSymbol.repository_id == repo.id)
@@ -114,6 +129,8 @@ async def test_batch_upsert_symbols_updates_existing(async_session):
     assert len(rows) == 1
     assert rows[0].signature == "(x)"
     assert rows[0].kind == "method"
+    assert rows[0].parent_name == "Owner"
+    assert rows[0].parent_symbol_id == "m.py::Owner"
 
 
 @pytest.mark.asyncio

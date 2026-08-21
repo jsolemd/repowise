@@ -212,7 +212,10 @@ class GraphBuilder(MetricsMixin, ResolveMixin, EdgesMixin, SerializeMixin, Rehyd
             path,
             node_type="file",
             language=parsed.file_info.language,
-            symbol_count=len(parsed.symbols),
+            # Architectural rollups count repository-level declarations, not
+            # implementation-local structure. Local nodes remain present and
+            # directly inspectable below.
+            symbol_count=sum(symbol.visibility != "local" for symbol in parsed.symbols),
             has_error=bool(parsed.parse_errors),
             is_test=parsed.file_info.is_test,
             is_entry_point=parsed.file_info.is_entry_point,
@@ -239,6 +242,7 @@ class GraphBuilder(MetricsMixin, ResolveMixin, EdgesMixin, SerializeMixin, Rehyd
                 is_async=sym.is_async,
                 language=sym.language,
                 parent_name=sym.parent_name,
+                parent_symbol_id=sym.parent_symbol_id,
                 signature=sym.signature,
                 decorators=sym.decorators,
                 is_exported_symbol=sym.is_exported_symbol,
@@ -254,8 +258,8 @@ class GraphBuilder(MetricsMixin, ResolveMixin, EdgesMixin, SerializeMixin, Rehyd
             )
 
             # HAS_METHOD edge: class/struct → method
-            if sym.parent_name and sym.kind == "method":
-                parent_id = f"{path}::{sym.parent_name}"
+            if sym.parent_symbol_id and sym.kind == "method":
+                parent_id = sym.parent_symbol_id
                 if parent_id in self._graph:
                     self._graph.add_edge(
                         parent_id,

@@ -9,6 +9,38 @@ from repowise.core.analysis.dead_code import (
 from tests.unit.dead_code._helpers import _build_graph
 
 
+def test_lexical_local_is_never_an_unused_export_candidate():
+    graph = _build_graph(
+        nodes={
+            "pkg/app.py": {
+                "is_entry_point": False,
+                "is_test": False,
+                "is_api_contract": False,
+                "symbol_count": 0,
+                "symbols": [
+                    {
+                        "name": "nested_helper",
+                        "kind": "function",
+                        "visibility": "local",
+                        "decorators": [],
+                        "start_line": 3,
+                        "end_line": 5,
+                        "complexity_estimate": 1,
+                    }
+                ],
+            }
+        }
+    )
+    report = DeadCodeAnalyzer(graph, git_meta_map={}).analyze(
+        {"detect_unreachable_files": False, "detect_zombie_packages": False}
+    )
+    assert not [
+        finding
+        for finding in report.findings
+        if finding.kind == DeadCodeKind.UNUSED_EXPORT and finding.symbol_name == "nested_helper"
+    ]
+
+
 def test_unused_export_detected():
     """A public symbol with no importers should be flagged as unused export."""
     g = _build_graph(

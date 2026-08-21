@@ -45,6 +45,7 @@ _NODE_ATTR_KEYS = (
     "visibility",
     "signature",
     "docstring",
+    "parent_name",
     "parent_symbol_id",
 )
 
@@ -84,10 +85,6 @@ class RehydrateMixin:
                 for key in _NODE_ATTR_KEYS
                 if node.get(key) is not None
             }
-            # ``parent_symbol_id`` is persisted under that name but the live
-            # graph uses ``parent_name`` (see GraphBuilder.add_file).
-            if "parent_symbol_id" in attrs:
-                attrs["parent_name"] = attrs.pop("parent_symbol_id")
             graph.add_node(node_id, **attrs)
             node_count += 1
 

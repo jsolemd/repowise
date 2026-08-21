@@ -63,6 +63,8 @@ class TopEntry:
     lexical_rank: int | None
     exact_name: bool
     fused_score: float
+    concept_coverage: float | None = None
+    same_path_corroborated: bool | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -72,6 +74,8 @@ class TopEntry:
             "lexical_rank": self.lexical_rank,
             "exact_name": self.exact_name,
             "fused_score": self.fused_score,
+            "concept_coverage": self.concept_coverage,
+            "same_path_corroborated": self.same_path_corroborated,
         }
 
 
@@ -91,6 +95,7 @@ class QueryEvent:
     result_count: int
     top: list[TopEntry] = field(default_factory=list)
     selected_owner_file: str | None = None
+    selected_owner_evidence: dict[str, Any] | None = None
     no_match: bool = False
     ts: str = field(default_factory=lambda: datetime.now(UTC).isoformat(timespec="milliseconds"))
 
@@ -105,6 +110,7 @@ class QueryEvent:
             "result_count": self.result_count,
             "top": [entry.to_dict() for entry in self.top[:TOP_EVENTS_LOGGED]],
             "selected_owner_file": self.selected_owner_file,
+            "selected_owner_evidence": self.selected_owner_evidence,
             "no_match": self.no_match,
         }
 

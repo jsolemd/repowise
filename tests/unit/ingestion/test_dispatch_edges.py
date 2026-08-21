@@ -365,10 +365,8 @@ def test_a_csharp_bare_call_reaches_an_inherited_method(tmp_path: Path) -> None:
     )
 
 
-def test_a_csharp_overload_set_resolves_to_the_one_id_it_shares(tmp_path: Path) -> None:
-    """Overloads of one name in one class carry one symbol id, so a call
-    reaching any of them lands on the same node. Pins the property the
-    inherited tier relies on: there is nothing to choose between."""
+def test_a_csharp_overload_set_resolves_to_the_matching_fetchable_id(tmp_path: Path) -> None:
+    """An inherited call resolves to the fetchable overload matching its arity."""
     graph = _build(
         tmp_path,
         {
@@ -385,6 +383,15 @@ def test_a_csharp_overload_set_resolves_to_the_one_id_it_shares(tmp_path: Path) 
         },
         "csharp",
     )
-    assert ("Test.cs::Test::Run", "Steps.cs::Steps::Given") in _calls_by_origin(
-        graph, "enclosing_inherited"
+    overloads = {
+        node_id: data
+        for node_id, data in graph.nodes(data=True)
+        if node_id.startswith("Steps.cs::Steps::Given~")
+    }
+    assert len(overloads) == 3
+    two_arg_id = next(
+        node_id
+        for node_id, data in overloads.items()
+        if data["signature"] == "func Given(int a, int b)"
     )
+    assert ("Test.cs::Test::Run", two_arg_id) in _calls_by_origin(graph, "enclosing_inherited")

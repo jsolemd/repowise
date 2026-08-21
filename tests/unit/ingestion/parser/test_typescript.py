@@ -102,12 +102,7 @@ class TestTypeScriptParser:
         result = parser.parse_file(fi, TS_SOURCE)
         assert result.parse_errors == []
 
-    def test_nested_helpers_inside_component_not_extracted(self, parser: ASTParser) -> None:
-        # Regression (D5): React component bodies contain helper function
-        # declarations and arrow-const handlers (``handleSave``,
-        # ``handleKeyDown``, ``Section``) that were being flattened to
-        # top-level public symbols and surfacing as ``unused_export``
-        # findings with confidence 1.0.
+    def test_nested_helpers_inside_component_are_local_not_exports(self, parser: ASTParser) -> None:
         src = b"""
 export function GeneralForm({ onSave }: Props) {
   function addPattern(p: string) { return p; }
@@ -119,16 +114,20 @@ export function GeneralForm({ onSave }: Props) {
 
 export const Wrapper = () => {
   const inner = () => 42;
+  queueMicrotask(() => { function anonymousChild() {} });
   return inner();
 };
 """
         fi = _make_file_info("ui/src/general-form.tsx", "typescript")
         result = parser.parse_file(fi, src)
-        names = {s.name for s in result.symbols}
-        assert "GeneralForm" in names
-        assert "Wrapper" in names
-        for hidden in ("addPattern", "handleSave", "Section", "handleKeyDown", "inner"):
-            assert hidden not in names, f"nested helper {hidden} leaked to top level"
+        by_name = {s.name: s for s in result.symbols}
+        assert {"GeneralForm", "Wrapper"} <= set(by_name)
+        for local_name in ("addPattern", "handleSave", "Section", "handleKeyDown", "inner"):
+            assert by_name[local_name].visibility == "local"
+        assert by_name["Section"].parent_symbol_id == "ui/src/general-form.tsx::GeneralForm"
+        assert by_name["inner"].id == "ui/src/general-form.tsx::Wrapper::inner"
+        assert "anonymousChild" not in by_name
+        assert set(result.exports) == {"GeneralForm", "Wrapper"}
 
     def test_tsx_file_uses_jsx_grammar(self, parser: ASTParser) -> None:
         # .tsx files require the JSX-aware grammar variant; the default
@@ -145,7 +144,10 @@ export function Card({ title }: { title: string }) {
         assert result.parse_errors == []
         names = {s.name for s in result.symbols}
         assert "Card" in names
-        assert "handleClick" not in names
+        assert "handleClick" in names
+        helper = next(symbol for symbol in result.symbols if symbol.name == "handleClick")
+        assert helper.visibility == "local"
+        assert helper.parent_symbol_id == "ui/src/card.tsx::Card"
 
     def test_ts_file_with_jsx_falls_back_to_tsx_grammar(self, parser: ASTParser) -> None:
         # A .ts file (not .tsx) containing JSX markup normally produces ERROR nodes.
@@ -162,7 +164,10 @@ export function Button({ label }: { label: string }) {
         assert result.parse_errors == []
         names = {s.name for s in result.symbols}
         assert "Button" in names
-        assert "handleClick" not in names  # nested helper must not be hoisted
+        assert "handleClick" in names
+        helper = next(symbol for symbol in result.symbols if symbol.name == "handleClick")
+        assert helper.visibility == "local"
+        assert helper.parent_symbol_id == "ui/src/Button.ts::Button"
 
     def test_ts_file_jsx_call_site_edges_captured_after_fallback(self, parser: ASTParser) -> None:
         # After the TSX grammar fallback, JSX component usages (<StatRow />,

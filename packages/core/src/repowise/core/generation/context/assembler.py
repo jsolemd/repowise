@@ -300,9 +300,12 @@ class ContextAssembler:
         # Always include: path + language tag overhead
         used += self._estimate_tokens(path) + 5
 
-        # Separate public and private symbols
-        public_syms = [s for s in parsed.symbols if s.visibility == "public"]
-        private_syms = [s for s in parsed.symbols if s.visibility != "public"]
+        # Lexical locals are searchable source facts, not architectural or
+        # generated-document surface. Treating "anything non-public" as
+        # private would leak every nested helper into file/module pages.
+        page_syms = [s for s in parsed.symbols if s.visibility != "local"]
+        public_syms = [s for s in page_syms if s.visibility == "public"]
+        private_syms = [s for s in page_syms if s.visibility != "public"]
 
         # Build symbol dicts — public first, then private (documented before
         # undocumented), each added only while the running budget allows.
@@ -956,6 +959,8 @@ class ContextAssembler:
         endpoints: list[str] = []
         schemas: list[str] = []
         for sym in parsed.symbols:
+            if sym.visibility == "local":
+                continue
             if sym.kind in ("function", "method"):
                 endpoints.append(sym.signature)
             elif sym.kind in ("class", "interface", "struct"):
@@ -983,7 +988,7 @@ class ContextAssembler:
         remaining = self._config.token_budget
         raw_content = self._trim_to_budget(source_text, remaining)
 
-        targets = [sym.name for sym in parsed.symbols]
+        targets = [sym.name for sym in parsed.symbols if sym.visibility != "local"]
 
         return InfraPageContext(
             file_path=parsed.file_info.path,

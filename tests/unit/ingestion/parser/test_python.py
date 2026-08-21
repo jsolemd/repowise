@@ -85,6 +85,7 @@ class TestPythonParser:
             s for s in result.symbols if s.name == "add" and s.parent_name == "Calculator"
         )
         assert calc_add.parent_name == "Calculator"
+        assert calc_add.parent_symbol_id == "pkg/calc.py::Calculator"
 
     def test_private_visibility(self, parser: ASTParser) -> None:
         fi = _make_file_info("pkg/calc.py", "python")
@@ -162,11 +163,10 @@ class TestPythonParser:
         imp = next(i for i in result.imports if i.module_path == "python_pkg.models")
         assert imp.imported_names == ["Operation", "Result"]
 
-    def test_nested_function_not_extracted_as_top_level(self, parser: ASTParser) -> None:
-        # Regression (D8): orchestrator-style helpers defined inside an
-        # async method (e.g. ``_on_start``, ``_on_done``, ``_step``) were
-        # flattened to the top-level symbol list and read as unused public
-        # exports. Only module-top-level + class-body members should appear.
+    def test_nested_functions_are_local_not_top_level_exports(self, parser: ASTParser) -> None:
+        # A3 narrows the old anti-hoisting guard: stable named helpers remain
+        # structurally searchable, but their lexical chain and local
+        # visibility prevent them from masquerading as module exports.
         src = (
             b"async def run():\n"
             b"    def _on_start():\n"
@@ -182,18 +182,45 @@ class TestPythonParser:
         )
         fi = _make_file_info("pkg/orchestrator.py", "python")
         result = parser.parse_file(fi, src)
-        names = {s.name for s in result.symbols}
-        assert names == {"run", "Worker", "perform"}
-        assert "_on_start" not in names
-        assert "_step" not in names
-        assert "_on_done" not in names
+        by_name = {s.name: s for s in result.symbols}
+        assert set(by_name) == {"run", "_on_start", "_step", "Worker", "perform", "_on_done"}
+        assert by_name["_on_start"].visibility == "local"
+        assert by_name["_on_start"].parent_symbol_id == "pkg/orchestrator.py::run"
+        assert by_name["_step"].id == "pkg/orchestrator.py::run::_step"
+        assert by_name["_on_done"].id == "pkg/orchestrator.py::Worker::perform::_on_done"
+        assert by_name["_on_done"].parent_symbol_id == "pkg/orchestrator.py::Worker::perform"
+        assert result.exports == ["run", "Worker"]
 
-    def test_nested_class_inside_function_not_extracted(self, parser: ASTParser) -> None:
+    def test_nested_class_and_method_keep_the_full_local_chain(self, parser: ASTParser) -> None:
         src = b"def make():\n    class Helper:\n        def m(self): pass\n"
         fi = _make_file_info("pkg/factories.py", "python")
         result = parser.parse_file(fi, src)
-        names = {s.name for s in result.symbols}
-        assert names == {"make"}
+        by_name = {s.name: s for s in result.symbols}
+        assert by_name["Helper"].visibility == "local"
+        assert by_name["Helper"].id == "pkg/factories.py::make::Helper"
+        assert by_name["Helper"].parent_symbol_id == "pkg/factories.py::make"
+        assert by_name["m"].visibility == "local"
+        assert by_name["m"].id == "pkg/factories.py::make::Helper::m"
+        assert by_name["m"].parent_symbol_id == "pkg/factories.py::make::Helper"
+
+    def test_same_named_locals_get_stable_fetchable_collision_ids(self, parser: ASTParser) -> None:
+        src = (
+            b"def outer():\n"
+            b"    def helper(value): return value\n"
+            b"    def helper(value, fallback): return value or fallback\n"
+        )
+        file_info = _make_file_info("pkg/collisions.py", "python")
+        first = parser.parse_file(file_info, src)
+        second = parser.parse_file(file_info, src)
+        helpers = [symbol for symbol in first.symbols if symbol.name == "helper"]
+
+        assert len(helpers) == 2
+        assert len({symbol.id for symbol in helpers}) == 2
+        assert all(symbol.id.startswith("pkg/collisions.py::outer::helper~") for symbol in helpers)
+        assert all(symbol.parent_symbol_id == "pkg/collisions.py::outer" for symbol in helpers)
+        assert [symbol.id for symbol in helpers] == [
+            symbol.id for symbol in second.symbols if symbol.name == "helper"
+        ]
 
     def test_function_docstring(self, parser: ASTParser) -> None:
         fi = _make_file_info("pkg/calc.py", "python")

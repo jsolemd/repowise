@@ -411,6 +411,8 @@ class SymbolMatch:
                 "name": r.name,
                 "qualified_name": r.qualified_name,
                 "kind": r.kind,
+                "visibility": getattr(r, "visibility", None),
+                "parent_symbol_id": getattr(r, "parent_symbol_id", None),
                 "start_line": r.start_line,
             }
             for r in self.rows

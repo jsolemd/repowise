@@ -19,6 +19,8 @@ from repowise.core.source_search.coordinator import (
     CONFIDENT_DENSE_COSINE,
     NO_MATCH_DENSE_COSINE,
     SourceSearchCoordinator,
+    _Item,
+    _query_intent,
 )
 from repowise.core.source_search.query_log import QueryLog
 from repowise.core.source_search.vector_store import SourceChunkHit, SourceChunkRecord
@@ -56,11 +58,32 @@ class _SourceVectors:
 
 
 class _SourceFTS:
-    def __init__(self, hits: list[Any]) -> None:
+    def __init__(
+        self,
+        hits: list[Any],
+        term_files: dict[str, set[str]] | None = None,
+        active_paths: set[str] | None = None,
+    ) -> None:
         self._hits = hits
+        self._term_files = term_files
+        self._active_paths = set(active_paths or ())
+        self._active_paths.update(hit.file_path for hit in hits if hit.file_path)
 
     def query(self, match: str, limit: int = 20) -> list[Any]:
         return self._hits[:limit]
+
+    def active_file_paths(self) -> list[str]:
+        if self._term_files is not None:
+            self._active_paths.update(path for paths in self._term_files.values() for path in paths)
+        return sorted(self._active_paths)
+
+    def term_file_evidence(self, terms: list[str] | tuple[str, ...]) -> dict[str, frozenset[str]]:
+        if self._term_files is not None:
+            return {term: frozenset(self._term_files.get(term, set())) for term in terms}
+        # Every fake lexical hit stands in for a chunk matching this fake
+        # query. Fine-grained co-location cases pass an explicit mapping.
+        matched = frozenset(hit.file_path for hit in self._hits if hit.file_path)
+        return {term: matched for term in terms}
 
 
 class _WikiVectors:
@@ -117,9 +140,10 @@ def _hit(
     is_test: bool = False,
     source: str = "symbol",
     snippet: str = "",
+    chunk_id: str | None = None,
 ) -> SourceChunkHit:
     return SourceChunkHit(
-        chunk_id=f"{path}::{name}",
+        chunk_id=chunk_id or f"{path}::{name}",
         file_path=path,
         name=name,
         kind=kind,
@@ -157,12 +181,16 @@ def _coordinator(
     wiki_lexical: list[Any] | None = None,
     records: dict[str, SourceChunkRecord] | None = None,
     embedder: Any = None,
+    source_term_files: dict[str, set[str]] | None = None,
+    source_active_paths: set[str] | None = None,
 ) -> SourceSearchCoordinator:
     return SourceSearchCoordinator(
         repo_path=tmp_path,
         embedder=embedder or _Embedder(),
         source_vectors=_SourceVectors(source_dense or [], records),  # type: ignore[arg-type]
-        source_fts=_SourceFTS(source_lexical or []),  # type: ignore[arg-type]
+        source_fts=_SourceFTS(  # type: ignore[arg-type]
+            source_lexical or [], source_term_files, source_active_paths
+        ),
         wiki_vectors=_WikiVectors(wiki_dense or []),
         wiki_fts=_WikiFTS(wiki_lexical or []),
         query_log=QueryLog(tmp_path / "log.jsonl"),
@@ -437,10 +465,9 @@ async def test_the_embedded_arm_names_itself_in_the_owner_reason(tmp_path):
         ],
     )
     response = await coordinator.search("fix the failing merged_with case", limit=5)
-    assert response["selected_owner"] == {
-        "file": "src/target.py",
-        "reason": "embedded identifier match",
-    }
+    assert response["selected_owner"]["file"] == "src/target.py"
+    assert response["selected_owner"]["reason"] == "embedded identifier match"
+    assert response["selected_owner"]["evidence"]["exact_name"] is True
     assert response["confidence"] == "confident"
 
 
@@ -562,10 +589,9 @@ async def test_a_suffix_match_does_not_claim_an_exact_name(tmp_path):
     response = await coordinator.search("fix the wants_tests classifier", limit=5)
     assert _files(response) == ["src/suffix.py", "src/other.py"]
     assert response["results"][0]["evidence"]["exact_name"] is False
-    assert response["selected_owner"] == {
-        "file": "src/suffix.py",
-        "reason": "embedded identifier suffix match",
-    }
+    assert response["selected_owner"]["file"] == "src/suffix.py"
+    assert response["selected_owner"]["reason"] == "embedded identifier suffix match"
+    assert response["selected_owner"]["evidence"]["exact_name"] is False
 
 
 async def test_a_suffix_match_alone_does_not_make_the_answer_confident(tmp_path):
@@ -792,10 +818,9 @@ async def test_the_owner_is_named_with_the_evidence_for_it(tmp_path):
         source_lexical=[_FTSHit(hit.chunk_id, hit.file_path)],
     )
     response = await coordinator.search("how alpha works", limit=5)
-    assert response["selected_owner"] == {
-        "file": "src/a.py",
-        "reason": "dense+lexical agreement",
-    }
+    assert response["selected_owner"]["file"] == "src/a.py"
+    assert response["selected_owner"]["reason"] == "dense+lexical agreement"
+    assert response["selected_owner"]["evidence"]["concept_coverage"] == 1.0
 
 
 async def test_an_exact_name_hit_says_so(tmp_path):
@@ -830,6 +855,312 @@ async def test_a_clear_winner_outside_the_band_is_not_second_guessed(tmp_path):
     assert response["selected_owner"]["file"] == "src/page.py"
 
 
+async def test_exact_file_qualified_id_owns_only_its_named_path(tmp_path):
+    coordinator = _coordinator(
+        tmp_path,
+        source_dense=[
+            _hit(
+                "inner",
+                "src/other.py",
+                0.90,
+                chunk_id="src/other.py::Outer::inner",
+            ),
+            _hit(
+                "inner",
+                "src/target.py",
+                0.80,
+                chunk_id="src/target.py::Outer::inner",
+            ),
+        ],
+    )
+
+    response = await coordinator.search("src/target.py::Outer::inner", limit=5)
+
+    assert response["selected_owner"]["file"] == "src/target.py"
+    assert response["selected_owner"]["reason"].startswith("owner policy: exact path/full-ID owner")
+
+
+@pytest.mark.parametrize(
+    "query",
+    ["canonicalize_workspace_copy_path", "query_wants_tests", "build_symbol_uid"],
+)
+def test_bare_identifiers_are_not_misclassified_as_exact_paths(query):
+    intent = _query_intent(query)
+
+    assert intent.identifier == query
+    assert intent.exact_target is None
+
+
+async def test_exact_wiki_declaration_proxy_survives_source_declaration_policy(tmp_path):
+    page = _PageHit(
+        "symbol_spotlight:src/target.py::canonical_name",
+        "src/target.py::canonical_name",
+        0.90,
+        page_type="symbol_spotlight",
+        title="Symbol: canonical_name",
+    )
+    coordinator = _coordinator(
+        tmp_path,
+        wiki_dense=[page],
+        source_dense=[
+            _hit("usage", "src/usage.py", 0.80, snippet="canonical_name()"),
+            _hit("canonical_name", "src/target.py", 0.70),
+        ],
+    )
+
+    response = await coordinator.search("canonical_name", limit=5)
+
+    assert response["selected_owner"]["file"] == "src/target.py"
+    assert response["selected_owner"]["reason"] == "exact name match"
+    assert response["results"][0]["file"] == "src/target.py"
+    assert response["results"][0]["evidence"]["lane"] == "source"
+
+
+async def test_filename_like_prose_does_not_claim_exact_path_ownership(tmp_path):
+    coordinator = _coordinator(
+        tmp_path,
+        source_dense=[
+            _hit("routing", "src/current.py", 0.90),
+            _hit("config", "src/config.py", 0.80),
+        ],
+    )
+
+    response = await coordinator.search("how config.py controls routing", limit=5)
+
+    assert "exact path/full-ID owner" not in response["selected_owner"]["reason"]
+
+
+async def test_explicit_test_discovery_selects_a_close_test_owner(tmp_path):
+    coordinator = _coordinator(
+        tmp_path,
+        source_dense=[
+            _hit("worker", "src/worker.py", 0.90),
+            _hit("worker", "tests/test_worker.py", 0.80, is_test=True),
+        ],
+    )
+
+    response = await coordinator.search("where are the worker fixtures", limit=5)
+
+    assert response["selected_owner"]["file"] == "tests/test_worker.py"
+    assert response["selected_owner"]["reason"].startswith("owner policy: explicit test owner")
+
+
+async def test_repair_intent_treats_a_close_failing_test_as_the_symptom(tmp_path):
+    coordinator = _coordinator(
+        tmp_path,
+        source_dense=[
+            _hit("worker", "tests/test_worker.py", 0.90, is_test=True),
+            _hit("worker", "src/worker.py", 0.80),
+        ],
+    )
+
+    response = await coordinator.search("fix the failing worker test", limit=5)
+
+    assert response["selected_owner"]["file"] == "src/worker.py"
+    assert response["selected_owner"]["reason"].startswith("owner policy: symptom test demotion")
+
+
+async def test_complete_subject_evidence_beats_a_close_single_token_neighbor(tmp_path):
+    coordinator = _coordinator(
+        tmp_path,
+        source_dense=[
+            _hit("neo4j_writer", "src/graph.py", 0.90),
+            _hit("neo4j_cashflow", "src/combined.py", 0.80),
+        ],
+        source_term_files={
+            "neo4j": {"src/graph.py", "src/combined.py"},
+            "cashflow": {"src/combined.py"},
+        },
+    )
+
+    response = await coordinator.search("how neo4j cashflow behaves", limit=5)
+
+    assert response["selected_owner"]["file"] == "src/combined.py"
+    assert response["selected_owner"]["reason"].startswith(
+        "owner policy: co-located subject completeness"
+    )
+
+
+async def test_embedded_identifier_bypasses_prose_completeness(tmp_path):
+    coordinator = _coordinator(
+        tmp_path,
+        source_dense=[
+            _hit("walk_notes", "src/complete.py", 0.90),
+            _hit("walk_vault", "src/declaration.py", 0.80),
+        ],
+        source_term_files={
+            "walk": {"src/complete.py", "src/declaration.py"},
+            "vault": {"src/complete.py", "src/declaration.py"},
+            "underscore": {"src/complete.py"},
+            "directory": {"src/complete.py"},
+        },
+    )
+
+    response = await coordinator.search("fix the walk_vault underscore directory test", limit=5)
+
+    assert response["selected_owner"]["file"] == "src/declaration.py"
+    assert "co-located subject completeness" not in response["selected_owner"]["reason"]
+
+
+async def test_test_subject_bypasses_prose_completeness_between_test_files(tmp_path):
+    coordinator = _coordinator(
+        tmp_path,
+        source_dense=[
+            _hit("test_pack_spans", "tests/test_packing.py", 0.90, is_test=True),
+            _hit("test_other_exhaustion", "tests/test_other.py", 0.80, is_test=True),
+        ],
+        source_term_files={
+            "pack": {"tests/test_packing.py", "tests/test_other.py"},
+            "spans": {"tests/test_packing.py", "tests/test_other.py"},
+            "budget": {"tests/test_packing.py", "tests/test_other.py"},
+            "exhaustion": {"tests/test_other.py"},
+        },
+    )
+
+    response = await coordinator.search("show the tests for pack spans budget exhaustion", limit=5)
+
+    assert response["selected_owner"]["file"] == "tests/test_packing.py"
+    assert "co-located subject completeness" not in response["selected_owner"]["reason"]
+
+
+async def test_implementation_intent_prefers_close_source_over_generated_prose(tmp_path):
+    coordinator = _coordinator(
+        tmp_path,
+        source_dense=[_hit("alpha", "src/alpha.py", 0.80)],
+        wiki_dense=[
+            _PageHit(
+                "file_page:docs/alpha.md",
+                "docs/alpha.md",
+                0.90,
+                snippet="alpha",
+            )
+        ],
+        source_term_files={"alpha": {"src/alpha.py", "docs/alpha.md"}},
+    )
+
+    response = await coordinator.search("how is alpha implemented", limit=5)
+
+    assert response["selected_owner"]["file"] == "src/alpha.py"
+    assert response["selected_owner"]["reason"].startswith("owner policy: source-owner bias")
+
+
+async def test_explicit_docs_intent_does_not_apply_source_owner_bias(tmp_path):
+    page = _PageHit(
+        "file_page:docs/alpha.md",
+        "docs/alpha.md",
+        0.90,
+        snippet="alpha",
+    )
+    coordinator = _coordinator(
+        tmp_path,
+        source_dense=[_hit("alpha", "src/alpha.py", 0.80)],
+        wiki_dense=[page],
+        source_term_files={"alpha": {"src/alpha.py", "docs/alpha.md"}},
+    )
+
+    response = await coordinator.search("where is alpha documented", limit=5)
+
+    assert response["selected_owner"]["file"] == "docs/alpha.md"
+    assert "source-owner bias" not in response["selected_owner"]["reason"]
+
+
+async def test_declaration_owns_an_implementation_query_over_close_usage(tmp_path):
+    coordinator = _coordinator(
+        tmp_path,
+        source_dense=[
+            _hit("request_usage", "src/caller.py", 0.90, kind="reference"),
+            _hit("request_router", "src/router.py", 0.80, kind="function"),
+        ],
+        source_term_files={
+            "request": {"src/caller.py", "src/router.py"},
+            "routing": {"src/caller.py", "src/router.py"},
+        },
+    )
+
+    response = await coordinator.search("where request routing is implemented", limit=5)
+
+    assert response["selected_owner"]["file"] == "src/router.py"
+    assert response["selected_owner"]["reason"].startswith("owner policy: declaration over usage")
+
+
+async def test_operational_intent_preserves_a_close_file_window_owner(tmp_path):
+    coordinator = _coordinator(
+        tmp_path,
+        source_dense=[
+            _hit("healthcheck", "src/health.py", 0.90, kind="function"),
+            _hit(
+                "compose.yaml",
+                "deploy/compose.yaml",
+                0.80,
+                kind="file_window",
+                source="file_window",
+            ),
+        ],
+        source_term_files={
+            "compose": {"src/health.py", "deploy/compose.yaml"},
+            "healthcheck": {"src/health.py", "deploy/compose.yaml"},
+        },
+    )
+
+    response = await coordinator.search("where compose service healthcheck is configured", limit=5)
+
+    assert response["selected_owner"]["file"] == "deploy/compose.yaml"
+    assert response["selected_owner"]["reason"].startswith(
+        "owner policy: operational file preservation"
+    )
+
+
+async def test_bare_code_identifier_does_not_trigger_operational_file_policy(tmp_path):
+    coordinator = _coordinator(
+        tmp_path,
+        source_dense=[
+            _hit(
+                "compose.yaml",
+                "deploy/compose.yaml",
+                0.90,
+                kind="file_window",
+                source="file_window",
+            ),
+            _hit("healthcheck", "src/health.py", 0.80, kind="function"),
+        ],
+    )
+
+    response = await coordinator.search("healthcheck", limit=5)
+
+    assert response["selected_owner"]["file"] == "src/health.py"
+    assert "operational file preservation" not in response["selected_owner"]["reason"]
+
+
+def test_true_owner_evidence_ties_use_path_line_and_stable_key() -> None:
+    later = _Item(
+        key="source:z",
+        lane="source",
+        file="src/z.py",
+        name="topic",
+        kind="reference",
+        snippet="topic",
+        source="symbol",
+        fused_score=0.01,
+    )
+    earlier = _Item(
+        key="source:a",
+        lane="source",
+        file="src/a.py",
+        name="topic",
+        kind="reference",
+        snippet="topic",
+        source="symbol",
+        fused_score=0.01,
+    )
+
+    owner, reason = SourceSearchCoordinator._select_owner(
+        [later, earlier], intent=_query_intent("ordinary topic")
+    )
+
+    assert owner is earlier
+    assert reason.startswith("owner policy: deterministic tie")
+
+
 async def test_no_results_means_no_owner(tmp_path):
     coordinator = _coordinator(tmp_path)
     response = await coordinator.search("nothing at all like this", limit=5)
@@ -842,12 +1173,13 @@ async def test_no_results_means_no_owner(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-async def test_a_strong_cosine_alone_is_confident(tmp_path):
+async def test_a_strong_cosine_alone_is_only_caution(tmp_path):
     coordinator = _coordinator(
         tmp_path, source_dense=[_hit("alpha", "src/a.py", CONFIDENT_DENSE_COSINE)]
     )
     response = await coordinator.search("how alpha works", limit=5)
-    assert response["confidence"] == "confident"
+    assert response["results"][0]["evidence"]["concept_coverage"] == 1.0
+    assert response["confidence"] == "caution"
 
 
 async def test_just_under_the_threshold_is_caution(tmp_path):
@@ -858,7 +1190,21 @@ async def test_just_under_the_threshold_is_caution(tmp_path):
     assert response["confidence"] == "caution"
 
 
-async def test_a_middling_cosine_plus_lexical_agreement_is_confident(tmp_path):
+async def test_strong_dense_complete_concepts_and_own_lexical_evidence_are_confident(tmp_path):
+    hit = _hit("alpha", "src/a.py", CONFIDENT_DENSE_COSINE)
+    coordinator = _coordinator(
+        tmp_path,
+        source_dense=[hit],
+        source_lexical=[_FTSHit(hit.chunk_id, hit.file_path)],
+    )
+    response = await coordinator.search("how alpha works", limit=5)
+    assert response["results"][0]["evidence"]["concept_coverage"] == 1.0
+    assert response["confidence"] == "confident"
+
+
+async def test_middling_dense_and_lexical_without_cross_corpus_corroboration_is_caution(
+    tmp_path,
+):
     hit = _hit("alpha", "src/a.py", AGREEMENT_DENSE_COSINE)
     coordinator = _coordinator(
         tmp_path,
@@ -866,7 +1212,102 @@ async def test_a_middling_cosine_plus_lexical_agreement_is_confident(tmp_path):
         source_lexical=[_FTSHit(hit.chunk_id, hit.file_path)],
     )
     response = await coordinator.search("how alpha works", limit=5)
+    assert response["confidence"] == "caution"
+
+
+async def test_middling_dense_complete_concepts_and_same_path_corroboration_are_confident(
+    tmp_path,
+):
+    hit = _hit("alpha", "src/a.py", AGREEMENT_DENSE_COSINE)
+    page = _PageHit("file_page:src/a.py", "src/a.py", AGREEMENT_DENSE_COSINE - 0.01)
+    coordinator = _coordinator(
+        tmp_path,
+        source_dense=[hit],
+        source_lexical=[_FTSHit(hit.chunk_id, hit.file_path)],
+        wiki_dense=[page],
+    )
+    response = await coordinator.search("how alpha works", limit=5)
+    assert response["results"][0]["evidence"]["same_path_corroborated"] is True
     assert response["confidence"] == "confident"
+
+
+async def test_vocabulary_split_across_files_cannot_be_pooled_into_confidence(tmp_path):
+    owner = _hit("neo4j_writer", "src/graph.py", 0.60)
+    neighbour = _hit("cashflow_projection", "src/finance.py", 0.55)
+    coordinator = _coordinator(
+        tmp_path,
+        source_dense=[owner, neighbour],
+        source_lexical=[_FTSHit(owner.chunk_id, owner.file_path)],
+        source_term_files={
+            "neo4j": {"src/graph.py"},
+            "cashflow": {"src/finance.py"},
+        },
+    )
+
+    response = await coordinator.search("neo4j cashflow", limit=5)
+
+    assert response["selected_owner"]["file"] == "src/graph.py"
+    assert response["results"][0]["evidence"]["concept_coverage"] == 0.5
+    assert response["confidence"] == "caution"
+
+
+async def test_complete_subject_concepts_on_one_owner_can_be_confident(tmp_path):
+    owner = _hit("neo4j_cashflow", "src/combined.py", 0.60)
+    coordinator = _coordinator(
+        tmp_path,
+        source_dense=[owner],
+        source_lexical=[_FTSHit(owner.chunk_id, owner.file_path)],
+        source_term_files={
+            "neo4j": {"src/combined.py"},
+            "cashflow": {"src/combined.py"},
+        },
+    )
+
+    response = await coordinator.search("neo4j cashflow", limit=5)
+
+    assert response["results"][0]["evidence"]["concept_coverage"] == 1.0
+    assert response["confidence"] == "confident"
+
+
+async def test_a_different_candidates_strong_cosine_cannot_make_the_owner_confident(tmp_path):
+    """The file named as owner must carry the evidence behind the claim."""
+    coordinator = _coordinator(
+        tmp_path,
+        source_dense=[
+            _hit("symptom", "tests/test_symptom.py", 0.90, is_test=True),
+            _hit("implementation", "src/implementation.py", 0.35),
+        ],
+    )
+
+    response = await coordinator.search("fix the failing symptom test", limit=5)
+
+    assert response["selected_owner"]["file"] == "src/implementation.py"
+    assert response["results"][1]["evidence"]["dense_cosine"] == 0.9
+    assert response["results"][0]["evidence"]["dense_cosine"] == 0.35
+    assert response["confidence"] == "caution"
+
+
+async def test_symptom_demotion_cannot_cross_the_owner_score_band(tmp_path):
+    """A two-leg test that decisively wins retrieval stays the owner."""
+    lexical = _hit("symptom", "tests/test_symptom.py", 0.0, is_test=True)
+    coordinator = _coordinator(
+        tmp_path,
+        source_dense=[
+            _hit("implementation", "src/implementation.py", AGREEMENT_DENSE_COSINE),
+            _hit("symptom", "tests/test_symptom.py", 0.20, is_test=True),
+        ],
+        source_lexical=[_FTSHit(lexical.chunk_id, lexical.file_path)],
+    )
+
+    response = await coordinator.search("fix the failing symptom test", limit=5)
+
+    assert response["selected_owner"]["file"] == "tests/test_symptom.py"
+    implementation = next(
+        result for result in response["results"] if result["file"] == "src/implementation.py"
+    )
+    assert implementation["evidence"]["lexical_rank"] is None
+    assert "symptom test demotion" not in response["selected_owner"]["reason"]
+    assert response["confidence"] == "caution"
 
 
 async def test_an_exact_name_is_confident_however_weak_the_cosine(tmp_path):
@@ -901,6 +1342,7 @@ async def test_a_wiki_owner_no_source_chunk_corroborates_is_only_caution(tmp_pat
         wiki_dense=[page],
         wiki_lexical=[page],
         source_dense=[_hit("elsewhere", "src/other.py", 0.20)],
+        source_term_files={"page": {"src/page.py"}, "thing": {"src/page.py"}},
     )
     response = await coordinator.search("how the page thing works", limit=5)
     assert response["selected_owner"]["file"] == "src/page.py"
@@ -915,6 +1357,7 @@ async def test_a_wiki_owner_the_source_corpus_agrees_with_is_confident(tmp_path)
         wiki_dense=[page],
         wiki_lexical=[page],
         source_dense=[_hit("thing", "src/page.py", 0.85, source="file_window")],
+        source_term_files={"page": {"src/page.py"}, "thing": {"src/page.py"}},
     )
     response = await coordinator.search("how the page thing works", limit=5)
     assert response["selected_owner"]["file"] == "src/page.py"
@@ -969,7 +1412,16 @@ async def test_the_envelope_carries_every_contract_key(tmp_path):
         "relevance_score",
         "evidence",
     }
-    assert set(result["evidence"]) == {"dense_cosine", "lexical_rank", "exact_name", "lane"}
+    assert set(result["evidence"]) == {
+        "dense_cosine",
+        "lexical_rank",
+        "exact_name",
+        "lane",
+        "concept_coverage",
+        "corpus_file_count",
+        "same_path_corroborated",
+        "concepts",
+    }
     assert response["candidates"] == [{"path": "src/a.py"}]
 
 
@@ -1151,9 +1603,10 @@ async def test_a_broken_source_store_is_reported_not_swallowed(tmp_path, caplog)
 async def test_a_slow_store_is_still_just_swallowed(tmp_path):
     """A timeout is a thinner answer, not a broken one — no degraded flag.
 
-    The source lexical leg still names the file, so the confidence rules see a
-    corroborated page and would say "confident": that is what proves the
-    timeout did not pin anything, only that it contributed nothing.
+    The source lexical leg still names the file, but its evidence belongs to a
+    different candidate than the dense wiki owner.  The timeout is not reported
+    as a durable degradation; the owner-bound profile independently keeps the
+    thinner answer at caution.
     """
     coordinator = _coordinator(
         tmp_path,
@@ -1166,7 +1619,7 @@ async def test_a_slow_store_is_still_just_swallowed(tmp_path):
     source_meta = response["_meta"]["source_search"]
     assert "degraded" not in source_meta
     assert "failed_legs" not in source_meta
-    assert response["confidence"] == "confident"
+    assert response["confidence"] == "caution"
     assert _files(response) == ["src/a.py"]
 
 
@@ -1347,6 +1800,24 @@ async def test_every_query_writes_one_event(tmp_path):
     assert event["top"][0]["file"] == "src/a.py"
     assert event["top"][0]["lane"] == "source"
     assert event["top"][0]["lexical_rank"] == 1
+    assert event["top"][0]["concept_coverage"] == 1.0
+    assert event["top"][0]["same_path_corroborated"] is False
+    assert event["selected_owner_evidence"] == {
+        "dense_cosine": 0.6,
+        "lexical_rank": 1,
+        "exact_name": False,
+        "lane": "source",
+        "concept_coverage": 1.0,
+        "corpus_file_count": 1,
+        "same_path_corroborated": False,
+        "concepts": [
+            {
+                "token": "alpha",
+                "document_frequency": 1,
+                "matched": True,
+            }
+        ],
+    }
 
 
 async def test_a_log_that_cannot_be_written_does_not_fail_the_search(tmp_path):

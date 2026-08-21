@@ -66,18 +66,15 @@ def _serialize(builder: GraphBuilder) -> tuple[list[dict], list[dict]]:
     """Serialize the live graph to the dict shape the SQL readers return.
 
     Mirrors ``persistence.crud.get_all_graph_nodes`` / ``get_all_graph_edges``
-    so the test exercises the real round-trip contract (note ``parent_name`` is
-    persisted under the ``parent_symbol_id`` key).
+    so the test exercises the real round-trip contract. Parent display text and
+    exact identity deliberately occupy separate fields.
     """
     graph = builder.graph()
     nodes: list[dict] = []
     for node_id, data in graph.nodes(data=True):
         row = {"node_id": node_id}
         for key in _NODE_ATTR_KEYS:
-            if key == "parent_symbol_id":
-                row[key] = data.get("parent_name")
-            else:
-                row[key] = data.get(key)
+            row[key] = data.get(key)
         nodes.append(row)
     edges: list[dict] = []
     for u, v, data in graph.edges(data=True):
@@ -127,6 +124,22 @@ def test_rehydrated_graph_is_traversal_equivalent():
         # Edge types survive the round-trip.
         for succ in og.successors(node):
             assert og[node][succ].get("edge_type") == hg[node][succ].get("edge_type")
+
+
+def test_parent_name_and_exact_parent_id_survive_rehydration_separately():
+    nodes = [
+        {
+            "node_id": "src/a.py::Owner::local",
+            "node_type": "symbol",
+            "name": "local",
+            "parent_name": "Owner",
+            "parent_symbol_id": "src/a.py::Owner",
+        }
+    ]
+    hydrated = GraphBuilder.from_persisted(nodes, [], metrics=None)
+    data = hydrated.graph().nodes["src/a.py::Owner::local"]
+    assert data["parent_name"] == "Owner"
+    assert data["parent_symbol_id"] == "src/a.py::Owner"
 
 
 def test_resolution_origin_survives_rehydration():

@@ -602,6 +602,8 @@ async def _render_ambiguous(
             "name": row.name,
             "kind": row.kind,
             "qualified_name": row.qualified_name,
+            "visibility": row.visibility,
+            "parent_symbol_id": row.parent_symbol_id,
             "signature": row.signature,
             "start_line": row.start_line,
         }
@@ -1027,6 +1029,8 @@ async def _serve_symbol(
         "name": row.name,
         "kind": row.kind,
         "qualified_name": row.qualified_name,
+        "visibility": row.visibility,
+        "parent_symbol_id": row.parent_symbol_id,
         "signature": row.signature,
         "language": row.language,
         "start_line": start,

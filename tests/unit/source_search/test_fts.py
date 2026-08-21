@@ -168,6 +168,53 @@ def test_delete_by_file_with_no_paths_is_a_no_op(index):
     assert index.count() == 1
 
 
+def test_term_file_evidence_keeps_concepts_bound_to_their_own_files(index):
+    index.index_chunks(
+        [
+            _chunk("neo4j_writer", "def neo4j_writer():\n    return graph", path="src/graph.py"),
+            _chunk(
+                "cashflow_projection",
+                "def cashflow_projection():\n    return forecast",
+                path="src/finance.py",
+            ),
+            _chunk(
+                "combined",
+                "def combined():\n    return neo4j_cashflow",
+                path="src/combined.py",
+            ),
+        ]
+    )
+
+    evidence = index.term_file_evidence(["Neo4j", "cashflow", "neo4j"])
+
+    assert evidence == {
+        "neo4j": frozenset({"src/graph.py", "src/combined.py"}),
+        "cashflow": frozenset({"src/finance.py", "src/combined.py"}),
+    }
+
+
+def test_term_file_evidence_cache_is_invalidated_by_a_write(index):
+    index.index_chunks([_chunk("alpha", "def alpha():\n    pass", path="src/a.py")])
+    assert index.term_file_evidence(["alpha"])["alpha"] == frozenset({"src/a.py"})
+
+    index.delete_by_file(["src/a.py"])
+
+    assert index.term_file_evidence(["alpha"])["alpha"] == frozenset()
+    assert index.active_file_paths() == []
+
+
+def test_legacy_delete_invalidates_term_and_path_caches(index):
+    index.index_chunks([_chunk("alpha", "def alpha():\n    pass", path="src/a.py")])
+    index._versioned = False
+    assert index.term_file_evidence(["alpha"])["alpha"] == frozenset({"src/a.py"})
+    assert index.active_file_paths() == ["src/a.py"]
+
+    index.delete_by_file(["src/a.py"])
+
+    assert index.term_file_evidence(["alpha"])["alpha"] == frozenset()
+    assert index.active_file_paths() == []
+
+
 def test_file_inventory_counts_active_lanes_exactly(index):
     path = "src/alpha.py"
     chunks = [

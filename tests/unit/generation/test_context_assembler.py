@@ -242,6 +242,46 @@ def test_assemble_file_page_private_undocumented_dropped_first():
     assert "_private" not in symbol_names
 
 
+def test_local_symbols_stay_out_of_generated_page_and_rollup_contexts(
+    sample_config, sample_parsed_file, sample_graph, graph_metrics, sample_source_bytes
+):
+    local = _make_symbol(
+        name="nested_helper",
+        visibility="local",
+        parent_name="add",
+        signature="def nested_helper() -> None:",
+    )
+    parsed = dataclasses.replace(
+        sample_parsed_file,
+        symbols=[*sample_parsed_file.symbols, local],
+    )
+    assembler = ContextAssembler(sample_config)
+    file_ctx = assembler.assemble_file_page(
+        parsed,
+        sample_graph,
+        graph_metrics["pagerank"],
+        graph_metrics["betweenness"],
+        graph_metrics["community"],
+        sample_source_bytes,
+    )
+    assert "nested_helper" not in {symbol["name"] for symbol in file_ctx.symbols}
+
+    module_ctx = assembler.assemble_module_page(
+        "python_pkg",
+        "python",
+        [file_ctx],
+        sample_graph,
+    )
+    scc_ctx = assembler.assemble_scc_page("scc-1", [file_ctx.file_path], [file_ctx])
+    assert module_ctx.total_symbols == len(sample_parsed_file.symbols)
+    assert scc_ctx.total_symbols == len(sample_parsed_file.symbols)
+
+    api_ctx = assembler.assemble_api_contract(parsed, sample_source_bytes)
+    infra_ctx = assembler.assemble_infra_page(parsed, sample_source_bytes)
+    assert all("nested_helper" not in endpoint for endpoint in api_ctx.endpoints)
+    assert "nested_helper" not in infra_ctx.targets
+
+
 # ---------------------------------------------------------------------------
 # assemble_symbol_spotlight
 # ---------------------------------------------------------------------------

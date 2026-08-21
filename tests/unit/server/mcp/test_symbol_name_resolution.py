@@ -25,6 +25,12 @@ class Gatekeeper:
 
 def helper():
     return 1
+
+
+def outer():
+    def local_helper():
+        return 2
+    return local_helper()
 '''
 
 OTHER_SOURCE = '''"""Another module with the same leaf name."""
@@ -87,6 +93,20 @@ HELPER = {
     "start_line": 9,
     "end_line": 10,
 }
+LOCAL_HELPER = {
+    "id": "ddd1",
+    "file_path": "pkg/auth.py",
+    "symbol_id": "pkg/auth.py::outer::local_helper",
+    "name": "local_helper",
+    "qualified_name": "pkg.auth.outer.local_helper",
+    "kind": "function",
+    "signature": "def local_helper()",
+    "start_line": 14,
+    "end_line": 15,
+    "visibility": "local",
+    "parent_name": "outer",
+    "parent_symbol_id": "pkg/auth.py::outer",
+}
 
 
 @pytest.mark.asyncio
@@ -133,6 +153,38 @@ async def test_exact_symbol_id_form_is_unchanged(setup_mcp, repo_on_disk, sessio
 
 
 @pytest.mark.asyncio
+async def test_local_symbol_exposes_visibility_and_exact_parent_identity(
+    setup_mcp, repo_on_disk, session
+):
+    from repowise.server.mcp_server import get_symbol
+
+    local = {
+        **GATE_SIGNIN,
+        "visibility": "local",
+        "parent_name": "Gatekeeper",
+        "parent_symbol_id": "pkg/auth.py::Gatekeeper",
+    }
+    await _seed(session, [local])
+    result = await get_symbol("pkg/auth.py::Gatekeeper::signin")
+
+    assert result["visibility"] == "local"
+    assert result["parent_symbol_id"] == "pkg/auth.py::Gatekeeper"
+
+
+@pytest.mark.asyncio
+async def test_full_local_qualified_chain_resolves(setup_mcp, repo_on_disk, session):
+    from repowise.server.mcp_server import get_symbol
+
+    await _seed(session, [LOCAL_HELPER])
+    result = await get_symbol("outer.local_helper")
+
+    assert result.get("error") is None
+    assert result["symbol_id"] == "pkg/auth.py::outer::local_helper"
+    assert result["visibility"] == "local"
+    assert "return 2" in result["source"]
+
+
+@pytest.mark.asyncio
 async def test_ambiguous_bare_name_returns_candidates_not_an_answer(
     setup_mcp, repo_on_disk, session
 ):
@@ -154,6 +206,8 @@ async def test_ambiguous_bare_name_returns_candidates_not_an_answer(
             "name",
             "qualified_name",
             "kind",
+            "visibility",
+            "parent_symbol_id",
             "start_line",
         }
 

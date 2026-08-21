@@ -278,6 +278,7 @@ class GraphNode(Base):
     end_line: Mapped[int | None] = mapped_column(Integer, nullable=True)
     visibility: Mapped[str | None] = mapped_column(String(16), nullable=True)
     signature: Mapped[str | None] = mapped_column(Text, nullable=True)
+    parent_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     parent_symbol_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     # Set when this node represents an `external:*` import that we resolved to
     # a known third-party dependency declared in a manifest. Powers C4 L1.
@@ -496,6 +497,7 @@ class WikiSymbol(Base):
     complexity_estimate: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     language: Mapped[str] = mapped_column(String(32), nullable=False, default="")
     parent_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    parent_symbol_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_now_utc
     )
@@ -518,6 +520,11 @@ class WikiSymbol(Base):
         # order the chosen index walks. ``augment_cmd``'s symbol rescue had two
         # such queries and now orders explicitly — see ``symbols_named``.
         Index("ix_wiki_symbols_repo_path", "repository_id", "file_path"),
+        Index(
+            "ix_wiki_symbols_repo_parent_symbol_id",
+            "repository_id",
+            "parent_symbol_id",
+        ),
     )
 
 

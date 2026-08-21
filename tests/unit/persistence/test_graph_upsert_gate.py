@@ -80,6 +80,7 @@ def symbol_node(node_id: str, **over) -> dict:
         end_line=9,
         visibility="public",
         signature="def f()",
+        parent_name=None,
         parent_symbol_id=None,
     )
     base.update(over)

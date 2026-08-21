@@ -179,12 +179,143 @@ class TestUnpinnedStrategies:
             {
                 "caller.py": (
                     "python",
-                    "def run(obj):\n    obj.never_declared_anywhere()\n    "
-                    "also_never_declared()\n",
+                    "def run(obj):\n    obj.never_declared_anywhere()\n    also_never_declared()\n",
                 )
             },
         )
         assert _edges(parsed, tmp_path) == []
+
+    def test_same_named_locals_resolve_only_through_their_lexical_owner(
+        self, tmp_path: Path
+    ) -> None:
+        parsed = _parse_all(
+            tmp_path,
+            {
+                "app.py": (
+                    "python",
+                    "def alpha():\n"
+                    "    def helper():\n"
+                    "        return 1\n"
+                    "    return helper()\n"
+                    "\n"
+                    "def beta():\n"
+                    "    def helper():\n"
+                    "        return 2\n"
+                    "    return helper()\n"
+                    "\n"
+                    "def sibling():\n"
+                    "    return helper()\n",
+                ),
+                "other.py": ("python", "def caller():\n    return helper()\n"),
+            },
+        )
+        edges = _edges(parsed, tmp_path)
+        assert (
+            "app.py::alpha",
+            "app.py::alpha::helper",
+            0.95,
+            "same_file",
+        ) in edges
+        assert (
+            "app.py::beta",
+            "app.py::beta::helper",
+            0.95,
+            "same_file",
+        ) in edges
+        assert all(caller not in {"app.py::sibling", "other.py::caller"} for caller, *_ in edges)
+
+    def test_local_type_member_resolves_inside_owner_but_not_sibling_scope(
+        self, tmp_path: Path
+    ) -> None:
+        parsed = _parse_all(
+            tmp_path,
+            {
+                "app.ts": (
+                    "typescript",
+                    "function outer() {\n"
+                    "  class LocalAdapter { run() { return 1; } }\n"
+                    "  function invoke() { return LocalAdapter.run(); }\n"
+                    "  return invoke();\n"
+                    "}\n"
+                    "function sibling() { return LocalAdapter.run(); }\n",
+                )
+            },
+        )
+        edges = _edges(parsed, tmp_path)
+        assert (
+            "app.ts::outer::invoke",
+            "app.ts::outer::LocalAdapter::run",
+            0.93,
+            "receiver_same_file",
+        ) in edges
+        assert all(
+            not (caller == "app.ts::sibling" and callee.endswith("::LocalAdapter::run"))
+            for caller, callee, *_ in edges
+        )
+
+    def test_local_class_implicit_method_call_stays_inside_that_class(self, tmp_path: Path) -> None:
+        parsed = _parse_all(
+            tmp_path,
+            {
+                "Factory.java": (
+                    "java",
+                    "class Factory {\n"
+                    "  void build() {\n"
+                    "    class Local {\n"
+                    "      void helper() {}\n"
+                    "      void run() { helper(); }\n"
+                    "    }\n"
+                    "  }\n"
+                    "  void sibling() { helper(); }\n"
+                    "}\n",
+                )
+            },
+        )
+        edges = _edges(parsed, tmp_path)
+        assert (
+            "Factory.java::Factory::build::Local::run",
+            "Factory.java::Factory::build::Local::helper",
+            0.95,
+            "same_file",
+        ) in edges
+        assert all(
+            not (caller == "Factory.java::Factory::sibling" and callee.endswith("::Local::helper"))
+            for caller, callee, *_ in edges
+        )
+
+    def test_receiver_typed_as_local_class_resolves_only_in_lexical_scope(
+        self, tmp_path: Path
+    ) -> None:
+        parsed = _parse_all(
+            tmp_path,
+            {
+                "Factory.java": (
+                    "java",
+                    "class Factory {\n"
+                    "  void build() {\n"
+                    "    class LocalAdapter { void run() {} }\n"
+                    "    LocalAdapter adapter = new LocalAdapter();\n"
+                    "    adapter.run();\n"
+                    "  }\n"
+                    "  void sibling(LocalAdapter adapter) { adapter.run(); }\n"
+                    "}\n",
+                )
+            },
+        )
+        edges = _edges(parsed, tmp_path)
+        assert (
+            "Factory.java::Factory::build",
+            "Factory.java::Factory::build::LocalAdapter::run",
+            0.93,
+            "receiver_typed_same_file",
+        ) in edges
+        assert all(
+            not (
+                caller == "Factory.java::Factory::sibling"
+                and callee.endswith("::LocalAdapter::run")
+            )
+            for caller, callee, *_ in edges
+        )
 
 
 class _Spy:

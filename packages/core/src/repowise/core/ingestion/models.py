@@ -177,11 +177,14 @@ class Symbol:
     end_line: int  # 1-indexed
     docstring: str | None
     decorators: list[str] = field(default_factory=list)
-    visibility: Literal["public", "private", "protected", "internal"] = "public"
+    visibility: Literal["public", "private", "protected", "internal", "local"] = "public"
     is_async: bool = False
     complexity_estimate: int = 1  # cyclomatic complexity
     language: str = ""
     parent_name: str | None = None  # for methods: the containing class name
+    # Exact ID of the immediate lexical parent. ``parent_name`` remains display
+    # text; it is deliberately not overloaded as an identifier.
+    parent_symbol_id: str | None = None
     # True when a language-level export marker is present (e.g. C/C++
     # ``__declspec(dllexport)`` / ``__attribute__((visibility("default")))``).
     # Used by dead-code analysis to whitelist exported entry points.

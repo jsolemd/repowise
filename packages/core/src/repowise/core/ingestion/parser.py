@@ -24,6 +24,7 @@ Capture-name conventions (shared across ALL .scm files):
 
 from __future__ import annotations
 
+import hashlib
 import re
 from collections.abc import Iterable
 from functools import cache
@@ -74,7 +75,6 @@ from .parser_helpers import (
     _count_arguments,
     _dedupe_pascal_interface_symbols,
     _find_enclosing_symbol,
-    _has_callable_ancestor,
     _head_type_identifier,
     _is_async_node,
     _qualified_cpp_parent,
@@ -96,10 +96,9 @@ _SYMBOL_COUNT_WARN_THRESHOLD = 500
 
 QUERIES_DIR = Path(__file__).parent / "queries"
 
-# Node types whose .scm patterns are anchored at module/program level
-# (constants and module variables). They can never be function-local, so
-# the callable-ancestor filter must not apply — and for TS/JS declarators
-# it would misfire on the parent lexical_declaration kind mapping.
+# Node types whose data-binding .scm patterns are anchored at module/program
+# level. Callable bindings use a separate recursive query and therefore still
+# pass through lexical-parent classification below.
 _MODULE_ANCHORED_NODE_TYPES = frozenset({"assignment", "variable_declarator"})
 
 # Languages whose source reaches the parser as TypeScript/JavaScript. The two
@@ -432,6 +431,7 @@ class ASTParser:
         if synthetic:
             existing_ids = {s.id for s in symbols}
             symbols.extend(s for s in synthetic if s.id not in existing_ids)
+            self._link_named_symbol_parents(symbols)
         imports = self._extract_imports(matches, config, file_info, src)
         calls = self._extract_calls(matches, config, file_info, src, symbols)
         # An SFC instantiates a component by writing its tag in the markup
@@ -506,6 +506,7 @@ class ASTParser:
         src: str,
     ) -> list[Symbol]:
         symbols: list[Symbol] = []
+        symbol_nodes: list[Node] = []
         seen: set[tuple[int, str]] = set()  # (start_line, name) — dedup decorated dupes
         # Parallel to ``symbols`` (same indices) -- only populated/consumed
         # for Pascal, to dedupe interface-declaration vs. implementation
@@ -545,22 +546,6 @@ class ASTParser:
             if kind is None:
                 continue
 
-            # Skip symbols nested inside another function/method body. The
-            # Tree-sitter query is recursive, so helpers defined inside a
-            # React component or an async orchestrator method get hoisted
-            # to the top-level symbol list and read as unused public
-            # exports. Filtering by callable ancestor restricts extraction
-            # to module-top-level + class-body members. Class bodies don't
-            # match (``class_definition`` is not callable), so methods are
-            # preserved. Module-anchored node types skip the check: their
-            # .scm patterns only match at module/program level, and a TS
-            # variable_declarator's parent (lexical_declaration → "function")
-            # would otherwise read as a callable ancestor.
-            if node_type not in _MODULE_ANCHORED_NODE_TYPES and _has_callable_ancestor(
-                def_node, config.symbol_node_types
-            ):
-                continue
-
             # Refine "struct" kind for Go type_spec (check if struct or interface body)
             if kind == "struct" and config.parent_extraction == "receiver":
                 kind = refine_go_type_kind(def_node, src)
@@ -575,27 +560,15 @@ class ASTParser:
 
             # Dart: a function is a ``function_signature`` whose BODY is a
             # sibling ``function_body`` node (members wrap the signature in
-            # ``method_signature``). Two consequences the generic path can't
-            # see: local functions nested inside another function's body have
-            # no callable *ancestor* (the enclosing signature is a sibling),
-            # so filter them here; and the symbol's line range must extend to
-            # the trailing body sibling or call-site attribution stops at the
-            # signature line.
+            # ``method_signature``). Extend the symbol's line range to that
+            # body; lexical classification below maps the sibling body back to
+            # its named signature rather than dropping local functions.
             end_line = def_node.end_point[0] + 1
             if file_info.language == "dart" and node_type in (
                 "function_signature",
                 "getter_signature",
                 "setter_signature",
             ):
-                ancestor = def_node.parent
-                is_local = False
-                while ancestor is not None:
-                    if ancestor.type in ("function_body", "function_expression"):
-                        is_local = True
-                        break
-                    ancestor = ancestor.parent
-                if is_local:
-                    continue
                 anchor = def_node
                 if def_node.parent is not None and def_node.parent.type == "method_signature":
                     anchor = def_node.parent
@@ -786,12 +759,277 @@ class ASTParser:
                     is_declaration=node_type in config.declaration_node_types,
                 )
             )
+            symbol_nodes.append(def_node)
             node_types.append(node_type)
 
         if file_info.language == "pascal":
-            symbols = _dedupe_pascal_interface_symbols(symbols, node_types)
+            deduped = _dedupe_pascal_interface_symbols(symbols, node_types)
+            retained = {id(symbol) for symbol in deduped}
+            symbol_nodes = [
+                node
+                for symbol, node in zip(symbols, symbol_nodes, strict=True)
+                if id(symbol) in retained
+            ]
+            node_types = [
+                node_type
+                for symbol, node_type in zip(symbols, node_types, strict=True)
+                if id(symbol) in retained
+            ]
+            symbols = deduped
 
-        return symbols
+        return self._finalize_symbol_parentage(symbols, symbol_nodes, config, file_info, src)
+
+    @staticmethod
+    def _bound_callable_node(node: Node, symbol: Symbol, src: str) -> Node | None:
+        """Return the callable AST node represented by a binding wrapper.
+
+        TypeScript/JavaScript name ``const handler = () => ...`` at the
+        lexical-declaration or declarator wrapper, while an inner declaration
+        sees the arrow/function expression as its nearest callable ancestor.
+        Mapping only the bound value keeps an anonymous callback between two
+        named declarations fail-closed.
+        """
+        if node.type not in {"lexical_declaration", "variable_declarator"}:
+            return None
+        stack = [node]
+        while stack:
+            current = stack.pop()
+            if current.type == "variable_declarator":
+                name_node = current.child_by_field_name("name")
+                value = current.child_by_field_name("value")
+                if (
+                    name_node is not None
+                    and value is not None
+                    and _node_text(name_node, src) == symbol.name
+                ):
+                    pending = [value]
+                    while pending:
+                        candidate = pending.pop()
+                        if candidate.type in {"arrow_function", "function_expression"}:
+                            return candidate
+                        pending.extend(reversed(candidate.named_children))
+            stack.extend(reversed(current.named_children))
+        return None
+
+    @staticmethod
+    def _dart_body_owners(symbols: list[Symbol], nodes: list[Node]) -> dict[int, int]:
+        """Map Dart's sibling function bodies to their named signature."""
+        owners: dict[int, int] = {}
+        for index, (symbol, node) in enumerate(zip(symbols, nodes, strict=True)):
+            if symbol.kind not in {"function", "method"}:
+                continue
+            anchor = node
+            if node.parent is not None and node.parent.type == "method_signature":
+                anchor = node.parent
+            body = anchor.next_named_sibling
+            if body is not None and body.type == "function_body":
+                owners[body.id] = index
+        return owners
+
+    def _finalize_symbol_parentage(
+        self,
+        symbols: list[Symbol],
+        nodes: list[Node],
+        config: LanguageConfig,
+        file_info: FileInfo,
+        src: str,
+    ) -> list[Symbol]:
+        """Classify lexical locals and assign exact immediate-parent IDs.
+
+        AST ancestry is authoritative. A callable ancestor must map to a named
+        extracted candidate; otherwise the nested symbol is suppressed rather
+        than attributed through an anonymous or unparsed scope.
+        """
+        if not symbols:
+            return []
+
+        by_node = {node.id: index for index, node in enumerate(nodes)}
+        callable_nodes: dict[int, int] = {}
+        for index, (symbol, node) in enumerate(zip(symbols, nodes, strict=True)):
+            if symbol.kind not in {"function", "method"}:
+                continue
+            callable_nodes[node.id] = index
+            bound = self._bound_callable_node(node, symbol, src)
+            if bound is not None:
+                callable_nodes[bound.id] = index
+
+        dart_body_owners = (
+            self._dart_body_owners(symbols, nodes) if file_info.language == "dart" else {}
+        )
+        parents: list[int | None] = [None] * len(symbols)
+        direct_local: list[bool] = [False] * len(symbols)
+        keep = [True] * len(symbols)
+
+        for index, node in enumerate(nodes):
+            nearest_parent: int | None = None
+            represented_callable: int | None = None
+            ancestor = node.parent
+            while ancestor is not None:
+                candidate_index = by_node.get(ancestor.id)
+                if (
+                    candidate_index is not None
+                    and candidate_index != index
+                    and nearest_parent is None
+                    and symbols[candidate_index].kind
+                    in {
+                        "class",
+                        "interface",
+                        "struct",
+                        "trait",
+                        "enum",
+                        "function",
+                        "method",
+                    }
+                ):
+                    nearest_parent = candidate_index
+
+                callable_owner = callable_nodes.get(ancestor.id)
+                if callable_owner is not None and callable_owner != index:
+                    represented_callable = callable_owner
+                    if nearest_parent is None:
+                        nearest_parent = callable_owner
+                    break
+
+                if ancestor.type in {"function_body", "function_expression"}:
+                    dart_owner = dart_body_owners.get(ancestor.id)
+                    if dart_owner is not None and dart_owner != index:
+                        represented_callable = dart_owner
+                        if nearest_parent is None:
+                            nearest_parent = dart_owner
+                        break
+                    if file_info.language == "dart":
+                        keep[index] = False
+                        break
+
+                if ancestor.type not in {
+                    "lexical_declaration",
+                    "variable_declarator",
+                } and config.symbol_node_types.get(ancestor.type) in {"function", "method"}:
+                    # A callable node with no candidate representation is an
+                    # anonymous/unparsed scope. Do not leap across it to a
+                    # more distant named owner.
+                    keep[index] = False
+                    break
+                ancestor = ancestor.parent
+
+            if not keep[index]:
+                continue
+            parents[index] = nearest_parent
+            direct_local[index] = represented_callable is not None
+
+        # Preserve receiver/out-of-line class membership when the parent is
+        # not an AST ancestor, but only on a unique same-file type match.
+        types_by_name: dict[str, list[int]] = {}
+        for index, symbol in enumerate(symbols):
+            if symbol.kind in {"class", "interface", "struct", "trait", "enum"}:
+                types_by_name.setdefault(symbol.name, []).append(index)
+        for index, symbol in enumerate(symbols):
+            if not keep[index] or parents[index] is not None or not symbol.parent_name:
+                continue
+            candidates = types_by_name.get(symbol.parent_name, [])
+            if len(candidates) == 1:
+                parents[index] = candidates[0]
+
+        local: list[bool | None] = [None] * len(symbols)
+
+        def is_local(index: int, visiting: set[int] | None = None) -> bool:
+            cached = local[index]
+            if cached is not None:
+                return cached
+            trail = set() if visiting is None else visiting
+            if index in trail:
+                local[index] = False
+                return False
+            trail.add(index)
+            parent = parents[index]
+            value = direct_local[index] or (
+                parent is not None and keep[parent] and is_local(parent, trail)
+            )
+            trail.remove(index)
+            local[index] = value
+            return value
+
+        def lexical_names(index: int, visiting: set[int] | None = None) -> list[str]:
+            trail = set() if visiting is None else visiting
+            if index in trail:
+                return [symbols[index].name]
+            trail.add(index)
+            parent = parents[index]
+            names = (
+                [*lexical_names(parent, trail), symbols[index].name]
+                if parent is not None and keep[parent]
+                else [symbols[index].name]
+            )
+            trail.remove(index)
+            return names
+
+        module = Path(file_info.path).with_suffix("").as_posix().replace("/", ".")
+        for index, symbol in enumerate(symbols):
+            if not keep[index]:
+                continue
+            parent = parents[index]
+            if parent is not None and keep[parent]:
+                symbol.parent_name = symbols[parent].name
+            names = lexical_names(index)
+            symbol.id = f"{file_info.path}::{'::'.join(names)}"
+            symbol.qualified_name = f"{module}.{'.'.join(names)}"
+            if is_local(index):
+                symbol.visibility = "local"
+
+        # Contained overloads and sibling collisions keep readable names while
+        # receiving deterministic fetchable IDs. Top-level IDs remain exactly
+        # compatible with the pre-A3 contract.
+        groups: dict[str, list[int]] = {}
+        for index, symbol in enumerate(symbols):
+            if keep[index] and parents[index] is not None:
+                groups.setdefault(symbol.id, []).append(index)
+        for base_id, indices in groups.items():
+            if len(indices) < 2:
+                continue
+            by_discriminator: dict[str, list[int]] = {}
+            for index in indices:
+                symbol = symbols[index]
+                normalized = re.sub(r"\s+", " ", symbol.signature.strip())
+                discriminator = hashlib.sha256(f"{symbol.kind}\0{normalized}".encode()).hexdigest()[
+                    :8
+                ]
+                by_discriminator.setdefault(discriminator, []).append(index)
+            for discriminator, collisions in by_discriminator.items():
+                ordered = sorted(
+                    collisions,
+                    key=lambda item: (
+                        symbols[item].start_line,
+                        symbols[item].end_line,
+                        symbols[item].kind,
+                    ),
+                )
+                for position, item in enumerate(ordered, start=1):
+                    suffix = discriminator if len(ordered) == 1 else f"{discriminator}-{position}"
+                    symbols[item].id = f"{base_id}~{suffix}"
+
+        for index, symbol in enumerate(symbols):
+            if not keep[index]:
+                continue
+            parent = parents[index]
+            symbol.parent_symbol_id = (
+                symbols[parent].id if parent is not None and keep[parent] else None
+            )
+
+        return [symbol for index, symbol in enumerate(symbols) if keep[index]]
+
+    @staticmethod
+    def _link_named_symbol_parents(symbols: list[Symbol]) -> None:
+        """Attach synthetic/out-of-line members to a unique named type."""
+        types: dict[str, list[Symbol]] = {}
+        for symbol in symbols:
+            if symbol.kind in {"class", "interface", "struct", "trait", "enum"}:
+                types.setdefault(symbol.name, []).append(symbol)
+        for symbol in symbols:
+            if symbol.parent_symbol_id is not None or not symbol.parent_name:
+                continue
+            candidates = types.get(symbol.parent_name, [])
+            if len(candidates) == 1:
+                symbol.parent_symbol_id = candidates[0].id
 
     def _find_parent(
         self,
@@ -811,6 +1049,12 @@ class ASTParser:
             # Walk up the AST to find a class/impl ancestor
             ancestor = def_node.parent
             while ancestor is not None:
+                # A class outside an enclosing function is not this symbol's
+                # immediate parent. Local parentage is resolved in the second
+                # pass, which can name the callable exactly instead of
+                # misclassifying the nested function as a class method.
+                if config.symbol_node_types.get(ancestor.type) in {"function", "method"}:
+                    return None
                 if ancestor.type in config.parent_class_types:
                     name_node = ancestor.child_by_field_name("name") or (
                         ancestor.child_by_field_name("type")  # Rust impl_item

@@ -118,6 +118,48 @@ class TestAddFile:
         # 2 file nodes + 2 synthetic __module__ symbol nodes
         assert g.number_of_nodes() == 4
 
+    def test_local_symbols_are_structural_but_not_architecture_rollup(self) -> None:
+        parsed = _parsed("src/factory.py")
+        outer = _sym("src/factory.py", "outer")
+        local_class = Symbol(
+            id="src/factory.py::outer::Local",
+            name="Local",
+            qualified_name="src.factory.outer.Local",
+            kind="class",
+            signature="class Local",
+            start_line=2,
+            end_line=8,
+            docstring=None,
+            visibility="local",
+            language="python",
+            parent_name="outer",
+            parent_symbol_id=outer.id,
+        )
+        local_method = Symbol(
+            id="src/factory.py::outer::Local::run",
+            name="run",
+            qualified_name="src.factory.outer.Local.run",
+            kind="method",
+            signature="def run(self)",
+            start_line=3,
+            end_line=7,
+            docstring=None,
+            visibility="local",
+            language="python",
+            parent_name="Local",
+            parent_symbol_id=local_class.id,
+        )
+        parsed.symbols = [outer, local_class, local_method]
+
+        builder = GraphBuilder()
+        builder.add_file(parsed)
+        graph = builder.graph()
+
+        assert graph.nodes["src/factory.py"]["symbol_count"] == 1
+        assert graph.nodes[local_method.id]["parent_symbol_id"] == local_class.id
+        assert graph.has_edge("src/factory.py", local_class.id)
+        assert graph.edges[local_class.id, local_method.id]["edge_type"] == "has_method"
+
 
 # ---------------------------------------------------------------------------
 # Docstring propagation

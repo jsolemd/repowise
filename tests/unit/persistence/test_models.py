@@ -273,9 +273,10 @@ def test_wiki_symbol_defaults():
     assert col_defaults["visibility"].arg == "public"
     assert col_defaults["is_async"].arg == False  # noqa: E712
     assert col_defaults["complexity_estimate"].arg == 0
-    # docstring and parent_name are nullable
+    # docstring and both parent representations are nullable
     assert WikiSymbol.__table__.c.docstring.nullable is True
     assert WikiSymbol.__table__.c.parent_name.nullable is True
+    assert WikiSymbol.__table__.c.parent_symbol_id.nullable is True
 
 
 def test_wiki_symbol_unique_constraint_defined():

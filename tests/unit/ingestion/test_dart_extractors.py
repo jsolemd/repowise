@@ -92,7 +92,7 @@ void multiLine(int x) {
         assert call.caller_symbol_id is not None
         assert call.caller_symbol_id.endswith("::multiLine")
 
-    def test_local_functions_are_not_hoisted(self, parser: ASTParser) -> None:
+    def test_local_functions_are_scoped_to_the_sibling_signature(self, parser: ASTParser) -> None:
         src = b"""\
 void outer() {
   void inner() {}
@@ -100,9 +100,10 @@ void outer() {
 }
 """
         result = parser.parse_file(_file(), src)
-        names = {s.name for s in result.symbols}
-        assert "outer" in names
-        assert "inner" not in names
+        by_name = {symbol.name: symbol for symbol in result.symbols}
+        assert by_name["inner"].visibility == "local"
+        assert by_name["inner"].id == "lib/foo.dart::outer::inner"
+        assert by_name["inner"].parent_symbol_id == "lib/foo.dart::outer"
 
     def test_underscore_visibility(self, parser: ASTParser) -> None:
         src = b"""\

@@ -177,6 +177,7 @@ def _new_wiki_symbol(repository_id: str, sym: Any) -> WikiSymbol:
         complexity_estimate=getattr(sym, "complexity_estimate", 0),
         language=getattr(sym, "language", ""),
         parent_name=getattr(sym, "parent_name", None),
+        parent_symbol_id=getattr(sym, "parent_symbol_id", None),
     )
 
 
@@ -193,6 +194,7 @@ def _update_wiki_symbol(existing: WikiSymbol, sym: Any) -> None:
     existing.complexity_estimate = getattr(sym, "complexity_estimate", 0)
     existing.language = getattr(sym, "language", "")
     existing.parent_name = getattr(sym, "parent_name", None)
+    existing.parent_symbol_id = getattr(sym, "parent_symbol_id", None)
     existing.updated_at = _now_utc()
 
 
