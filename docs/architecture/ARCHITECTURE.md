@@ -16,7 +16,7 @@ For per-package detail (installation, full API reference, all CLI flags, file ma
 |---------|--------|----------------|
 | `packages/core` | [`packages/core/README.md`](../../packages/core/README.md) | Ingestion, generation, persistence, providers — all key classes with code examples |
 | `packages/cli` | [`packages/cli/README.md`](../../packages/cli/README.md) | CLI entrypoints and flags; full surface in [`CLI_REFERENCE.md`](../reference/CLI_REFERENCE.md) |
-| `packages/server` | [`packages/server/README.md`](../../packages/server/README.md) | All REST API endpoints, 11 MCP tools, webhook setup, scheduler jobs |
+| `packages/server` | [`packages/server/README.md`](../../packages/server/README.md) | All REST API endpoints, 12 default MCP tools, webhook setup, scheduler jobs |
 | `packages/web` | [`packages/web/README.md`](../../packages/web/README.md) | Every frontend file with purpose — API client, hooks, components, pages |
 
 ---
@@ -172,7 +172,7 @@ repowise/
 │   ├── server/                 # Python: FastAPI REST API + MCP server
 │   │   └── src/repowise/server/
 │   │       ├── routers/         # FastAPI routers (repos, pages, jobs, symbols, graph, git, dead-code, decisions, search, claude-md)
-│   │       ├── mcp_server/      # MCP server package (11 default tools, split into focused modules)
+│   │       ├── mcp_server/      # MCP server package (12 default tools, split into focused modules)
 │   │       ├── webhooks/        # GitHub + GitLab handlers
 │   │       ├── job_executor.py  # Background pipeline executor — bridges REST endpoints to core pipeline
 │   │       └── scheduler.py     # APScheduler background jobs
@@ -1058,13 +1058,14 @@ and supports two transports:
 - **stdio** — for Claude Code, Cursor, Cline (add to their MCP config)
 - **SSE** — for web-based MCP clients (served on port 7338)
 
-### Tools (11 default in single-repo mode)
+### Tools (12 default in single-repo mode)
 
 Canonical reference: [`docs/agent/MCP_TOOLS.md`](../agent/MCP_TOOLS.md).
-A single-repo server advertises **11** tools by default (ten flagship +
+A single-repo server advertises **12** tools by default (eleven flagship +
 `list_repos`). Workspace mode adds `get_architecture` and `get_blast_radius`.
-Four more are registered but opt-in (`get_dependency_path`,
-`get_execution_flows`, `generate_refactoring_code`, `get_conformance`).
+Six more are registered but opt-in (`get_dependents`, `get_dependency_path`,
+`get_execution_flows`, `generate_refactoring_code`, `get_conformance`,
+`reindex_repository`).
 
 | Tool | What it answers | When to call |
 |------|----------------|-------------|
@@ -1078,6 +1079,7 @@ Four more are registered but opt-in (`get_dependency_path`,
 | `get_why(query?)` | Architectural decisions and git archaeology. | Before making architectural changes. |
 | `get_dead_code` | Dead/unused code findings sorted by confidence. | Before cleanup tasks. |
 | `get_health` | Code-health marker scores (defect / maintainability / performance). | Self-check before a PR or refactor. |
+| `get_index_status` | Source-search publication trust and per-path eligibility. | Before relying on indexed search results. |
 | `list_repos` | Repo aliases this server is serving. | Discover `repo=` targets (especially in a workspace). |
 
 ### Auto-generated Config

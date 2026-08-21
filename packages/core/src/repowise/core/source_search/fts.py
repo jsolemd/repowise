@@ -32,6 +32,7 @@ __all__ = [
     "TOKENIZER_VERSION",
     "SourceFTSHit",
     "SourceFTSIndex",
+    "SourceFileInventory",
     "default_fts_path",
     "generation_fts_path",
     "tokenize",
@@ -119,6 +120,15 @@ class SourceFTSHit:
     chunk_id: str
     file_path: str
     score: float
+
+
+@dataclass(frozen=True, slots=True)
+class SourceFileInventory:
+    """Exact active-generation chunk counts for one repository-relative path."""
+
+    total: int
+    symbol: int
+    file_window: int
 
 
 class SourceFTSIndex:
@@ -451,6 +461,39 @@ class SourceFTSIndex:
                 ).fetchone()
             total += int(row[0])
         return total
+
+    def inventory_for_file(self, file_path: str) -> SourceFileInventory:
+        """Return exact visible symbol/window counts for *file_path*.
+
+        The lexical store predates an explicit ``source`` column. File-window
+        chunk ids nevertheless have one canonical constructor in
+        ``iter_file_windows``: ``file:<path>:<start>-<end>``. Match that full
+        shape against rows already scoped to *file_path*; every other row is a
+        symbol chunk. This reads the active generation only and never consults
+        the newer SQL symbol table, whose contents may be ahead of publication.
+        """
+
+        if self._versioned:
+            rows = self._conn.execute(
+                f"SELECT f.chunk_id FROM {_TABLE} AS f "
+                f"JOIN {_VERSIONS} AS v ON v.row_key = f.row_key "
+                "WHERE v.file_path = ? AND v.valid_from <= ? AND v.valid_to > ?",
+                (file_path, self.generation.sequence, self.generation.sequence),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                f"SELECT chunk_id FROM {_TABLE} WHERE file_path = ?",
+                (file_path,),
+            ).fetchall()
+
+        window_id = re.compile(rf"^file:{re.escape(file_path)}:\d+-\d+$")
+        window_count = sum(bool(window_id.fullmatch(str(row[0]))) for row in rows)
+        total = len(rows)
+        return SourceFileInventory(
+            total=total,
+            symbol=total - window_count,
+            file_window=window_count,
+        )
 
     def close(self) -> None:
         self._conn.close()

@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import pytest
 
-from repowise.core.source_search.chunks import SymbolRecord, build_symbol_chunk
+from repowise.core.source_search.chunks import (
+    SymbolRecord,
+    build_symbol_chunk,
+    iter_file_windows,
+)
 from repowise.core.source_search.fts import SourceFTSIndex, default_fts_path, tokenize
 
 # ---------------------------------------------------------------------------
@@ -162,6 +166,31 @@ def test_delete_by_file_with_no_paths_is_a_no_op(index):
     index.index_chunks([_chunk("alpha", "def alpha():\n    pass")])
     assert index.delete_by_file([]) == 0
     assert index.count() == 1
+
+
+def test_file_inventory_counts_active_lanes_exactly(index):
+    path = "src/alpha.py"
+    chunks = [
+        _chunk("alpha", "def alpha():\n    pass", path=path),
+        *iter_file_windows(path, "alpha = 1\nbeta = 2\n"),
+    ]
+    index.index_chunks(chunks)
+
+    inventory = index.inventory_for_file(path)
+
+    assert inventory.total == 2
+    assert inventory.symbol == 1
+    assert inventory.file_window == 1
+
+
+def test_file_inventory_reports_exact_zero_for_absent_path(index):
+    index.index_chunks([_chunk("alpha", "def alpha():\n    pass")])
+
+    inventory = index.inventory_for_file("src/missing.py")
+
+    assert inventory.total == 0
+    assert inventory.symbol == 0
+    assert inventory.file_window == 0
 
 
 def test_recreate_empties_the_table(index):

@@ -1181,87 +1181,18 @@ def _resolve_repo_session_factory(app_state, repo_id: str):
 
 
 def _launch_job_task(request: Request, job_id: str, repo_id: str) -> None:
-    """Launch a background job task with proper lifecycle management.
+    """Resolve REST runtime state and delegate to the shared job launcher."""
+    from repowise.server.services.job_queue import launch_job_task
 
-    Stores a strong reference in ``app.state.background_tasks`` to prevent
-    garbage collection, and removes it when the task finishes.  Exceptions
-    are logged instead of silently swallowed.
-
-    If task creation itself fails (or the task ends with an unhandled
-    exception that ``execute_job`` couldn't record), we mark the job as
-    failed via a fallback path so the active-job guard never gets stuck.
-
-    ``repo_id`` is required so we can resolve the per-repo session factory
-    in workspace mode — that's the same DB the route handler just wrote
-    the job to.
-    """
     app_state = request.app.state
     session_factory = _resolve_repo_session_factory(app_state, repo_id)
-
-    async def _mark_terminal(status: str, reason: str) -> None:
-        try:
-            from repowise.core.persistence.crud import update_job_status
-
-            async with get_session(session_factory) as session:
-                await update_job_status(
-                    session,
-                    job_id,
-                    status,
-                    error_message=reason[:500],
-                )
-        except Exception:
-            logger.exception("fallback_job_failure_record_failed", extra={"job_id": job_id})
-
-    try:
-        task = asyncio.create_task(
-            execute_job(job_id, app_state, session_factory_override=session_factory),
-            name=f"job-{job_id}",
-        )
-    except Exception as exc:
-        logger.exception("create_task_failed", extra={"job_id": job_id})
-        # Schedule the failure-marking on the running loop; we're already in
-        # an async request handler so a fresh task is fine. Hold a strong ref
-        # so garbage collection doesn't drop the task mid-flight.
-        _t = asyncio.create_task(
-            _mark_terminal("failed", f"Failed to launch background task: {exc}")
-        )
-        app_state.background_tasks.add(_t)
-        _t.add_done_callback(app_state.background_tasks.discard)
-        return
-
-    bg_tasks: set[asyncio.Task] = app_state.background_tasks  # type: ignore[assignment]
-    bg_tasks.add(task)
-
-    def _fire_and_track(coro) -> None:
-        """Create a short-lived task and hold a strong reference until it completes."""
-        t = asyncio.create_task(coro)
-        bg_tasks.add(t)
-        t.add_done_callback(bg_tasks.discard)
-
-    # Track by job id so the cancel endpoint can interrupt the task itself.
-    job_tasks = getattr(app_state, "job_tasks", None)
-    if job_tasks is None:
-        job_tasks = {}
-        app_state.job_tasks = job_tasks
-    job_tasks[job_id] = task
-
-    def _on_done(t: asyncio.Task) -> None:
-        bg_tasks.discard(t)
-        job_tasks.pop(job_id, None)
-        if t.cancelled():
-            # execute_job normally records "cancelled" itself; this covers a
-            # cancel that landed before its try block was entered.
-            _fire_and_track(_mark_terminal("cancelled", "Cancelled by user"))
-            return
-        exc = t.exception()
-        if exc is not None:
-            logger.error("background_job_failed", exc_info=exc)
-            # execute_job already tries to mark failed in its except block,
-            # but if that itself raised we must still ensure the row is
-            # not left in pending/running.
-            _fire_and_track(_mark_terminal("failed", f"Background task crashed: {exc}"))
-
-    task.add_done_callback(_on_done)
+    launch_job_task(
+        app_state=app_state,
+        job_id=job_id,
+        session_factory=session_factory,
+        # Keep this router binding patchable for the existing REST tests.
+        executor=execute_job,
+    )
 
 
 @router.get("/{repo_id}/export")

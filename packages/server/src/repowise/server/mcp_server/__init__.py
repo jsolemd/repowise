@@ -1,10 +1,11 @@
 """repowise MCP Server — a curated, configurable tool surface for AI agents.
 
-By default a single-repo server exposes eleven tools (get_answer, get_context,
+By default a single-repo server exposes twelve tools (get_answer, get_context,
 get_symbol, search_codebase, get_overview, get_risk, get_change_risk, get_why,
-get_dead_code, get_health, list_repos); two more (get_blast_radius, get_architecture) are added
-automatically in workspace mode. Five further tools (get_dependents,
-get_dependency_path, get_execution_flows, generate_refactoring_code, get_conformance) are registered
+get_dead_code, get_health, get_index_status, list_repos); two more
+(get_blast_radius, get_architecture) are added automatically in workspace mode.
+Six further tools (get_dependents, get_dependency_path, get_execution_flows,
+generate_refactoring_code, get_conformance, reindex_repository) are registered
 but off by default and can be opted in via the ``mcp.tools`` config block or the
 ``repowise mcp --tools`` flag; get_conformance only does useful work in workspace
 mode. The selection layer lives in :mod:`._tool_selection`.
@@ -14,7 +15,7 @@ Supports stdio transport (Claude Code, Cursor, Cline), streamable HTTP, and
 legacy SSE transport.
 
 Tool modules load lazily (see :func:`ensure_full_surface`), so importing this
-package, or one tool out of it, does not drag in the other seventeen.
+package, or one tool out of it, does not drag in the other eighteen modules.
 
 Usage:
     repowise mcp --transport stdio  # for Claude Code / Cursor / Cline
@@ -64,11 +65,13 @@ _TOOL_MODULES: dict[str, str] = {
     "get_dependents": "tool_dependents",
     "get_execution_flows": "tool_flows",
     "get_health": "tool_health",
+    "get_index_status": "tool_index_status",
     "get_overview": "tool_overview",
     "get_risk": "tool_risk",
     "get_symbol": "tool_symbol",
     "get_why": "tool_why",
     "list_repos": "tool_repos",
+    "reindex_repository": "tool_index_status",
     "search_codebase": "tool_search",
 }
 
@@ -245,12 +248,14 @@ __all__ = [
     "get_dependents",
     "get_execution_flows",
     "get_health",
+    "get_index_status",
     "get_overview",
     "get_risk",
     "get_symbol",
     "get_why",
     "list_repos",
     "mcp",
+    "reindex_repository",
     "run_mcp",
     "search_codebase",
 ]

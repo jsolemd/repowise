@@ -558,6 +558,12 @@ async def test_status_distinguishes_pending_from_degraded_work(lifecycle_repo):
     repo = lifecycle_repo
     current = await inspect_source_index(repo, embedder=MockEmbedder())
     assert current.state == "current"
+    assert current.manifest_state == "ok"
+    assert current.built_at
+    assert current.embedder == _IDENTITY
+    assert current.parser_fingerprint
+    assert current.symbol_chunks + current.file_window_chunks == current.expected_chunks
+    assert current.files_covered > 0
     assert current.fts_chunks == current.expected_chunks
     assert current.vector_chunks == current.expected_chunks
 
@@ -571,6 +577,30 @@ async def test_status_distinguishes_pending_from_degraded_work(lifecycle_repo):
     degraded = await inspect_source_index(repo, embedder=MockEmbedder())
     assert degraded.state == "degraded"
     assert degraded.last_error == "ollama unavailable"
+
+
+async def test_status_cannot_mistake_unreadable_manifest_for_missing(lifecycle_repo):
+    manifest_path = default_manifest_path(lifecycle_repo)
+    manifest_path.write_text("not json", encoding="utf-8")
+
+    status = await inspect_source_index(lifecycle_repo, embedder=MockEmbedder())
+
+    assert status.state == "inconsistent"
+    assert status.manifest_state == "unreadable"
+    assert status.manifest_error
+    assert any("manifest unreadable" in error for error in status.integrity_errors)
+
+
+async def test_status_read_does_not_recreate_a_missing_lance_store(lifecycle_repo):
+    lance_path = lifecycle_repo / ".repowise" / "lancedb"
+    displaced = lifecycle_repo / ".repowise" / "lancedb-displaced"
+    lance_path.rename(displaced)
+
+    status = await inspect_source_index(lifecycle_repo, embedder=MockEmbedder())
+
+    assert status.state == "inconsistent"
+    assert any("Lance store missing" in error for error in status.integrity_errors)
+    assert not lance_path.exists()
 
 
 @pytest.mark.parametrize(

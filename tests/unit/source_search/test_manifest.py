@@ -14,6 +14,7 @@ from repowise.core.source_search.manifest import (
     SourceIndexManifest,
     corpus_hash,
     default_manifest_path,
+    inspect_manifest,
     read_manifest,
     recipe_fingerprint,
     write_manifest,
@@ -183,12 +184,43 @@ def test_a_missing_manifest_reads_as_none(tmp_path):
     assert read_manifest(tmp_path / "nope.json") is None
 
 
+def test_observer_manifest_read_distinguishes_missing(tmp_path):
+    result = inspect_manifest(tmp_path / "nope.json")
+
+    assert result.state == "missing"
+    assert result.manifest is None
+    assert result.error is None
+
+
 @pytest.mark.parametrize("body", ["not json", "[]", "null", '"a string"'])
 def test_an_unusable_manifest_reads_as_none_rather_than_raising(tmp_path, body):
     """A rebuild deciding whether to reuse vectors must degrade, not crash."""
     path = tmp_path / "source_index.json"
     path.write_text(body)
     assert read_manifest(path) is None
+
+
+@pytest.mark.parametrize("body", ["not json", "[]", "null", '"a string"'])
+def test_observer_manifest_read_reports_unreadable(tmp_path, body):
+    path = tmp_path / "source_index.json"
+    path.write_text(body)
+
+    result = inspect_manifest(path)
+
+    assert result.state == "unreadable"
+    assert result.manifest is None
+    assert result.error
+
+
+def test_observer_manifest_read_reports_ok(tmp_path):
+    path = tmp_path / "source_index.json"
+    write_manifest(path, _manifest())
+
+    result = inspect_manifest(path)
+
+    assert result.state == "ok"
+    assert result.manifest == _manifest()
+    assert result.error is None
 
 
 def test_a_manifest_missing_fields_degrades_to_defaults(tmp_path):

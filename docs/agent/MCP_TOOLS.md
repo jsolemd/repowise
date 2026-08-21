@@ -2,7 +2,7 @@
 
 repowise exposes a curated set of tools via the [Model Context Protocol](https://modelcontextprotocol.io) (MCP). These tools give AI coding assistants (Claude Code, Codex, Cursor, Cline, Windsurf) structured access to your codebase intelligence: dependency graph, git history, documentation, and architectural decisions.
 
-18 tools are registered in total. A single-repo server advertises 11 by default: the ten flagship tools below plus `list_repos`. Workspace mode adds 2 more automatically (`get_architecture`, `get_blast_radius`), for 13. Five further tools are off by default everywhere and must be opted in. The surface is configurable; see [Configuring the tool surface](#configuring-the-tool-surface).
+20 tools are registered in total. A single-repo server advertises 12 by default: the eleven flagship tools below plus `list_repos`. Workspace mode adds 2 more automatically (`get_architecture`, `get_blast_radius`), for 14. Six further tools are off by default everywhere and must be opted in. The surface is configurable; see [Configuring the tool surface](#configuring-the-tool-surface).
 
 **Start the MCP server:**
 
@@ -20,7 +20,7 @@ repowise mcp --transport sse --port 7338 # legacy SSE transport
 
 ## Contents
 
-**Default tools (single-repo, 11)**
+**Default tools (single-repo, 12)**
 [get_overview](#get_overview) &middot;
 [get_answer](#get_answer) &middot;
 [get_context](#get_context) &middot;
@@ -31,24 +31,26 @@ repowise mcp --transport sse --port 7338 # legacy SSE transport
 [get_why](#get_why) &middot;
 [get_dead_code](#get_dead_code) &middot;
 [get_health](#get_health) &middot;
+[get_index_status](#get_index_status) &middot;
 [list_repos](#list_repos)
 
 **Workspace-only tools (added automatically, 2)**
 [get_architecture](#get_architecture) &middot;
 [get_blast_radius](#get_blast_radius)
 
-**Opt-in tools (off by default everywhere, 5)**
+**Opt-in tools (off by default everywhere, 6)**
 [get_dependents](#get_dependents) &middot;
 [get_dependency_path](#get_dependency_path) &middot;
 [get_execution_flows](#get_execution_flows) &middot;
 [generate_refactoring_code](#generate_refactoring_code) &middot;
-[get_conformance](#get_conformance)
+[get_conformance](#get_conformance) &middot;
+[reindex_repository](#reindex_repository)
 
 Also see [Configuring the tool surface](#configuring-the-tool-surface), [Reversible truncation](#reversible-truncation-_metaomitted) and [Unrecognised arguments](#unrecognised-arguments-ignored_arguments).
 
 ---
 
-## The ten flagship tools
+## The eleven flagship tools
 
 | Tool | Purpose | Typical use |
 |------|---------|-------------|
@@ -62,6 +64,7 @@ Also see [Configuring the tool surface](#configuring-the-tool-surface), [Reversi
 | `get_why` | Architectural decisions | Before structural changes |
 | `get_dead_code` | Unreachable code | Cleanup tasks |
 | `get_health` | Code-health marker scores | Before refactoring, find the worst files |
+| `get_index_status` | Source-search publication trust | Before relying on indexed search results |
 
 Also always on by default: `list_repos` (repo aliases). See [Supplementary tools](#supplementary-tools).
 
@@ -71,9 +74,9 @@ Also always on by default: `list_repos` (repo aliases). See [Supplementary tools
 
 The default surface is deliberately small: fewer, richer tools mean fewer round-trips and less schema overhead per task. What a server advertises is resolved from three things: each tool's `default`/`requires_workspace` metadata, whether the server is in workspace mode, and an optional override.
 
-- **Default (single-repo):** 11 tools, the ten flagship tools plus `list_repos`.
-- **Default (workspace):** those 11 plus `get_architecture` and `get_blast_radius`, added automatically when the server starts inside a workspace. They are never advertised outside one.
-- **Opt-in tools:** `get_dependents`, `get_dependency_path`, `get_execution_flows`, `generate_refactoring_code`, and `get_conformance` are registered but off by default. Turn them on per repo; `get_conformance` only does useful work in workspace mode (name it there).
+- **Default (single-repo):** 12 tools, the eleven flagship tools plus `list_repos`.
+- **Default (workspace):** those 12 plus `get_architecture` and `get_blast_radius`, added automatically when the server starts inside a workspace. They are never advertised outside one.
+- **Opt-in tools:** `get_dependents`, `get_dependency_path`, `get_execution_flows`, `generate_refactoring_code`, `get_conformance`, and `reindex_repository` are registered but off by default. Turn them on per repo; `get_conformance` only does useful work in workspace mode (name it there). `reindex_repository` remains separate from the default read surface because it starts background work.
 
 **Configure it in `.repowise/config.yaml`** under an `mcp.tools` key. Four shapes are supported:
 
@@ -867,6 +870,55 @@ get_health(only=["kpis"], limit=0)                    # headline numbers, no row
 
 ---
 
+## `get_index_status`
+
+Checks the source-search publication before an agent relies on indexed results. This
+tool is read-only and on by default. It never resolves an LLM provider, embeds text,
+or starts a job.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `mode` | string | No | `"status"` (default) or `"path"` |
+| `path` | string | Path mode only | One repository-relative path to diagnose |
+| `repo` | string | No | *(workspace only)* Target repo alias; `"all"` is not supported |
+
+**Status mode returns:**
+
+- `trust.search_results`: `trustworthy`, `stale`, or `unknown`, plus exact reasons.
+- Active generation id/sequence, indexed commit versus live HEAD, build/publication
+  times, working-tree paths captured by the last index, and per-file stale reasons.
+- Exact pending/building/ready/blocked queue totals. Their stated unit is source-index
+  update rows after the active generation; there is no pagination or hidden cap.
+- Manifest symbol/file-window totals and file coverage, plus independently read FTS
+  and vector counts and parity.
+- Indexed/runtime embedder and parser identities. A missing identity produces
+  `unknown`; it is never guessed from a plausible default.
+- The existing `degraded`, `degraded_reason`, and `failed_legs` vocabulary when a
+  publication leg is broken.
+
+`verify_stores=true` is unconditional. On the frozen SoleMD.Infra mirror (8,200
+active chunks over 940 files), six warm checks measured 10.45–13.31 ms with an
+11.23 ms median. The first cold check was 830.11 ms including the deferred LanceDB
+import. Counting rows makes no embedding or generative call.
+
+**Path mode returns:** exact active-generation symbol/file-window inventory, tracked
+and working-tree state, parser/window lane eligibility, and the winning wiki exclusion
+rule (`config`, root `.gitignore`, or `.git/info/exclude`) when one matched. Closed
+reasons include `indexed`, `parser_failed_stale`, `eligible_not_indexed`,
+`config_excluded`, `gitignored`, `untracked_window_only`, and `not_source_eligible`.
+When a public policy API cannot identify the deciding rule, the result is `unknown`
+with the missing fact stated; the handler does not re-derive private traversal logic.
+
+```
+get_index_status()
+get_index_status(mode="path", path="src/auth/service.py")
+```
+
+Pair a stale/unknown result with the opt-in [`reindex_repository`](#reindex_repository)
+action only after reviewing its preview.
+
+---
+
 ## Supplementary tools
 
 These are registered and on by default (in the modes noted) but are not part
@@ -1023,6 +1075,31 @@ Turns one structured refactoring plan from `get_health(include=["refactoring"])`
 
 ```
 generate_refactoring_code(suggestion_id="a1b2c3d4")
+```
+
+#### `reindex_repository`
+
+Previews or queues a non-generative, full-repository `index_only` job. The tool is
+off by default and cannot be reached merely by enabling the ordinary read surface.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `repo` | string | No | *(workspace only)* Target repo alias; `"all"` is not supported |
+| `confirm` | boolean | No | Defaults to `false`; must be `true` before work is queued |
+| `force` | boolean | No | Queue even when verified status is already trustworthy/current |
+
+Without confirmation, the response is read-only: it reports active jobs and a cost
+preview based on the active generation's exact file/chunk counts, with zero
+generative calls. An already-current repository is a no-op unless `force=true`.
+Concurrent requests reuse the repository's pending/running job instead of launching
+overlapping work. Confirmed work uses the established `index_only` executor so parsing
+and SQL symbols refresh before the derived source stores publish; it never performs a
+direct reconcile against possibly stale symbol bounds.
+
+```
+reindex_repository()                    # preview only
+reindex_repository(confirm=true)        # queue when stale/unknown
+reindex_repository(confirm=true, force=true)
 ```
 
 ---

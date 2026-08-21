@@ -19,7 +19,7 @@ models. Specific pricing figures are provided in a separate proposal.
 ## 1. Who the commercial license is for
 
 The open-source distribution covers the full developer-experience surface — the five
-intelligence layers, the eleven MCP tools, multi-repo workspaces, the local dashboard,
+intelligence layers, the twelve MCP tools, multi-repo workspaces, the local dashboard,
 auto-sync, and auto-generated `CLAUDE.md`. That is everything an engineer or a team
 needs to make their AI coding agents codebase-aware.
 
@@ -49,9 +49,9 @@ All of the following ship in `pip install repowise` today, free for internal use
   decision records linked to graph nodes, staleness tracking), and Code Health
   (49 deterministic detectors, 1–10 score per file, coverage ingestion, trend
   alerts).
-- **Ten task-shaped MCP tools** — `get_overview`, `get_answer`, `get_context`,
+- **Eleven task-shaped MCP tools** — `get_overview`, `get_answer`, `get_context`,
   `get_symbol`, `search_codebase`, `get_risk`, `get_change_risk`, `get_why`,
-  `get_dead_code`, `get_health`. Benchmarked at **−33.5 % cost per question**
+  `get_dead_code`, `get_health`, `get_index_status`. Benchmarked at **−33.5 % cost per question**
   against a bare agent, cheaper on 13 of 15 questions (n=15, p=0.007), and
   **−49 % to −70 % tool calls** across paired runs on `pallets/flask` and
   `scikit-learn`. See [docs/BENCHMARKS.md](../BENCHMARKS.md) for the sample
@@ -121,7 +121,7 @@ the items that matter most to you can be prioritized.
 | Capability | Open Source (AGPL) | Commercial License |
 |------------|:------------------:|:------------------:|
 | Five intelligence layers | ✅ | ✅ |
-| Eleven MCP tools | ✅ | ✅ |
+| Twelve MCP tools | ✅ | ✅ |
 | Multi-repo workspaces | ✅ | ✅ |
 | Full-tier language support (incl. C# / .NET) | ✅ | ✅ |
 | Local dashboard (incl. local security pattern scan) | ✅ | ✅ |

@@ -9,13 +9,26 @@ that logic; ``repowise.server.mcp_server._helpers`` delegates here.
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 # Per-spec memo ceiling. Comfortably above any real repo's distinct path count,
 # low enough that 64 cached specs cannot pin unbounded memory.
 _MEMO_MAX = 200_000
+
+ExclusionRuleSource = Literal["config", "gitignore", "git_info_exclude"]
+
+
+@dataclass(frozen=True, slots=True)
+class ExclusionDecision:
+    """The final rule that decided one query-time exclusion check."""
+
+    excluded: bool
+    matched: bool
+    source: ExclusionRuleSource | None = None
+    pattern: str | None = None
 
 
 def _gitignore_files(root: Path) -> tuple[Path, ...]:
@@ -61,25 +74,43 @@ def _rules_stamp(root: Path) -> tuple[tuple[int, int], ...]:
 # ``Path.resolve()`` and three ``stat`` calls. Specs are small; the mtime/size
 # stamp in the key means stale entries are unreachable rather than merely old.
 @lru_cache(maxsize=64)
-def _compile_spec(root_key: str, _stamp: tuple[int, ...]) -> Any:
+def _compile_spec(root_key: str, _stamp: tuple[tuple[int, int], ...]) -> Any:
     """Compile and cache one repo's spec. Keyed by root + rule-file mtimes."""
     import pathspec
 
     from repowise.core.repo_config import load_repo_config
 
     root = Path(root_key)
-    patterns = list(load_repo_config(root).get("exclude_patterns") or [])
-    for ignore_file in _gitignore_files(root):
+    rule_sets: list[tuple[ExclusionRuleSource, list[str]]] = [
+        ("config", list(load_repo_config(root).get("exclude_patterns") or [])),
+    ]
+    ignore_sources: tuple[tuple[ExclusionRuleSource, Path], ...] = (
+        ("gitignore", root / ".gitignore"),
+        ("git_info_exclude", root / ".git" / "info" / "exclude"),
+    )
+    for source, ignore_file in ignore_sources:
+        lines: list[str] = []
         try:
             if ignore_file.exists():
-                patterns.extend(
-                    ignore_file.read_text(encoding="utf-8", errors="ignore").splitlines()
-                )
+                lines = ignore_file.read_text(encoding="utf-8", errors="ignore").splitlines()
         except OSError:
-            continue
+            pass
+        rule_sets.append((source, lines))
+
+    patterns: list[Any] = []
+    sources: list[ExclusionRuleSource] = []
+    for source, lines in rule_sets:
+        compiled = pathspec.PathSpec.from_lines("gitwildmatch", lines)
+        patterns.extend(compiled.patterns)
+        sources.extend([source] * len(compiled.patterns))
     if not patterns:
         return None
-    spec = pathspec.PathSpec.from_lines("gitwildmatch", patterns)
+    # Concatenating the compiled patterns preserves the exact cross-source
+    # precedence of the former one-shot ``from_lines`` call, including a later
+    # negation re-including a path. The parallel source tuple lets an observer
+    # name the rule set containing the final deciding pattern.
+    spec = pathspec.PathSpec(patterns)
+    spec._repowise_rule_sources = tuple(sources)  # type: ignore[attr-defined]
     # Per-path decision memo, carried on the spec so it lives exactly as long as
     # the compiled spec does. ``match_file`` is a regex sweep over every pattern;
     # a repo-wide read filters the same few thousand paths over and over, both
@@ -127,6 +158,34 @@ def is_excluded(path: str | None, spec: Any) -> bool:
             memo.clear()
         cached = memo[path] = bool(spec.match_file(path))
     return cached
+
+
+def exclusion_decision(repo_path: Path | str, path: str) -> ExclusionDecision:
+    """Return whether *path* is excluded and which rule source decided it.
+
+    The winning source is read from the same combined, ordered PathSpec used by
+    :func:`is_excluded`; it is not reconstructed by matching three independent
+    specs, which would get cross-file negations wrong.
+    """
+
+    spec = build_exclude_spec(repo_path)
+    if spec is None:
+        return ExclusionDecision(excluded=False, matched=False)
+
+    checked = spec.check_file(path)
+    if checked.index is None or checked.include is None:
+        return ExclusionDecision(excluded=False, matched=False)
+
+    sources = getattr(spec, "_repowise_rule_sources", ())
+    source = sources[checked.index] if checked.index < len(sources) else None
+    raw_pattern = getattr(spec.patterns[checked.index], "pattern", None)
+    pattern = str(raw_pattern) if raw_pattern is not None else None
+    return ExclusionDecision(
+        excluded=bool(checked.include),
+        matched=True,
+        source=source,
+        pattern=pattern,
+    )
 
 
 def decision_is_excluded(decision_row: Any, spec: Any) -> bool:

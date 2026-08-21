@@ -22,7 +22,7 @@ import tempfile
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from .chunks import SourceChunk, recipe_parameters
 from .fts import tokenizer_parameters
@@ -30,11 +30,13 @@ from .fts import tokenizer_parameters
 __all__ = [
     "MANIFEST_FILENAME",
     "EmbedderIdentity",
+    "ManifestReadResult",
     "SourceIndexManifest",
     "corpus_hash",
     "corpus_hash_entries",
     "default_manifest_path",
     "identify_embedder",
+    "inspect_manifest",
     "read_manifest",
     "recipe_fingerprint",
     "write_manifest",
@@ -194,12 +196,26 @@ class SourceIndexManifest:
             lance_table=str(raw.get("lance_table") or "source_chunks"),
             fts_path=str(raw.get("fts_path") or ".repowise/source_search/source_fts.db"),
             stale_files={
-                str(path): str(reason)
-                for path, reason in (raw.get("stale_files") or {}).items()
+                str(path): str(reason) for path, reason in (raw.get("stale_files") or {}).items()
             }
             if isinstance(raw.get("stale_files") or {}, dict)
             else {},
         )
+
+
+@dataclass(frozen=True, slots=True)
+class ManifestReadResult:
+    """Discriminated manifest read for status surfaces.
+
+    Rebuild callers deliberately use :func:`read_manifest`, where both an
+    absent and an unreadable manifest mean "do not reuse vectors". Observers
+    need the stronger distinction: a broken publication pointer must never be
+    reported as an empty index.
+    """
+
+    state: Literal["missing", "unreadable", "ok"]
+    manifest: SourceIndexManifest | None = None
+    error: str | None = None
 
 
 def write_manifest(path: Path | str, manifest: SourceIndexManifest) -> None:
@@ -234,6 +250,39 @@ def write_manifest(path: Path | str, manifest: SourceIndexManifest) -> None:
     except BaseException:
         Path(tmp_name).unlink(missing_ok=True)
         raise
+
+
+def inspect_manifest(path: Path | str) -> ManifestReadResult:
+    """Read a manifest while preserving missing vs unreadable state.
+
+    This is the observer-facing sibling of :func:`read_manifest`. It never
+    raises, but unlike that rebuild-oriented API it carries the parse or I/O
+    failure so health checks cannot mistake corruption for absence.
+    """
+
+    target = Path(path)
+    try:
+        raw = json.loads(target.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return ManifestReadResult(state="missing")
+    except (OSError, ValueError) as exc:
+        return ManifestReadResult(
+            state="unreadable",
+            error=f"{type(exc).__name__}: {exc}",
+        )
+    if not isinstance(raw, dict):
+        return ManifestReadResult(
+            state="unreadable",
+            error=f"manifest root must be an object, found {type(raw).__name__}",
+        )
+    try:
+        manifest = SourceIndexManifest.from_dict(raw)
+    except (TypeError, ValueError) as exc:
+        return ManifestReadResult(
+            state="unreadable",
+            error=f"{type(exc).__name__}: {exc}",
+        )
+    return ManifestReadResult(state="ok", manifest=manifest)
 
 
 def read_manifest(path: Path | str) -> SourceIndexManifest | None:

@@ -11,7 +11,7 @@ FastAPI REST API, webhook handlers, MCP server, and background job scheduler for
 | Component | Description |
 |-----------|-------------|
 | **REST API** | FastAPI application with full CRUD for repos, pages (with version history), symbols, jobs, git analytics, dead code, decisions, graph intelligence, blast radius, costs, knowledge map, security findings, providers, chat, CLAUDE.md generation, and multi-repo workspace |
-| **MCP Server** | 17 registered MCP tools (11 advertised by default in single-repo mode: ten flagship + `list_repos`) for AI coding assistants (Claude Code, Cursor, Cline) |
+| **MCP Server** | 20 registered MCP tools (12 advertised by default in single-repo mode: eleven flagship + `list_repos`) for AI coding assistants (Claude Code, Cursor, Cline) |
 | **Webhooks** | GitHub and GitLab push event handlers — trigger sync jobs automatically on push |
 | **Scheduler** | APScheduler background jobs — polling fallback (auto-syncs diverged repos), stale page detection |
 
@@ -232,9 +232,9 @@ Job progress events (`JobProgressEvent`) carry: `event` type, `file` currently b
 
 ## MCP Server
 
-repowise registers 17 MCP tools and advertises **11 by default** in single-repo
-mode (the ten flagship tools plus `list_repos`). Workspace mode adds two more;
-four further tools are opt-in. See [`docs/agent/MCP_TOOLS.md`](../../docs/agent/MCP_TOOLS.md).
+repowise registers 20 MCP tools and advertises **12 by default** in single-repo
+mode (the eleven flagship tools plus `list_repos`). Workspace mode adds two more;
+six further tools are opt-in. See [`docs/agent/MCP_TOOLS.md`](../../docs/agent/MCP_TOOLS.md).
 Start the MCP server via:
 
 ```bash
@@ -255,6 +255,7 @@ repowise mcp --transport sse          # legacy SSE transport on port 7338
 | `get_why(query?)` | Architectural decisions, rationale, constraints | Before making architectural changes — understand existing intent |
 | `get_dead_code` | Unused/unreachable code sorted by cleanup impact | Before cleanup tasks |
 | `get_health` | 1–10 code-health scores and marker findings | Before refactoring — find the worst files |
+| `get_index_status(mode?, path?)` | Source-search trust, store parity, queue depth, and path eligibility | Before relying on indexed search results |
 
 Also on by default: `list_repos`. Opt-in / workspace-only tools are documented in `MCP_TOOLS.md`.
 

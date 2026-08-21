@@ -6,11 +6,11 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from .fts import SourceFTSIndex
 from .generation import GenerationRef
-from .manifest import default_manifest_path, read_manifest
+from .manifest import EmbedderIdentity, default_manifest_path, inspect_manifest
 
 __all__ = ["SourceIndexStatus", "inspect_source_index"]
 
@@ -26,6 +26,15 @@ class SourceIndexStatus:
     blocked_updates: int
     building_updates: int
     ready_updates: int
+    manifest_state: str = "missing"
+    manifest_error: str | None = None
+    built_at: str | None = None
+    published_at: str | None = None
+    embedder: EmbedderIdentity | None = None
+    parser_fingerprint: str | None = None
+    symbol_chunks: int = 0
+    file_window_chunks: int = 0
+    files_covered: int = 0
     stale_files: dict[str, str] = field(default_factory=dict)
     expected_chunks: int = 0
     fts_chunks: int | None = None
@@ -45,12 +54,21 @@ class SourceIndexStatus:
         return result
 
 
-async def _outbox_rows(
+@dataclass(frozen=True, slots=True)
+class _SourceUpdateSnapshot:
+    active: Any | None
+    counts: dict[str, int]
+    outstanding_total: int
+    last_error: str | None
+
+
+async def _source_update_snapshot(
     repo: Path,
     db_url: str | None,
     *,
-    after_sequence: int,
-) -> list[Any]:
+    active_sequence: int,
+    active_generation_id: str | None,
+) -> _SourceUpdateSnapshot:
     from repowise.core.persistence.database import (
         create_engine,
         create_session_factory,
@@ -74,20 +92,58 @@ async def _outbox_rows(
             if repository_id is None and len(repositories) == 1:
                 repository_id = repositories[0].id
             if repository_id is None:
-                return []
-            return list(
-                (
-                    await session.execute(
-                        select(SourceIndexUpdate)
-                        .where(
-                            SourceIndexUpdate.repository_id == repository_id,
-                            SourceIndexUpdate.sequence > after_sequence,
+                return _SourceUpdateSnapshot(None, {}, 0, None)
+
+            active_candidate = None
+            if active_sequence > 0:
+                active_candidate = (
+                    (
+                        await session.execute(
+                            select(SourceIndexUpdate).where(
+                                SourceIndexUpdate.repository_id == repository_id,
+                                SourceIndexUpdate.sequence == active_sequence,
+                            )
                         )
-                        .order_by(SourceIndexUpdate.sequence)
                     )
+                    .scalars()
+                    .one_or_none()
                 )
-                .scalars()
-                .all()
+            outstanding_filter = (
+                SourceIndexUpdate.repository_id == repository_id,
+                SourceIndexUpdate.sequence > active_sequence,
+            )
+            count_rows = (
+                await session.execute(
+                    select(SourceIndexUpdate.state, func.count())
+                    .where(*outstanding_filter)
+                    .group_by(SourceIndexUpdate.state)
+                )
+            ).all()
+            counts = {str(state): int(count) for state, count in count_rows}
+            last_error_value = (
+                await session.execute(
+                    select(SourceIndexUpdate.last_error)
+                    .where(
+                        *outstanding_filter,
+                        SourceIndexUpdate.last_error.is_not(None),
+                        SourceIndexUpdate.last_error != "",
+                    )
+                    .order_by(SourceIndexUpdate.sequence.desc())
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            active = (
+                active_candidate
+                if active_candidate is not None
+                and active_candidate.generation_id == active_generation_id
+                and active_candidate.state in {"ready", "published"}
+                else None
+            )
+            return _SourceUpdateSnapshot(
+                active=active,
+                counts=counts,
+                outstanding_total=sum(counts.values()),
+                last_error=str(last_error_value) if last_error_value else None,
             )
     finally:
         await engine.dispose()
@@ -103,28 +159,31 @@ async def inspect_source_index(
     """Inspect publication, queue and optional cross-store count parity."""
 
     repo = Path(repo_path).resolve()
-    manifest = read_manifest(default_manifest_path(repo))
+    manifest_result = inspect_manifest(default_manifest_path(repo))
+    manifest = manifest_result.manifest
     active_sequence = manifest.generation_sequence if manifest is not None else 0
     errors: list[str] = []
+    if manifest_result.state == "unreadable":
+        errors.append(f"source manifest unreadable: {manifest_result.error}")
     try:
-        rows = await _outbox_rows(repo, db_url, after_sequence=active_sequence)
+        updates = await _source_update_snapshot(
+            repo,
+            db_url,
+            active_sequence=active_sequence,
+            active_generation_id=manifest.generation_id if manifest is not None else None,
+        )
     except Exception as exc:
-        rows = []
+        updates = _SourceUpdateSnapshot(None, {}, 0, None)
         errors.append(f"source outbox unreadable: {exc}")
 
-    outstanding = rows
-    pending = sum(row.state == "pending" for row in outstanding)
-    blocked = sum(row.state == "blocked" for row in outstanding)
-    building = sum(row.state == "building" for row in outstanding)
-    ready = sum(row.state == "ready" for row in outstanding)
-    last_error = next(
-        (str(row.last_error) for row in reversed(outstanding) if row.last_error),
-        None,
-    )
+    active_update = updates.active
+    pending = updates.counts.get("pending", 0)
+    blocked = updates.counts.get("blocked", 0)
+    building = updates.counts.get("building", 0)
+    ready = updates.counts.get("ready", 0)
+    last_error = updates.last_error
 
-    expected = (
-        manifest.symbol_chunks + manifest.file_window_chunks if manifest is not None else 0
-    )
+    expected = manifest.symbol_chunks + manifest.file_window_chunks if manifest is not None else 0
     fts_count: int | None = None
     vector_count: int | None = None
     if manifest is not None and verify_stores:
@@ -142,30 +201,34 @@ async def inspect_source_index(
                 errors.append(f"FTS store unreadable: {exc}")
 
         if embedder is not None:
-            try:
-                from .vector_store import SourceChunkVectorStore
-
-                store = SourceChunkVectorStore(
-                    str(repo / ".repowise" / "lancedb"),
-                    embedder=embedder,
-                    table_name=manifest.lance_table,
-                    generation=generation,
-                )
+            lance_path = repo / ".repowise" / "lancedb"
+            if not lance_path.is_dir():
+                errors.append("Lance store missing: .repowise/lancedb")
+            else:
                 try:
-                    vector_count = await store.count()
-                finally:
-                    await store.close()
-                if vector_count != expected:
-                    errors.append(
-                        f"Lance count mismatch: expected {expected}, found {vector_count}"
+                    from .vector_store import SourceChunkVectorStore
+
+                    store = SourceChunkVectorStore(
+                        str(lance_path),
+                        embedder=embedder,
+                        table_name=manifest.lance_table,
+                        generation=generation,
                     )
-            except Exception as exc:
-                errors.append(f"Lance store unreadable: {exc}")
+                    try:
+                        vector_count = await store.count()
+                    finally:
+                        await store.close()
+                    if vector_count != expected:
+                        errors.append(
+                            f"Lance count mismatch: expected {expected}, found {vector_count}"
+                        )
+                except Exception as exc:
+                    errors.append(f"Lance store unreadable: {exc}")
 
     if errors:
         state = "inconsistent"
     elif manifest is None:
-        state = "degraded" if outstanding else "missing"
+        state = "degraded" if updates.outstanding_total else "missing"
     elif blocked or last_error or manifest.stale_files:
         state = "degraded"
     elif pending or building or ready:
@@ -183,6 +246,21 @@ async def inspect_source_index(
         blocked_updates=blocked,
         building_updates=building,
         ready_updates=ready,
+        manifest_state=manifest_result.state,
+        manifest_error=manifest_result.error,
+        built_at=manifest.built_at if manifest else None,
+        published_at=(
+            active_update.published_at.isoformat()
+            if active_update is not None and active_update.published_at is not None
+            else None
+        ),
+        embedder=manifest.embedder if manifest else None,
+        parser_fingerprint=(
+            str(active_update.parser_fingerprint) if active_update is not None else None
+        ),
+        symbol_chunks=manifest.symbol_chunks if manifest else 0,
+        file_window_chunks=manifest.file_window_chunks if manifest else 0,
+        files_covered=manifest.files_covered if manifest else 0,
         stale_files=dict(manifest.stale_files) if manifest else {},
         expected_chunks=expected,
         fts_chunks=fts_count,

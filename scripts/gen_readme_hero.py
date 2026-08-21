@@ -247,34 +247,59 @@ for txt, col in badges:
     bxp += wpx + 8
 add(f'<text x="{ex+34}" y="{ey+186}" class="cap">Delivered back at session start, and the moment</text>')
 add(f'<text x="{ex+34}" y="{ey+202}" class="cap">your agent edits a file the decision governs.</text>')
-outcome(ex, ey+RH-46, ew, "Don’t re-litigate what we settled.")
-add(f'<text x="{ex+22}" y="{ey+RH-25}" class="outsub">Captured nowhere else.</text>')
+outcome(ex, ey + RH - 46, ew, "Don’t re-litigate what we settled.")
+add(f'<text x="{ex + 22}" y="{ey + RH - 25}" class="outsub">Captured nowhere else.</text>')
 
 # F: Agent surface
 fx0, fy0 = ex + ew + GAP, ROW2
 fw = W - PAD - fx0
-card(fx0, fy0, fw, RH, "SERVED TO YOUR AGENT", "10 MCP tools")
-# All eleven of the single-repo default surface. The card headline counts them,
-# so a chip missing here is a picture that contradicts its own title.
-tools = ["get_overview", "get_answer", "get_context", "get_symbol", "search_codebase",
-         "get_risk", "get_change_risk", "get_why", "get_dead_code", "get_health"]
+card(fx0, fy0, fw, RH, "SERVED TO YOUR AGENT", "11 MCP tools")
+# All eleven task-shaped tools in the single-repo default surface. The card
+# headline counts them, so a chip missing here contradicts its own title.
+tools = [
+    "get_overview",
+    "get_answer",
+    "get_context",
+    "get_symbol",
+    "search_codebase",
+    "get_risk",
+    "get_change_risk",
+    "get_why",
+    "get_dead_code",
+    "get_health",
+    "get_index_status",
+]
 tx, ty = fx0 + 20, fy0 + 54
 for _i, t in enumerate(tools):
     wpx = 12 + len(t) * 6.9
     if tx + wpx > fx0 + fw - 20:
         tx = fx0 + 20
         ty += 30
-    add(f'<rect x="{tx:.0f}" y="{ty}" width="{wpx:.0f}" height="24" rx="6" fill="{INSET}" stroke="{BORDER}"/>')
-    add(f'<text x="{tx+wpx/2:.0f}" y="{ty+16}" class="mono" text-anchor="middle">{esc(t)}</text>')
+    add(
+        f'<rect x="{tx:.0f}" y="{ty}" width="{wpx:.0f}" height="24" rx="6" fill="{INSET}" stroke="{BORDER}"/>'
+    )
+    add(
+        f'<text x="{tx + wpx / 2:.0f}" y="{ty + 16}" class="mono" text-anchor="middle">{esc(t)}</text>'
+    )
     tx += wpx + 8
 # savings strip
 sy = fy0 + 176
-add(f'<text x="{fx0+20}" y="{fy0+162}" class="cap">Every response carries index age, indexed commit, and a staleness warning.</text>')
-add(f'<rect x="{fx0+20}" y="{sy}" width="{fw-40}" height="46" rx="9" fill="{SAVE_BG}" stroke="{SAVE_BD}"/>')
-add(f'<text x="{fx0+34}" y="{sy+20}" class="chipval" fill="{ACCENT}" font-size="19">−96%<tspan class="chipunit" fill="{T_SEC}"> context tokens</tspan></text>')
-add(f'<text x="{fx0+34}" y="{sy+38}" class="cap">−70% tool calls · −89% file reads · fewer round-trips per answer</text>')
-outcome(fx0, fy0+RH-46, fw, "Claude Code, Codex, Cursor, VS Code.")
-add(f'<text x="{fx0+22}" y="{fy0+RH-25}" class="outsub">Plus hooks, so it arrives unasked.</text>')
+add(
+    f'<text x="{fx0 + 20}" y="{fy0 + 162}" class="cap">Every response carries index age, indexed commit, and a staleness warning.</text>'
+)
+add(
+    f'<rect x="{fx0 + 20}" y="{sy}" width="{fw - 40}" height="46" rx="9" fill="{SAVE_BG}" stroke="{SAVE_BD}"/>'
+)
+add(
+    f'<text x="{fx0 + 34}" y="{sy + 20}" class="chipval" fill="{ACCENT}" font-size="19">−96%<tspan class="chipunit" fill="{T_SEC}"> context tokens</tspan></text>'
+)
+add(
+    f'<text x="{fx0 + 34}" y="{sy + 38}" class="cap">−70% tool calls · −89% file reads · fewer round-trips per answer</text>'
+)
+outcome(fx0, fy0 + RH - 46, fw, "Claude Code, Codex, Cursor, VS Code.")
+add(
+    f'<text x="{fx0 + 22}" y="{fy0 + RH - 25}" class="outsub">Plus hooks, so it arrives unasked.</text>'
+)
 
 # ============ assemble ====================================================
 style = f"""
@@ -295,13 +320,19 @@ style = f"""
   .pill {{ font-size: 10.5px; font-weight: 600; }}
   .mono {{ font-size: 11.5px; fill: {T_SEC}; font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace; }}
 """
-svg = (f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" viewBox="0 0 {W} {H}" '
-       f'role="img" aria-label="repowise: one index producing code health, a dependency graph, git history, generated docs, architectural decisions, and ten MCP tools">'
-       f'<style>{style}</style>' + "".join(out) + '</svg>')
+svg = (
+    f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" viewBox="0 0 {W} {H}" '
+    f'role="img" aria-label="repowise: one index producing code health, a dependency graph, git history, generated docs, architectural decisions, and eleven MCP tools">'
+    f"<style>{style}</style>" + "".join(out) + "</svg>"
+)
 
 suffix = "" if THEME == "light" else "-dark"
-path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                    ".github", "assets", f"one-index{suffix}.svg")
+path = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    ".github",
+    "assets",
+    f"one-index{suffix}.svg",
+)
 with open(path, "w", encoding="utf-8") as f:
     f.write(svg)
 print("wrote", path, len(svg), "bytes")
