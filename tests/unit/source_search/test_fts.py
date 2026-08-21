@@ -183,6 +183,25 @@ def test_file_inventory_counts_active_lanes_exactly(index):
     assert inventory.file_window == 1
 
 
+def test_file_inventory_reads_the_indexed_versions_table_without_scanning_fts(index):
+    path = "src/alpha.py"
+    index.index_chunks([_chunk("alpha", "def alpha():\n    pass", path=path)])
+    statements: list[str] = []
+    index._conn.set_trace_callback(statements.append)
+    try:
+        inventory = index.inventory_for_file(path)
+    finally:
+        index._conn.set_trace_callback(None)
+
+    inventory_selects = [
+        statement for statement in statements if statement.lstrip().upper().startswith("SELECT")
+    ]
+    assert inventory.total == 1
+    assert len(inventory_selects) == 1
+    assert "FROM source_fts_versions AS v" in inventory_selects[0]
+    assert "source_fts AS f" not in inventory_selects[0]
+
+
 def test_file_inventory_reports_exact_zero_for_absent_path(index):
     index.index_chunks([_chunk("alpha", "def alpha():\n    pass")])
 

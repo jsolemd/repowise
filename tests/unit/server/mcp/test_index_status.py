@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from repowise.core.persistence.models import Repository
+from repowise.core.persistence.models import GenerationJob, Repository
 from repowise.core.source_search.chunks import (
     SymbolRecord,
     build_symbol_chunk,
@@ -159,11 +159,11 @@ async def test_status_verifies_both_stores_and_reports_exact_uncapped_queue_coun
     }
     assert result["degraded"] is False
     assert "degraded_reason" not in result
-    assert "failed_legs" not in result
+    assert "degradation_findings" not in result
 
 
 @pytest.mark.asyncio
-async def test_status_reuses_standard_degradation_keys(
+async def test_status_keeps_publication_findings_separate_from_retrieval_failures(
     tmp_path,
     monkeypatch,
     session,
@@ -203,13 +203,14 @@ async def test_status_reuses_standard_degradation_keys(
 
     assert result["degraded"] is True
     assert result["degraded_reason"] == "FTS count mismatch: expected 10, found 9"
-    assert result["failed_legs"] == [
+    assert result["degradation_findings"] == [
         {
-            "leg": "source lexical",
-            "error": "count_mismatch",
+            "component": "source lexical",
+            "code": "count_mismatch",
             "detail": "FTS count mismatch: expected 10, found 9",
         }
     ]
+    assert "failed_legs" not in result
 
 
 @pytest.mark.parametrize(
@@ -287,9 +288,11 @@ def test_path_mode_uses_active_inventory_and_authoritative_policy_sites(
     (repo / "src").mkdir()
     (repo / "src" / "app.py").write_text("def indexed_symbol():\n    return 1\n", encoding="utf-8")
     (repo / "deploy.yaml").write_text("services:\n  api: {}\n", encoding="utf-8")
+    (repo / "infra").mkdir()
+    (repo / "infra" / "nginx.conf").write_text("server {}\n", encoding="utf-8")
     (repo / ".gitignore").write_text("scratch/\n", encoding="utf-8")
     _git(repo, "init", "-q")
-    _git(repo, "add", "src/app.py", "deploy.yaml", ".gitignore")
+    _git(repo, "add", "src/app.py", "deploy.yaml", "infra/nginx.conf", ".gitignore")
     _git(
         repo,
         "-c",
@@ -341,13 +344,19 @@ def test_path_mode_uses_active_inventory_and_authoritative_policy_sites(
     assert window["lanes"] == ["file_window"]
     assert window["chunks"]["total"] == 1
 
+    tracked_window = diagnose("infra/nginx.conf")
+    assert tracked_window["reason"] == "eligible_not_indexed"
+    assert tracked_window["eligibility"]["eligible"] is True
+    assert tracked_window["eligibility"]["file_window"]["lane_eligible"] is True
+    assert tracked_window["path_shape_candidate"] is False
+
     config_excluded = diagnose("ignored/tool.py")
-    assert config_excluded["reason"] == "config_excluded"
-    assert config_excluded["eligibility"]["wiki_exclusion"]["source"] == "config"
+    assert config_excluded["reason"] == "untracked_window_only"
+    assert config_excluded["eligibility"]["parser"]["wiki_eligible"] is False
 
     gitignored = diagnose("scratch/tool.py")
-    assert gitignored["reason"] == "gitignored"
-    assert gitignored["eligibility"]["wiki_exclusion"]["source"] == "gitignore"
+    assert gitignored["reason"] == "untracked_window_only"
+    assert gitignored["eligibility"]["parser"]["wiki_eligible"] is False
 
     untracked = diagnose("local.yaml")
     assert untracked["reason"] == "untracked_window_only"
@@ -355,7 +364,30 @@ def test_path_mode_uses_active_inventory_and_authoritative_policy_sites(
 
     unknown = diagnose("assets/blob.zzz")
     assert unknown["reason"] == "unknown"
-    assert "does not expose the deciding rule" in unknown["unknown_reason"]
+    assert "deciding rule is unavailable" in unknown["unknown_reason"]
+
+
+@pytest.mark.asyncio
+async def test_active_jobs_discloses_corrupt_config_instead_of_guessing_sync(
+    session,
+    factory,
+    repo_id,
+) -> None:
+    module = importlib.import_module("repowise.server.mcp_server.tool_index_status")
+    job = GenerationJob(
+        repository_id=repo_id,
+        status="running",
+        config_json="{not-json",
+    )
+    session.add(job)
+    await session.commit()
+
+    jobs = await module._active_jobs(factory, repo_id)
+
+    assert len(jobs) == 1
+    assert jobs[0]["id"] == job.id
+    assert jobs[0]["mode"] is None
+    assert jobs[0]["config_error"] == "invalid_config_json"
 
 
 @pytest.mark.asyncio

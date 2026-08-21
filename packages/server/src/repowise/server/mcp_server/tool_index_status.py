@@ -12,12 +12,12 @@ from typing import Any
 
 from sqlalchemy import select
 
-from repowise.core.exclusion import exclusion_decision
 from repowise.core.ingestion import FileTraverser, is_candidate_source_path
 from repowise.core.persistence.database import get_session
 from repowise.core.persistence.models import GenerationJob
 from repowise.core.registry import mcp_tool_registry as mcp
 from repowise.core.source_search.chunks import parser_eligible, window_eligible
+from repowise.core.source_search.coordinator import LEG_SOURCE_DENSE, LEG_SOURCE_LEXICAL
 from repowise.core.source_search.fts import SourceFTSIndex
 from repowise.core.source_search.generation import GenerationRef
 from repowise.core.source_search.manifest import identify_embedder
@@ -36,6 +36,9 @@ from repowise.server.mcp_server._meta import build_meta as _build_meta
 from repowise.server.services.job_queue import queue_index_only_job
 
 _READ_MODES = frozenset({"status", "path"})
+_SOURCE_MANIFEST_COMPONENT = "source manifest"
+_SOURCE_QUEUE_COMPONENT = "source queue"
+_SOURCE_PUBLICATION_COMPONENT = "source publication"
 
 # Standalone MCP has no FastAPI ``app.state``. Keep the process-owned
 # registries stable across calls, but snapshot repo-specific attributes in a
@@ -164,47 +167,53 @@ def _trust_state(
     return "trustworthy", []
 
 
-def _failed_legs(status: SourceIndexStatus) -> list[dict[str, str]]:
-    failures: list[dict[str, str]] = []
+def _degradation_findings(status: SourceIndexStatus) -> list[dict[str, str]]:
+    """Structured index-health findings, distinct from retrieval failures.
+
+    ``failed_legs`` is reserved for runtime retrieval failures whose ``error``
+    value is an exception class.  Publication health has durable status codes,
+    so it uses a separate field and shape instead of overloading that contract.
+    """
+    findings: list[dict[str, str]] = []
     for detail in status.integrity_errors:
         lowered = detail.lower()
         if "fts" in lowered:
-            leg = "source lexical"
+            component = LEG_SOURCE_LEXICAL
         elif "lance" in lowered:
-            leg = "source dense"
+            component = LEG_SOURCE_DENSE
         elif "manifest" in lowered:
-            leg = "source manifest"
+            component = _SOURCE_MANIFEST_COMPONENT
         elif "outbox" in lowered:
-            leg = "source queue"
+            component = _SOURCE_QUEUE_COMPONENT
         else:
-            leg = "source publication"
-        error = "count_mismatch" if "count mismatch" in lowered else "unavailable"
-        failures.append({"leg": leg, "error": error, "detail": detail})
+            component = _SOURCE_PUBLICATION_COMPONENT
+        code = "count_mismatch" if "count mismatch" in lowered else "unavailable"
+        findings.append({"component": component, "code": code, "detail": detail})
     if status.last_error:
-        failures.append(
+        findings.append(
             {
-                "leg": "source queue",
-                "error": "update_failed",
+                "component": _SOURCE_QUEUE_COMPONENT,
+                "code": "update_failed",
                 "detail": status.last_error,
             }
         )
     if status.stale_files:
-        failures.append(
+        findings.append(
             {
-                "leg": "source publication",
-                "error": "stale_files",
+                "component": _SOURCE_PUBLICATION_COMPONENT,
+                "code": "stale_files",
                 "detail": f"{len(status.stale_files)} source files are stale",
             }
         )
     if status.blocked_updates and not status.last_error:
-        failures.append(
+        findings.append(
             {
-                "leg": "source queue",
-                "error": "updates_blocked",
+                "component": _SOURCE_QUEUE_COMPONENT,
+                "code": "updates_blocked",
                 "detail": f"{status.blocked_updates} source-index update rows are blocked",
             }
         )
-    return failures
+    return findings
 
 
 async def _status_payload(ctx: Any, repository: Any, *, started: float) -> tuple[dict, Any, dict]:
@@ -319,13 +328,13 @@ async def _status_payload(ctx: Any, repository: Any, *, started: float) -> tuple
         ),
     }
     if status.degraded:
-        failures = _failed_legs(status)
+        findings = _degradation_findings(status)
         payload["degraded_reason"] = (
             status.last_error
             or "; ".join(status.integrity_errors)
-            or (failures[0]["detail"] if failures else status.state)
+            or (findings[0]["detail"] if findings else status.state)
         )
-        payload["failed_legs"] = failures
+        payload["degradation_findings"] = findings
     return payload, status, repo_state
 
 
@@ -442,7 +451,6 @@ def _path_mode_payload(
     indexed = inventory["total"] > 0 if inventory is not None else None
     tracked = _tracked_state(repo_path, normalized)
     parser_policy = parser_eligible(normalized)
-    exclusion = exclusion_decision(repo_path, normalized)
     wiki_eligible, wiki_unknown = _wiki_eligibility(repo_path, normalized)
     shape_candidate = is_candidate_source_path(normalized)
 
@@ -489,16 +497,8 @@ def _path_mode_payload(
         unknown_reason = inventory_error or "active inventory unavailable"
     elif indexed:
         reason = "parser_failed_stale" if stale_reason else "indexed"
-    elif not shape_candidate:
-        reason = "unknown"
-        unknown_reason = (
-            "is_candidate_source_path rejected the path shape, but its public "
-            "contract does not expose the deciding rule"
-        )
     elif eligible is True:
         reason = "eligible_not_indexed"
-    elif exclusion.excluded:
-        reason = "config_excluded" if exclusion.source == "config" else "gitignored"
     elif tracked is False and window_policy is True and not parser_lane:
         reason = "untracked_window_only"
     elif eligible is False and wiki_unknown is None:
@@ -534,7 +534,6 @@ def _path_mode_payload(
                 "lane_eligible": window_lane,
                 "requires_tracked_path": True,
             },
-            "wiki_exclusion": asdict(exclusion),
         },
         "indexed": indexed,
         "generation": (
@@ -574,19 +573,22 @@ async def _active_jobs(session_factory: Any, repository_id: str) -> list[dict[st
         )
     jobs = []
     for row in rows:
+        config_error = None
         try:
             config = json.loads(row.config_json) if row.config_json else {}
         except (TypeError, ValueError):
             config = {}
-        jobs.append(
-            {
-                "id": row.id,
-                "state": row.status,
-                "mode": config.get("mode") or "sync",
-                "force": config.get("force"),
-                "created_at": row.created_at.isoformat() if row.created_at else None,
-            }
-        )
+            config_error = "invalid_config_json"
+        job = {
+            "id": row.id,
+            "state": row.status,
+            "mode": None if config_error else config.get("mode") or "sync",
+            "bypass_current_noop": config.get("bypass_current_noop", config.get("force")),
+            "created_at": row.created_at.isoformat() if row.created_at else None,
+        }
+        if config_error:
+            job["config_error"] = config_error
+        jobs.append(job)
     return jobs
 
 
@@ -614,7 +616,7 @@ async def get_index_status(
 
     Use ``mode="status"`` before relying on indexed results. Use
     ``mode="path"`` with one repository-relative path to inspect its exact
-    active-generation inventory, parser/window eligibility, exclusions,
+    active-generation inventory, parser/window eligibility,
     tracked state, and any fact the public index APIs cannot determine.
 
     Args:
@@ -708,7 +710,8 @@ async def reindex_repository(
         "active_job_count": len(active_jobs),
         "cost": {
             "generative_calls": 0,
-            "scope": "full repository parse, analysis, and derived-index publication",
+            "scope": "repository index_only pipeline and derived-index publication",
+            "force_effect": "queue_when_current_only",
             "estimate": estimate,
         },
     }

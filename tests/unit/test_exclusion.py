@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from repowise.core import exclusion as exclusion_module
 from repowise.core.exclusion import exclusion_decision
 
 
@@ -43,3 +44,19 @@ def test_exclusion_decision_reports_no_match_without_guessing(tmp_path):
     assert decision.excluded is False
     assert decision.source is None
     assert decision.pattern is None
+
+
+def test_compile_spec_reads_every_declared_ignore_source(tmp_path, monkeypatch):
+    custom_ignore = tmp_path / ".repowiseignore"
+    custom_ignore.write_text("custom/**\n", encoding="utf-8")
+    monkeypatch.setattr(
+        exclusion_module,
+        "_gitignore_sources",
+        lambda _root: (("gitignore", custom_ignore),),
+    )
+    exclusion_module._compile_spec.cache_clear()
+
+    decision = exclusion_decision(tmp_path, "custom/probe.py")
+
+    assert decision.excluded is True
+    assert decision.source == "gitignore"

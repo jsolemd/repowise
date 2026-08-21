@@ -475,8 +475,7 @@ class SourceFTSIndex:
 
         if self._versioned:
             rows = self._conn.execute(
-                f"SELECT f.chunk_id FROM {_TABLE} AS f "
-                f"JOIN {_VERSIONS} AS v ON v.row_key = f.row_key "
+                f"SELECT v.chunk_id FROM {_VERSIONS} AS v "
                 "WHERE v.file_path = ? AND v.valid_from <= ? AND v.valid_to > ?",
                 (file_path, self.generation.sequence, self.generation.sequence),
             ).fetchall()

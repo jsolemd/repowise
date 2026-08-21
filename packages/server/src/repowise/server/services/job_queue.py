@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -16,7 +16,7 @@ from repowise.core.persistence.models import GenerationJob
 
 logger = logging.getLogger(__name__)
 
-JobExecutor = Callable[..., Awaitable[None]]
+JobExecutor = Callable[..., Coroutine[Any, Any, None]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,9 +31,15 @@ class IndexJobQueueResult:
 
 
 # One lock per repository/session-factory pair closes the check-then-insert
-# race for REST and MCP callers in this process. The durable active-row check
-# below remains authoritative across restarts and pre-existing work.
+# race for every in-process caller that uses :func:`repository_job_lock`.
+# The durable active-row check remains authoritative across restarts and
+# pre-existing work.
 _queue_locks: dict[tuple[int, str], asyncio.Lock] = {}
+
+
+def repository_job_lock(session_factory: Any, repository_id: str) -> asyncio.Lock:
+    """Return the process-wide launch lock for one repository database."""
+    return _queue_locks.setdefault((id(session_factory), repository_id), asyncio.Lock())
 
 
 def launch_job_task(
@@ -71,7 +77,7 @@ def launch_job_task(
         app_state.background_tasks = bg_tasks
 
     try:
-        task = asyncio.create_task(
+        task: asyncio.Task[None] = asyncio.create_task(
             executor(job_id, app_state, session_factory_override=session_factory),
             name=f"job-{job_id}",
         )
@@ -86,8 +92,8 @@ def launch_job_task(
 
     bg_tasks.add(task)
 
-    def _fire_and_track(coro: Awaitable[None]) -> None:
-        short_task = asyncio.create_task(coro)
+    def _fire_and_track(coro: Coroutine[Any, Any, None]) -> None:
+        short_task: asyncio.Task[None] = asyncio.create_task(coro)
         bg_tasks.add(short_task)
         short_task.add_done_callback(bg_tasks.discard)
 
@@ -127,7 +133,7 @@ async def queue_index_only_job(
     and SQL state before publishing the derived source stores.
     """
 
-    lock = _queue_locks.setdefault((id(session_factory), repository_id), asyncio.Lock())
+    lock = repository_job_lock(session_factory, repository_id)
     async with lock:
         async with get_session(session_factory) as session:
             repository = await crud.get_repository(session, repository_id)
@@ -164,7 +170,9 @@ async def queue_index_only_job(
                 status="pending",
                 config={
                     "mode": "index_only",
-                    "force": force,
+                    # This records request semantics, not an executor rebuild
+                    # mode: force only bypasses the status-tool current no-op.
+                    "bypass_current_noop": force,
                     "generate_docs": False,
                 },
             )
@@ -188,4 +196,9 @@ async def queue_index_only_job(
         )
 
 
-__all__ = ["IndexJobQueueResult", "launch_job_task", "queue_index_only_job"]
+__all__ = [
+    "IndexJobQueueResult",
+    "launch_job_task",
+    "queue_index_only_job",
+    "repository_job_lock",
+]

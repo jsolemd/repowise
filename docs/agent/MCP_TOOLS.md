@@ -893,8 +893,9 @@ or starts a job.
   and vector counts and parity.
 - Indexed/runtime embedder and parser identities. A missing identity produces
   `unknown`; it is never guessed from a plausible default.
-- The existing `degraded`, `degraded_reason`, and `failed_legs` vocabulary when a
-  publication leg is broken.
+- `degraded`, `degraded_reason`, and structured `degradation_findings` when a
+  publication component is broken. Retrieval-time `failed_legs` remains a distinct
+  exception-oriented contract on search responses.
 
 `verify_stores=true` is unconditional. On the frozen SoleMD.Infra mirror (8,200
 active chunks over 940 files), six warm checks measured 10.45–13.31 ms with an
@@ -902,12 +903,12 @@ active chunks over 940 files), six warm checks measured 10.45–13.31 ms with an
 import. Counting rows makes no embedding or generative call.
 
 **Path mode returns:** exact active-generation symbol/file-window inventory, tracked
-and working-tree state, parser/window lane eligibility, and the winning wiki exclusion
-rule (`config`, root `.gitignore`, or `.git/info/exclude`) when one matched. Closed
-reasons include `indexed`, `parser_failed_stale`, `eligible_not_indexed`,
-`config_excluded`, `gitignored`, `untracked_window_only`, and `not_source_eligible`.
-When a public policy API cannot identify the deciding rule, the result is `unknown`
-with the missing fact stated; the handler does not re-derive private traversal logic.
+and working-tree state, and parser/window lane eligibility. `path_shape_candidate` is
+reported only as a file-watcher/diff hint; it never decides source-index membership.
+Closed reasons include `indexed`, `parser_failed_stale`, `eligible_not_indexed`,
+`untracked_window_only`, and `not_source_eligible`. When a source-lane policy cannot
+identify its deciding rule, the result is `unknown` with the missing fact stated; the
+handler does not substitute the separate query-time wiki-exclusion policy.
 
 ```
 get_index_status()
@@ -1079,7 +1080,7 @@ generate_refactoring_code(suggestion_id="a1b2c3d4")
 
 #### `reindex_repository`
 
-Previews or queues a non-generative, full-repository `index_only` job. The tool is
+Previews or queues a non-generative repository `index_only` job. The tool is
 off by default and cannot be reached merely by enabling the ordinary read surface.
 
 | Parameter | Type | Required | Description |
@@ -1094,7 +1095,8 @@ generative calls. An already-current repository is a no-op unless `force=true`.
 Concurrent requests reuse the repository's pending/running job instead of launching
 overlapping work. Confirmed work uses the established `index_only` executor so parsing
 and SQL symbols refresh before the derived source stores publish; it never performs a
-direct reconcile against possibly stale symbol bounds.
+direct reconcile against possibly stale symbol bounds. `force` only bypasses the
+already-current no-op; it does not change the executor into a full rebuild mode.
 
 ```
 reindex_repository()                    # preview only

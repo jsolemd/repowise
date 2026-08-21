@@ -136,7 +136,12 @@ async def create_repo(
 
 async def _enqueue_index_job(request: Request, session_factory, repo_id: str) -> str | None:
     """Create and launch an ``initial_index`` job unless one is already active."""
-    async with get_session(session_factory) as session:
+    from repowise.server.services.job_queue import repository_job_lock
+
+    async with (
+        repository_job_lock(session_factory, repo_id),
+        get_session(session_factory) as session,
+    ):
         active = await session.execute(
             select(GenerationJob.id)
             .where(GenerationJob.repository_id == repo_id)
@@ -690,6 +695,14 @@ async def _ensure_no_active_job(session: AsyncSession, repo_id: str) -> None:
         )
 
 
+def _repository_job_lock(request: Request, repo_id: str) -> asyncio.Lock:
+    """Resolve the same repo lock used by MCP index-only queueing."""
+    from repowise.server.services.job_queue import repository_job_lock
+
+    session_factory = _resolve_repo_session_factory(request.app.state, repo_id)
+    return repository_job_lock(session_factory, repo_id)
+
+
 @router.post("/{repo_id}/sync", status_code=202)
 async def sync_repo(
     repo_id: str,
@@ -701,21 +714,21 @@ async def sync_repo(
     Creates a generation job, launches the pipeline in the background,
     and returns immediately with the job ID.
     """
-    repo = await crud.get_repository(session, repo_id)
-    if repo is None:
-        raise HTTPException(status_code=404, detail="Repository not found")
+    async with _repository_job_lock(request, repo_id):
+        repo = await crud.get_repository(session, repo_id)
+        if repo is None:
+            raise HTTPException(status_code=404, detail="Repository not found")
+        await _ensure_no_active_job(session, repo_id)
 
-    await _ensure_no_active_job(session, repo_id)
-
-    job = await crud.upsert_generation_job(
-        session,
-        repository_id=repo_id,
-        status="pending",
-    )
-    # Commit (not just flush) so the background task's separate session can
-    # see the job row.  SQLite WAL isolation hides uncommitted rows from
-    # other connections, so flush() alone is not sufficient.
-    await session.commit()
+        job = await crud.upsert_generation_job(
+            session,
+            repository_id=repo_id,
+            status="pending",
+        )
+        # Commit (not just flush) so the background task's separate session can
+        # see the job row.  SQLite WAL isolation hides uncommitted rows from
+        # other connections, so flush() alone is not sufficient.
+        await session.commit()
     _launch_job_task(request, job.id, repo_id)
     return _accepted(job.id)
 
@@ -731,21 +744,21 @@ async def full_resync(
     Creates a generation job, launches the pipeline in the background,
     and returns immediately with the job ID.
     """
-    repo = await crud.get_repository(session, repo_id)
-    if repo is None:
-        raise HTTPException(status_code=404, detail="Repository not found")
+    async with _repository_job_lock(request, repo_id):
+        repo = await crud.get_repository(session, repo_id)
+        if repo is None:
+            raise HTTPException(status_code=404, detail="Repository not found")
+        await _ensure_no_active_job(session, repo_id)
 
-    await _ensure_no_active_job(session, repo_id)
-
-    job = await crud.upsert_generation_job(
-        session,
-        repository_id=repo_id,
-        status="pending",
-        config={"mode": "full_resync"},
-    )
-    # Commit (not just flush) so the background task's separate session can
-    # see the job row.  See sync_repo comment for rationale.
-    await session.commit()
+        job = await crud.upsert_generation_job(
+            session,
+            repository_id=repo_id,
+            status="pending",
+            config={"mode": "full_resync"},
+        )
+        # Commit (not just flush) so the background task's separate session can
+        # see the job row.  See sync_repo comment for rationale.
+        await session.commit()
     _launch_job_task(request, job.id, repo_id)
     return _accepted(job.id)
 
@@ -888,28 +901,28 @@ async def generate_pages(
     the requested selection + cascade, and writes exactly those pages via the
     shared core engine. Returns immediately with a job id to stream.
     """
-    repo = await crud.get_repository(session, repo_id)
-    if repo is None:
-        raise HTTPException(status_code=404, detail="Repository not found")
-    if generative_calls_disabled(repo.local_path):
-        raise HTTPException(
-            status_code=409,
-            detail=f"Generative jobs disabled by deployment policy: {NO_GENERATIVE_ENV}=1",
+    async with _repository_job_lock(request, repo_id):
+        repo = await crud.get_repository(session, repo_id)
+        if repo is None:
+            raise HTTPException(status_code=404, detail="Repository not found")
+        if generative_calls_disabled(repo.local_path):
+            raise HTTPException(
+                status_code=409,
+                detail=f"Generative jobs disabled by deployment policy: {NO_GENERATIVE_ENV}=1",
+            )
+        _validate_generate_selection(body.selection)
+        _validate_generate_style(body.style)
+        await _ensure_no_active_job(session, repo_id)
+
+        job = await crud.upsert_generation_job(
+            session,
+            repository_id=repo_id,
+            status="pending",
+            config=_generate_job_config(body),
         )
-
-    _validate_generate_selection(body.selection)
-    _validate_generate_style(body.style)
-    await _ensure_no_active_job(session, repo_id)
-
-    job = await crud.upsert_generation_job(
-        session,
-        repository_id=repo_id,
-        status="pending",
-        config=_generate_job_config(body),
-    )
-    # Commit (not just flush) so the background task's separate session sees the
-    # job row.  See sync_repo comment for rationale.
-    await session.commit()
+        # Commit (not just flush) so the background task's separate session sees the
+        # job row.  See sync_repo comment for rationale.
+        await session.commit()
     _launch_job_task(request, job.id, repo_id)
     return _accepted(job.id)
 

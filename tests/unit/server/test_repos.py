@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
 import tempfile
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
 from httpx import AsyncClient
+from sqlalchemy import select
 
+from repowise.core.persistence.models import GenerationJob
+from repowise.server.services.job_queue import queue_index_only_job
 from tests.unit.server.conftest import create_test_repo
 
 
@@ -153,6 +157,48 @@ async def test_full_resync_duplicate_returns_409(client: AsyncClient) -> None:
 
         resp2 = await client.post(f"/api/repos/{repo['id']}/full-resync")
         assert resp2.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_rest_sync_and_mcp_reindex_share_one_repository_launch_lock(
+    client: AsyncClient,
+    app,
+) -> None:
+    repo = await create_test_repo(client)
+    mcp_executor = AsyncMock()
+
+    with patch("repowise.server.routers.repos.execute_job", new_callable=AsyncMock):
+        rest_response, mcp_result = await asyncio.gather(
+            client.post(f"/api/repos/{repo['id']}/sync"),
+            queue_index_only_job(
+                app_state=app.state,
+                session_factory=app.state.session_factory,
+                repository_id=repo["id"],
+                force=True,
+                executor=mcp_executor,
+            ),
+        )
+    await asyncio.sleep(0)
+
+    async with app.state.session_factory() as session:
+        jobs = list(
+            (
+                await session.execute(
+                    select(GenerationJob).where(GenerationJob.repository_id == repo["id"])
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    assert len(jobs) == 1
+    if rest_response.status_code == 202:
+        assert mcp_result.status == "already_running"
+        assert rest_response.json()["job_id"] == mcp_result.job_id
+    else:
+        assert rest_response.status_code == 409
+        assert mcp_result.status == "accepted"
+        assert mcp_result.job_id == jobs[0].id
 
 
 @pytest.mark.asyncio

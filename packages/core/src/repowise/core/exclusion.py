@@ -31,9 +31,12 @@ class ExclusionDecision:
     pattern: str | None = None
 
 
-def _gitignore_files(root: Path) -> tuple[Path, ...]:
-    """The gitignore-stack files unioned into the spec."""
-    return (root / ".gitignore", root / ".git" / "info" / "exclude")
+def _gitignore_sources(root: Path) -> tuple[tuple[ExclusionRuleSource, Path], ...]:
+    """The named gitignore-stack files unioned into the spec."""
+    return (
+        ("gitignore", root / ".gitignore"),
+        ("git_info_exclude", root / ".git" / "info" / "exclude"),
+    )
 
 
 def _rule_files(root: Path) -> tuple[Path, ...]:
@@ -45,7 +48,10 @@ def _rule_files(root: Path) -> tuple[Path, ...]:
     """
     from repowise.core.repo_config import CONFIG_FILENAME, get_repowise_dir
 
-    return (get_repowise_dir(root) / CONFIG_FILENAME, *_gitignore_files(root))
+    return (
+        get_repowise_dir(root) / CONFIG_FILENAME,
+        *(path for _source, path in _gitignore_sources(root)),
+    )
 
 
 def _rules_stamp(root: Path) -> tuple[tuple[int, int], ...]:
@@ -84,11 +90,7 @@ def _compile_spec(root_key: str, _stamp: tuple[tuple[int, int], ...]) -> Any:
     rule_sets: list[tuple[ExclusionRuleSource, list[str]]] = [
         ("config", list(load_repo_config(root).get("exclude_patterns") or [])),
     ]
-    ignore_sources: tuple[tuple[ExclusionRuleSource, Path], ...] = (
-        ("gitignore", root / ".gitignore"),
-        ("git_info_exclude", root / ".git" / "info" / "exclude"),
-    )
-    for source, ignore_file in ignore_sources:
+    for source, ignore_file in _gitignore_sources(root):
         lines: list[str] = []
         try:
             if ignore_file.exists():

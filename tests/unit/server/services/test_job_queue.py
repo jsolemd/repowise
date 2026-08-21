@@ -52,7 +52,7 @@ async def test_queue_index_only_job_persists_auditable_non_generative_mode(
     assert job is not None
     assert json.loads(job.config_json) == {
         "mode": "index_only",
-        "force": True,
+        "bypass_current_noop": True,
         "generate_docs": False,
     }
     executor.assert_awaited_once()
