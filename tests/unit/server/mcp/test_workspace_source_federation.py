@@ -226,6 +226,33 @@ async def test_federated_winner_block_leads_regardless_of_config_order(monkeypat
 
 @pytest.mark.asyncio
 async def test_two_confident_repos_with_different_owners_demote_to_caution(monkeypatch):
+    # Genuinely different owner files — the same-path shape has its own test
+    # below, because the two are different claims and the review caught this
+    # test's fixtures contradicting its name.
+    registry = _StubRegistry(["alpha", "beta"], default="alpha")
+    alpha = _StubCoordinator(
+        _envelope([("lib/x.ts", 1.0)], "confident", owner="lib/x.ts", cosine=0.91)
+    )
+    beta = _StubCoordinator(
+        _envelope([("lib/y.ts", 1.0)], "confident", owner="lib/y.ts", cosine=0.90)
+    )
+    _wire(monkeypatch, {"alpha": alpha, "beta": beta})
+
+    resp = await workspace_source_search(
+        "the helper", limit=5, mode="concept", repo="all",
+        registry=registry, build_meta=_META,
+    )
+
+    assert resp["confidence"] == "caution"
+    competing = {(c["repo"], c["file"]) for c in resp["competing_owners"]}
+    assert competing == {("alpha", "lib/x.ts"), ("beta", "lib/y.ts")}
+    # The winner's owner is still named — demotion is uncertainty, not amnesia.
+    assert resp["selected_owner"]["repo"] == "alpha"
+    assert "note" in resp
+
+
+@pytest.mark.asyncio
+async def test_the_same_relative_path_in_two_repos_is_still_two_claims(monkeypatch):
     registry = _StubRegistry(["alpha", "beta"], default="alpha")
     alpha = _StubCoordinator(
         _envelope([("lib/x.ts", 1.0)], "confident", owner="lib/x.ts", cosine=0.91)
@@ -243,9 +270,6 @@ async def test_two_confident_repos_with_different_owners_demote_to_caution(monke
     assert resp["confidence"] == "caution"
     competing = {(c["repo"], c["file"]) for c in resp["competing_owners"]}
     assert competing == {("alpha", "lib/x.ts"), ("beta", "lib/x.ts")}
-    # The winner's owner is still named — demotion is uncertainty, not amnesia.
-    assert resp["selected_owner"]["repo"] == "alpha"
-    assert "note" in resp
     # Identical relative paths in two repos are two candidates, each tagged.
     cands = {(c["repo"], c["path"]) for c in resp["candidates"]}
     assert cands == {("alpha", "lib/x.ts"), ("beta", "lib/x.ts")}
@@ -1135,3 +1159,173 @@ def test_file_candidates_single_repo_shape_unchanged():
         {"page_type": "file_page", "target_path": "b.py"},
     ]
     assert file_candidates(hits, limit=5) == [{"path": "a.py"}, {"path": "b.py"}]
+
+
+# ---------------------------------------------------------------------------
+# Review round 1: error envelopes, composition, guarded collection
+# ---------------------------------------------------------------------------
+
+
+def _error_envelope(code: str = "all_legs_failed") -> dict[str, Any]:
+    """The coordinator's read-no-corpus shape, per its _error_envelope."""
+    return {
+        "results": [],
+        "candidates": [],
+        "selected_owner": None,
+        "confidence": "caution",
+        "mode": "concept",
+        "status": "error",
+        "error": {"code": code, "message": "every retrieval leg failed"},
+        "_meta": {"source_search": {"degraded": True}},
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_broken_repo_never_outranks_an_honest_abstention(monkeypatch):
+    # H3, and the max() killer: the error envelope's placeholder caution must
+    # not beat a repo that searched everything and honestly declined. A plain
+    # max() over confidence classes returns caution-with-answers here.
+    registry = _StubRegistry(["alpha", "beta"], default="alpha")
+    alpha = _StubCoordinator(_error_envelope())
+    beta = _StubCoordinator(_envelope([("near.py", 0.2)], "no_match"))
+    _wire(monkeypatch, {"alpha": alpha, "beta": beta})
+
+    resp = await workspace_source_search(
+        "no such subsystem", limit=5, mode="concept", repo="all",
+        registry=registry, build_meta=_META,
+    )
+
+    assert resp["confidence"] == "no_match"
+    assert "status" not in resp
+    assert "error" not in resp
+    assert resp["_meta"]["source_search"]["repo_order"] == ["beta"]
+    assert all(r["repo"] == "beta" for r in resp["results"])
+    alpha_meta = resp["_meta"]["source_search"]["repos"]["alpha"]
+    assert alpha_meta["degraded"] is True
+    assert alpha_meta["errored"] == "all_legs_failed"
+
+
+@pytest.mark.asyncio
+async def test_all_legs_error_composes_an_error_not_an_answer(monkeypatch):
+    registry = _StubRegistry(["alpha", "beta"], default="alpha")
+    _wire(monkeypatch, {
+        "alpha": _StubCoordinator(_error_envelope("lance_down")),
+        "beta": _StubCoordinator(_error_envelope("fts_down")),
+    })
+
+    resp = await workspace_source_search(
+        "anything", limit=5, mode="concept", repo="all",
+        registry=registry, build_meta=_META,
+    )
+
+    assert resp["status"] == "error"
+    assert resp["error"]["code"] == "lance_down"
+    assert resp["results"] == []
+    assert resp["selected_owner"] is None
+    assert resp["confidence"] == "caution"
+    repos = resp["_meta"]["source_search"]["repos"]
+    assert repos["alpha"]["errored"] == "lance_down"
+    assert repos["beta"]["errored"] == "fts_down"
+    assert resp["_meta"]["source_search"]["repo_order"] == []
+
+
+@pytest.mark.asyncio
+async def test_composition_preserves_winner_fields_it_does_not_own(monkeypatch):
+    # M1: compose-by-override, never rebuild-by-enumeration. Fields this
+    # layer has no opinion about must survive the trip.
+    registry = _StubRegistry(["alpha", "beta"], default="alpha")
+    winner_env = _envelope([("b.py", 1.0)], "confident", owner="b.py", cosine=0.9)
+    winner_env["note"] = "a note the coordinator wrote"
+    winner_env["exact_match"] = True
+    winner_env["a_future_field"] = {"x": 1}
+    _wire(monkeypatch, {
+        "alpha": _StubCoordinator(_envelope([("a.py", 0.5)], "caution")),
+        "beta": _StubCoordinator(winner_env),
+    })
+
+    resp = await workspace_source_search(
+        "who owns it", limit=5, mode="concept", repo="all",
+        registry=registry, build_meta=_META,
+    )
+
+    assert resp["note"] == "a note the coordinator wrote"
+    assert resp["exact_match"] is True
+    assert resp["a_future_field"] == {"x": 1}
+
+
+@pytest.mark.asyncio
+async def test_a_raising_coordinator_constructor_is_disclosed_not_fatal(monkeypatch):
+    # M2: registry.get was guarded; context_coordinator was not — one broken
+    # member's wiring took down the whole workspace search.
+    registry = _StubRegistry(["alpha", "beta"], default="alpha")
+    beta_coordinator = _StubCoordinator(
+        _envelope([("b.py", 1.0)], "confident", owner="b.py")
+    )
+
+    async def exploding_context_coordinator(ctx):
+        if ctx.alias == "alpha":
+            raise RuntimeError("wiring exploded")
+        return beta_coordinator
+
+    monkeypatch.setattr(
+        "repowise.server.source_search_wiring.context_coordinator",
+        exploding_context_coordinator,
+    )
+
+    resp = await workspace_source_search(
+        "who owns it", limit=5, mode="concept", repo="all",
+        registry=registry, build_meta=_META,
+    )
+
+    assert resp is not None
+    assert resp["_meta"]["source_search"]["repos"]["alpha"] == {
+        "unavailable": "coordinator failed: RuntimeError"
+    }
+    assert [r["repo"] for r in resp["results"]] == ["beta"]
+
+
+@pytest.mark.asyncio
+async def test_an_ownerless_confident_envelope_does_not_erase_the_real_owner(monkeypatch):
+    # L2: confident-with-no-owner used to win the cosine coin flip and the
+    # composed answer said confident with selected_owner null, while the only
+    # real owner in the workspace vanished from the payload.
+    registry = _StubRegistry(["alpha", "beta"], default="alpha")
+    _wire(monkeypatch, {
+        "alpha": _StubCoordinator(_envelope([("a.py", 1.0)], "confident", cosine=0.99)),
+        "beta": _StubCoordinator(
+            _envelope([("b.py", 1.0)], "confident", owner="b.py", cosine=0.50)
+        ),
+    })
+
+    resp = await workspace_source_search(
+        "who owns it", limit=5, mode="concept", repo="all",
+        registry=registry, build_meta=_META,
+    )
+
+    assert resp["selected_owner"] is not None
+    assert resp["selected_owner"]["repo"] == "beta"
+    assert resp["selected_owner"]["file"] == "b.py"
+
+
+@pytest.mark.asyncio
+async def test_competing_owners_come_ranked_and_carry_evidence(monkeypatch):
+    # L3: the disagreement block used to come out in workspace-config order —
+    # the exact order this module exists to eliminate — and dropped evidence,
+    # forcing the second round-trip its own note prescribes.
+    registry = _StubRegistry(["alpha", "beta"], default="alpha")
+    _wire(monkeypatch, {
+        "alpha": _StubCoordinator(
+            _envelope([("lib/a.ts", 1.0)], "confident", owner="lib/a.ts", cosine=0.60)
+        ),
+        "beta": _StubCoordinator(
+            _envelope([("lib/b.ts", 1.0)], "confident", owner="lib/b.ts", cosine=0.95)
+        ),
+    })
+
+    resp = await workspace_source_search(
+        "the helper", limit=5, mode="concept", repo="all",
+        registry=registry, build_meta=_META,
+    )
+
+    assert [c["repo"] for c in resp["competing_owners"]] == ["beta", "alpha"]
+    assert all(c.get("evidence") for c in resp["competing_owners"])

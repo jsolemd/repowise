@@ -25,16 +25,19 @@ reserved tail slot for its top row — the same bargain
 for files the page retrievers structurally cannot see.
 
 Confidence composes downward, never upward: the federated class is the
-winner's own, except when two repos are each confident of different owners —
-that disagreement IS uncertainty, and the response says ``caution`` and lists
-the competitors rather than picking one silently. When every repo declines,
-the workspace declines; federation must not turn four abstentions into an
-answer.
+winner's own, except when two repos are EACH confident of an owner — the same
+relative path in two repos is still two distinct claims — in which case that
+disagreement IS uncertainty, and the response says ``caution`` and lists the
+competitors rather than picking one silently. When every repo declines, the
+workspace declines; federation must not turn four abstentions into an answer,
+and a repo whose search read no corpus at all (the ``status: "error"``
+envelope) is disclosed as broken, never ranked as if it had answered.
 """
 
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
 from typing import Any, Callable
 
@@ -45,6 +48,19 @@ log = logging.getLogger(__name__)
 _CONF_ORDER = {"confident": 2, "caution": 1, "no_match": 0}
 _CAUTION = "caution"
 _NO_MATCH = "no_match"
+
+
+def _is_error_envelope(env: dict[str, Any]) -> bool:
+    """An envelope for a search that reached no corpus at all.
+
+    The coordinator marks it ``status: "error"`` and deliberately says
+    ``caution`` rather than ``no_match``, because a search that read nothing
+    cannot assert absence. That placeholder caution must never compete with
+    envelopes that actually searched: ranked naively it outranks a genuine
+    ``no_match``, wins, and the composition would launder a broken repo into
+    an ordinary answer with the error block dropped on the floor.
+    """
+    return env.get("status") == "error"
 
 
 def _tag_scoped(response: dict[str, Any], alias: str) -> dict[str, Any]:
@@ -165,13 +181,18 @@ def _envelope_strength(env: dict[str, Any]) -> tuple[int, int, int, float]:
         cos = evidence.get("dense_cosine")
         if isinstance(cos, (int, float)):
             cosines.append(float(cos))
-    return (exact, _declares_subject(env), conf, max(cosines, default=-1.0))
+    # An envelope that selected no owner asserts no ownership. At equal class
+    # it must not beat one that did on a cosine coin flip: the composition
+    # adopts the winner's owner, and a null one would erase the only real
+    # owner in the workspace from the payload entirely.
+    has_owner = 1 if owner.get("file") else 0
+    return (exact, _declares_subject(env), conf, has_owner, max(cosines, default=-1.0))
 
 
 def _order_key(item: tuple[str, dict[str, Any]]) -> tuple:
     alias, env = item
-    exact, declares, conf, cosine = _envelope_strength(env)
-    return (-exact, -declares, -conf, -cosine, alias)
+    exact, declares, conf, has_owner, cosine = _envelope_strength(env)
+    return (-exact, -declares, -conf, -has_owner, -cosine, alias)
 
 
 def _query_concept_tokens(envelopes: list[tuple[str, dict[str, Any]]]) -> set[str]:
@@ -316,17 +337,34 @@ async def workspace_source_search(
         return _tag_scoped(response, resolved)
 
     unavailable: dict[str, str] = {}
-    members: list[tuple[str, Any]] = []
+    live: list[tuple[str, Any]] = []
+    # Context and coordinator are resolved together, per repo, in one pass.
+    # Two-pass collection (all contexts, then all coordinators) breaks on a
+    # workspace larger than the registry's LRU cap: fetching the sixth context
+    # evicts the first while it is still in hand, its background store load is
+    # cancelled, and its readiness event never fires. Building the coordinator
+    # immediately gives each context its stores while the context is
+    # guaranteed live. The searches below still run in parallel.
     for alias in resolved:
         try:
-            members.append((alias, await registry.get(alias)))
+            ctx = await registry.get(alias)
         except Exception as exc:
             unavailable[alias] = f"context unavailable: {type(exc).__name__}"
-    coordinators = await asyncio.gather(
-        *(context_coordinator(ctx) for _, ctx in members)
-    )
-    live: list[tuple[str, Any]] = []
-    for (alias, _), coordinator in zip(members, coordinators):
+            continue
+        try:
+            coordinator = await context_coordinator(ctx)
+        except Exception as exc:
+            # Guarded for the same reason the search gather below is: one
+            # member repo's broken wiring must degrade to that repo being
+            # disclosed as unavailable, never to the whole workspace erroring
+            # where the stock path would have answered.
+            log.warning(
+                "source-search: coordinator construction for %s failed: %r",
+                alias,
+                exc,
+            )
+            unavailable[alias] = f"coordinator failed: {type(exc).__name__}"
+            continue
         if coordinator is None:
             unavailable[alias] = "source index unavailable"
         else:
@@ -339,15 +377,26 @@ async def workspace_source_search(
         return_exceptions=True,
     )
     envelopes: list[tuple[str, dict[str, Any]]] = []
+    errored: list[tuple[str, dict[str, Any]]] = []
     for (alias, _), result in zip(live, searches):
         if isinstance(result, BaseException):
             log.warning(
                 "source-search: federated leg %s failed: %r", alias, result
             )
             unavailable[alias] = f"search failed: {type(result).__name__}"
+        elif _is_error_envelope(result):
+            # A repo that read no corpus produced no answer. It never ranks,
+            # never wins, and never lends its placeholder caution to the
+            # composition — it is disclosed beside the other unavailability.
+            errored.append((alias, result))
         else:
             envelopes.append((alias, result))
+
     if not envelopes:
+        if errored:
+            return _compose_all_error(
+                errored, unavailable, mode=mode, build_meta=build_meta
+            )
         return None
 
     ranked = sorted(envelopes, key=_order_key)
@@ -398,31 +447,55 @@ async def workspace_source_search(
     if rivals and _CONF_ORDER.get(confidence, 0) > _CONF_ORDER[_CAUTION]:
         confidence = _CAUTION
 
-    meta = build_meta()
     per_repo: dict[str, Any] = {}
     for alias, env in envelopes:
         per_repo[alias] = (env.get("_meta") or {}).get("source_search") or {}
+    for alias, env in errored:
+        per_repo[alias] = {
+            "errored": ((env.get("error") or {}).get("code") or "search error"),
+            "degraded": True,
+        }
     for alias, reason in unavailable.items():
         per_repo[alias] = {"unavailable": reason}
+
+    # Compose by copying the winner's envelope and overriding, never by
+    # rebuilding an enumerated key set. Every field the coordinator serves
+    # that this layer does not explicitly own — a note, an exact_match flag,
+    # anything added later — survives the trip, which is what keeps the
+    # federated and scoped lanes speaking the same response contract.
+    response: dict[str, Any] = copy.deepcopy(winner)
+    response["results"] = results
+    response["confidence"] = confidence
+    response["selected_owner"] = owner
+    response.setdefault("mode", mode)
+    if candidates:
+        response["candidates"] = candidates
+    else:
+        response.pop("candidates", None)
+
+    meta = dict(response.get("_meta") or {})
+    meta.update(build_meta())
     meta["source_search"] = {
         "federated": True,
         "repo_order": [alias for alias, _ in ranked],
         "repos": per_repo,
     }
+    response["_meta"] = meta
 
-    response: dict[str, Any] = {
-        "results": results,
-        "mode": winner.get("mode", mode),
-        "confidence": confidence,
-        "selected_owner": owner,
-        "_meta": meta,
-    }
-    if candidates:
-        response["candidates"] = candidates
     if conflict:
+        # Ranked order, with the owners' evidence intact: the reader deciding
+        # between claims should not need a second round-trip, and this list
+        # must never resurrect the workspace-config order the ranking left.
+        confident_by_alias = dict(confident)
         response["competing_owners"] = [
-            {"repo": alias, "file": so.get("file"), "reason": so.get("reason")}
-            for alias, so in confident
+            {
+                "repo": alias,
+                "file": confident_by_alias[alias].get("file"),
+                "reason": confident_by_alias[alias].get("reason"),
+                "evidence": confident_by_alias[alias].get("evidence"),
+            }
+            for alias, _ in ranked
+            if alias in confident_by_alias
         ]
         response["note"] = (
             f"{len(confident)} repositories each returned a confident owner for "
@@ -445,4 +518,47 @@ async def workspace_source_search(
             "results (if any) are nearest neighbours, not evidence — "
             "_meta.source_search.repos names each corpus and commit consulted."
         )
+    return response
+
+
+def _compose_all_error(
+    errored: list[tuple[str, dict[str, Any]]],
+    unavailable: dict[str, str],
+    *,
+    mode: str,
+    build_meta: Callable[[], dict[str, Any]],
+) -> dict[str, Any]:
+    """Every reachable repo read no corpus: compose an error, not an answer.
+
+    The per-repo error envelope exists so a caller cannot mistake "nothing
+    was searched" for "nothing matched"; a workspace of them must make the
+    same statement. The first repo's envelope is copied whole — ``status``,
+    ``error`` block, its deliberate ``caution`` — and the federation meta
+    discloses every leg. Nothing here is an answer, and no field pretends
+    otherwise.
+    """
+    first_alias, first = errored[0]
+    response = copy.deepcopy(first)
+    response["results"] = []
+    response.pop("candidates", None)
+    response["selected_owner"] = None
+    response.setdefault("mode", mode)
+
+    per_repo: dict[str, Any] = {}
+    for alias, env in errored:
+        per_repo[alias] = {
+            "errored": ((env.get("error") or {}).get("code") or "search error"),
+            "degraded": True,
+        }
+    for alias, reason in unavailable.items():
+        per_repo[alias] = {"unavailable": reason}
+
+    meta = dict(response.get("_meta") or {})
+    meta.update(build_meta())
+    meta["source_search"] = {
+        "federated": True,
+        "repo_order": [],
+        "repos": per_repo,
+    }
+    response["_meta"] = meta
     return response
