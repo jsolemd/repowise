@@ -433,7 +433,7 @@ the **wiki**, instead of forcing a fallback to Grep for identifiers.
 | `kind` | string | No | `implementation` \| `test` \| `config` \| `doc` |
 | `symbol_kind` | string | No | Restrict symbol hits by kind (`function`, `class`, `method`, ...) |
 | `page_type` | string | No | Restrict to one page type. The two you will reach for are `file_page` (the always-on per-file docs) and `module_page` (the subsystem/concept pages). Other stored types (`repo_overview`, `layer_page`, `scc_page`, `api_contract`, `infra_page`, `symbol_spotlight`) also filter. |
-| `repo` | string | No | *(workspace only)* Target repo alias, or `"all"` to search across workspace |
+| `repo` | string | No | *(workspace only)* Target repo alias, or `"all"` to search across the workspace. Against a single-repo server `"all"` means the same as omitting it — there is one repo, and all of it is what an unqualified search returns. |
 
 **Modes:**
 
@@ -452,7 +452,8 @@ the **wiki**, instead of forcing a fallback to Grep for identifiers.
 - *Concept hits*: ranked wiki pages with `relevance_score`, `snippet`, `target_path`, and a `search_method` (`embedding` vs `bm25` fallback). A `symbol_spotlight` page's `target_path` is a page identifier of the form `file.py::Symbol`; those hits also carry `file` with the openable path. **Read `file` when present.** `target_path` is for piping into `get_symbol`, not for opening.
 
 Alongside `results`, the response carries **`candidates`**: up to `limit`
-distinct files worth opening next, one `{path}` entry each, best first.
+distinct files worth opening next, best first — one `{path}` entry each, plus a
+`repo` on a federated workspace call (see below).
 
 Every entry is a real file path, and that is the difference between the two
 blocks. `results` ranks *pages*, and a page is not always a file: a
@@ -468,11 +469,28 @@ matches or resolving a `symbol_id`, read `results`.
 
 Tombstoned and `exclude_patterns`-excluded results are filtered. In workspace
 mode, structural and concept searches both federate across repos and merge
-(this is the one tool where `repo="all"` is fully supported). Every result row
-and every `candidates` entry then carries its `repo`, and identical relative
-paths in two repos stay two distinct candidates — the path alone is not
-openable in a workspace. The federated merge ranks by relevance, never by the
-workspace config's repo order. When the source-search lane is active, a
+(this is the one tool where `repo="all"` is fully supported). **On that
+federated call** — `repo="all"` against a workspace, and only that — every
+result row and every `candidates` entry carries its `repo`, and identical
+relative paths in two repos stay two distinct candidates, because the path
+alone is not openable in a workspace. A call scoped to one repo
+(`repo=<alias>`) answers from that repo alone and carries no `repo` key, and
+neither does any single-repo response.
+
+The federated merge ranks by relevance, never by the workspace config's repo
+order, and it carries each repo's own noise demotion: decision records and test
+pages that a repo ranked below its real pages stay below them after the merge.
+
+A federated response also carries its freshness per corpus, because a workspace
+answer can mix a repo indexed this morning with one indexed six weeks ago.
+`_meta.repo_freshness` maps each alias to that repository's own `indexed_commit`,
+`index_age_days`, `index_behind` and any `stale_warning`, scoped to the rows
+that repo actually contributed; the roll-up beside it reports the oldest age and
+warns only when a repo that contributed content is behind. There is deliberately
+no workspace-level `indexed_commit`: each repo has its own, and one of them is
+not the workspace's.
+
+When the source-search lane is active, a
 federated response is composed from per-repo engines: the strongest repo's
 results lead, `confidence` is that repo's own (a workspace never upgrades a
 member repo's confidence), and when two repos are each confident of different

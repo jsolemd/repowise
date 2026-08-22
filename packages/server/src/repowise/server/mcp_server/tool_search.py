@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import re
+from collections.abc import Callable
 from typing import Any
 
 from sqlalchemy import select
@@ -31,6 +32,7 @@ from repowise.server.mcp_server._helpers import (
     resolve_enum_argument,
 )
 from repowise.server.mcp_server._meta import build_meta as _build_meta
+from repowise.server.mcp_server._meta import federated_freshness
 from repowise.server.mcp_server._page_paths import file_candidates, hit_file_path
 from repowise.server.mcp_server._prose_symbols import symbol_backed_pages
 from repowise.server.mcp_server.tool_search_symbols import (
@@ -219,9 +221,10 @@ def _downweight_test_pages(output: list[dict], query: str) -> None:
             item["relevance_score"] = round(item["relevance_score"] * _TEST_DOWNWEIGHT, 4)
 
 
-def _sort_demoting_noise(output: list[dict], query: str) -> None:
-    """Sort by relevance, ranking retrieval noise below every real page.
+def noise_classifier(query: str) -> Callable[[dict], int]:
+    """The one owner of "is this hit retrieval noise for *this* query".
 
+    Returns a classifier over hits: ``1`` for noise, ``0`` for a real page.
     Two classes crowd the top ranks on a plain implementation query and are
     demoted absolutely for their query class (the relevance score still orders
     each class among itself):
@@ -232,17 +235,38 @@ def _sort_demoting_noise(output: list[dict], query: str) -> None:
       a why-shaped query ranks them naturally instead.
     - test file pages — a test is rarely a better first Read than the code it
       exercises. A query explicitly about tests ranks them naturally instead.
+
+    A *class* partition, not a score adjustment, and that is the whole point:
+    the scores these two classes win are precisely what the multiplicative
+    down-weights above could not overcome. Any later sort that re-orders a list
+    this partitioned must carry the partition too, or it re-promotes exactly
+    what the partition demoted — which is why this is a shared helper with one
+    owner rather than a closure inside the sort that first needed it. Callers
+    outside this module (the CLI fan-out) merge lists that were partitioned
+    here, and must classify them the same way.
+
+    Built once per query rather than per hit: the two query predicates are
+    regex matches over the query alone, so they are loop-invariant.
     """
     why = _is_why_shaped(query)
     test_focused = _is_test_query(query)
 
-    def key(item: dict) -> tuple:
-        pt = item.get("page_type")
-        is_decision = (not why) and pt == "decision_record"
+    def classify(item: dict) -> int:
+        is_decision = (not why) and item.get("page_type") == "decision_record"
         is_test = (not test_focused) and _is_test_page(item)
-        return (1 if (is_decision or is_test) else 0, -(item.get("relevance_score") or 0.0))
+        return 1 if (is_decision or is_test) else 0
 
-    output.sort(key=key)
+    return classify
+
+
+def _sort_demoting_noise(output: list[dict], query: str) -> None:
+    """Sort by relevance, ranking retrieval noise below every real page.
+
+    See :func:`noise_classifier` for what counts as noise and why the demotion
+    is a class partition rather than a weight.
+    """
+    classify = noise_classifier(query)
+    output.sort(key=lambda item: (classify(item), -(item.get("relevance_score") or 0.0)))
 
 
 def _norm_decision_title(title: str) -> str:
@@ -740,8 +764,8 @@ async def _search_single_repo(
     return output[:limit]
 
 
-def _federated_rank_key(item: dict) -> tuple:
-    """Cross-repo order: relevance, then raw evidence, then determinism.
+def _federated_rank_key_for(query: str) -> Callable[[dict], tuple]:
+    """Cross-repo order for *query*: noise class, relevance, raw evidence, determinism.
 
     Applying RRF *across* repos was a round-robin wearing a ranking's name:
     every repo's rank-N got the identical ``1/(N+60)``, so the stable sort
@@ -753,22 +777,67 @@ def _federated_rank_key(item: dict) -> tuple:
     shared embedder), raw BM25 second (corpus-flavoured, but evidence where
     cosine is absent) — and only then on alias/page_id, which is determinism,
     not preference.
+
+    The noise class leads all of it, because every list merged here arrived
+    from :func:`_search_single_repo` already partitioned by
+    :func:`noise_classifier`, and it is partitioned there precisely because a
+    decision record's or a test page's score BEATS the real page it should
+    rank under. Sorting the merged list on score alone therefore undoes the
+    demotion repo by repo: a plain implementation query across a workspace led
+    with a decision record and a test file while both repos' own answers had
+    ranked them last. Cross-repo order is a re-merge of per-repo orders, so it
+    has to carry the partition those orders were built on.
     """
-    cosine = item.get("_best_cosine")
-    bm25 = item.get("_best_fts")
-    return (
-        -(item.get("relevance_score") or 0.0),
-        -(cosine if isinstance(cosine, (int, float)) else -1.0),
-        -(bm25 if isinstance(bm25, (int, float)) else -1.0),
-        item.get("repo") or "",
-        item.get("page_id") or "",
-    )
+    classify = noise_classifier(query)
+
+    def key(item: dict) -> tuple:
+        cosine = item.get("_best_cosine")
+        bm25 = item.get("_best_fts")
+        return (
+            classify(item),
+            -(item.get("relevance_score") or 0.0),
+            -(cosine if isinstance(cosine, (int, float)) else -1.0),
+            -(bm25 if isinstance(bm25, (int, float)) else -1.0),
+            item.get("repo") or "",
+            item.get("page_id") or "",
+        )
+
+    return key
+
+
+async def _federated_freshness(contexts: list, output: list[dict]) -> dict:
+    """The freshness envelope for a merged workspace answer.
+
+    Reads one Repository row per member repo — the single-repo lanes already
+    do this for their own ``_build_meta``; a federated answer needs it once
+    per corpus it drew on. Each repo's warning is scoped to the paths that
+    repo actually contributed to the final cut, so a stale member that lost
+    every row cannot make the answer look stale.
+
+    Fail-soft per repo, like everything else on this path: a repo whose row
+    cannot be read contributes an empty block rather than taking the search
+    down, and its alias still appears so the caller can see it was consulted.
+    """
+    per_repo: list[tuple[str, Any, list[str] | None]] = []
+    for ctx in contexts:
+        served = _result_paths([row for row in output if row.get("repo") == ctx.alias])
+        repository = None
+        with contextlib.suppress(Exception):
+            async with get_session(ctx.session_factory) as session:
+                repository = await _get_repo(session)
+        per_repo.append((ctx.alias, repository, served))
+    return federated_freshness(per_repo)
 
 
 async def _federated_search(
     query: str, limit: int, page_type: str | None, kind: str | None = None
 ) -> dict:
-    """Search across all repos, merged on relevance (see _federated_rank_key)."""
+    """Search across all repos, merged on relevance (see _federated_rank_key_for).
+
+    Workspace mode only: ``search_codebase`` resolves ``repo="all"`` to
+    ``repo=None`` without a registry, so the single repo answers for itself
+    rather than being federated with nobody.
+    """
     contexts = await _resolve_all_contexts()
     all_results = []
 
@@ -778,13 +847,16 @@ async def _federated_search(
             item["repo"] = ctx.alias
         all_results.extend(repo_results)
 
-    all_results.sort(key=_federated_rank_key)
+    all_results.sort(key=_federated_rank_key_for(query))
     output = all_results[:limit]
 
     # Derive confidence from relative position in the merged ranking.
     _assign_confidence(output, "relevance_score", "confidence_score")
 
-    response: dict = {"results": output, "_meta": _build_meta()}
+    response: dict = {
+        "results": output,
+        "_meta": _build_meta(extra=await _federated_freshness(contexts, output)),
+    }
     # Drawn from every repo's ranked list, not the merged cut: a workspace
     # search that spends its window on module pages should still be able to
     # name files.
@@ -953,8 +1025,14 @@ async def _structured_search(
         concepts = [c for c in concepts if c.get("target_path") not in sym_files]
         # Federation appends per-repo concept lists in repo order — re-rank by
         # relevance so a strong page in repo B isn't buried under repo A's weak
-        # ones. (Single-repo: already sorted upstream; this is a no-op.)
-        concepts.sort(key=lambda x: -(x.get("relevance_score") or 0.0))
+        # ones. Carries the noise class first for the same reason the federated
+        # merge does (see _federated_rank_key_for): these lists come out of
+        # _search_single_repo class-partitioned, and a bare score sort promotes
+        # the decision records and test pages that partition exists to demote.
+        # Not a no-op in single-repo mode either — one repo's partitioned list
+        # re-sorted on score alone is just as unpartitioned as two repos'.
+        _classify_concept = noise_classifier(query)
+        concepts.sort(key=lambda x: (_classify_concept(x), -(x.get("relevance_score") or 0.0)))
         results = _interleave_hybrid(query, symbols, concepts, limit, exact)
 
     repository = None
@@ -1041,12 +1119,30 @@ async def search_codebase(
             Any stored type filters (repo_overview, layer_page, scc_page,
             api_contract, infra_page, symbol_spotlight).
         kind: implementation | test | config | doc (concept/symbol modes).
-        repo: alias, or "all" for workspace-wide (rows then carry `repo`).
+        repo: workspace only. Alias, or "all" (rows carry `repo`).
         mode: auto | concept | symbol | path | hybrid.
         symbol_kind: filter symbol hits by kind (function|class|method|...).
     """
     grep_hint = _grep_hint_for(query)
     resolved_mode = _resolve_mode(query, mode)
+
+    # ``repo`` is a workspace argument: without a registry there is one repo,
+    # and all of it is what an unqualified search already returns. So "all"
+    # means omitted here — which routes it to the branch below rather than to
+    # ``_federated_search``, whose merge and repo-tagging have no meaning over
+    # a list of one.
+    #
+    # This is not a relabeling, and it is not a restoration of some earlier
+    # equivalence: measured against the same retrieval input, the federated
+    # branch answered a materially *poorer* question. It loaded page info
+    # without git metadata, so no freshness boost applied and the ranking
+    # differed by the freshness tiebreak; it never ran the symbol-backed
+    # append; and it built its meta bare, so the response carried no index
+    # age, no indexed commit and no staleness warning. Sending "all" down the
+    # single-repo branch is a deliberate move to the richer of two behaviours,
+    # not a revert to one of them.
+    if repo == "all" and not _is_workspace_mode():
+        repo = None
 
     # Source+wiki hybrid retrieval, behind REPOWISE_SOURCE_SEARCH and off by
     # default. Path queries stay on the stock resolver: a path is a filename

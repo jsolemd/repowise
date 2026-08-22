@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import subprocess
 from pathlib import Path
@@ -877,3 +878,97 @@ async def test_outbox_row_rolls_back_with_its_symbol_transaction(lifecycle_repo)
     finally:
         await engine.dispose()
     assert len(await _updates(repo)) == before
+
+
+class _OtherModelVectors:
+    """A wiki store at the same width, embedded by a different model.
+
+    ``dimensions`` matches ``_IDENTITY`` exactly, which is the whole point: the
+    width check cannot tell these two corpora apart, and federation compares
+    their cosines as if one space produced both.
+    """
+
+    class _Embedder(MockEmbedder):
+        _model = "not-the-model-that-built-this"
+
+    def __init__(self) -> None:
+        self._embedder = self._Embedder()
+
+    async def search_by_vector(self, vector, limit=10):
+        return []
+
+
+def _workspace_ctx(repo: Path, vectors) -> SimpleNamespace:
+    ready = asyncio.Event()
+    ready.set()
+    return SimpleNamespace(
+        alias="alpha",
+        path=repo,
+        vector_store=vectors,
+        fts=None,
+        vector_store_ready=ready,
+    )
+
+
+async def test_workspace_reader_reopens_on_manifest_flip_without_closing_the_old_one(
+    lifecycle_repo,
+):
+    """The workspace sibling of the REST reader test above, over real stores.
+
+    Two things it pins that the REST one does not: the reopened reader answers
+    from the newer generation, and the reader it replaced is still usable —
+    a caller who took it before the flip is inside ``search()`` on it, and
+    closing it there is a live query reading a closed database.
+    """
+    from repowise.server import source_search_wiring as wiring
+
+    repo = lifecycle_repo
+    wiring.reset_for_tests()
+    try:
+        ctx = _workspace_ctx(repo, _WikiVectors())
+        first = await wiring.context_coordinator(ctx)
+        assert first is not None
+        first_manifest = read_manifest(default_manifest_path(repo))
+        assert first_manifest is not None
+
+        (repo / "src" / "app.py").write_text(_APP_V2)
+        await _capture(repo, path="src/app.py")
+        await reconcile_source_index(repo, embedder=MockEmbedder(), embedder_identity=_IDENTITY)
+
+        second = await wiring.context_coordinator(ctx)
+        assert second is not None and second is not first
+        second_manifest = read_manifest(default_manifest_path(repo))
+        assert second_manifest is not None
+        assert second_manifest.generation_sequence > first_manifest.generation_sequence
+
+        response = await second.search("newnebula", limit=3)
+        assert any(result["file"] == "src/app.py" for result in response["results"])
+        assert (
+            response["_meta"]["source_search"]["generation_sequence"]
+            == second_manifest.generation_sequence
+        )
+
+        # The replaced reader is retired, not closed: its stores still answer.
+        stale = await first.search("stablecomet", limit=3)
+        assert stale["_meta"]["source_search"]["generation_sequence"] is not None
+    finally:
+        wiring.reset_for_tests()
+
+
+async def test_a_generation_embedded_by_another_model_is_refused(lifecycle_repo):
+    """Same width, different model: the lane declines rather than compare
+    cosines across two vector spaces that only look like one."""
+    from repowise.server import source_search_wiring as wiring
+
+    repo = lifecycle_repo
+    manifest = read_manifest(default_manifest_path(repo))
+    assert manifest is not None
+    assert manifest.embedder.dims == _OtherModelVectors._Embedder.dimensions
+
+    wiring.reset_for_tests()
+    try:
+        assert await wiring.context_coordinator(_workspace_ctx(repo, _OtherModelVectors())) is None
+        # The same repo, read by the model that wrote it, still opens.
+        assert await wiring.context_coordinator(_workspace_ctx(repo, _WikiVectors())) is not None
+    finally:
+        wiring.reset_for_tests()

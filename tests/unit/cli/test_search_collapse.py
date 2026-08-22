@@ -526,19 +526,59 @@ def _hit(path: str, score: float) -> dict:
     return {**PAGE_HIT, "target_path": path, "relevance_score": score}
 
 
-def test_the_fan_out_fuses_on_rank_not_on_raw_score(monkeypatch, tmp_path, capsys):
-    """Each repo scores its own list independently, so the numbers are only
-    comparable within a repo. Sorting them together lets one repo's scale
-    evict every hit from the other."""
+def test_the_fan_out_fuses_on_relevance_not_on_rank(monkeypatch, tmp_path, capsys):
+    """The merge ranks; it does not hand out one slot per repo.
+
+    This used to fuse on ``1/(rank+60)``, guarding against one repo's score
+    scale evicting another's hits. The guard cost more than it bought: every
+    repo's rank-N scores identically under that formula, so the merge resolved
+    to the order the repos happened to be visited in, and a weak leading hit
+    in the first repo outranked a strong one in the second. It is the defect
+    ``_federated_search`` was fixed for on the server side; the CLI kept it.
+
+    The scale worry does not survive contact with the producer. A concept
+    ``relevance_score`` is ``rrf * _RRF_SCORE_SCALE`` — at most two retrievers
+    contributing ``1/(rank+60)`` each, scaled by 180 — so it is bounded above
+    by 6.0 in every repo, by construction, and one bounded rank-derived scale
+    is the same scale everywhere. The disparity the old fixture modelled (0.9
+    against 90.0) is fifteen times the maximum the tool can emit.
+    """
+    per_repo = {
+        "api": {"results": [_hit("api/weak.py", 1.2)]},
+        "web": {"results": [_hit("web/strong.py", 5.4), _hit("web/mid.py", 3.0)]},
+    }
+    _fan(monkeypatch, tmp_path, per_repo, fmt="json", limit=3)
+
+    rows = json.loads(capsys.readouterr().out)["results"]
+    assert [r["path"] for r in rows] == ["web/strong.py", "web/mid.py", "api/weak.py"]
+
+
+def test_a_stronger_repo_may_take_the_whole_window(monkeypatch, tmp_path, capsys):
+    """The corollary, stated so it cannot be mistaken for a regression: if one
+    repo's hits are simply better, they win the window. Reserving a slot for
+    every repo regardless is representation, not ranking."""
     per_repo = {
         "api": {"results": [_hit("api/a.py", 0.9), _hit("api/b.py", 0.8)]},
-        # Much larger raw scores: a score sort would take both of these first.
-        "web": {"results": [_hit("web/a.py", 90.0), _hit("web/b.py", 80.0)]},
+        "web": {"results": [_hit("web/a.py", 5.9), _hit("web/b.py", 5.8)]},
     }
     _fan(monkeypatch, tmp_path, per_repo, fmt="json", limit=2)
 
     rows = json.loads(capsys.readouterr().out)["results"]
-    assert {r["repo"] for r in rows} == {"api", "web"}, "one repo evicted the other"
+    assert {r["repo"] for r in rows} == {"web"}
+
+
+def test_the_fan_out_demotes_noise_the_way_each_repo_did(monkeypatch, tmp_path, capsys):
+    """Each repo's list arrives partitioned by ``noise_classifier``; merging on
+    score alone re-promotes what that partition demoted."""
+    decision = {**PAGE_HIT, "page_type": "decision_record"}
+    per_repo = {
+        "api": {"results": [{**decision, "target_path": "api/why.md", "relevance_score": 5.9}]},
+        "web": {"results": [_hit("web/impl.py", 2.0)]},
+    }
+    _fan(monkeypatch, tmp_path, per_repo, fmt="json", limit=5)
+
+    rows = json.loads(capsys.readouterr().out)["results"]
+    assert [r["path"] for r in rows] == ["web/impl.py", "api/why.md"]
 
 
 def test_the_fan_out_tags_every_row_with_its_repo(monkeypatch, tmp_path, capsys):

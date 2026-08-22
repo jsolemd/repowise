@@ -22,6 +22,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
+import weakref
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
@@ -142,6 +145,40 @@ def _manifest_key(repo_path: Path | str) -> tuple[Any, ...] | None:
     )
 
 
+def _embedder_identity_mismatch(embedder: Any, stored: Any) -> str | None:
+    """A description of how *embedder* disagrees with the manifest's, or None.
+
+    Width alone does not make two corpora comparable. Federation ranks repos
+    against each other on dense cosine, and a cosine is only a shared unit when
+    one model produced both vectors — two 1536-wide models from different
+    families pass the width check and then get compared as if their spaces were
+    the same one. The manifest already records who wrote it, so ask.
+
+    Disagreement has to be *proved*, not assumed from silence: a manifest
+    written before these fields existed reads back as empty strings (see
+    ``SourceIndexManifest.from_dict``), and refusing on an empty field would
+    lock the lane out of every legacy index over a fact nobody recorded.
+    Compared the way :mod:`~repowise.server.mcp_server.tool_index_status`
+    already compares them, through ``identify_embedder`` — the same two sides,
+    so the two answers cannot drift apart.
+    """
+    from repowise.core.source_search.manifest import identify_embedder
+
+    try:
+        live = identify_embedder(embedder)
+    except Exception:  # pragma: no cover - identity is best-effort
+        log.debug("source-search: could not identify the live embedder", exc_info=True)
+        return None
+    for field, live_value, stored_value in (
+        ("provider", live.provider, stored.provider),
+        ("model", live.model, stored.model),
+    ):
+        one, two = (live_value or "").strip().lower(), (stored_value or "").strip().lower()
+        if one and two and one != two:
+            return f"{field} {two!r} on disk, {one!r} live"
+    return None
+
+
 def _build(repo_path: Path | str, wiki_vectors: Any, wiki_fts: Any) -> Any:
     """A coordinator over *repo_path*, or None when it has no source index.
 
@@ -178,6 +215,14 @@ def _build(repo_path: Path | str, wiki_vectors: Any, wiki_fts: Any) -> Any:
             "(%s != %s)",
             getattr(embedder, "dimensions", None),
             manifest.embedder.dims,
+        )
+        return None
+    if mismatch := _embedder_identity_mismatch(embedder, manifest.embedder):
+        log.warning(
+            "source-search: active generation at %s was embedded by a different model "
+            "(%s), staying on the stock path",
+            repo,
+            mismatch,
         )
         return None
 
@@ -246,8 +291,11 @@ async def mcp_coordinator() -> Any:
         old = _mcp_coordinator
         _mcp_coordinator = None
         _mcp_generation = None
-        if old is not None:
-            await old.close()
+        # Retired rather than closed, for the reason ``_retired`` gives: this
+        # one's caller is ``search_codebase`` itself, which awaits ``search()``
+        # on a coordinator it took from here with nothing held in between.
+        _retire(old)
+        await _sweep_retired()
         try:
             _mcp_coordinator = _build(repo_path, _state._vector_store, _state._fts)
         except Exception:
@@ -315,10 +363,138 @@ def _repo_root_from_db_url(db_url: str) -> Path | None:
 #: the identity of the wiki vector store it was built FROM: the registry
 #: evicts and reloads contexts, and a reloaded context arrives with fresh
 #: store objects while the old coordinator still holds the closed ones.
-#: Identity (``is``, via ``id``), never equality — the job-lock work already
-#: paid for that lesson.
-_ctx_coordinators: dict[Path, tuple[Any, tuple[Any, ...], int]] = {}
-_ctx_lock = asyncio.Lock()
+#: Identity, never equality — the job-lock work already paid for that lesson —
+#: and held weakly rather than as an address (see ``_store_token``).
+#:
+#: Ordered and bounded, least-recently-used first. Every entry is an open
+#: LanceDB table plus an open SQLite sidecar, so an unbounded map is one file
+#: descriptor pair per repo ever queried, held for the life of the process —
+#: which for a workspace server is every repo in it, forever.
+_ctx_coordinators: OrderedDict[Path, tuple[Any, tuple[Any, ...], int]] = OrderedDict()
+
+#: How many repos keep an open coordinator. Sized for a fan-out to stay warm
+#: across a whole federated query (the workspaces this serves are single
+#: digits) while still bounding the descriptors a long-lived server holds.
+_CTX_CACHE_MAX = 8
+
+#: One lock per repo path, not one global lock. The build has to be
+#: serialised per repo — two concurrent first queries must not both open the
+#: FTS sidecar — but a build for repo A has nothing to serialise against a
+#: build for repo B, and a global lock turned a federated fan-out over N cold
+#: repos into N sequential readiness timeouts.
+#:
+#: Created without an await between the lookup and the insert, so two
+#: coroutines cannot mint two locks for one path. Bounded by the number of
+#: distinct repo paths the process ever queries (a workspace's size); a lock
+#: is a few bytes and is not a handle, so these are not swept with the
+#: coordinators they guard.
+_ctx_locks: dict[Path, asyncio.Lock] = {}
+
+#: Coordinators removed from the cache and awaiting close, oldest first.
+#:
+#: A caller takes a coordinator from the cache and then awaits ``search()`` on
+#: it, holding no lock in between — so closing one at the moment it is replaced
+#: closes a live query's stores out from under it ("Cannot operate on a closed
+#: database", raised out of ``search_codebase`` on the scoped lane). Nothing
+#: here can observe that a search is still in flight — the caller borrows the
+#: object with no protocol to give it back — so replacement retires rather than
+#: closes, and the close happens on a later pass, once no search that could
+#: have started before the swap can still be running.
+_retired: list[tuple[float, Any]] = []
+
+#: How long a retired coordinator is left open before it is closed. Longer
+#: than any search that could still be holding one; short enough that a repo
+#: republishing its index does not accumulate generations. A grace period is
+#: the honest shape of this: it is a bound on how long a borrowed object can
+#: still be in use, which is the only fact available here.
+_RETIRE_GRACE = 30.0
+
+#: Hard cap on retirements awaiting close. Reached only by a repo republishing
+#: faster than the grace period, and bounded memory beats a perfect grace: past
+#: this the oldest are closed early, on the same reasoning that made the grace
+#: period a heuristic in the first place.
+_RETIRE_MAX = 16
+
+
+def _store_token(store: Any) -> Any:
+    """A handle on the wiki store an entry was built from, owning nothing.
+
+    Weak, not ``id()``. The identity check exists because a reloaded context
+    arrives with fresh store objects while the cached coordinator still holds
+    the closed ones — but an ``int`` address only answers that question while
+    the object it named is alive. Once the old context is disposed and freed,
+    CPython hands the very next allocation the same address, and the check
+    then reports a brand-new store as the one already built from, serving a
+    coordinator over stores that were closed with the context.
+
+    A dead referent compares equal to nothing, which is the right answer: an
+    entry whose store has been collected is stale by definition. A store that
+    cannot be weakly referenced falls back to the address, which is no worse
+    than what this replaces.
+    """
+    if store is None:
+        return None
+    try:
+        return weakref.ref(store)
+    except TypeError:  # pragma: no cover - every real store supports weakref
+        return id(store)
+
+
+def _same_store(token: Any, store: Any) -> bool:
+    """Whether a cache entry's token still names *store*."""
+    if token is None or store is None:
+        return token is None and store is None
+    if isinstance(token, weakref.ref):
+        return token() is store
+    return token == id(store)
+
+
+def _lock_for(repo_path: Path) -> asyncio.Lock:
+    """The build lock for one repo path, created on first use."""
+    lock = _ctx_locks.get(repo_path)
+    if lock is None:
+        lock = _ctx_locks[repo_path] = asyncio.Lock()
+    return lock
+
+
+def _retire(coordinator: Any) -> None:
+    """Hand a coordinator over for closing later (see ``_retired``)."""
+    if coordinator is not None:
+        _retired.append((time.monotonic(), coordinator))
+
+
+async def _sweep_retired(*, drain: bool = False) -> None:
+    """Close retired coordinators whose grace period has run out.
+
+    Claims its victims before the first ``await`` — the slice and the delete
+    are one uninterruptible step — so two concurrent sweeps cannot close the
+    same coordinator twice.
+    """
+    if not _retired:
+        return
+    now = time.monotonic()
+    expired = 0
+    for retired_at, _ in _retired:  # oldest first, by construction
+        if not (drain or now - retired_at >= _RETIRE_GRACE):
+            break
+        expired += 1
+    count = max(expired, len(_retired) - _RETIRE_MAX)
+    if count <= 0:
+        return
+    doomed = _retired[:count]
+    del _retired[:count]
+    for _, coordinator in doomed:
+        try:
+            await coordinator.close()
+        except Exception:
+            log.debug("source-search: closing a retired coordinator failed", exc_info=True)
+
+
+def _evict(repo_path: Path) -> None:
+    """Drop one repo's cached coordinator, retiring it for close."""
+    entry = _ctx_coordinators.pop(repo_path, None)
+    if entry is not None:
+        _retire(entry[0])
 
 
 async def context_coordinator(ctx: Any) -> Any:
@@ -329,40 +505,68 @@ async def context_coordinator(ctx: Any) -> Any:
     itself. Same doctrine otherwise: anything missing — no source index for
     this member repo, stores still loading, a mock embedder — returns ``None``
     and the caller falls through to the stock path for that repo.
+
+    Three things are deliberate about the order of operations here.
+
+    **The readiness wait happens before the build lock.** Waiting is a
+    read of the context's own event and serialising it buys nothing, while
+    holding a lock across it costs every other repo in a fan-out the full
+    timeout in turn.
+
+    **The manifest key is re-read inside the lock.** The one read before it is
+    a cache probe and nothing more. A coroutine that waited on the lock woke up
+    into a world where the repo may have republished and another request may
+    already have built for the newer generation; deciding what to evict on the
+    key it read before it slept would pop and close that fresher coordinator
+    and then cache its own build under a stale key.
+
+    **A replaced coordinator is retired, not closed** — see ``_retired``.
     """
     repo_path = Path(ctx.path)
+    await _sweep_retired()
+
     generation = _manifest_key(repo_path)
     if generation is None:
+        # The source index was removed. Evicting is the point: without it the
+        # entry outlives the index it reads, pinning open handles onto a
+        # generation that no longer exists for as long as the process runs.
+        if repo_path in _ctx_coordinators:
+            async with _lock_for(repo_path):
+                _evict(repo_path)
+            await _sweep_retired()
         return None
+
     wiki_vs = getattr(ctx, "vector_store", None)
     cached = _ctx_coordinators.get(repo_path)
-    if cached is not None and cached[1] == generation and cached[2] == id(wiki_vs):
+    if cached is not None and cached[1] == generation and _same_store(cached[2], wiki_vs):
+        _ctx_coordinators.move_to_end(repo_path)
         return cached[0]
-    async with _ctx_lock:
-        # The registry loads real vector stores in the background and repoints
-        # ctx.vector_store when done; build only from the settled store.
-        ready = getattr(ctx, "vector_store_ready", None)
-        if ready is not None:
-            try:
-                await asyncio.wait_for(ready.wait(), timeout=_READY_TIMEOUT)
-            except TimeoutError:
-                log.debug(
-                    "source-search: vector stores for %s still loading, staying on "
-                    "the stock path",
-                    getattr(ctx, "alias", repo_path),
-                )
-                return None
+
+    # The registry loads real vector stores in the background and repoints
+    # ctx.vector_store when done; build only from the settled store.
+    ready = getattr(ctx, "vector_store_ready", None)
+    if ready is not None and not ready.is_set():
+        try:
+            await asyncio.wait_for(ready.wait(), timeout=_READY_TIMEOUT)
+        except TimeoutError:
+            log.debug(
+                "source-search: vector stores for %s still loading, staying on "
+                "the stock path",
+                getattr(ctx, "alias", repo_path),
+            )
+            return None
+
+    async with _lock_for(repo_path):
+        generation = _manifest_key(repo_path)
+        if generation is None:
+            _evict(repo_path)
+            return None
         wiki_vs = getattr(ctx, "vector_store", None)
         cached = _ctx_coordinators.get(repo_path)
-        if cached is not None and cached[1] == generation and cached[2] == id(wiki_vs):
+        if cached is not None and cached[1] == generation and _same_store(cached[2], wiki_vs):
+            _ctx_coordinators.move_to_end(repo_path)
             return cached[0]
-        if cached is not None:
-            _ctx_coordinators.pop(repo_path, None)
-            try:
-                await cached[0].close()
-            except Exception:
-                log.debug("source-search: closing a stale workspace coordinator failed",
-                          exc_info=True)
+        _evict(repo_path)
         try:
             built = _build(repo_path, wiki_vs, getattr(ctx, "fts", None))
         except Exception:
@@ -374,13 +578,52 @@ async def context_coordinator(ctx: Any) -> Any:
             return None
         if built is None:
             return None
-        _ctx_coordinators[repo_path] = (built, generation, id(wiki_vs))
-        return built
+        _ctx_coordinators[repo_path] = (built, generation, _store_token(wiki_vs))
+        _ctx_coordinators.move_to_end(repo_path)
+        while len(_ctx_coordinators) > _CTX_CACHE_MAX:
+            _, evicted = _ctx_coordinators.popitem(last=False)
+            _retire(evicted[0])
+    # Outside the lock: sweeping awaits, and nothing above it needs holding.
+    await _sweep_retired()
+    return built
 
 
 def reset_for_tests() -> None:
-    """Forget the MCP process caches. Only tests have a reason to."""
+    """Forget the MCP process caches, closing what they held.
+
+    Best-effort on the closing, because ``close()`` is a coroutine and this is
+    not: a caller already inside a loop gets the close scheduled on it rather
+    than awaited. Dropping the references without closing leaks a LanceDB table
+    and an SQLite sidecar per cached repo across a test session, which is how a
+    suite ends up failing on file handles rather than on its assertions.
+
+    The per-repo locks go too. An :class:`asyncio.Lock` binds to the loop that
+    first contends it, and pytest gives each test its own loop.
+    """
     global _mcp_coordinator, _mcp_generation
+    for entry in _ctx_coordinators.values():
+        _retire(entry[0])
+    _ctx_coordinators.clear()
+    _ctx_locks.clear()
+    if _mcp_coordinator is not None:
+        _retire(_mcp_coordinator)
     _mcp_coordinator = None
     _mcp_generation = None
-    _ctx_coordinators.clear()
+    retired, _retired[:] = list(_retired), []
+    for _, coordinator in retired:
+        _close_detached(coordinator)
+
+
+def _close_detached(coordinator: Any) -> None:
+    """Close a coordinator from synchronous code, however we can."""
+    coro = coordinator.close()
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        try:
+            asyncio.run(coro)
+        except Exception:
+            log.debug("source-search: detached close failed", exc_info=True)
+        return
+    task = loop.create_task(coro)
+    task.add_done_callback(lambda done: done.cancelled() or done.exception())

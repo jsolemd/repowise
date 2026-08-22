@@ -18,6 +18,7 @@ Rules of thumb baked into the hint generators:
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -303,6 +304,82 @@ def freshness_from_repo(repository: Any | None, targets: list[str] | None = None
             "results may be stale. Run `repowise update`."
         )
 
+    return out
+
+
+def federated_freshness(
+    per_repo: Sequence[tuple[str, Any, list[str] | None]],
+) -> dict[str, Any]:
+    """Freshness for one response drawn from several repositories at once.
+
+    A single-repo response can say "the index is 3 days old" because there is
+    one index. A workspace response cannot: it mixes a repo updated this
+    morning with one last indexed six weeks ago, and those rows sit in one
+    ranked list with nothing to tell them apart. That is the response shape
+    where staleness differs *most* between rows, and it was the only shape
+    carrying no freshness signal at all.
+
+    So both halves are emitted, and they answer different questions.
+    ``repo_freshness`` maps each alias to that repository's own
+    :func:`freshness_from_repo` block — which repo is behind, by which commit,
+    and whether the rows *it* contributed are affected. The roll-up beside it
+    is the one-glance answer for a caller that will not read the map.
+
+    Deliberately absent from the roll-up: ``indexed_commit`` and
+    ``live_head``. Each repo has its own, and collapsing several into one
+    field would publish one repo's SHA as though it described the workspace —
+    which is the flaw in the CLI's ``_worst_freshness`` (see
+    ``search_cmd._worst_freshness``, which takes the first behind repo's SHAs
+    and admits in its own comment that it cannot say whose they are). They
+    stay in ``repo_freshness``, where each one has an owner.
+
+    *per_repo* is a sequence of ``(alias, repository_row_or_None, targets)``,
+    where ``targets`` are the paths **this response** serves from that repo —
+    so ``stale_warning`` stays scoped to content actually returned, and a repo
+    that contributed no surviving row cannot make the answer look stale.
+    Pass ``None`` for targets to keep that repo's warning repo-level.
+
+    Roll-up fields:
+      * ``index_age_days`` — the oldest repo's age. A workspace answer is as
+        stale as the stalest corpus it drew on.
+      * ``index_behind`` — true when any repo is behind; false only when every
+        repo that could be evaluated was current. Omitted when no repo could be
+        evaluated at all, keeping :func:`freshness_from_repo`'s rule that
+        absence means "not evaluated", never "false".
+      * ``stale_warning`` — only when a repo warns, and it names which.
+    """
+    repos: dict[str, dict[str, Any]] = {}
+    ages: list[int] = []
+    behind: list[str] = []
+    warned: list[str] = []
+    evaluated = False
+    for alias, repository, targets in per_repo:
+        block = freshness_from_repo(repository, targets=targets)
+        repos[alias] = block
+        age = block.get("index_age_days")
+        if isinstance(age, int):
+            ages.append(age)
+        if "index_behind" in block:
+            evaluated = True
+            if block["index_behind"]:
+                behind.append(alias)
+        if block.get("stale_warning"):
+            warned.append(alias)
+    if not repos:
+        return {}
+
+    out: dict[str, Any] = {"repo_freshness": repos}
+    if ages:
+        out["index_age_days"] = max(ages)
+    if evaluated:
+        out["index_behind"] = bool(behind)
+    if warned:
+        names = ", ".join(sorted(warned))
+        out["stale_warning"] = (
+            f"Content this response serves may be stale in {names} — run "
+            "`repowise update` there. `_meta.repo_freshness` carries each "
+            "repository's own commit and signal."
+        )
     return out
 
 

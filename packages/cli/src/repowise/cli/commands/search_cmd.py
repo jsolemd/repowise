@@ -30,13 +30,6 @@ from repowise.cli.helpers import console
 from repowise.cli.output import emit_json, format_option, full_option
 from repowise.cli.output import notice_console as _notices
 
-# Rank-fusion damping for the workspace fan-out. The tool federates internally
-# through a workspace registry the CLI does not build (see ``tool_bridge``), so
-# ``--all`` calls it once per repo and fuses the ranked lists here. k=60 is the
-# same constant ``_federated_search`` uses, so a fanned-out CLI search ranks the
-# way a fanned-out MCP search does.
-_WORKSPACE_RRF_K = 60
-
 #: CLI mode spelling -> the tool's ``mode=`` argument.
 #:
 #: ``fulltext`` and ``semantic`` both land on ``concept``: the tool's concept
@@ -65,6 +58,18 @@ def _result_kind(item: dict) -> str:
     """
     kind = item.get("type")
     return kind if kind in ("symbol", "file") else "page"
+
+
+def _merge_score(item: dict) -> float:
+    """The score a fanned-out row is merged on, whatever mode produced it.
+
+    Dispatches on :func:`_result_kind` for the same reason
+    :func:`_project_result` does: a page carries ``relevance_score`` and a
+    symbol or file hit carries ``score``, and one fan-out only ever mixes the
+    two inside a hybrid payload, where the tool has already interleaved them.
+    """
+    key = "relevance_score" if _result_kind(item) == "page" else "score"
+    return float(item.get(key) or 0.0)
 
 
 def _project_result(item: dict, *, multi: bool) -> dict:
@@ -329,12 +334,21 @@ def _fan_out(
     full: bool,
     notices,
 ) -> None:
-    """``--all``: one tool call per repo, fused on rank, rendered once.
+    """``--all``: one tool call per repo, fused on relevance, rendered once.
 
-    Rank fusion rather than raw score: each repo scores its own list
-    independently (RRF within a repo for concept mode, a token-overlap score
-    for symbol mode), so the numbers are only comparable within a repo. This is
-    what ``_federated_search`` does with the same constant.
+    The tool federates internally through a workspace registry the CLI does not
+    build (see ``tool_bridge``), so ``--all`` calls it once per repo and merges
+    the ranked lists here — with the same key ``_federated_search`` uses, so a
+    fanned-out CLI search ranks the way a fanned-out MCP search does.
+
+    That key used to be cross-corpus RRF on ``1/(rank+60)``, which is a
+    round-robin wearing a ranking's name: every repo's rank-N scores the same,
+    so the whole merge resolved to the order the repos were visited in. It
+    leads with the noise class instead, then relevance, because each repo's
+    list arrives partitioned by ``noise_classifier`` and merging on score alone
+    re-promotes exactly the decision records and test pages that partition
+    demoted. The per-repo rank survives as a tiebreak, which is all it was ever
+    evidence for.
     """
     merged: list[tuple[int, dict]] = []
     payloads: list[dict] = []
@@ -374,7 +388,17 @@ def _fan_out(
         _ta.emit_full(out)
         return
 
-    merged.sort(key=lambda pair: 1.0 / (pair[0] + _WORKSPACE_RRF_K), reverse=True)
+    from repowise.server.mcp_server.tool_search import noise_classifier
+
+    classify = noise_classifier(query)
+    merged.sort(
+        key=lambda pair: (
+            classify(pair[1]),
+            -_merge_score(pair[1]),
+            pair[0],
+            pair[1].get("repo") or "",
+        )
+    )
     results = [item for _, item in merged[:limit]]
 
     fused: dict = {"results": results}
@@ -497,7 +521,14 @@ def _render_notes(projected: dict) -> None:
     if candidates:
         console.print("\n[bold]Files to read[/bold]")
         for entry in candidates:
-            console.print(f"  [cyan]{escape(str(entry.get('path', '')))}[/cyan]")
+            path = escape(str(entry.get("path", "")))
+            # A fan-out's candidates are deduped per (repo, path), so the same
+            # relative path in two repos is two entries — correctly, they are
+            # two different files. Printing the path alone rendered them as one
+            # line repeated, naming neither.
+            repo = entry.get("repo")
+            where = f" [magenta]({escape(str(repo))})[/magenta]" if repo else ""
+            console.print(f"  [cyan]{path}[/cyan]{where}")
 
 
 def _titled(query: str, mode: str, *, multi: bool) -> str:
