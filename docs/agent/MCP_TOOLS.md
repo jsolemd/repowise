@@ -477,7 +477,10 @@ federated response is composed from per-repo engines: the strongest repo's
 results lead, `confidence` is that repo's own (a workspace never upgrades a
 member repo's confidence), and when two repos are each confident of different
 owners the response says `caution` and lists them under `competing_owners`.
-`repo` omitted means the workspace's default repo, not all of them.
+The leading repo does not take the whole window: every other repo that
+answered keeps a tail slot for its own top row, so a `limit` at least the
+number of answering repos shows you something from each of them. `repo`
+omitted means the workspace's default repo, not all of them.
 
 **When to use:** Locating a function/class/method by name, resolving a
 path-shaped query, or discovering pages by topic: the symbol/file shapes pipe

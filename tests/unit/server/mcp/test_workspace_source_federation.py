@@ -68,6 +68,24 @@ class _StubRegistry:
         return self.contexts[alias]
 
 
+def _evidence(
+    cosine: float | None,
+    exact: bool,
+    coverage: tuple[float, float] | None,
+) -> dict[str, Any]:
+    """One evidence dict in the shape the coordinator serves it.
+
+    ``coverage`` is A3's ``(concept_coverage, content_concept_coverage)`` pair.
+    Omitting it omits both keys, which is the real shape of a response whose
+    co-location evidence never arrived — not a pair of zeros.
+    """
+    evidence: dict[str, Any] = {"dense_cosine": cosine, "exact_name": exact, "lane": "source"}
+    if coverage is not None:
+        evidence["concept_coverage"] = coverage[0]
+        evidence["content_concept_coverage"] = coverage[1]
+    return evidence
+
+
 def _envelope(
     files: list[tuple[str, float]],
     confidence: str,
@@ -75,13 +93,15 @@ def _envelope(
     owner: str | None = None,
     cosine: float | None = None,
     exact: bool = False,
+    coverage: tuple[float, float] | None = None,
+    owner_coverage: tuple[float, float] | None = None,
 ) -> dict[str, Any]:
     results = [
         {
             "file": f,
             "target_path": f,
             "relevance_score": score,
-            "evidence": {"dense_cosine": cosine, "exact_name": exact, "lane": "source"},
+            "evidence": _evidence(cosine, exact, coverage),
         }
         for f, score in files
     ]
@@ -93,7 +113,9 @@ def _envelope(
             {
                 "file": owner,
                 "reason": "top evidence",
-                "evidence": {"dense_cosine": cosine, "exact_name": exact, "lane": "source"},
+                "evidence": _evidence(
+                    cosine, exact, coverage if owner_coverage is None else owner_coverage
+                ),
             }
             if owner
             else None
@@ -303,6 +325,314 @@ async def test_every_coordinator_missing_falls_through(monkeypatch):
         registry=registry, build_meta=_META,
     )
     assert resp is None
+
+
+# ---------------------------------------------------------------------------
+# Envelope strength: whose owner actually carries the subject
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_caution_tie_resolves_on_owner_subject_evidence_not_cosine(monkeypatch):
+    """The measured SEO defect, with the evidence the probe actually returned.
+
+    "Where are the SEO metadata endpoints for robots, sitemap, and web app
+    manifest defined?" — web's ``src/app/robots.ts`` is the owner and carries
+    robots/sitemap/manifest in itself; infra's ``semantic_file_scope.py`` is
+    semantically nearby noise that carries none of them. Both envelopes are
+    caution with no exact name, so the pre-fix key fell straight to dense
+    cosine, where infra's embedding happened to sit closer — and infra's
+    block led a question only web can answer.
+    """
+    registry = _StubRegistry(["infra", "web"], default="infra")
+    infra = _StubCoordinator(
+        _envelope(
+            [("codeatlas/code_search/tools/semantic_file_scope.py", 0.71)],
+            "caution",
+            owner="codeatlas/code_search/tools/semantic_file_scope.py",
+            cosine=0.4612,
+            coverage=(0.3333, 0.0),
+        )
+    )
+    web = _StubCoordinator(
+        _envelope(
+            [("src/app/robots.ts", 0.68)],
+            "caution",
+            owner="src/app/robots.ts",
+            cosine=0.3874,
+            coverage=(1.0, 0.6667),
+        )
+    )
+    _wire(monkeypatch, {"infra": infra, "web": web})
+
+    resp = await workspace_source_search(
+        "Where are the SEO metadata endpoints for robots, sitemap, and web app "
+        "manifest defined?",
+        limit=10, mode="concept", repo="all",
+        registry=registry, build_meta=_META,
+    )
+
+    assert resp["_meta"]["source_search"]["repo_order"] == ["web", "infra"]
+    assert resp["results"][0]["repo"] == "web"
+    assert resp["selected_owner"]["file"] == "src/app/robots.ts"
+    assert resp["selected_owner"]["repo"] == "web"
+
+
+@pytest.mark.asyncio
+async def test_an_owner_whose_case_is_its_path_loses_to_one_that_carries_it(monkeypatch):
+    """A3's boundary, applied across corpora.
+
+    Alpha's owner matches every concept in the query and carries none of them
+    — the whole match is its filename. Beta's owner matches half and carries
+    that half. Alpha wins on both permissive coverage and cosine, and still
+    must not lead: a candidate whose entire case is its path may corroborate
+    a subject, never constitute one.
+    """
+    registry = _StubRegistry(["alpha", "beta"], default="alpha")
+    alpha = _StubCoordinator(
+        _envelope(
+            [("retry_queue_drain_worker.py", 0.9)],
+            "caution",
+            owner="retry_queue_drain_worker.py",
+            cosine=0.88,
+            coverage=(1.0, 0.0),
+        )
+    )
+    beta = _StubCoordinator(
+        _envelope(
+            [("workers/pump.py", 0.9)],
+            "caution",
+            owner="workers/pump.py",
+            cosine=0.42,
+            coverage=(0.5, 0.5),
+        )
+    )
+    _wire(monkeypatch, {"alpha": alpha, "beta": beta})
+
+    resp = await workspace_source_search(
+        "how does the retry queue drain?", limit=5, mode="concept", repo="all",
+        registry=registry, build_meta=_META,
+    )
+
+    assert resp["_meta"]["source_search"]["repo_order"] == ["beta", "alpha"]
+    assert resp["selected_owner"]["file"] == "workers/pump.py"
+
+
+@pytest.mark.asyncio
+async def test_coverage_outranks_cosine_once_both_owners_carry_the_subject(monkeypatch):
+    """Both owners clear A3's content gate, so the question becomes how much
+    of the subject each one covers — not which corpus the shared embedder
+    placed nearer. Alpha holds the far better cosine and still loses."""
+    registry = _StubRegistry(["alpha", "beta"], default="alpha")
+    alpha = _StubCoordinator(
+        _envelope([("a.py", 0.9)], "caution", owner="a.py", cosine=0.91, coverage=(0.4, 0.4))
+    )
+    beta = _StubCoordinator(
+        _envelope([("b.py", 0.9)], "caution", owner="b.py", cosine=0.30, coverage=(0.9, 0.2))
+    )
+    _wire(monkeypatch, {"alpha": alpha, "beta": beta})
+
+    resp = await workspace_source_search(
+        "who owns it", limit=5, mode="concept", repo="all",
+        registry=registry, build_meta=_META,
+    )
+
+    assert resp["_meta"]["source_search"]["repo_order"] == ["beta", "alpha"]
+
+
+@pytest.mark.asyncio
+async def test_coverage_is_read_from_the_owner_not_from_a_neighbour(monkeypatch):
+    """Evidence from another candidate cannot make *owner* trustworthy — the
+    coordinator's own rule, and it has to survive federation. Alpha's window
+    is full of the subject while the file alpha nominated carries none of it;
+    beta's nominee carries it. Alpha also holds the better cosine."""
+    registry = _StubRegistry(["alpha", "beta"], default="alpha")
+    alpha = _StubCoordinator(
+        _envelope(
+            [("neighbour.py", 0.9)],
+            "caution",
+            owner="named_for_the_topic.py",
+            cosine=0.87,
+            coverage=(1.0, 1.0),
+            owner_coverage=(1.0, 0.0),
+        )
+    )
+    beta = _StubCoordinator(
+        _envelope([("b.py", 0.9)], "caution", owner="b.py", cosine=0.44, coverage=(0.6, 0.4))
+    )
+    _wire(monkeypatch, {"alpha": alpha, "beta": beta})
+
+    resp = await workspace_source_search(
+        "who owns it", limit=5, mode="concept", repo="all",
+        registry=registry, build_meta=_META,
+    )
+
+    assert resp["_meta"]["source_search"]["repo_order"] == ["beta", "alpha"]
+    assert resp["selected_owner"]["file"] == "b.py"
+
+
+# ---------------------------------------------------------------------------
+# The federated window: no answering repo is starved out of sight
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_the_winner_block_does_not_fill_the_whole_window(monkeypatch):
+    """The second measured defect on the SEO query: limit=10 and all ten rows
+    came from one repo, so the other repo's correct owner was never in the
+    window at all. The winner keeps the head and its order; the loser is owed
+    its top row, and that row is the one it ranked first."""
+    registry = _StubRegistry(["infra", "web"], default="infra")
+    web = _StubCoordinator(
+        _envelope(
+            [(f"src/app/w{i}.ts", 1.0 - i / 100) for i in range(10)],
+            "caution",
+            owner="src/app/w0.ts",
+            cosine=0.39,
+            coverage=(1.0, 0.67),
+        )
+    )
+    infra = _StubCoordinator(
+        _envelope(
+            [(f"codeatlas/i{i}.py", 1.0 - i / 100) for i in range(10)],
+            "caution",
+            owner="codeatlas/i0.py",
+            cosine=0.46,
+            coverage=(0.33, 0.0),
+        )
+    )
+    _wire(monkeypatch, {"infra": infra, "web": web})
+
+    resp = await workspace_source_search(
+        "seo metadata endpoints", limit=10, mode="concept", repo="all",
+        registry=registry, build_meta=_META,
+    )
+
+    assert [r["repo"] for r in resp["results"]] == ["web"] * 9 + ["infra"]
+    assert [r["file"] for r in resp["results"][:9]] == [f"src/app/w{i}.ts" for i in range(9)]
+    # The reserved slot holds infra's own top row, not whatever fell off last.
+    assert resp["results"][-1]["file"] == "codeatlas/i0.py"
+
+
+@pytest.mark.asyncio
+async def test_every_answering_repo_is_seated_when_the_window_can_hold_them(monkeypatch):
+    """The bound: ``limit`` at least the number of answering repos means every
+    answering repo has at least its top row in the window."""
+    registry = _StubRegistry(["alpha", "beta", "gamma"], default="alpha")
+    _wire(monkeypatch, {
+        "alpha": _StubCoordinator(
+            _envelope([(f"a{i}.py", 0.9) for i in range(5)], "confident", owner="a0.py",
+                      cosine=0.8, coverage=(1.0, 0.9))
+        ),
+        "beta": _StubCoordinator(
+            _envelope([(f"b{i}.py", 0.9) for i in range(5)], "caution", cosine=0.5,
+                      coverage=(0.5, 0.3))
+        ),
+        "gamma": _StubCoordinator(
+            _envelope([(f"g{i}.py", 0.9) for i in range(5)], "caution", cosine=0.4,
+                      coverage=(0.4, 0.2))
+        ),
+    })
+
+    resp = await workspace_source_search(
+        "who owns it", limit=3, mode="concept", repo="all",
+        registry=registry, build_meta=_META,
+    )
+
+    assert [(r["repo"], r["file"]) for r in resp["results"]] == [
+        ("alpha", "a0.py"), ("beta", "b0.py"), ("gamma", "g0.py")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_window_too_small_for_everyone_pays_the_strongest_first(monkeypatch):
+    """Below the bound the window cannot seat every repo, so it says who gives
+    way: the winner never loses its top row, and the remaining slots go in
+    envelope order — gamma, the weakest envelope, is the one left out."""
+    registry = _StubRegistry(["alpha", "beta", "gamma"], default="alpha")
+    _wire(monkeypatch, {
+        "alpha": _StubCoordinator(
+            _envelope([(f"a{i}.py", 0.9) for i in range(4)], "confident", owner="a0.py",
+                      cosine=0.8, coverage=(1.0, 0.9))
+        ),
+        "beta": _StubCoordinator(
+            _envelope([(f"b{i}.py", 0.9) for i in range(4)], "caution", cosine=0.5,
+                      coverage=(0.5, 0.3))
+        ),
+        "gamma": _StubCoordinator(
+            _envelope([(f"g{i}.py", 0.9) for i in range(4)], "caution", cosine=0.4,
+                      coverage=(0.4, 0.2))
+        ),
+    })
+
+    resp = await workspace_source_search(
+        "who owns it", limit=2, mode="concept", repo="all",
+        registry=registry, build_meta=_META,
+    )
+
+    assert [(r["repo"], r["file"]) for r in resp["results"]] == [
+        ("alpha", "a0.py"), ("beta", "b0.py")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_repo_with_no_rows_is_owed_no_slot(monkeypatch):
+    """A reserved slot is for an answering repo. A repo that returned nothing
+    is not owed one, and must not cost the winner a row to hold it open."""
+    registry = _StubRegistry(["alpha", "beta", "gamma"], default="alpha")
+    _wire(monkeypatch, {
+        "alpha": _StubCoordinator(
+            _envelope([(f"a{i}.py", 0.9) for i in range(5)], "confident", owner="a0.py",
+                      cosine=0.8, coverage=(1.0, 0.9))
+        ),
+        "beta": _StubCoordinator(_envelope([], "no_match")),
+        "gamma": _StubCoordinator(
+            _envelope([(f"g{i}.py", 0.9) for i in range(3)], "caution", cosine=0.4,
+                      coverage=(0.4, 0.2))
+        ),
+    })
+
+    resp = await workspace_source_search(
+        "who owns it", limit=3, mode="concept", repo="all",
+        registry=registry, build_meta=_META,
+    )
+
+    assert [(r["repo"], r["file"]) for r in resp["results"]] == [
+        ("alpha", "a0.py"), ("alpha", "a1.py"), ("gamma", "g0.py")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_reserved_row_already_in_the_head_is_not_seated_twice(monkeypatch):
+    """The winner is short, so the head spills into the runner-up's block and
+    seats the very row that block was owed. That reservation is already paid:
+    it must not be charged again, and the freed slot goes back to the head."""
+    registry = _StubRegistry(["alpha", "beta", "gamma"], default="alpha")
+    _wire(monkeypatch, {
+        "alpha": _StubCoordinator(
+            _envelope([("a0.py", 0.9)], "confident", owner="a0.py", cosine=0.8,
+                      coverage=(1.0, 0.9))
+        ),
+        "beta": _StubCoordinator(
+            _envelope([(f"b{i}.py", 0.9) for i in range(6)], "caution", cosine=0.5,
+                      coverage=(0.5, 0.3))
+        ),
+        "gamma": _StubCoordinator(
+            _envelope([(f"g{i}.py", 0.9) for i in range(3)], "caution", cosine=0.4,
+                      coverage=(0.4, 0.2))
+        ),
+    })
+
+    resp = await workspace_source_search(
+        "who owns it", limit=5, mode="concept", repo="all",
+        registry=registry, build_meta=_META,
+    )
+
+    assert [(r["repo"], r["file"]) for r in resp["results"]] == [
+        ("alpha", "a0.py"),
+        ("beta", "b0.py"), ("beta", "b1.py"), ("beta", "b2.py"),
+        ("gamma", "g0.py"),
+    ]
 
 
 # ---------------------------------------------------------------------------
