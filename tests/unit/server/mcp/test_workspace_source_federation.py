@@ -569,42 +569,100 @@ async def test_envelopes_without_coverage_evidence_rank_exactly_as_before(monkey
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_the_winner_block_does_not_fill_the_whole_window(monkeypatch):
-    """The second measured defect on the SEO query: limit=10 and all ten rows
-    came from one repo, so the other repo's correct owner was never in the
-    window at all. The winner keeps the head and its order; the loser is owed
-    its top row, and that row is the one it ranked first."""
+def _seo_registry_and_coordinators():
+    """The measured "Next.js metadata route handlers" shape, at limit=10.
+
+    infra's envelope is the stronger one on every signal the wire carries —
+    confident, coverage 1.0/1.0, cosine 0.5645 — and it legitimately leads.
+    Web's ``robots.ts`` is the file a reader actually wants and matches only
+    one of web's four concepts (coverage 0.2111, cosine 0.5223), so web loses
+    the ranking and the whole question is whether the window still shows it.
+    """
     registry = _StubRegistry(["infra", "web"], default="infra")
-    web = _StubCoordinator(
-        _envelope(
-            [(f"src/app/w{i}.ts", 1.0 - i / 100) for i in range(10)],
-            "caution",
-            owner="src/app/w0.ts",
-            cosine=0.39,
-            coverage=(1.0, 0.67),
-        )
-    )
     infra = _StubCoordinator(
         _envelope(
-            [(f"codeatlas/i{i}.py", 1.0 - i / 100) for i in range(10)],
-            "caution",
-            owner="codeatlas/i0.py",
-            cosine=0.46,
-            coverage=(0.33, 0.0),
+            [(f"codeatlas/code_search/i{i}.py", 0.02 - i / 1000) for i in range(10)],
+            "confident",
+            owner="codeatlas/code_search/tools/semantic_file_scope.py",
+            cosine=0.5645,
+            coverage=(1.0, 1.0),
         )
     )
+    web = _StubCoordinator(
+        _envelope(
+            [("src/app/robots.ts", 0.019), ("src/app/sitemap.ts", 0.018),
+             ("src/app/manifest.ts", 0.017)],
+            "caution",
+            owner="src/app/robots.ts",
+            cosine=0.5223,
+            coverage=(0.2111, 0.2111),
+        )
+    )
+    return registry, infra, web
+
+
+@pytest.mark.asyncio
+async def test_the_winner_block_does_not_fill_the_whole_window(monkeypatch):
+    """The second measured defect: limit=10 and all ten rows came from one
+    repo, so the other repo's file was never in the window at all. The winner
+    keeps the head and its order; the loser is owed its top row, and that row
+    is the one it ranked first."""
+    registry, infra, web = _seo_registry_and_coordinators()
     _wire(monkeypatch, {"infra": infra, "web": web})
 
     resp = await workspace_source_search(
-        "seo metadata endpoints", limit=10, mode="concept", repo="all",
+        "Next.js metadata route handlers", limit=10, mode="concept", repo="all",
         registry=registry, build_meta=_META,
     )
 
-    assert [r["repo"] for r in resp["results"]] == ["web"] * 9 + ["infra"]
-    assert [r["file"] for r in resp["results"][:9]] == [f"src/app/w{i}.ts" for i in range(9)]
-    # The reserved slot holds infra's own top row, not whatever fell off last.
-    assert resp["results"][-1]["file"] == "codeatlas/i0.py"
+    assert [r["repo"] for r in resp["results"]] == ["infra"] * 9 + ["web"]
+    assert [r["file"] for r in resp["results"][:9]] == [
+        f"codeatlas/code_search/i{i}.py" for i in range(9)
+    ]
+    # The reserved slot holds web's own top row, not whatever fell off last.
+    assert resp["results"][-1]["file"] == "src/app/robots.ts"
+
+
+@pytest.mark.asyncio
+async def test_the_losing_repos_path_survives_in_candidates(monkeypatch):
+    """``candidates`` is documented as the block to Read, so the winner taking
+    all of it costs the losing repo the only openable path it offered. Same
+    shape, same limit: web's robots.ts must be there to open even though web
+    lost the ranking."""
+    registry, infra, web = _seo_registry_and_coordinators()
+    _wire(monkeypatch, {"infra": infra, "web": web})
+
+    resp = await workspace_source_search(
+        "Next.js metadata route handlers", limit=10, mode="concept", repo="all",
+        registry=registry, build_meta=_META,
+    )
+
+    assert ("web", "src/app/robots.ts") in {
+        (c["repo"], c["path"]) for c in resp["candidates"]
+    }
+    assert [c["repo"] for c in resp["candidates"]] == ["infra"] * 9 + ["web"]
+    assert resp["candidates"][-1]["path"] == "src/app/robots.ts"
+
+
+@pytest.mark.asyncio
+async def test_candidates_keep_the_repo_pair_dedup_under_the_reserve(monkeypatch):
+    """The reserve must not cost the dedup: identical relative paths in two
+    repos are still two openable candidates, and a repo repeating its own path
+    is still one."""
+    registry = _StubRegistry(["alpha", "beta"], default="alpha")
+    alpha = _StubCoordinator(_envelope([("lib/x.ts", 1.0)], "confident", owner="lib/x.ts"))
+    beta = _StubCoordinator(_envelope([("lib/x.ts", 0.9)], "caution"))
+    beta._envelope["candidates"] = [{"path": "lib/x.ts"}, {"path": "lib/x.ts"}]
+    _wire(monkeypatch, {"alpha": alpha, "beta": beta})
+
+    resp = await workspace_source_search(
+        "the x helper", limit=5, mode="concept", repo="all",
+        registry=registry, build_meta=_META,
+    )
+
+    assert [(c["repo"], c["path"]) for c in resp["candidates"]] == [
+        ("alpha", "lib/x.ts"), ("beta", "lib/x.ts")
+    ]
 
 
 @pytest.mark.asyncio

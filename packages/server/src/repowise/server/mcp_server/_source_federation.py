@@ -302,19 +302,22 @@ async def workspace_source_search(
         blocks.append((alias, list(rows)))
     results = _federated_window(blocks, limit)
 
-    candidates: list[dict[str, Any]] = []
+    # Same tail reserve as the results window, for the same reason. This block
+    # is documented as the one to Read, so starving the losing repo out of it
+    # takes away the only openable path that repo offered — the results row
+    # names a file, the candidate is what a caller opens.
     seen: set[tuple[str, str]] = set()
+    cand_blocks: list[tuple[str, list[dict[str, Any]]]] = []
     for alias, env in ranked:
+        paths: list[dict[str, Any]] = []
         for cand in env.get("candidates") or []:
             path = cand.get("path")
             if not path or (alias, path) in seen:
                 continue
             seen.add((alias, path))
-            candidates.append({"path": path, "repo": alias})
-            if len(candidates) >= limit:
-                break
-        if len(candidates) >= limit:
-            break
+            paths.append({"path": path, "repo": alias})
+        cand_blocks.append((alias, paths))
+    candidates = _federated_window(cand_blocks, limit)
 
     owner = winner.get("selected_owner")
     if owner:
