@@ -328,147 +328,240 @@ async def test_every_coordinator_missing_falls_through(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Envelope strength: whose owner actually carries the subject
+# Envelope strength: which repo's owner is named for the subject
+#
+# Every envelope below carries the evidence the live workspace actually
+# returned for that query (G4 federated probe set, pulled per repo from the
+# scoped calls). The numbers are measurements, not illustrations, which is why
+# they are odd.
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_caution_tie_resolves_on_owner_subject_evidence_not_cosine(monkeypatch):
-    """The measured SEO defect, with the evidence the probe actually returned.
+async def test_a_named_owner_takes_the_answer_from_a_confident_term_sponge(monkeypatch):
+    """The archetype bleed: "docx template engine".
 
-    "Where are the SEO metadata endpoints for robots, sitemap, and web app
-    manifest defined?" — web's ``src/app/robots.ts`` is the owner and carries
-    robots/sitemap/manifest in itself; infra's ``semantic_file_scope.py`` is
-    semantically nearby noise that carries none of them. Both envelopes are
-    caution with no exact name, so the pre-fix key fell straight to dense
-    cosine, where infra's embedding happened to sit closer — and infra's
-    block led a question only web can answer.
+    infra's ``boost_make.py`` is a frozenset of authoring words that literally
+    contains docx/template/engine, so it matches every concept in its body and
+    its corpus honestly calls it confident. Make holds the only docx engine in
+    the workspace, and ``docx_template.py`` matches the same subject through
+    its *path* — coverage 0.7105 with none of it content-carried.
+
+    Ranking confidence first hands a Make question to infra. The federated
+    answer is Make's, and it is ``caution`` — composing down from infra's
+    confident, never up from Make's caution.
     """
-    registry = _StubRegistry(["infra", "web"], default="infra")
+    registry = _StubRegistry(["infra", "make"], default="infra")
     infra = _StubCoordinator(
         _envelope(
-            [("codeatlas/code_search/tools/semantic_file_scope.py", 0.71)],
-            "caution",
-            owner="codeatlas/code_search/tools/semantic_file_scope.py",
-            cosine=0.4612,
-            coverage=(0.3333, 0.0),
+            [("codeatlas/code_search/boost_make.py", 0.01639)],
+            "confident",
+            owner="codeatlas/code_search/boost_make.py",
+            cosine=0.4326,
+            coverage=(1.0, 1.0),
         )
     )
-    web = _StubCoordinator(
+    make = _StubCoordinator(
         _envelope(
-            [("src/app/robots.ts", 0.68)],
+            [("src/make/engines/docx_template.py", 0.0161)],
             "caution",
-            owner="src/app/robots.ts",
-            cosine=0.3874,
-            coverage=(1.0, 0.6667),
+            owner="src/make/engines/docx_template.py",
+            cosine=0.5736,
+            coverage=(0.7105, 0.0),
         )
     )
-    _wire(monkeypatch, {"infra": infra, "web": web})
+    _wire(monkeypatch, {"infra": infra, "make": make})
 
     resp = await workspace_source_search(
-        "Where are the SEO metadata endpoints for robots, sitemap, and web app "
-        "manifest defined?",
+        "docx template engine", limit=10, mode="concept", repo="all",
+        registry=registry, build_meta=_META,
+    )
+
+    assert resp["_meta"]["source_search"]["repo_order"] == ["make", "infra"]
+    assert resp["selected_owner"]["file"] == "src/make/engines/docx_template.py"
+    assert resp["selected_owner"]["repo"] == "make"
+    # Federation composes downward: the winner's own class, never infra's.
+    assert resp["confidence"] == "caution"
+
+
+@pytest.mark.asyncio
+async def test_a_partly_named_owner_still_declares_the_subject(monkeypatch):
+    """"health check endpoint" — graph's ``routes/health.py`` carries the
+    subject partly in its path (coverage 0.6412, content 0.2507) against
+    infra's confident ``transport/handlers.py`` at a saturated 1.0/1.0. The
+    declaration is about the split between path and body, not about the path
+    carrying everything."""
+    registry = _StubRegistry(["graph", "infra"], default="infra")
+    infra = _StubCoordinator(
+        _envelope(
+            [("codeatlas/code_search/transport/handlers.py", 0.02)],
+            "confident",
+            owner="codeatlas/code_search/transport/handlers.py",
+            cosine=0.5287,
+            coverage=(1.0, 1.0),
+        )
+    )
+    graph = _StubCoordinator(
+        _envelope(
+            [("apps/api/app/routes/health.py", 0.02)],
+            "caution",
+            owner="apps/api/app/routes/health.py",
+            cosine=0.5034,
+            coverage=(0.6412, 0.2507),
+        )
+    )
+    _wire(monkeypatch, {"graph": graph, "infra": infra})
+
+    resp = await workspace_source_search(
+        "health check endpoint", limit=10, mode="concept", repo="all",
+        registry=registry, build_meta=_META,
+    )
+
+    assert resp["_meta"]["source_search"]["repo_order"] == ["graph", "infra"]
+    assert resp["selected_owner"]["file"] == "apps/api/app/routes/health.py"
+
+
+@pytest.mark.asyncio
+async def test_one_query_word_in_a_path_is_not_a_declaration(monkeypatch):
+    """The false positive the coverage floor exists to stop.
+
+    "dramatiq broker wired to Redis with retry middleware and shutdown
+    notifications" is an eight-concept query. infra's
+    ``neo4j/writer_retry.py`` matches exactly one of them, "retry", through
+    its path — coverage 0.0724, all of it path-carried. Graph's ``broker.py``
+    is the real owner at coverage 0.7641. A bare "the path carries something"
+    test hands this to infra; the engine's own no-match floor is what refuses
+    to call one incidental token a declaration.
+    """
+    registry = _StubRegistry(["graph", "infra"], default="graph")
+    infra = _StubCoordinator(
+        _envelope(
+            [("codeatlas/code_search/neo4j/writer_retry.py", 0.01)],
+            "caution",
+            owner="codeatlas/code_search/neo4j/writer_retry.py",
+            cosine=0.4331,
+            coverage=(0.0724, 0.0),
+        )
+    )
+    graph = _StubCoordinator(
+        _envelope(
+            [("apps/worker/app/broker.py", 0.02)],
+            "caution",
+            owner="apps/worker/app/broker.py",
+            cosine=0.6035,
+            coverage=(0.7641, 0.7641),
+        )
+    )
+    _wire(monkeypatch, {"graph": graph, "infra": infra})
+
+    resp = await workspace_source_search(
+        "dramatiq broker wired to Redis with retry middleware and shutdown "
+        "notifications",
         limit=10, mode="concept", repo="all",
         registry=registry, build_meta=_META,
     )
 
-    assert resp["_meta"]["source_search"]["repo_order"] == ["web", "infra"]
-    assert resp["results"][0]["repo"] == "web"
-    assert resp["selected_owner"]["file"] == "src/app/robots.ts"
-    assert resp["selected_owner"]["repo"] == "web"
+    assert resp["_meta"]["source_search"]["repo_order"] == ["graph", "infra"]
+    assert resp["selected_owner"]["file"] == "apps/worker/app/broker.py"
 
 
 @pytest.mark.asyncio
-async def test_an_owner_whose_case_is_its_path_loses_to_one_that_carries_it(monkeypatch):
-    """A3's boundary, applied across corpora.
-
-    Alpha's owner matches every concept in the query and carries none of them
-    — the whole match is its filename. Beta's owner matches half and carries
-    that half. Alpha wins on both permissive coverage and cosine, and still
-    must not lead: a candidate whose entire case is its path may corroborate
-    a subject, never constitute one.
-    """
-    registry = _StubRegistry(["alpha", "beta"], default="alpha")
-    alpha = _StubCoordinator(
+async def test_the_inverse_control_a_repo_full_of_another_repos_words(monkeypatch):
+    """The inverse control: infra's ``boost_graph_ui.py`` is a helper whose
+    *content* is web-authoring vocabulary, and it is the correct owner of a
+    question about that helper. Graph's ``SearchSection.tsx`` picks up "search"
+    in its path at coverage 0.2173. Any rule that simply prefers the repo whose
+    path matches loses this case; the answer stays with infra on cosine."""
+    registry = _StubRegistry(["graph", "infra"], default="infra")
+    infra = _StubCoordinator(
         _envelope(
-            [("retry_queue_drain_worker.py", 0.9)],
+            [("codeatlas/code_search/boost_graph_ui.py", 0.02)],
             "caution",
-            owner="retry_queue_drain_worker.py",
-            cosine=0.88,
-            coverage=(1.0, 0.0),
+            owner="codeatlas/code_search/boost_graph_ui.py",
+            cosine=0.5909,
+            coverage=(0.6696, 0.6696),
         )
     )
-    beta = _StubCoordinator(
+    graph = _StubCoordinator(
         _envelope(
-            [("workers/pump.py", 0.9)],
+            [("apps/web/features/graph/components/explore/info/SearchSection.tsx", 0.01)],
             "caution",
-            owner="workers/pump.py",
-            cosine=0.42,
-            coverage=(0.5, 0.5),
+            owner="apps/web/features/graph/components/explore/info/SearchSection.tsx",
+            cosine=0.4235,
+            coverage=(0.2173, 0.1617),
         )
     )
-    _wire(monkeypatch, {"alpha": alpha, "beta": beta})
+    _wire(monkeypatch, {"graph": graph, "infra": infra})
 
     resp = await workspace_source_search(
-        "how does the retry queue drain?", limit=5, mode="concept", repo="all",
+        "helper deciding whether a search query is asking about web UI "
+        "authoring from anchor terms like hero, cta and card",
+        limit=10, mode="concept", repo="all",
         registry=registry, build_meta=_META,
     )
 
-    assert resp["_meta"]["source_search"]["repo_order"] == ["beta", "alpha"]
-    assert resp["selected_owner"]["file"] == "workers/pump.py"
+    assert resp["_meta"]["source_search"]["repo_order"] == ["infra", "graph"]
+    assert resp["selected_owner"]["file"] == "codeatlas/code_search/boost_graph_ui.py"
 
 
 @pytest.mark.asyncio
-async def test_coverage_outranks_cosine_once_both_owners_carry_the_subject(monkeypatch):
-    """Both owners clear A3's content gate, so the question becomes how much
-    of the subject each one covers — not which corpus the shared embedder
-    placed nearer. Alpha holds the far better cosine and still loses."""
-    registry = _StubRegistry(["alpha", "beta"], default="alpha")
-    alpha = _StubCoordinator(
-        _envelope([("a.py", 0.9)], "caution", owner="a.py", cosine=0.91, coverage=(0.4, 0.4))
-    )
-    beta = _StubCoordinator(
-        _envelope([("b.py", 0.9)], "caution", owner="b.py", cosine=0.30, coverage=(0.9, 0.2))
-    )
-    _wire(monkeypatch, {"alpha": alpha, "beta": beta})
-
-    resp = await workspace_source_search(
-        "who owns it", limit=5, mode="concept", repo="all",
-        registry=registry, build_meta=_META,
-    )
-
-    assert resp["_meta"]["source_search"]["repo_order"] == ["beta", "alpha"]
-
-
-@pytest.mark.asyncio
-async def test_coverage_is_read_from_the_owner_not_from_a_neighbour(monkeypatch):
+async def test_declaration_is_read_from_the_owner_not_from_a_neighbour(monkeypatch):
     """Evidence from another candidate cannot make *owner* trustworthy — the
-    coordinator's own rule, and it has to survive federation. Alpha's window
-    is full of the subject while the file alpha nominated carries none of it;
-    beta's nominee carries it. Alpha also holds the better cosine."""
+    coordinator's own rule, and it has to survive federation. Alpha's top row
+    is named for the subject while the file alpha actually nominated is not;
+    beta's nominee is. Alpha also holds the better cosine."""
     registry = _StubRegistry(["alpha", "beta"], default="alpha")
     alpha = _StubCoordinator(
         _envelope(
-            [("neighbour.py", 0.9)],
+            [("alpha/retrieval_profile.py", 0.9)],
             "caution",
-            owner="named_for_the_topic.py",
+            owner="alpha/server.py",
             cosine=0.87,
-            coverage=(1.0, 1.0),
-            owner_coverage=(1.0, 0.0),
+            coverage=(0.9, 0.0),
+            owner_coverage=(0.9, 0.9),
         )
     )
     beta = _StubCoordinator(
-        _envelope([("b.py", 0.9)], "caution", owner="b.py", cosine=0.44, coverage=(0.6, 0.4))
+        _envelope(
+            [("beta/retrieval_profile.py", 0.9)],
+            "caution",
+            owner="beta/retrieval_profile.py",
+            cosine=0.44,
+            coverage=(0.9, 0.0),
+        )
     )
     _wire(monkeypatch, {"alpha": alpha, "beta": beta})
+
+    resp = await workspace_source_search(
+        "retrieval profile", limit=5, mode="concept", repo="all",
+        registry=registry, build_meta=_META,
+    )
+
+    assert resp["_meta"]["source_search"]["repo_order"] == ["beta", "alpha"]
+    assert resp["selected_owner"]["file"] == "beta/retrieval_profile.py"
+
+
+@pytest.mark.asyncio
+async def test_envelopes_without_coverage_evidence_rank_exactly_as_before(monkeypatch):
+    """The degradation guard. An evidence dict with no coverage keys is the
+    real shape of a response whose co-location evidence never arrived, and
+    with no repo declaring anything the order must fall back to confidence
+    then cosine — what it was before the declaration test existed."""
+    registry = _StubRegistry(["alpha", "beta"], default="alpha")
+    _wire(monkeypatch, {
+        "alpha": _StubCoordinator(
+            _envelope([("a.py", 0.9)], "caution", owner="a.py", cosine=0.41)
+        ),
+        "beta": _StubCoordinator(
+            _envelope([("b.py", 0.9)], "caution", owner="b.py", cosine=0.83)
+        ),
+    })
 
     resp = await workspace_source_search(
         "who owns it", limit=5, mode="concept", repo="all",
         registry=registry, build_meta=_META,
     )
-
     assert resp["_meta"]["source_search"]["repo_order"] == ["beta", "alpha"]
-    assert resp["selected_owner"]["file"] == "b.py"
 
 
 # ---------------------------------------------------------------------------

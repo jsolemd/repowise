@@ -11,11 +11,11 @@ contract, and this layer's whole job is to compose it honestly.
 Fusion policy — envelope-ranked repo blocks. Per-repo fused scores are
 rank-derived (RRF), so comparing them across corpora manufactures precision
 that is not there: every repo's top hit scores alike by construction. Repos
-are ranked instead by what IS comparable across corpora — the confidence
-class each envelope asserts, the owner's own subject evidence, and dense
-cosine under the one shared embedder — and the merged list presents the
-winning repo's rows first with their internal order intact, then the rest in
-envelope order.
+are ranked instead by what IS comparable across corpora — an exact-name hit,
+whether the owner's own *name* declares the queried subject, the confidence
+class each envelope asserts, and dense cosine under the one shared embedder —
+and the merged list presents the winning repo's rows first with their
+internal order intact, then the rest in envelope order.
 
 The window is not the winner's block cut at ``limit``. A federated answer
 that fills every slot from one repo has silently answered a workspace
@@ -37,6 +37,8 @@ from __future__ import annotations
 import asyncio
 import logging
 from typing import Any, Callable
+
+from repowise.core.source_search.coordinator import NO_MATCH_CONCEPT_COVERAGE
 
 log = logging.getLogger(__name__)
 
@@ -62,8 +64,8 @@ def _tag_scoped(response: dict[str, Any], alias: str) -> dict[str, Any]:
 def _owner_evidence(env: dict[str, Any]) -> dict[str, Any]:
     """The evidence dict belonging to the claim this envelope actually makes.
 
-    Coverage is read from the selected owner and nowhere else, because that is
-    the coordinator's own rule: evidence from another candidate cannot make
+    Read from the selected owner and nowhere else, because that is the
+    coordinator's own rule: evidence from another candidate cannot make
     *owner* trustworthy. An envelope with no owner asserts no ownership at all
     — its top row is the only thing it offers, and reading that keeps the key
     total instead of special-cased.
@@ -78,43 +80,77 @@ def _owner_evidence(env: dict[str, Any]) -> dict[str, Any]:
 def _coverage(evidence: dict[str, Any], key: str) -> float:
     """One coverage fraction, or 0.0 where the envelope carries no such measure.
 
-    Absent is deliberately not a penalty and not a bonus. An evidence dict
-    without the coverage keys is the coordinator's real shape for "retrieval
-    succeeded but the co-location evidence did not" — a state it already
-    answers with ``caution``. Mapping it to 0.0 makes these keys inert when no
-    leg measured a subject, so the ordering degrades to exactly what it was
-    before this signal existed rather than to an accident of which corpus
-    reported more fields.
+    Absent is neither a penalty nor a bonus. An evidence dict without the
+    coverage keys is the coordinator's real shape for "retrieval succeeded but
+    the co-location evidence did not" — a state it already answers with
+    ``caution`` — and mapping it to 0.0 leaves the declaration test below
+    false, which is what "we could not measure a subject" should mean.
     """
     value = evidence.get(key)
     return float(value) if isinstance(value, (int, float)) else 0.0
 
 
-def _envelope_strength(env: dict[str, Any]) -> tuple[int, int, int, float, float, float]:
+def _declares_subject(env: dict[str, Any]) -> int:
+    """Whether this repo's owner is *named* for the subject it was asked about.
+
+    Two conditions, both read off the owner's own evidence:
+
+    * ``concept_coverage >= NO_MATCH_CONCEPT_COVERAGE`` — the engine's own
+      floor for a file being a plausible subject at all, reused rather than
+      reinvented. Without it a file that merely happens to have one query word
+      in its path wins: measured, ``neo4j/writer_retry.py`` takes "dramatiq
+      broker wired to Redis with retry middleware and shutdown notifications"
+      away from the real broker on the token "retry", and a search component
+      takes an infra ranking-helper query on the token "search".
+    * ``concept_coverage > content_concept_coverage`` — some of that subject
+      is carried by the path and not by the body. This is the *difference*
+      between A3's permissive and strict coverage, so it needs nothing that is
+      not already on the wire.
+
+    Together they read: the engine considers this owner a plausible subject,
+    and its name declares part of that subject its content does not.
+
+    This does not contradict A3, it answers a different question. A3 governs
+    whether a claim inside one corpus may be called *confident*, and there a
+    filename may corroborate a subject but never constitute one. Which
+    repository *owns* a subject is a separate question, and a file named for
+    the subject is the strongest declaration of ownership a workspace has —
+    ``docx_template.py`` owns docx templating, and a 493-line file that merely
+    mentions docx does not. Nothing here upgrades a confidence class; the
+    winner's own class is what the response says, so this only ever moves an
+    answer from a confidently wrong repository to a cautiously right one.
+    """
+    evidence = _owner_evidence(env)
+    coverage = _coverage(evidence, "concept_coverage")
+    content = _coverage(evidence, "content_concept_coverage")
+    declares = coverage >= NO_MATCH_CONCEPT_COVERAGE and coverage > content
+    return 1 if declares else 0
+
+
+def _envelope_strength(env: dict[str, Any]) -> tuple[int, int, int, float]:
     """What one repo's answer asserts, in cross-corpus-comparable terms only.
 
-    Ordered the way the coordinator's own confidence gate composes the same
-    evidence, because the honest cross-repo question is which owner best
-    satisfies that gate — not which corpus the embedder happened to place
-    nearer.
+    1. ``exact_name`` — the query named the artifact. The coordinator returns
+       ``confident`` on this alone, and nothing here outranks it.
+    2. ``declares_subject`` — see :func:`_declares_subject`. Deliberately
+       above ``confidence``: measured across the G4 federated set, five of the
+       six cross-repo bleeds had the *wrong* repo answering ``confident`` off
+       a term-dense file that mentions the whole query vocabulary, while the
+       right repo answered ``caution`` from the file named for the subject.
+       Ranking confidence first cannot see that, because both classes are
+       honestly earned inside their own corpus.
+    3. ``confidence`` — the class the repo committed to.
+    4. ``dense_cosine`` — the last resort, and the only magnitude here.
 
-    1. ``confidence`` — the class the repo already committed to.
-    2. ``exact_name`` — the query named the artifact; nothing outranks it.
-    3. ``content_concept_coverage > 0`` — whether the owner carries any of the
-       query's concepts in itself. A3 reads this as a boolean gate, not a
-       magnitude: a filename may corroborate a subject the candidate already
-       carries, but it may never constitute one, and a candidate whose entire
-       case is its path cannot own the answer for the workspace either.
-    4. ``concept_coverage`` — how much of the query's subject the owner
-       matches at all. Coverage keeps A3's permissive reading here, so a file
-       honestly named for its topic still counts for everything it is worth.
-    5. ``content_concept_coverage`` again, now as a magnitude, to separate
-       owners that cover the subject equally by how much of it they carry
-       themselves.
-    6. ``dense_cosine`` — the last resort it always was. It is the one signal
-       that is numerically comparable across corpora and the one that says
-       least about ownership, which is why it now runs after the evidence the
-       coordinator actually gates on rather than in front of it.
+    What is deliberately *absent* is any coverage magnitude. Coverage looks
+    cross-corpus comparable and is not: each corpus derives its own concept
+    list and its own IDF weights, so the fractions have different denominators
+    — for "Next.js metadata route handlers" one repo's concepts are
+    ``[js, metadata, handlers]`` and another's are
+    ``[next, js, metadata, handlers]``. Comparing those fractions across repos
+    is the same error as comparing RRF scores, which is the error this module
+    exists to avoid. Only the boolean above, whose inputs are the *query's*
+    tokens, and dense cosine under the one shared embedder, survive the trip.
     """
     conf = _CONF_ORDER.get(env.get("confidence"), 0)
     cosines: list[float] = []
@@ -129,23 +165,13 @@ def _envelope_strength(env: dict[str, Any]) -> tuple[int, int, int, float, float
         cos = evidence.get("dense_cosine")
         if isinstance(cos, (int, float)):
             cosines.append(float(cos))
-    claim = _owner_evidence(env)
-    subject = _coverage(claim, "concept_coverage")
-    carried = _coverage(claim, "content_concept_coverage")
-    return (
-        conf,
-        exact,
-        1 if carried > 0.0 else 0,
-        subject,
-        carried,
-        max(cosines, default=-1.0),
-    )
+    return (exact, _declares_subject(env), conf, max(cosines, default=-1.0))
 
 
 def _order_key(item: tuple[str, dict[str, Any]]) -> tuple:
     alias, env = item
-    conf, exact, carries, subject, carried, cosine = _envelope_strength(env)
-    return (-conf, -exact, -carries, -subject, -carried, -cosine, alias)
+    exact, declares, conf, cosine = _envelope_strength(env)
+    return (-exact, -declares, -conf, -cosine, alias)
 
 
 def _federated_window(
