@@ -132,32 +132,71 @@ class SourceFileInventory:
 
 
 class SourceFTSIndex:
-    """Synchronous FTS5 index bound to one visible generation."""
+    """Synchronous FTS5 index bound to one visible generation.
+
+    Constructing this class is a write by default: it creates the store
+    directory, flips journal mode, and applies the schema script.  Observers
+    that only inspect a published index must pass ``read_only=True`` instead
+    (see :meth:`_connect_read_only`).
+    """
 
     def __init__(
         self,
         db_path: Path | str,
         *,
         generation: GenerationRef | None = None,
+        read_only: bool = False,
     ) -> None:
         self.db_path = Path(db_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.read_only = read_only
         self.generation = generation or LEGACY_GENERATION
-        self._conn = sqlite3.connect(self.db_path)
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        # The manifest may publish immediately after this connection commits.
-        # FULL prevents that publication pointer from outliving the staged
-        # lexical transaction after a host crash or power loss.
-        self._conn.execute("PRAGMA synchronous=FULL")
-        self._conn.execute("PRAGMA busy_timeout=5000")
-        self._conn.executescript(_SCHEMA)
-        self._conn.commit()
+        if read_only:
+            self._conn = self._connect_read_only()
+        else:
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+            self._conn = sqlite3.connect(self.db_path)
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            # The manifest may publish immediately after this connection
+            # commits. FULL prevents that publication pointer from outliving
+            # the staged lexical transaction after a host crash or power loss.
+            self._conn.execute("PRAGMA synchronous=FULL")
+            self._conn.execute("PRAGMA busy_timeout=5000")
+            self._conn.executescript(_SCHEMA)
+            self._conn.commit()
         self._versioned = self._has_column(_TABLE, "row_key")
         # Bound to one visible generation.  These caches are invalidated by
         # every write method because tests and legacy callers may reuse one
         # instance for a write followed by a read.
         self._active_file_paths_cache: tuple[str, ...] | None = None
         self._term_files_cache: dict[str, frozenset[str]] = {}
+
+    def _connect_read_only(self) -> sqlite3.Connection:
+        """Open an existing store without creating or migrating anything.
+
+        Status checks and per-path diagnostics answer questions *about* a
+        published index; they must not be able to bring one into existence.
+        The default constructor mkdirs the parent, flips journal mode, runs
+        the schema script and commits — on a repository that never built a
+        source index that manufactures an empty store, and on one mid-reconcile
+        it takes a write lock the writer already holds.
+
+        ``mode=ro`` makes the guarantee SQLite's rather than this class's:
+        every write method raises ``sqlite3.OperationalError`` instead of
+        silently mutating a store the caller promised only to read.  A missing
+        store is refused up front with ``FileNotFoundError`` so an observer
+        gets "there is nothing to read" rather than a generic open failure.
+
+        SQLite still materialises the ``-wal``/``-shm`` sidecars while a WAL
+        database has any connection open; those are the reader's own shared
+        memory, are removed when the last connection closes, and never change
+        a byte of the database file.
+        """
+
+        if not self.db_path.is_file():
+            raise FileNotFoundError(f"source FTS store not found: {self.db_path}")
+        conn = sqlite3.connect(f"{self.db_path.resolve().as_uri()}?mode=ro", uri=True)
+        conn.execute("PRAGMA busy_timeout=5000")
+        return conn
 
     def _invalidate_read_caches(self) -> None:
         self._active_file_paths_cache = None

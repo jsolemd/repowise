@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sqlite3
+
 import pytest
 
 from repowise.core.source_search.chunks import (
@@ -273,3 +275,43 @@ def test_reopening_sees_the_previous_run(tmp_path):
     with SourceFTSIndex(path) as second:
         assert second.count() == 1
         assert second.query("alpha")
+
+
+# ---------------------------------------------------------------------------
+# Read-only opens
+# ---------------------------------------------------------------------------
+
+
+def test_a_read_only_open_reads_the_store_without_writing_a_byte_of_it(tmp_path):
+    """Observers must be able to answer questions about a store they cannot alter."""
+
+    path = tmp_path / "store" / "source_fts.db"
+    with SourceFTSIndex(path) as writer:
+        writer.index_chunks([_chunk("alpha", "def alpha():\n    pass")])
+    before = (path.read_bytes(), path.stat().st_mtime_ns)
+
+    with SourceFTSIndex(path, read_only=True) as reader:
+        assert reader.count() == 1
+        assert reader.query("alpha")
+        assert reader.inventory_for_file("src/alpha.py").total == 1
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            reader.index_chunks([_chunk("beta", "def beta():\n    pass")])
+
+    assert (path.read_bytes(), path.stat().st_mtime_ns) == before
+
+
+def test_a_read_only_open_refuses_a_missing_store_instead_of_creating_one(tmp_path):
+    """The default constructor mkdirs and applies the schema; this one must not.
+
+    A status read on a repository that never built a source index has to be
+    able to say "there is nothing here" without leaving an empty store behind
+    that the next read would then report as a real, if empty, publication.
+    """
+
+    path = tmp_path / "never-built" / "source_fts.db"
+
+    with pytest.raises(FileNotFoundError, match="source FTS store not found"):
+        SourceFTSIndex(path, read_only=True)
+
+    assert not path.exists()
+    assert not path.parent.exists()

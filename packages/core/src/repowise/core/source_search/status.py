@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -12,7 +13,72 @@ from .fts import SourceFTSIndex
 from .generation import GenerationRef
 from .manifest import EmbedderIdentity, default_manifest_path, inspect_manifest
 
-__all__ = ["SourceIndexStatus", "inspect_source_index"]
+__all__ = [
+    "CODE_COUNT_MISMATCH",
+    "CODE_MISSING",
+    "CODE_UNREADABLE",
+    "COMPONENT_DENSE",
+    "COMPONENT_LEXICAL",
+    "COMPONENT_MANIFEST",
+    "COMPONENT_PUBLICATION",
+    "COMPONENT_QUEUE",
+    "EVIDENCE_PRESERVING_CODES",
+    "INTEGRITY_CODES",
+    "INTEGRITY_COMPONENTS",
+    "IntegrityFinding",
+    "SourceIndexStatus",
+    "inspect_source_index",
+]
+
+# Which store or stage the fault belongs to. Consumers switch on these, never
+# on the prose in ``IntegrityFinding.detail``.
+COMPONENT_MANIFEST = "manifest"
+COMPONENT_QUEUE = "queue"
+COMPONENT_LEXICAL = "lexical"
+COMPONENT_DENSE = "dense"
+COMPONENT_PUBLICATION = "publication"
+
+# What kind of fault it is.
+CODE_UNREADABLE = "unreadable"
+CODE_MISSING = "missing"
+CODE_COUNT_MISMATCH = "count_mismatch"
+
+INTEGRITY_COMPONENTS = frozenset(
+    {
+        COMPONENT_MANIFEST,
+        COMPONENT_QUEUE,
+        COMPONENT_LEXICAL,
+        COMPONENT_DENSE,
+        COMPONENT_PUBLICATION,
+    }
+)
+INTEGRITY_CODES = frozenset({CODE_UNREADABLE, CODE_MISSING, CODE_COUNT_MISMATCH})
+
+#: Codes that leave enough evidence standing to judge the publication anyway:
+#: a count mismatch is a *known* divergence, so an observer may report the
+#: stronger claim "stale".  Every other code — including one a consumer has
+#: never seen — destroyed the evidence, and the honest verdict is "unknown".
+#: Consumers must treat this set as the allowlist, not its complement, so that
+#: a code added here later is the only way a fault becomes judgeable.
+EVIDENCE_PRESERVING_CODES = frozenset({CODE_COUNT_MISMATCH})
+
+
+@dataclass(frozen=True, slots=True)
+class IntegrityFinding:
+    """One structured integrity fault, named by the code that produced it.
+
+    ``component`` and ``code`` come from the constants above and are the only
+    fields a consumer may classify on.  ``detail`` is free text for humans and
+    may be reworded at any time; a consumer that substring-matches it silently
+    changes verdict when someone edits a message string in this module.
+    """
+
+    component: str
+    code: str
+    detail: str
+
+    def to_dict(self) -> dict[str, str]:
+        return {"component": self.component, "code": self.code, "detail": self.detail}
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,15 +108,27 @@ class SourceIndexStatus:
     lance_table: str | None = None
     fts_path: str | None = None
     last_error: str | None = None
-    integrity_errors: tuple[str, ...] = ()
+    integrity_findings: tuple[IntegrityFinding, ...] = ()
 
     @property
     def degraded(self) -> bool:
         return self.state in {"degraded", "inconsistent"}
 
+    @property
+    def integrity_errors(self) -> tuple[str, ...]:
+        """Human-readable details of :attr:`integrity_findings`, in order.
+
+        Kept for display surfaces (``repowise doctor``, ``/health``).  It is
+        deliberately derived rather than stored so no caller can classify on
+        these strings and drift away from the structured findings beside them.
+        """
+
+        return tuple(finding.detail for finding in self.integrity_findings)
+
     def to_dict(self) -> dict[str, Any]:
         result = asdict(self)
         result["degraded"] = self.degraded
+        result["integrity_errors"] = list(self.integrity_errors)
         return result
 
 
@@ -149,6 +227,21 @@ async def _source_update_snapshot(
         await engine.dispose()
 
 
+def _read_fts_count(fts_path: Path, generation: GenerationRef) -> tuple[int | None, str | None]:
+    """Count the active generation's lexical rows without touching the store.
+
+    Synchronous and blocking (a SQLite open plus one aggregate), so callers on
+    an event loop hand it to a worker thread.  ``read_only=True`` is what keeps
+    a status read from creating or migrating the store it is reporting on.
+    """
+
+    try:
+        with SourceFTSIndex(fts_path, generation=generation, read_only=True) as fts:
+            return fts.count(), None
+    except Exception as exc:
+        return None, f"{exc}"
+
+
 async def inspect_source_index(
     repo_path: Path | str,
     *,
@@ -162,9 +255,15 @@ async def inspect_source_index(
     manifest_result = inspect_manifest(default_manifest_path(repo))
     manifest = manifest_result.manifest
     active_sequence = manifest.generation_sequence if manifest is not None else 0
-    errors: list[str] = []
+    findings: list[IntegrityFinding] = []
     if manifest_result.state == "unreadable":
-        errors.append(f"source manifest unreadable: {manifest_result.error}")
+        findings.append(
+            IntegrityFinding(
+                COMPONENT_MANIFEST,
+                CODE_UNREADABLE,
+                f"source manifest unreadable: {manifest_result.error}",
+            )
+        )
     try:
         updates = await _source_update_snapshot(
             repo,
@@ -174,7 +273,9 @@ async def inspect_source_index(
         )
     except Exception as exc:
         updates = _SourceUpdateSnapshot(None, {}, 0, None)
-        errors.append(f"source outbox unreadable: {exc}")
+        findings.append(
+            IntegrityFinding(COMPONENT_QUEUE, CODE_UNREADABLE, f"source outbox unreadable: {exc}")
+        )
 
     active_update = updates.active
     pending = updates.counts.get("pending", 0)
@@ -190,20 +291,36 @@ async def inspect_source_index(
         generation = GenerationRef(manifest.generation_id, manifest.generation_sequence)
         fts_path = repo / manifest.fts_path
         if not fts_path.is_file():
-            errors.append(f"FTS store missing: {manifest.fts_path}")
+            findings.append(
+                IntegrityFinding(
+                    COMPONENT_LEXICAL, CODE_MISSING, f"FTS store missing: {manifest.fts_path}"
+                )
+            )
         else:
-            try:
-                with SourceFTSIndex(fts_path, generation=generation) as fts:
-                    fts_count = fts.count()
-                if fts_count != expected:
-                    errors.append(f"FTS count mismatch: expected {expected}, found {fts_count}")
-            except Exception as exc:
-                errors.append(f"FTS store unreadable: {exc}")
+            fts_count, fts_error = await asyncio.to_thread(_read_fts_count, fts_path, generation)
+            if fts_error is not None:
+                findings.append(
+                    IntegrityFinding(
+                        COMPONENT_LEXICAL, CODE_UNREADABLE, f"FTS store unreadable: {fts_error}"
+                    )
+                )
+            elif fts_count != expected:
+                findings.append(
+                    IntegrityFinding(
+                        COMPONENT_LEXICAL,
+                        CODE_COUNT_MISMATCH,
+                        f"FTS count mismatch: expected {expected}, found {fts_count}",
+                    )
+                )
 
         if embedder is not None:
             lance_path = repo / ".repowise" / "lancedb"
             if not lance_path.is_dir():
-                errors.append("Lance store missing: .repowise/lancedb")
+                findings.append(
+                    IntegrityFinding(
+                        COMPONENT_DENSE, CODE_MISSING, "Lance store missing: .repowise/lancedb"
+                    )
+                )
             else:
                 try:
                     from .vector_store import SourceChunkVectorStore
@@ -219,13 +336,21 @@ async def inspect_source_index(
                     finally:
                         await store.close()
                     if vector_count != expected:
-                        errors.append(
-                            f"Lance count mismatch: expected {expected}, found {vector_count}"
+                        findings.append(
+                            IntegrityFinding(
+                                COMPONENT_DENSE,
+                                CODE_COUNT_MISMATCH,
+                                f"Lance count mismatch: expected {expected}, found {vector_count}",
+                            )
                         )
                 except Exception as exc:
-                    errors.append(f"Lance store unreadable: {exc}")
+                    findings.append(
+                        IntegrityFinding(
+                            COMPONENT_DENSE, CODE_UNREADABLE, f"Lance store unreadable: {exc}"
+                        )
+                    )
 
-    if errors:
+    if findings:
         state = "inconsistent"
     elif manifest is None:
         state = "degraded" if updates.outstanding_total else "missing"
@@ -268,5 +393,5 @@ async def inspect_source_index(
         lance_table=manifest.lance_table if manifest else None,
         fts_path=manifest.fts_path if manifest else None,
         last_error=last_error,
-        integrity_errors=tuple(errors),
+        integrity_findings=tuple(findings),
     )

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import subprocess
 from dataclasses import asdict
@@ -10,7 +11,7 @@ from time import perf_counter
 from types import SimpleNamespace
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from repowise.core.ingestion import FileTraverser, is_candidate_source_path
 from repowise.core.persistence.database import get_session
@@ -21,10 +22,20 @@ from repowise.core.source_search.coordinator import LEG_SOURCE_DENSE, LEG_SOURCE
 from repowise.core.source_search.fts import SourceFTSIndex
 from repowise.core.source_search.generation import GenerationRef
 from repowise.core.source_search.manifest import identify_embedder
-from repowise.core.source_search.status import SourceIndexStatus, inspect_source_index
+from repowise.core.source_search.status import (
+    COMPONENT_DENSE,
+    COMPONENT_LEXICAL,
+    COMPONENT_MANIFEST,
+    COMPONENT_PUBLICATION,
+    COMPONENT_QUEUE,
+    EVIDENCE_PRESERVING_CODES,
+    SourceIndexStatus,
+    inspect_source_index,
+)
 from repowise.core.workspace.update import get_head_commit, read_repo_state
 from repowise.server.job_executor import execute_job
 from repowise.server.mcp_server import _state
+from repowise.server.mcp_server._budget.collector import OmissionCollector
 from repowise.server.mcp_server._helpers import (
     _get_repo,
     _resolve_repo_context,
@@ -39,6 +50,40 @@ _READ_MODES = frozenset({"status", "path"})
 _SOURCE_MANIFEST_COMPONENT = "source manifest"
 _SOURCE_QUEUE_COMPONENT = "source queue"
 _SOURCE_PUBLICATION_COMPONENT = "source publication"
+
+# Display names for the producer's component codes. The two retrieval legs
+# reuse the coordinator's constants rather than restating their spelling, so a
+# rename there reaches this payload. An unmapped code keeps the producer's own
+# word instead of being silently relabelled as something this tool recognises.
+_COMPONENT_LABELS = {
+    COMPONENT_LEXICAL: LEG_SOURCE_LEXICAL,
+    COMPONENT_DENSE: LEG_SOURCE_DENSE,
+    COMPONENT_MANIFEST: _SOURCE_MANIFEST_COMPONENT,
+    COMPONENT_QUEUE: _SOURCE_QUEUE_COMPONENT,
+    COMPONENT_PUBLICATION: _SOURCE_PUBLICATION_COMPONENT,
+}
+
+# The symbol lane chunks whatever the wiki ingestion pass persisted into
+# ``wiki_symbols`` (source_search/indexer.py::_load_symbols), so the surface
+# deciding its membership is that pass's FileTraverser walk — repo
+# ``exclude_patterns`` plus .gitignore/.repowiseIgnore. It is NOT the
+# query-time read-path exclusion spec, which the source index never consults.
+_PARSER_LANE_SURFACE = "wiki ingestion traversal (FileTraverser + repo exclude_patterns)"
+# The window lane is driven by ``git ls-files`` and ``window_eligible`` alone
+# (source_search/indexer.py::_build_window_chunks). It evaluates no exclusion
+# spec at all, deliberately: the formats it exists for are usually excluded.
+_WINDOW_LANE_SURFACE = "git ls-files + window_eligible (no exclusion spec)"
+
+# Bounds for the payload's variable-length arrays. Every cap is disclosed:
+# the exact total stays beside the listed slice, and the dropped tail goes to
+# the omission store so `_meta.omitted` can restore it verbatim.
+_MAX_LISTED_PATHS = 50
+_MAX_LISTED_STALE_FILES = 50
+_MAX_LISTED_JOBS = 20
+
+# Job modes this tool's own `reindex` block describes. Anything else running
+# on the repo is reported, but never as though it were the queued work.
+_REINDEX_JOB_MODES = frozenset({"index_only"})
 
 # Standalone MCP has no FastAPI ``app.state``. Keep the process-owned
 # registries stable across calls, but snapshot repo-specific attributes in a
@@ -94,19 +139,25 @@ def _trust_state(
     # These failures remove the evidence needed to judge the publication at
     # all. Do not let a known queue row turn a broken manifest/store into the
     # stronger claim "stale".
-    hard_unknown = status.manifest_state != "ok" or any(
-        marker in error.lower()
-        for error in status.integrity_errors
-        for marker in ("unreadable", "missing")
-    )
+    #
+    # Classification reads the producer's own ``code`` constants, never the
+    # prose in ``detail``. ``EVIDENCE_PRESERVING_CODES`` is an allowlist, so a
+    # code this consumer has never seen lands here and degrades the verdict to
+    # "unknown" — drift on either side of the contract can only ever weaken the
+    # claim, which is the direction that stays honest.
+    destroyed = [
+        finding
+        for finding in status.integrity_findings
+        if finding.code not in EVIDENCE_PRESERVING_CODES
+    ]
+    hard_unknown = status.manifest_state != "ok" or bool(destroyed)
     if hard_unknown:
         if status.manifest_state != "ok":
             reasons.append(f"manifest_{status.manifest_state}")
-        for error in status.integrity_errors:
-            lowered = error.lower()
-            if "outbox" in lowered:
+        for finding in destroyed:
+            if finding.component == COMPONENT_QUEUE:
                 reasons.append("source_queue_unverified")
-            elif "manifest" in lowered:
+            elif finding.component == COMPONENT_MANIFEST:
                 reasons.append("manifest_unverified")
         if status.fts_chunks is None:
             reasons.append("fts_unverified")
@@ -175,20 +226,16 @@ def _degradation_findings(status: SourceIndexStatus) -> list[dict[str, str]]:
     so it uses a separate field and shape instead of overloading that contract.
     """
     findings: list[dict[str, str]] = []
-    for detail in status.integrity_errors:
-        lowered = detail.lower()
-        if "fts" in lowered:
-            component = LEG_SOURCE_LEXICAL
-        elif "lance" in lowered:
-            component = LEG_SOURCE_DENSE
-        elif "manifest" in lowered:
-            component = _SOURCE_MANIFEST_COMPONENT
-        elif "outbox" in lowered:
-            component = _SOURCE_QUEUE_COMPONENT
-        else:
-            component = _SOURCE_PUBLICATION_COMPONENT
-        code = "count_mismatch" if "count mismatch" in lowered else "unavailable"
-        findings.append({"component": component, "code": code, "detail": detail})
+    for finding in status.integrity_findings:
+        findings.append(
+            {
+                "component": _COMPONENT_LABELS.get(
+                    finding.component, f"source {finding.component}"
+                ),
+                "code": finding.code,
+                "detail": finding.detail,
+            }
+        )
     if status.last_error:
         findings.append(
             {
@@ -216,6 +263,17 @@ def _degradation_findings(status: SourceIndexStatus) -> list[dict[str, str]]:
     return findings
 
 
+def _repo_facts(repo_path: Path) -> tuple[str | None, dict[str, Any]]:
+    """The two blocking repo reads a status payload needs, in one hop.
+
+    ``get_head_commit`` shells out to git and ``read_repo_state`` reads a file;
+    both are resolved as module globals at call time so the existing
+    monkeypatch seams in the tests still apply.
+    """
+
+    return get_head_commit(repo_path), read_repo_state(repo_path)
+
+
 async def _status_payload(ctx: Any, repository: Any, *, started: float) -> tuple[dict, Any, dict]:
     repo_path = Path(ctx.path).resolve()
     embedder = getattr(ctx.vector_store, "_embedder", None)
@@ -224,11 +282,24 @@ async def _status_payload(ctx: Any, repository: Any, *, started: float) -> tuple
         embedder=embedder,
         verify_stores=True,
     )
-    head_commit = get_head_commit(repo_path)
-    repo_state = read_repo_state(repo_path)
-    working_tree_paths = sorted(
+    head_commit, repo_state = await asyncio.to_thread(_repo_facts, repo_path)
+    all_working_tree_paths = sorted(
         str(path) for path in (repo_state.get("working_tree_paths") or []) if isinstance(path, str)
     )
+    # A grammar regression can mark every file in the repo stale, and the
+    # working tree can be arbitrarily large. Both arrays are capped, and both
+    # caps are disclosed: the exact total sits beside the listed slice and the
+    # dropped tail is recoverable through `_meta.omitted`.
+    collector = OmissionCollector("get_index_status", repo_root=ctx.path)
+    working_tree_paths = all_working_tree_paths[:_MAX_LISTED_PATHS]
+    omitted_working_tree = all_working_tree_paths[_MAX_LISTED_PATHS:]
+    if omitted_working_tree:
+        collector.add("uncommitted_indexed_paths (omitted tail)", omitted_working_tree)
+    all_stale_files = sorted(status.stale_files.items())
+    stale_files = dict(all_stale_files[:_MAX_LISTED_STALE_FILES])
+    omitted_stale = dict(all_stale_files[_MAX_LISTED_STALE_FILES:])
+    if omitted_stale:
+        collector.add("stale_files (omitted tail)", omitted_stale)
     runtime_embedder, runtime_parser, identity_error = _runtime_identities(ctx)
     trust, trust_reasons = _trust_state(
         status,
@@ -276,8 +347,11 @@ async def _status_payload(ctx: Any, repository: Any, *, started: float) -> tuple
             "built_at": status.built_at,
             "published_at": status.published_at,
             "uncommitted_indexed_paths": working_tree_paths,
-            "stale_files": dict(status.stale_files),
+            "uncommitted_indexed_path_count": len(all_working_tree_paths),
+            "uncommitted_indexed_paths_listed": len(working_tree_paths),
+            "stale_files": stale_files,
             "stale_file_count": len(status.stale_files),
+            "stale_files_listed": len(stale_files),
         },
         "queue": {
             "pending": status.pending_updates,
@@ -335,6 +409,7 @@ async def _status_payload(ctx: Any, repository: Any, *, started: float) -> tuple
             or (findings[0]["detail"] if findings else status.state)
         )
         payload["degradation_findings"] = findings
+    collector.attach(payload)
     return payload, status, repo_state
 
 
@@ -386,21 +461,69 @@ def _file_inventory(
         return None, "fts_store_missing"
     try:
         generation = GenerationRef(status.generation_id, status.generation_sequence)
-        with SourceFTSIndex(fts_path, generation=generation) as fts:
+        # read_only: a question about the index must not be able to create,
+        # migrate, or take a write lock on the store it is asking about.
+        with SourceFTSIndex(fts_path, generation=generation, read_only=True) as fts:
             return asdict(fts.inventory_for_file(rel_path)), None
     except Exception as exc:
         return None, f"FTS inventory unavailable: {type(exc).__name__}: {exc}"
 
 
-def _wiki_eligibility(repo_path: Path, rel_path: str) -> tuple[bool | None, str | None]:
+# One traverser per (repo, exclude patterns, rule-file identity). Constructing
+# one reads .gitignore/.repowiseIgnore/.gitmodules and logs a line, and path
+# mode would otherwise pay both on every call. The key carries the identity of
+# every rule file that can change the queried path's verdict — the root files
+# plus each ancestor directory's nested ignores — so an edit to any of them
+# misses the cache rather than being answered from a stale walk.
+_TRAVERSER_CACHE: dict[tuple[Any, ...], FileTraverser] = {}
+_TRAVERSER_CACHE_MAX = 4
+_ROOT_RULE_FILES = (".gitignore", ".repowiseIgnore", ".gitmodules", ".repowise/config.yaml")
+_NESTED_RULE_FILES = (".gitignore", ".repowiseIgnore")
+_MAX_RULE_DEPTH = 64
+
+
+def _traversal_rules_stamp(repo_path: Path, rel_path: str) -> tuple[tuple[str, int, int], ...]:
+    """Identity of every rule file that can change *rel_path*'s verdict."""
+
+    candidates = [repo_path / name for name in _ROOT_RULE_FILES]
+    directory = (repo_path / rel_path).parent
+    depth = 0
+    while directory != repo_path and repo_path in directory.parents and depth < _MAX_RULE_DEPTH:
+        candidates.extend(directory / name for name in _NESTED_RULE_FILES)
+        directory = directory.parent
+        depth += 1
+    stamp: list[tuple[str, int, int]] = []
+    for candidate in candidates:
+        try:
+            info = candidate.stat()
+        except OSError:
+            stamp.append((candidate.as_posix(), -1, -1))
+        else:
+            stamp.append((candidate.as_posix(), info.st_mtime_ns, info.st_size))
+    return tuple(stamp)
+
+
+def _traversal_eligibility(repo_path: Path, rel_path: str) -> tuple[bool | None, str | None]:
+    """Would the wiki ingestion walk have offered *rel_path* to a parser?
+
+    This is the surface that decides symbol-lane membership: the source index
+    chunks ``wiki_symbols`` rows, and those rows exist only for files this walk
+    yielded. It is deliberately not the query-time read-path exclusion spec —
+    the source index never consults that one, so answering from it would name a
+    rule that had no part in the outcome.
+    """
+
     try:
         from repowise.core.repo_config import load_repo_config
 
         excludes = list(load_repo_config(repo_path).get("exclude_patterns") or [])
-        traverser = FileTraverser(
-            repo_path,
-            extra_exclude_patterns=excludes,
-        )
+        key = (str(repo_path), tuple(excludes), _traversal_rules_stamp(repo_path, rel_path))
+        traverser = _TRAVERSER_CACHE.get(key)
+        if traverser is None:
+            traverser = FileTraverser(repo_path, extra_exclude_patterns=excludes)
+            if len(_TRAVERSER_CACHE) >= _TRAVERSER_CACHE_MAX:
+                _TRAVERSER_CACHE.clear()
+            _TRAVERSER_CACHE[key] = traverser
         if traverser.dir_chain_skipped(Path(rel_path).parent):
             return False, "directory policy rejected the path; deciding rule is unavailable"
         info = traverser.file_info_for_path(rel_path, resolve_entry_point=False)
@@ -451,7 +574,7 @@ def _path_mode_payload(
     indexed = inventory["total"] > 0 if inventory is not None else None
     tracked = _tracked_state(repo_path, normalized)
     parser_policy = parser_eligible(normalized)
-    wiki_eligible, wiki_unknown = _wiki_eligibility(repo_path, normalized)
+    traversal_eligible, traversal_unknown = _traversal_eligibility(repo_path, normalized)
     shape_candidate = is_candidate_source_path(normalized)
 
     if inventory is not None:
@@ -470,7 +593,7 @@ def _path_mode_payload(
         str(path) for path in (repo_state.get("working_tree_paths") or []) if isinstance(path, str)
     }
     working_tree_indexed = normalized in working_tree_paths
-    parser_lane = parser_policy and wiki_eligible is True
+    parser_lane = parser_policy and traversal_eligible is True
     if window_policy is True:
         if indexed is True or working_tree_indexed or tracked is True:
             window_lane: bool | None = True
@@ -485,7 +608,7 @@ def _path_mode_payload(
 
     if indexed is True or parser_lane or window_lane is True:
         eligible: bool | None = True
-    elif indexed is None or wiki_eligible is None or window_lane is None:
+    elif indexed is None or traversal_eligible is None or window_lane is None:
         eligible = None
     else:
         eligible = False
@@ -501,11 +624,11 @@ def _path_mode_payload(
         reason = "eligible_not_indexed"
     elif tracked is False and window_policy is True and not parser_lane:
         reason = "untracked_window_only"
-    elif eligible is False and wiki_unknown is None:
+    elif eligible is False and traversal_unknown is None:
         reason = "not_source_eligible"
     else:
         reason = "unknown"
-        unknown_reason = wiki_unknown or "one or more eligibility facts are unavailable"
+        unknown_reason = traversal_unknown or "one or more eligibility facts are unavailable"
 
     lanes = []
     if inventory is not None and inventory["symbol"]:
@@ -525,14 +648,16 @@ def _path_mode_payload(
             "eligible": eligible,
             "parser": {
                 "policy_eligible": parser_policy,
-                "wiki_eligible": wiki_eligible,
+                "traversal_eligible": traversal_eligible,
                 "lane_eligible": parser_lane,
-                "unknown_reason": wiki_unknown,
+                "unknown_reason": traversal_unknown,
+                "deciding_surface": _PARSER_LANE_SURFACE,
             },
             "file_window": {
                 "policy_eligible": window_policy,
                 "lane_eligible": window_lane,
                 "requires_tracked_path": True,
+                "deciding_surface": _WINDOW_LANE_SURFACE,
             },
         },
         "indexed": indexed,
@@ -555,21 +680,43 @@ def _path_mode_payload(
     return base
 
 
-async def _active_jobs(session_factory: Any, repository_id: str) -> list[dict[str, Any]]:
+async def _active_jobs(
+    session_factory: Any,
+    repository_id: str,
+    *,
+    limit: int = _MAX_LISTED_JOBS,
+) -> tuple[list[dict[str, Any]], int]:
+    """The active jobs for a repo, capped, plus the uncapped total.
+
+    The row list is bounded so a stuck queue cannot inflate the payload, but
+    the count beside it is the exact one — a capped list with a capped total
+    would understate a backlog, which is the opposite of what an operator
+    reading this is trying to find out.
+    """
+
+    active = (
+        GenerationJob.repository_id == repository_id,
+        GenerationJob.status.in_(["pending", "running"]),
+    )
     async with get_session(session_factory) as session:
         rows = list(
             (
                 await session.execute(
                     select(GenerationJob)
-                    .where(
-                        GenerationJob.repository_id == repository_id,
-                        GenerationJob.status.in_(["pending", "running"]),
-                    )
+                    .where(*active)
                     .order_by(GenerationJob.created_at)
+                    .limit(limit)
                 )
             )
             .scalars()
             .all()
+        )
+        total = int(
+            (
+                await session.execute(
+                    select(func.count()).select_from(GenerationJob).where(*active)
+                )
+            ).scalar_one()
         )
     jobs = []
     for row in rows:
@@ -589,7 +736,7 @@ async def _active_jobs(session_factory: Any, repository_id: str) -> list[dict[st
         if config_error:
             job["config_error"] = config_error
         jobs.append(job)
-    return jobs
+    return jobs, total
 
 
 def _job_runtime(ctx: Any) -> Any:
@@ -645,7 +792,10 @@ async def get_index_status(
                 }
             )
         else:
-            payload = _path_mode_payload(
+            # Path mode shells out to git, walks ignore rules, and opens
+            # SQLite. All of it is synchronous, so it runs off the event loop.
+            payload = await asyncio.to_thread(
+                _path_mode_payload,
                 payload,
                 status,
                 repo_state,
@@ -690,7 +840,7 @@ async def reindex_repository(
     async with get_session(ctx.session_factory) as session:
         repository = await _get_repo(session)
     index, status, _repo_state = await _status_payload(ctx, repository, started=started)
-    active_jobs = await _active_jobs(ctx.session_factory, repository.id)
+    active_jobs, active_job_total = await _active_jobs(ctx.session_factory, repository.id)
     trust = index["trust"]["search_results"]
     current_noop = trust == "trustworthy" and not force
     estimate = {
@@ -707,7 +857,8 @@ async def reindex_repository(
         "will_run": False,
         "confirmation_required": False,
         "active_jobs": active_jobs,
-        "active_job_count": len(active_jobs),
+        "active_job_count": active_job_total,
+        "active_jobs_listed": len(active_jobs),
         "cost": {
             "generative_calls": 0,
             "scope": "repository index_only pipeline and derived-index publication",
@@ -718,7 +869,19 @@ async def reindex_repository(
 
     if active_jobs:
         operation_status = "already_running"
-        reindex["job"] = active_jobs[-1]
+        # ``cost`` above describes the index_only job this tool would queue.
+        # Surface a job of that mode when one is running; otherwise say plainly
+        # that the running job is something else, because a generative
+        # full_resync reported under a block advertising
+        # ``generative_calls: 0`` reads as a promise the payload cannot keep.
+        matching = [job for job in active_jobs if job["mode"] in _REINDEX_JOB_MODES]
+        reindex["job"] = (matching or active_jobs)[-1]
+        reindex["job_matches_reindex_mode"] = bool(matching)
+        if not matching:
+            reindex["job_mode_note"] = (
+                "The running job is not the index_only work this block prices; "
+                "its own mode governs what it will do, including any generative calls."
+            )
     elif current_noop:
         operation_status = "current"
     elif not confirm:
