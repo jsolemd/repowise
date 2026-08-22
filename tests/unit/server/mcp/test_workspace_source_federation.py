@@ -787,6 +787,197 @@ async def test_a_reserved_row_already_in_the_head_is_not_seated_twice(monkeypatc
 
 
 # ---------------------------------------------------------------------------
+# Semantic ambiguity: the query names a file, not a repository
+# ---------------------------------------------------------------------------
+
+
+def _envelope_with_concepts(
+    files, confidence, *, owner, cosine, coverage, concepts, candidates=None
+):
+    """An envelope carrying the per-concept breakdown the coordinator emits.
+
+    ``concepts`` is ``[(token, matched, content_carried), ...]`` — the shape
+    ``_CandidateEvidence.to_dict`` serialises, and the only place this layer
+    can learn what the query was about.
+    """
+    env = _envelope(
+        files, confidence, owner=owner, cosine=cosine, coverage=coverage
+    )
+    detail = [
+        {"token": t, "document_frequency": 5, "matched": m, "content_carried": c}
+        for t, m, c in concepts
+    ]
+    env["selected_owner"]["evidence"]["concepts"] = detail
+    for row in env["results"]:
+        row["evidence"]["concepts"] = detail
+    if candidates is not None:
+        env["candidates"] = [{"path": p} for p in candidates]
+    return env
+
+
+@pytest.mark.asyncio
+async def test_a_file_several_repos_have_is_disclosed_not_silently_picked(monkeypatch):
+    """The measured "not found page" shape.
+
+    Graph answered ``confident`` on ``apps/web/app/not-found.tsx`` with
+    competing_owners empty, because that field only fired when two repos were
+    each confident of the same relative path. Web holds a not-found page too,
+    at ``src/app/not-found.tsx`` — a different relative path, the same file
+    name, and the query names neither repository.
+    """
+    registry = _StubRegistry(["graph", "web"], default="graph")
+    concepts = [("found", True, True), ("page", True, True)]
+    graph = _StubCoordinator(
+        _envelope_with_concepts(
+            [("apps/web/app/not-found.tsx", 0.02)],
+            "confident",
+            owner="apps/web/app/not-found.tsx",
+            cosine=0.5154,
+            coverage=(1.0, 1.0),
+            concepts=concepts,
+        )
+    )
+    web = _StubCoordinator(
+        _envelope_with_concepts(
+            [("src/app/lectures/[slug]/page.tsx", 0.01)],
+            "caution",
+            owner="src/app/lectures/[slug]/page.tsx",
+            cosine=0.3489,
+            coverage=(1.0, 1.0),
+            concepts=concepts,
+            candidates=["src/app/lectures/[slug]/page.tsx", "src/app/not-found.tsx"],
+        )
+    )
+    _wire(monkeypatch, {"graph": graph, "web": web})
+
+    resp = await workspace_source_search(
+        "not found page", limit=10, mode="concept", repo="all",
+        registry=registry, build_meta=_META,
+    )
+
+    # Downward only: graph's confident becomes the workspace's caution.
+    assert resp["confidence"] == "caution"
+    assert resp["competing_owners"] == [
+        {"repo": "web", "file": "src/app/not-found.tsx", "reason": "same filename"}
+    ]
+    assert "not-found.tsx" in resp["note"]
+    # The winner's owner is still named — disclosure is not abdication.
+    assert resp["selected_owner"]["file"] == "apps/web/app/not-found.tsx"
+    assert resp["selected_owner"]["repo"] == "graph"
+
+
+@pytest.mark.asyncio
+async def test_three_repos_holding_the_name_are_all_disclosed(monkeypatch):
+    """Every rival is named, not just the first one found."""
+    registry = _StubRegistry(["graph", "make", "web"], default="graph")
+    concepts = [("tokens", True, True), ("stylesheet", True, False)]
+    _wire(monkeypatch, {
+        "graph": _StubCoordinator(
+            _envelope_with_concepts(
+                [("apps/web/styles/tokens.css", 0.02)], "confident",
+                owner="apps/web/styles/tokens.css", cosine=0.6,
+                coverage=(1.0, 1.0), concepts=concepts,
+            )
+        ),
+        "make": _StubCoordinator(
+            _envelope_with_concepts(
+                [("src/make/assets/tokens.css", 0.01)], "caution",
+                owner="src/make/assets/tokens.css", cosine=0.4,
+                coverage=(0.6, 0.6), concepts=concepts,
+            )
+        ),
+        "web": _StubCoordinator(
+            _envelope_with_concepts(
+                [("src/styles/base.css", 0.01)], "caution",
+                owner="src/styles/base.css", cosine=0.4,
+                coverage=(0.6, 0.6), concepts=concepts,
+                candidates=["src/styles/base.css", "src/styles/tokens.css"],
+            )
+        ),
+    })
+
+    resp = await workspace_source_search(
+        "design token stylesheet", limit=10, mode="concept", repo="all",
+        registry=registry, build_meta=_META,
+    )
+
+    assert resp["confidence"] == "caution"
+    assert {(c["repo"], c["file"]) for c in resp["competing_owners"]} == {
+        ("make", "src/make/assets/tokens.css"),
+        ("web", "src/styles/tokens.css"),
+    }
+    assert resp["note"].startswith("3 repositories hold a file named")
+
+
+@pytest.mark.asyncio
+async def test_a_name_every_repo_has_does_not_hedge_an_unrelated_query(monkeypatch):
+    """The guard that keeps this from firing on every query.
+
+    ``package.json`` exists in all four workspace repos by construction. A
+    query about the dramatiq broker that happens to land on one must not be
+    demoted just because the other repos also have that file name — the shared
+    name has to carry something the query asked about.
+    """
+    registry = _StubRegistry(["graph", "web"], default="graph")
+    concepts = [("dramatiq", True, True), ("broker", True, True)]
+    graph = _StubCoordinator(
+        _envelope_with_concepts(
+            [("apps/worker/package.json", 0.02)], "confident",
+            owner="apps/worker/package.json", cosine=0.6,
+            coverage=(1.0, 1.0), concepts=concepts,
+        )
+    )
+    web = _StubCoordinator(
+        _envelope_with_concepts(
+            [("package.json", 0.01)], "caution",
+            owner="package.json", cosine=0.4,
+            coverage=(0.5, 0.5), concepts=concepts,
+        )
+    )
+    _wire(monkeypatch, {"graph": graph, "web": web})
+
+    resp = await workspace_source_search(
+        "dramatiq broker", limit=10, mode="concept", repo="all",
+        registry=registry, build_meta=_META,
+    )
+
+    assert resp["confidence"] == "confident"
+    assert "competing_owners" not in resp
+
+
+@pytest.mark.asyncio
+async def test_disclosure_never_raises_a_caution_answer(monkeypatch):
+    """Composition is downward-only. A shared name is a reason to doubt the
+    winner, never a reason to promote it."""
+    registry = _StubRegistry(["graph", "web"], default="graph")
+    concepts = [("found", True, True), ("page", True, True)]
+    graph = _StubCoordinator(
+        _envelope_with_concepts(
+            [("apps/web/app/not-found.tsx", 0.02)], "caution",
+            owner="apps/web/app/not-found.tsx", cosine=0.5,
+            coverage=(1.0, 1.0), concepts=concepts,
+        )
+    )
+    web = _StubCoordinator(
+        _envelope_with_concepts(
+            [("src/app/not-found.tsx", 0.01)], "caution",
+            owner="src/app/not-found.tsx", cosine=0.4,
+            coverage=(1.0, 1.0), concepts=concepts,
+        )
+    )
+    _wire(monkeypatch, {"graph": graph, "web": web})
+
+    resp = await workspace_source_search(
+        "not found page", limit=10, mode="concept", repo="all",
+        registry=registry, build_meta=_META,
+    )
+    assert resp["confidence"] == "caution"
+    assert resp["competing_owners"] == [
+        {"repo": "web", "file": "src/app/not-found.tsx", "reason": "same filename"}
+    ]
+
+
+# ---------------------------------------------------------------------------
 # Handler dispatch
 # ---------------------------------------------------------------------------
 

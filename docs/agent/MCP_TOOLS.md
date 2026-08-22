@@ -477,10 +477,14 @@ federated response is composed from per-repo engines: the strongest repo's
 results lead, `confidence` is that repo's own (a workspace never upgrades a
 member repo's confidence), and when two repos are each confident of different
 owners the response says `caution` and lists them under `competing_owners`.
-The leading repo does not take the whole window: every other repo that
-answered keeps a tail slot for its own top row, so a `limit` at least the
-number of answering repos shows you something from each of them. `repo`
-omitted means the workspace's default repo, not all of them.
+`competing_owners` also fires when the query names a kind of file rather than
+a repository — ask for "not found page" in a workspace where several repos
+have one and you get the rivals listed and `caution`, not one of them picked
+silently. Neither the leading repo nor its block takes the whole window:
+every other repo that answered keeps a tail slot for its own top row in both
+`results` and `candidates`, so a `limit` at least the number of answering
+repos shows you something openable from each of them. `repo` omitted means
+the workspace's default repo, not all of them.
 
 **When to use:** Locating a function/class/method by name, resolving a
 path-shaped query, or discovering pages by topic: the symbol/file shapes pipe

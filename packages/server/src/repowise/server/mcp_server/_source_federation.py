@@ -174,6 +174,73 @@ def _order_key(item: tuple[str, dict[str, Any]]) -> tuple:
     return (-exact, -declares, -conf, -cosine, alias)
 
 
+def _query_concept_tokens(envelopes: list[tuple[str, dict[str, Any]]]) -> set[str]:
+    """The informative tokens the corpora derived from this query.
+
+    Composed-envelope information only — every repo reports the concepts it
+    scored against, and their union is as close to "what the query is about"
+    as this layer can get without re-parsing the sentence the coordinator
+    already parsed.
+    """
+    tokens: set[str] = set()
+    for _, env in envelopes:
+        sources = [env.get("selected_owner") or {}]
+        sources.extend((env.get("results") or [])[:1])
+        for source in sources:
+            for concept in ((source.get("evidence") or {}).get("concepts") or []):
+                token = str(concept.get("token") or "").strip().lower()
+                if token:
+                    tokens.add(token)
+    return tokens
+
+
+def _same_name_rivals(
+    winner_alias: str,
+    owner_file: str,
+    envelopes: list[tuple[str, dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    """Other repos that hold a file of the same *name* as the winner's owner.
+
+    A workspace question that names a kind of file rather than a repository —
+    "not found page" — is answerable by every repo that has one, and picking
+    one silently is the federated version of the disagreement
+    ``competing_owners`` already exists to disclose. Measured: three repos
+    hold a ``not-found`` page and the federated answer named one of them
+    ``confident``, with ``competing_owners`` empty, because that field only
+    fired when two repos were each *confident* of the same relative path.
+
+    Matching is on the file name, not the relative path. Repos lay their trees
+    out differently — the measured collision is ``apps/web/app/not-found.tsx``
+    against ``src/app/not-found.tsx`` — so a relative-path test never fires;
+    it was measured at 0 of 17 cases against the federated probe set.
+
+    The name must also carry one of the query's own concepts. Without that
+    guard every repo's ``package.json``, ``__init__.py`` and ``index.ts``
+    collide by construction and the workspace would hedge on almost every
+    query, which trades a rare wrong answer for a constant useless one. With
+    it, the collision has to be about what was asked.
+    """
+    name = (owner_file or "").rsplit("/", 1)[-1].lower()
+    if not name:
+        return []
+    tokens = _query_concept_tokens(envelopes)
+    if not any(token in name for token in tokens):
+        return []
+    rivals: list[dict[str, Any]] = []
+    for alias, env in envelopes:
+        if alias == winner_alias:
+            continue
+        offered = [(env.get("selected_owner") or {}).get("file")]
+        offered.extend(cand.get("path") for cand in (env.get("candidates") or []))
+        for path in offered:
+            if path and path.rsplit("/", 1)[-1].lower() == name:
+                rivals.append(
+                    {"repo": alias, "file": path, "reason": "same filename"}
+                )
+                break
+    return rivals
+
+
 def _federated_window(
     blocks: list[tuple[str, list[dict[str, Any]]]], limit: int
 ) -> list[dict[str, Any]]:
@@ -324,6 +391,13 @@ async def workspace_source_search(
         owner = dict(owner)
         owner["repo"] = winner_alias
 
+    # A query that names a kind of file rather than a repository is answerable
+    # by every repo that has one. Disclose the rest rather than picking one
+    # silently, and hedge — downward only, so a caution answer stays caution.
+    rivals = _same_name_rivals(winner_alias, (owner or {}).get("file") or "", envelopes)
+    if rivals and _CONF_ORDER.get(confidence, 0) > _CONF_ORDER[_CAUTION]:
+        confidence = _CAUTION
+
     meta = build_meta()
     per_repo: dict[str, Any] = {}
     for alias, env in envelopes:
@@ -354,6 +428,16 @@ async def workspace_source_search(
             f"{len(confident)} repositories each returned a confident owner for "
             "this query. The federated confidence is caution until the query "
             "names one (repo=<alias>); competing_owners lists them all."
+        )
+    elif rivals:
+        name = ((owner or {}).get("file") or "").rsplit("/", 1)[-1]
+        response["competing_owners"] = rivals
+        response["note"] = (
+            f"{len(rivals) + 1} repositories hold a file named {name!r}, and "
+            "this query names none of them. The owner below is this "
+            "workspace's best single answer, not its only plausible one; "
+            "competing_owners lists the rest. Name a repository "
+            "(repo=<alias>) for that repository's own answer."
         )
     elif confidence == _NO_MATCH:
         response["note"] = (
