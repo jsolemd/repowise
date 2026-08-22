@@ -22,6 +22,7 @@ from repowise.core.source_search.chunks import (
 from repowise.core.source_search.fts import SourceFTSIndex
 from repowise.core.source_search.generation import GenerationRef
 from repowise.core.source_search.manifest import EmbedderIdentity
+from repowise.core.source_search.worktree import WorkingTreeDivergence
 from repowise.core.source_search.status import (
     CODE_COUNT_MISMATCH,
     CODE_MISSING,
@@ -61,6 +62,7 @@ def _status(**changes) -> SourceIndexStatus:
         fts_chunks=10,
         vector_chunks=10,
         fts_path=".repowise/source_search/source_fts_v2.db",
+        working_tree=WorkingTreeDivergence(checked=True),
     )
     return replace(status, **changes)
 
@@ -237,6 +239,15 @@ async def test_status_keeps_publication_findings_separate_from_retrieval_failure
     ("status", "head", "expected", "reason"),
     [
         (_status(), "indexed-head", "trustworthy", None),
+        # An unread working tree is not a clean one: same empty path
+        # tuples, opposite meaning, and only the read one supports
+        # trustworthy.
+        (
+            _status(working_tree=WorkingTreeDivergence(checked=False)),
+            "indexed-head",
+            "unknown",
+            "working_tree_unverified",
+        ),
         (_status(), "new-head", "stale", "index_behind_head"),
         (
             _status(

@@ -32,6 +32,7 @@ from repowise.core.source_search.status import (
     SourceIndexStatus,
     inspect_source_index,
 )
+from repowise.core.source_search.worktree import WorkingTreeDivergence
 from repowise.core.workspace.update import get_head_commit, read_repo_state
 from repowise.server.job_executor import execute_job
 from repowise.server.mcp_server import _state
@@ -80,6 +81,16 @@ _WINDOW_LANE_SURFACE = "git ls-files + window_eligible (no exclusion spec)"
 _MAX_LISTED_PATHS = 50
 _MAX_LISTED_STALE_FILES = 50
 _MAX_LISTED_JOBS = 20
+
+# Two adjacent things this payload must never let a reader confuse. The first
+# is the build's own record of what it read out of the working tree; it cannot
+# grow after the build and says nothing about what happened since. The second
+# is read live, per call, and is the only field here that can see an edit or a
+# deletion made after the index was published.
+_RECORDED_WORKING_TREE_SURFACE = "state.json working_tree_paths, recorded when the index was built"
+_LIVE_WORKING_TREE_SURFACE = (
+    "live git diff against HEAD, intersected with the active generation's indexed paths"
+)
 
 # Job modes this tool's own `reindex` block describes. Anything else running
 # on the repo is reported, but never as though it were the queued work.
@@ -174,6 +185,14 @@ def _trust_state(
         and head_commit != status.indexed_commit
     ):
         known_stale.append("index_behind_head")
+    # The same claim as ``index_behind_head``, for the half of reality that
+    # never reaches a commit. Deletion is named apart from modification because
+    # they are not the same failure: an edited file still exists to be read
+    # against, a deleted one is being served from the corpus alone.
+    if status.working_tree.deleted:
+        known_stale.append("indexed_files_deleted")
+    if status.working_tree.modified:
+        known_stale.append("indexed_files_modified")
     if status.pending_updates or status.building_updates or status.ready_updates:
         known_stale.append("updates_outstanding")
     if status.blocked_updates:
@@ -203,6 +222,11 @@ def _trust_state(
         reasons.append("head_unavailable")
     if status.indexed_commit is None:
         reasons.append("indexed_commit_unavailable")
+    if not status.working_tree.checked:
+        # An unread working tree cannot be reported as a clean one: the two are
+        # indistinguishable by the path lists alone, and only one of them
+        # supports "trustworthy".
+        reasons.append("working_tree_unverified")
     if status.fts_chunks is None:
         reasons.append("fts_unverified")
     if status.vector_chunks is None:
@@ -263,6 +287,39 @@ def _degradation_findings(status: SourceIndexStatus) -> list[dict[str, str]]:
     return findings
 
 
+def _working_tree_payload(
+    divergence: WorkingTreeDivergence,
+    collector: OmissionCollector,
+) -> dict[str, Any]:
+    """The live divergence block, capped the way every other array here is.
+
+    Both lists are bounded and both caps are disclosed: the exact total sits
+    beside the listed slice, and the dropped tail goes to the omission store.
+    A branch switch can leave thousands of indexed paths diverging at once, and
+    a payload that truncated silently would understate exactly the condition it
+    exists to report.
+    """
+
+    listed: dict[str, list[str]] = {}
+    for kind, paths in (("modified", divergence.modified), ("deleted", divergence.deleted)):
+        listed[kind] = list(paths[:_MAX_LISTED_PATHS])
+        omitted = list(paths[_MAX_LISTED_PATHS:])
+        if omitted:
+            collector.add(f"working_tree.{kind} (omitted tail)", omitted)
+    return {
+        "checked": divergence.checked,
+        "modified": listed["modified"],
+        "modified_count": len(divergence.modified),
+        "modified_listed": len(listed["modified"]),
+        "deleted": listed["deleted"],
+        "deleted_count": len(divergence.deleted),
+        "deleted_listed": len(listed["deleted"]),
+        "divergent_indexed_path_count": divergence.total,
+        "unavailable_reason": divergence.unavailable_reason,
+        "deciding_surface": _LIVE_WORKING_TREE_SURFACE,
+    }
+
+
 def _repo_facts(repo_path: Path) -> tuple[str | None, dict[str, Any]]:
     """The two blocking repo reads a status payload needs, in one hop.
 
@@ -300,6 +357,7 @@ async def _status_payload(ctx: Any, repository: Any, *, started: float) -> tuple
     omitted_stale = dict(all_stale_files[_MAX_LISTED_STALE_FILES:])
     if omitted_stale:
         collector.add("stale_files (omitted tail)", omitted_stale)
+    working_tree = _working_tree_payload(status.working_tree, collector)
     runtime_embedder, runtime_parser, identity_error = _runtime_identities(ctx)
     trust, trust_reasons = _trust_state(
         status,
@@ -349,9 +407,11 @@ async def _status_payload(ctx: Any, repository: Any, *, started: float) -> tuple
             "uncommitted_indexed_paths": working_tree_paths,
             "uncommitted_indexed_path_count": len(all_working_tree_paths),
             "uncommitted_indexed_paths_listed": len(working_tree_paths),
+            "uncommitted_indexed_paths_basis": _RECORDED_WORKING_TREE_SURFACE,
             "stale_files": stale_files,
             "stale_file_count": len(status.stale_files),
             "stale_files_listed": len(stale_files),
+            "working_tree": working_tree,
         },
         "queue": {
             "pending": status.pending_updates,

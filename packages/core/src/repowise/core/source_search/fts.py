@@ -495,6 +495,38 @@ class SourceFTSIndex:
         self._active_file_paths_cache = paths
         return list(paths)
 
+    def indexed_among(self, file_paths: Sequence[str]) -> set[str]:
+        """Which of *file_paths* the bound generation actually holds chunks for.
+
+        Deliberately not :meth:`active_file_paths` with a set intersection:
+        the caller asking this is a freshness check on a handful of changed
+        paths, and its cost should follow that handful rather than the size of
+        the corpus. Batched on ``_IN_CHUNK`` like :meth:`count_for_files`, so a
+        pathological change set cannot exceed SQLite's variable limit.
+        """
+
+        if not file_paths:
+            return set()
+        found: set[str] = set()
+        for start in range(0, len(file_paths), _IN_CHUNK):
+            batch = list(dict.fromkeys(file_paths[start : start + _IN_CHUNK]))
+            placeholders = ", ".join("?" for _ in batch)
+            if self._versioned:
+                rows = self._conn.execute(
+                    f"SELECT DISTINCT file_path FROM {_VERSIONS} "
+                    f"WHERE file_path IN ({placeholders}) "
+                    "AND valid_from <= ? AND valid_to > ?",
+                    (*batch, self.generation.sequence, self.generation.sequence),
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    f"SELECT DISTINCT file_path FROM {_TABLE} "
+                    f"WHERE file_path IN ({placeholders})",
+                    tuple(batch),
+                ).fetchall()
+            found.update(str(row[0]) for row in rows if row[0])
+        return found
+
     def term_file_evidence(self, terms: Sequence[str]) -> dict[str, frozenset[str]]:
         """Active files whose indexed chunks contain each normalized *term*.
 

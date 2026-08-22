@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -12,6 +13,12 @@ from sqlalchemy import func, select
 from .fts import SourceFTSIndex
 from .generation import GenerationRef
 from .manifest import EmbedderIdentity, default_manifest_path, inspect_manifest
+from .worktree import (
+    UNCHECKED,
+    WorkingTreeDivergence,
+    divergence_from_candidates,
+    working_tree_candidates,
+)
 
 __all__ = [
     "CODE_COUNT_MISMATCH",
@@ -102,6 +109,11 @@ class SourceIndexStatus:
     file_window_chunks: int = 0
     files_covered: int = 0
     stale_files: dict[str, str] = field(default_factory=dict)
+    #: Indexed paths the working tree has changed *since* the build, read live
+    #: rather than from anything the build recorded. Distinct from
+    #: :attr:`stale_files`, which is the build's own account of files it tried
+    #: to chunk and could not.
+    working_tree: WorkingTreeDivergence = UNCHECKED
     expected_chunks: int = 0
     fts_chunks: int | None = None
     vector_chunks: int | None = None
@@ -129,6 +141,7 @@ class SourceIndexStatus:
         result = asdict(self)
         result["degraded"] = self.degraded
         result["integrity_errors"] = list(self.integrity_errors)
+        result["working_tree"] = self.working_tree.to_dict()
         return result
 
 
@@ -227,19 +240,30 @@ async def _source_update_snapshot(
         await engine.dispose()
 
 
-def _read_fts_count(fts_path: Path, generation: GenerationRef) -> tuple[int | None, str | None]:
-    """Count the active generation's lexical rows without touching the store.
+def _read_fts_facts(
+    fts_path: Path,
+    generation: GenerationRef,
+    membership_probe: Sequence[str],
+) -> tuple[int | None, set[str] | None, str | None]:
+    """Row count and path membership from one open of the lexical store.
 
-    Synchronous and blocking (a SQLite open plus one aggregate), so callers on
-    an event loop hand it to a worker thread.  ``read_only=True`` is what keeps
-    a status read from creating or migrating the store it is reporting on.
+    Synchronous and blocking (a SQLite open plus two queries), so callers on an
+    event loop hand it to a worker thread — and the connection is created and
+    used inside that one thread, which is what ``sqlite3``'s default
+    same-thread check requires. ``read_only=True`` is what keeps a status read
+    from creating or migrating the store it is reporting on.
+
+    *membership_probe* is the live working-tree change set; the second query
+    answers which of those paths the generation actually serves. It is one open
+    rather than two because the count and the membership are facts about the
+    same generation and must not be read from different ones.
     """
 
     try:
         with SourceFTSIndex(fts_path, generation=generation, read_only=True) as fts:
-            return fts.count(), None
+            return fts.count(), fts.indexed_among(membership_probe), None
     except Exception as exc:
-        return None, f"{exc}"
+        return None, None, f"{exc}"
 
 
 async def inspect_source_index(
@@ -248,8 +272,22 @@ async def inspect_source_index(
     embedder: Any | None = None,
     db_url: str | None = None,
     verify_stores: bool = True,
+    fts: SourceFTSIndex | None = None,
+    working_tree_max_age: float = 0.0,
 ) -> SourceIndexStatus:
-    """Inspect publication, queue and optional cross-store count parity."""
+    """Inspect publication, queue, live working tree, and cross-store parity.
+
+    *fts* lets a caller that already holds the active lexical store — the
+    search path holds one open for every query — supply it instead of paying
+    a second open. Passing it is also the only way to learn working-tree
+    divergence with ``verify_stores=False``: which paths the generation serves
+    is a question only that store can answer, and a caller that skipped it
+    gets the unchecked verdict rather than a clean-looking empty one.
+
+    *working_tree_max_age* is how stale a cached live-git read may be. Zero,
+    the default, always re-reads: a caller asking this function what the index
+    is worth should not be answered from a cache.
+    """
 
     repo = Path(repo_path).resolve()
     manifest_result = inspect_manifest(default_manifest_path(repo))
@@ -287,6 +325,26 @@ async def inspect_source_index(
     expected = manifest.symbol_chunks + manifest.file_window_chunks if manifest is not None else 0
     fts_count: int | None = None
     vector_count: int | None = None
+    working_tree = UNCHECKED
+    # The live half of freshness. Only meaningful once there is a published
+    # generation to be behind: with no manifest the question is not "what has
+    # changed since the build" but "was there a build".
+    candidates: dict[str, str] = {}
+    candidate_error: str | None = None
+    if manifest is not None:
+        candidates, candidate_error = await asyncio.to_thread(
+            working_tree_candidates, repo, max_age=working_tree_max_age
+        )
+    if manifest is not None and fts is not None:
+        # The caller's store, so its connection stays on the caller's thread —
+        # ``sqlite3`` refuses cross-thread use, and the query is bounded by the
+        # change set rather than the corpus.
+        try:
+            probe: set[str] | None = fts.indexed_among(sorted(candidates))
+        except Exception as exc:
+            probe = None
+            candidate_error = candidate_error or f"lexical_store_unreadable: {type(exc).__name__}"
+        working_tree = divergence_from_candidates(candidates, probe, error=candidate_error)
     if manifest is not None and verify_stores:
         generation = GenerationRef(manifest.generation_id, manifest.generation_sequence)
         fts_path = repo / manifest.fts_path
@@ -297,7 +355,15 @@ async def inspect_source_index(
                 )
             )
         else:
-            fts_count, fts_error = await asyncio.to_thread(_read_fts_count, fts_path, generation)
+            fts_count, indexed_probe, fts_error = await asyncio.to_thread(
+                _read_fts_facts, fts_path, generation, sorted(candidates)
+            )
+            if fts is None:
+                working_tree = divergence_from_candidates(
+                    candidates,
+                    indexed_probe,
+                    error=candidate_error,
+                )
             if fts_error is not None:
                 findings.append(
                     IntegrityFinding(
@@ -350,6 +416,13 @@ async def inspect_source_index(
                         )
                     )
 
+    # ``state`` stays the *publication pipeline's* verdict and deliberately
+    # does not move for working-tree divergence. A checkout with unsaved edits
+    # is the normal condition of a repository someone is working in; folding it
+    # in here would make ``repowise doctor`` (which reads ``state == "current"``
+    # as health) permanently red while saying nothing about the pipeline. The
+    # divergence rides on its own field instead, where every consumer that
+    # speaks staleness reads it.
     if findings:
         state = "inconsistent"
     elif manifest is None:
@@ -387,6 +460,7 @@ async def inspect_source_index(
         file_window_chunks=manifest.file_window_chunks if manifest else 0,
         files_covered=manifest.files_covered if manifest else 0,
         stale_files=dict(manifest.stale_files) if manifest else {},
+        working_tree=working_tree,
         expected_chunks=expected,
         fts_chunks=fts_count,
         vector_chunks=vector_count,

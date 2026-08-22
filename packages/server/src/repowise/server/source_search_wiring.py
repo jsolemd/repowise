@@ -44,6 +44,22 @@ _rest_lock = asyncio.Lock()
 _READY_TIMEOUT = 10.0
 
 
+def _served_paths(response: dict[str, Any]) -> set[str]:
+    """Every repository path this particular response is standing behind."""
+
+    paths = {
+        str(row.get("file"))
+        for row in (response.get("results") or [])
+        if isinstance(row, dict) and row.get("file")
+    }
+    paths.update(
+        str(row.get("path"))
+        for row in (response.get("candidates") or [])
+        if isinstance(row, dict) and row.get("path")
+    )
+    return paths
+
+
 class _StatusCoordinator:
     """Add live queue health without changing the ranking coordinator."""
 
@@ -57,8 +73,18 @@ class _StatusCoordinator:
         response = await self._inner.search(*args, **kwargs)
         try:
             from repowise.core.source_search.status import inspect_source_index
+            from repowise.core.source_search.worktree import HOT_PATH_CACHE_TTL
 
-            status = await inspect_source_index(self._repo, verify_stores=False)
+            # ``fts`` is the store this coordinator already holds open, which
+            # is what lets a ``verify_stores=False`` read still answer which
+            # paths the generation serves — and therefore whether the working
+            # tree has moved out from under this very response.
+            status = await inspect_source_index(
+                self._repo,
+                verify_stores=False,
+                fts=self._source_fts,
+                working_tree_max_age=HOT_PATH_CACHE_TTL,
+            )
             meta = response.setdefault("_meta", {}).setdefault("source_search", {})
             meta.update(
                 {
@@ -72,6 +98,21 @@ class _StatusCoordinator:
                     "stale_files": len(status.stale_files),
                 }
             )
+            # Repo-wide counts answer "is the corpus behind the checkout".
+            # ``served_*`` answers the question a reader of *this* response
+            # actually has: are the rows in front of me describing files that
+            # have since changed or stopped existing. A count alone cannot,
+            # because a repo may diverge on files this query never touched.
+            served = _served_paths(response)
+            divergence = status.working_tree
+            meta["working_tree"] = {
+                "checked": divergence.checked,
+                "modified": len(divergence.modified),
+                "deleted": len(divergence.deleted),
+                "served_modified": sorted(served & frozenset(divergence.modified)),
+                "served_deleted": sorted(served & frozenset(divergence.deleted)),
+                "unavailable_reason": divergence.unavailable_reason,
+            }
             if status.last_error:
                 meta["last_error"] = status.last_error
             if status.degraded:
