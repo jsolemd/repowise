@@ -39,6 +39,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import logging
+import re
 from typing import Any, Callable
 
 from repowise.core.source_search.coordinator import NO_MATCH_CONCEPT_COVERAGE
@@ -241,11 +242,21 @@ def _same_name_rivals(
     query, which trades a rare wrong answer for a constant useless one. With
     it, the collision has to be about what was asked.
     """
-    name = (owner_file or "").rsplit("/", 1)[-1].lower()
+    raw_name = (owner_file or "").rsplit("/", 1)[-1]
+    name = raw_name.lower()
     if not name:
         return []
     tokens = _query_concept_tokens(envelopes)
-    if not any(token in name for token in tokens):
+    # Whole-token comparison on both sides: concept tokens are word-level, so a
+    # substring test lets "db" open the gate against "dashboard.py".
+    name_tokens = {
+        part
+        for part in re.split(
+            r"[^a-z0-9]+", re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", raw_name).lower()
+        )
+        if part
+    }
+    if not (tokens & name_tokens):
         return []
     rivals: list[dict[str, Any]] = []
     for alias, env in envelopes:

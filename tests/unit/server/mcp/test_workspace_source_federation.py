@@ -1406,3 +1406,46 @@ async def test_freshness_enrichment_failure_never_takes_the_answer_down(monkeypa
     assert resp is not None
     assert resp["selected_owner"]["file"] == "b.py"
     assert "repo_freshness" not in (resp.get("_meta") or {})
+
+
+def test_rival_gate_needs_a_whole_name_token_not_a_substring():
+    """R5: concept "db" must not open the rival gate against "dashboard.py".
+
+    Concept tokens are word-level, so the basename is compared token-wise
+    (split on separators and camelCase). Substring matching let every short
+    concept hedge unrelated same-named files.
+    """
+    from repowise.server.mcp_server._source_federation import _same_name_rivals
+
+    def env(owner_file, concepts):
+        return {
+            "selected_owner": {
+                "file": owner_file,
+                "evidence": {"concepts": [{"token": t} for t in concepts]},
+            },
+            "candidates": [],
+            "results": [],
+        }
+
+    # Substring-only overlap: no rival, no hedge.
+    envelopes = [
+        ("a", env("src/dashboard.py", ["db", "metrics"])),
+        ("b", env("lib/dashboard.py", [])),
+    ]
+    assert _same_name_rivals("a", "src/dashboard.py", envelopes) == []
+
+    # Whole-token overlap through a separator still fires.
+    envelopes = [
+        ("a", env("src/lib/mantine-theme.ts", ["theme"])),
+        ("b", env("apps/web/lib/mantine-theme.ts", [])),
+    ]
+    assert _same_name_rivals("a", "src/lib/mantine-theme.ts", envelopes) == [
+        {"repo": "b", "file": "apps/web/lib/mantine-theme.ts", "reason": "same filename"}
+    ]
+
+    # Whole-token overlap through a camelCase boundary still fires.
+    envelopes = [
+        ("a", env("src/createPageMetadata.ts", ["metadata"])),
+        ("b", env("web/createPageMetadata.ts", [])),
+    ]
+    assert _same_name_rivals("a", "src/createPageMetadata.ts", envelopes) != []
