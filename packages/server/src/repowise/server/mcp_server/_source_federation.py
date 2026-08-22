@@ -334,9 +334,15 @@ async def workspace_source_search(
         response = await coordinator.search(
             query, limit=limit, mode=mode, base_meta=build_meta()
         )
-        return _tag_scoped(response, resolved)
+        _tag_scoped(response, resolved)
+        # One freshness vocabulary for workspace mode, scoped and federated
+        # alike: the per-repo map plus the roll-up, never a bare single-repo
+        # commit published as though it described the workspace.
+        await _attach_workspace_freshness(response, {resolved: ctx}, [resolved])
+        return response
 
     unavailable: dict[str, str] = {}
+    contexts_by_alias: dict[str, Any] = {}
     live: list[tuple[str, Any]] = []
     # Context and coordinator are resolved together, per repo, in one pass.
     # Two-pass collection (all contexts, then all coordinators) breaks on a
@@ -368,6 +374,7 @@ async def workspace_source_search(
         if coordinator is None:
             unavailable[alias] = "source index unavailable"
         else:
+            contexts_by_alias[alias] = ctx
             live.append((alias, coordinator))
     if not live:
         return None
@@ -518,7 +525,38 @@ async def workspace_source_search(
             "results (if any) are nearest neighbours, not evidence — "
             "_meta.source_search.repos names each corpus and commit consulted."
         )
+    await _attach_workspace_freshness(
+        response, contexts_by_alias, [alias for alias, _ in ranked]
+    )
     return response
+
+
+async def _attach_workspace_freshness(
+    response: dict[str, Any],
+    contexts_by_alias: dict[str, Any],
+    aliases: list[str],
+) -> None:
+    """M9: give the workspace answer the freshness envelope it never had.
+
+    Delegates to the wiki lane's adapter so both lanes read one Repository row
+    per consulted repo and scope each repo's warning to the paths it actually
+    contributed — one implementation, one vocabulary (``repo_freshness`` plus
+    the roll-up). Fail-soft as everything here: an enrichment failure leaves
+    the answer standing, because freshness is disclosure about the response,
+    never a reason not to serve it.
+    """
+    from repowise.server.mcp_server.tool_search import _federated_freshness
+
+    contexts = [contexts_by_alias[alias] for alias in aliases if alias in contexts_by_alias]
+    if not contexts:
+        return
+    try:
+        freshness = await _federated_freshness(contexts, response.get("results") or [])
+    except Exception:
+        log.debug("source-search: workspace freshness enrichment failed", exc_info=True)
+        return
+    if freshness:
+        response.setdefault("_meta", {}).update(freshness)
 
 
 def _compose_all_error(

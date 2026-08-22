@@ -1329,3 +1329,80 @@ async def test_competing_owners_come_ranked_and_carry_evidence(monkeypatch):
 
     assert [c["repo"] for c in resp["competing_owners"]] == ["beta", "alpha"]
     assert all(c.get("evidence") for c in resp["competing_owners"])
+
+
+# ---------------------------------------------------------------------------
+# M9 wiring: the workspace answer carries a freshness envelope
+# ---------------------------------------------------------------------------
+
+
+def _wire_freshness(monkeypatch, canned):
+    calls: list[dict[str, Any]] = []
+
+    async def fake_adapter(contexts, output):
+        calls.append({"aliases": [c.alias for c in contexts], "rows": len(output)})
+        if isinstance(canned, Exception):
+            raise canned
+        return canned
+
+    monkeypatch.setattr(
+        "repowise.server.mcp_server.tool_search._federated_freshness", fake_adapter
+    )
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_federated_answers_carry_the_freshness_envelope(monkeypatch):
+    registry = _StubRegistry(["alpha", "beta"], default="alpha")
+    _wire(monkeypatch, {
+        "alpha": _StubCoordinator(_envelope([("a.py", 0.5)], "caution")),
+        "beta": _StubCoordinator(_envelope([("b.py", 1.0)], "confident", owner="b.py")),
+    })
+    canned = {"repo_freshness": {"beta": {"index_age_days": 1}}, "index_age_days": 1}
+    calls = _wire_freshness(monkeypatch, canned)
+
+    resp = await workspace_source_search(
+        "who owns it", limit=5, mode="concept", repo="all",
+        registry=registry, build_meta=_META,
+    )
+
+    assert resp["_meta"]["repo_freshness"] == {"beta": {"index_age_days": 1}}
+    assert resp["_meta"]["index_age_days"] == 1
+    # The adapter was handed the ANSWERING repos in ranked order.
+    assert calls and set(calls[0]["aliases"]) == {"alpha", "beta"}
+
+
+@pytest.mark.asyncio
+async def test_scoped_answers_speak_the_same_freshness_vocabulary(monkeypatch):
+    registry = _StubRegistry(["alpha", "beta"], default="alpha")
+    beta = _StubCoordinator(_envelope([("b.py", 1.0)], "confident", owner="b.py"))
+    _wire(monkeypatch, {"alpha": None, "beta": beta})
+    canned = {"repo_freshness": {"beta": {"index_behind": True}}, "index_behind": True}
+    calls = _wire_freshness(monkeypatch, canned)
+
+    resp = await workspace_source_search(
+        "where is b", limit=5, mode="concept", repo="beta",
+        registry=registry, build_meta=_META,
+    )
+
+    assert resp["_meta"]["repo_freshness"] == {"beta": {"index_behind": True}}
+    assert calls[0]["aliases"] == ["beta"]
+
+
+@pytest.mark.asyncio
+async def test_freshness_enrichment_failure_never_takes_the_answer_down(monkeypatch):
+    registry = _StubRegistry(["alpha", "beta"], default="alpha")
+    _wire(monkeypatch, {
+        "alpha": None,
+        "beta": _StubCoordinator(_envelope([("b.py", 1.0)], "confident", owner="b.py")),
+    })
+    _wire_freshness(monkeypatch, RuntimeError("repository row unreadable"))
+
+    resp = await workspace_source_search(
+        "where is b", limit=5, mode="concept", repo="beta",
+        registry=registry, build_meta=_META,
+    )
+
+    assert resp is not None
+    assert resp["selected_owner"]["file"] == "b.py"
+    assert "repo_freshness" not in (resp.get("_meta") or {})
