@@ -1265,8 +1265,15 @@ async def search_codebase(
     ranked = list(output)
     output = output[:limit]
 
-    # Derive confidence_score from relative position in the result set.
-    _assign_confidence(output, "relevance_score", "confidence_score")
+    # Confidence derives from the displayed position, exactly as the federated
+    # merge above does: keying it on raw relevance_score inverts it against the
+    # order _sort_demoting_noise just fixed, because the demoted class's raw
+    # scores are the highest in the window by construction.
+    for position, item in enumerate(output):
+        item["_merged_position_score"] = 1.0 / (position + 60)
+    _assign_confidence(output, "_merged_position_score", "confidence_score")
+    for item in output:
+        item.pop("_merged_position_score", None)
 
     response: dict = {
         "results": output,
