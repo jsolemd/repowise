@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -12,7 +13,8 @@ from httpx import AsyncClient
 from sqlalchemy import select
 
 from repowise.core.persistence.models import GenerationJob
-from repowise.server.services.job_queue import queue_index_only_job
+from repowise.server.routers import repos as repos_router
+from repowise.server.services.job_queue import queue_index_only_job, repository_job_lock
 from tests.unit.server.conftest import create_test_repo
 
 
@@ -160,16 +162,29 @@ async def test_full_resync_duplicate_returns_409(client: AsyncClient) -> None:
 
 
 @pytest.mark.asyncio
-async def test_rest_sync_and_mcp_reindex_share_one_repository_launch_lock(
+@pytest.mark.parametrize("rest_route", ["sync", "full-resync"])
+async def test_rest_job_creation_and_mcp_reindex_share_one_repository_launch_lock(
     client: AsyncClient,
     app,
+    rest_route: str,
 ) -> None:
+    """Two transports racing to create a job for one repo produce exactly one.
+
+    Both sides are real: an ASGI request through the actual route and an
+    actual ``queue_index_only_job``, concurrent under ``asyncio.gather``,
+    against one real database. Only the executor is mocked, so the
+    ``pending|running`` SELECT each handler races on is genuinely issued
+    against its own session. That SELECT is the whole finding: under SQLite
+    WAL snapshot isolation two sessions both see no active job, so without a
+    lock the two transports share, both handlers insert and two jobs run
+    against a repo whose cancel-token slot is process-global.
+    """
     repo = await create_test_repo(client)
     mcp_executor = AsyncMock()
 
     with patch("repowise.server.routers.repos.execute_job", new_callable=AsyncMock):
         rest_response, mcp_result = await asyncio.gather(
-            client.post(f"/api/repos/{repo['id']}/sync"),
+            client.post(f"/api/repos/{repo['id']}/{rest_route}"),
             queue_index_only_job(
                 app_state=app.state,
                 session_factory=app.state.session_factory,
@@ -199,6 +214,22 @@ async def test_rest_sync_and_mcp_reindex_share_one_repository_launch_lock(
         assert rest_response.status_code == 409
         assert mcp_result.status == "accepted"
         assert mcp_result.job_id == jobs[0].id
+
+
+@pytest.mark.asyncio
+async def test_rest_routes_resolve_the_shared_queue_lock_not_a_second_one(app) -> None:
+    """The REST helper must return the object MCP locks, not its own.
+
+    A private lock table on the REST side would still pass a REST-vs-REST
+    test and leave REST-vs-MCP racing, so lock *identity* is the assertion
+    that matters. All three job-creating routes (``/sync``, ``/full-resync``,
+    ``/generate``) go through this one helper, so pinning it covers them.
+    """
+    request = SimpleNamespace(app=app)
+    shared = repository_job_lock(app.state.session_factory, "repo-1")
+
+    assert repos_router._repository_job_lock(request, "repo-1") is shared
+    assert repos_router._repository_job_lock(request, "repo-2") is not shared
 
 
 @pytest.mark.asyncio
