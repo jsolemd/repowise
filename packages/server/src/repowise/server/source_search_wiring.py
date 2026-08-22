@@ -269,8 +269,77 @@ def _repo_root_from_db_url(db_url: str) -> Path | None:
     return path.parent.parent
 
 
+#: Workspace mode — one coordinator per member repo, keyed by resolved repo
+#: path. The value remembers the manifest generation it was built against and
+#: the identity of the wiki vector store it was built FROM: the registry
+#: evicts and reloads contexts, and a reloaded context arrives with fresh
+#: store objects while the old coordinator still holds the closed ones.
+#: Identity (``is``, via ``id``), never equality — the job-lock work already
+#: paid for that lesson.
+_ctx_coordinators: dict[Path, tuple[Any, tuple[Any, ...], int]] = {}
+_ctx_lock = asyncio.Lock()
+
+
+async def context_coordinator(ctx: Any) -> Any:
+    """A coordinator over one workspace repo context, or ``None`` (fail-soft).
+
+    The single-repo entry point reads the MCP module globals; a workspace has
+    no meaningful globals to read, so this one takes the ``RepoContext``
+    itself. Same doctrine otherwise: anything missing — no source index for
+    this member repo, stores still loading, a mock embedder — returns ``None``
+    and the caller falls through to the stock path for that repo.
+    """
+    repo_path = Path(ctx.path)
+    generation = _manifest_key(repo_path)
+    if generation is None:
+        return None
+    wiki_vs = getattr(ctx, "vector_store", None)
+    cached = _ctx_coordinators.get(repo_path)
+    if cached is not None and cached[1] == generation and cached[2] == id(wiki_vs):
+        return cached[0]
+    async with _ctx_lock:
+        # The registry loads real vector stores in the background and repoints
+        # ctx.vector_store when done; build only from the settled store.
+        ready = getattr(ctx, "vector_store_ready", None)
+        if ready is not None:
+            try:
+                await asyncio.wait_for(ready.wait(), timeout=_READY_TIMEOUT)
+            except TimeoutError:
+                log.debug(
+                    "source-search: vector stores for %s still loading, staying on "
+                    "the stock path",
+                    getattr(ctx, "alias", repo_path),
+                )
+                return None
+        wiki_vs = getattr(ctx, "vector_store", None)
+        cached = _ctx_coordinators.get(repo_path)
+        if cached is not None and cached[1] == generation and cached[2] == id(wiki_vs):
+            return cached[0]
+        if cached is not None:
+            _ctx_coordinators.pop(repo_path, None)
+            try:
+                await cached[0].close()
+            except Exception:
+                log.debug("source-search: closing a stale workspace coordinator failed",
+                          exc_info=True)
+        try:
+            built = _build(repo_path, wiki_vs, getattr(ctx, "fts", None))
+        except Exception:
+            log.debug(
+                "source-search: workspace coordinator construction failed for %s",
+                getattr(ctx, "alias", repo_path),
+                exc_info=True,
+            )
+            return None
+        if built is None:
+            return None
+        _ctx_coordinators[repo_path] = (built, generation, id(wiki_vs))
+        return built
+
+
 def reset_for_tests() -> None:
-    """Forget the MCP process cache. Only tests have a reason to."""
+    """Forget the MCP process caches. Only tests have a reason to."""
     global _mcp_coordinator, _mcp_generation
     _mcp_coordinator = None
     _mcp_generation = None
+    _ctx_coordinators.clear()

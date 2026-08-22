@@ -468,7 +468,16 @@ matches or resolving a `symbol_id`, read `results`.
 
 Tombstoned and `exclude_patterns`-excluded results are filtered. In workspace
 mode, structural and concept searches both federate across repos and merge
-(this is the one tool where `repo="all"` is fully supported).
+(this is the one tool where `repo="all"` is fully supported). Every result row
+and every `candidates` entry then carries its `repo`, and identical relative
+paths in two repos stay two distinct candidates — the path alone is not
+openable in a workspace. The federated merge ranks by relevance, never by the
+workspace config's repo order. When the source-search lane is active, a
+federated response is composed from per-repo engines: the strongest repo's
+results lead, `confidence` is that repo's own (a workspace never upgrades a
+member repo's confidence), and when two repos are each confident of different
+owners the response says `caution` and lists them under `competing_owners`.
+`repo` omitted means the workspace's default repo, not all of them.
 
 **When to use:** Locating a function/class/method by name, resolving a
 path-shaped query, or discovering pages by topic: the symbol/file shapes pipe

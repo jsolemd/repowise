@@ -23,6 +23,7 @@ from repowise.server.mcp_server._helpers import (
     _get_exclude_spec,
     _get_repo,
     _is_path,
+    _is_workspace_mode,
     _resolve_all_contexts,
     _resolve_repo_context,
     attach_ignored_arguments,
@@ -627,7 +628,20 @@ def _fused_entry(r) -> dict:
         "snippet": r.snippet,
         "_rrf": 0.0,
         "_sources": set(),
+        # Raw retriever signals, kept beside the rank-derived fused score
+        # because federated ranking needs them: RRF ties are structural across
+        # repos (every repo's #1 scores alike), and only the raw signals can
+        # break such a tie on evidence. Stripped before any response is built.
+        "_best_cosine": None,
+        "_best_fts": None,
     }
+
+
+def _strip_ranking_internals(items: list[dict]) -> None:
+    """Drop the underscore-prefixed ranking fields before a response is built."""
+    for item in items:
+        item.pop("_best_cosine", None)
+        item.pop("_best_fts", None)
 
 
 async def _fused_retrieve(ctx, query: str, fetch_limit: int, page_type: str | None) -> list[dict]:
@@ -663,12 +677,16 @@ async def _fused_retrieve(ctx, query: str, fetch_limit: int, page_type: str | No
         entry = fused.setdefault(r.page_id, _fused_entry(r))
         entry["_rrf"] += 1.0 / (rank + _RRF_K)
         entry["_sources"].add("vector")
+        if entry["_best_cosine"] is None or r.score > entry["_best_cosine"]:
+            entry["_best_cosine"] = r.score
     for rank, r in enumerate(fts_results):
         if r.score < _MIN_RELEVANCE_SCORE:
             continue
         entry = fused.setdefault(r.page_id, _fused_entry(r))
         entry["_rrf"] += 1.0 / (rank + _RRF_K)
         entry["_sources"].add("fts")
+        if entry["_best_fts"] is None or r.score > entry["_best_fts"]:
+            entry["_best_fts"] = r.score
 
     output: list[dict] = []
     for entry in fused.values():
@@ -722,26 +740,49 @@ async def _search_single_repo(
     return output[:limit]
 
 
+def _federated_rank_key(item: dict) -> tuple:
+    """Cross-repo order: relevance, then raw evidence, then determinism.
+
+    Applying RRF *across* repos was a round-robin wearing a ranking's name:
+    every repo's rank-N got the identical ``1/(N+60)``, so the stable sort
+    resolved each tie group to insertion order — the workspace config's repo
+    order. The per-repo ``relevance_score`` leads instead. It is itself
+    rank-derived, so head positions still tie across repos structurally;
+    those ties break on the raw retriever signals ``_fused_retrieve`` now
+    retains — dense cosine first (comparable across corpora under the one
+    shared embedder), raw BM25 second (corpus-flavoured, but evidence where
+    cosine is absent) — and only then on alias/page_id, which is determinism,
+    not preference.
+    """
+    cosine = item.get("_best_cosine")
+    bm25 = item.get("_best_fts")
+    return (
+        -(item.get("relevance_score") or 0.0),
+        -(cosine if isinstance(cosine, (int, float)) else -1.0),
+        -(bm25 if isinstance(bm25, (int, float)) else -1.0),
+        item.get("repo") or "",
+        item.get("page_id") or "",
+    )
+
+
 async def _federated_search(
     query: str, limit: int, page_type: str | None, kind: str | None = None
 ) -> dict:
-    """Search across all repos using Reciprocal Rank Fusion."""
+    """Search across all repos, merged on relevance (see _federated_rank_key)."""
     contexts = await _resolve_all_contexts()
     all_results = []
 
     for ctx in contexts:
         repo_results = await _search_single_repo(ctx, query, limit, page_type, kind)
-        for rank, item in enumerate(repo_results):
+        for item in repo_results:
             item["repo"] = ctx.alias
-            item["rrf_score"] = 1.0 / (rank + 60)  # RRF constant k=60
         all_results.extend(repo_results)
 
-    # Sort by RRF score and take top N
-    all_results.sort(key=lambda x: x.get("rrf_score", 0), reverse=True)
+    all_results.sort(key=_federated_rank_key)
     output = all_results[:limit]
 
-    # Derive confidence from RRF position
-    _assign_confidence(output, "rrf_score", "confidence_score")
+    # Derive confidence from relative position in the merged ranking.
+    _assign_confidence(output, "relevance_score", "confidence_score")
 
     response: dict = {"results": output, "_meta": _build_meta()}
     # Drawn from every repo's ranked list, not the merged cut: a workspace
@@ -749,7 +790,8 @@ async def _federated_search(
     # name files.
     if candidates := file_candidates(all_results, limit=limit):
         response["candidates"] = candidates
-    # Last, so nothing above has to know the field is on its way out.
+    # Last, so nothing above has to know the fields are on their way out.
+    _strip_ranking_internals(output)
     _drop_derivable_page_ids(output)
     return response
 
@@ -956,7 +998,8 @@ async def _structured_search(
             )
     if grep_hint and not results:
         response["grep_hint"] = grep_hint
-    # Last, so nothing above has to know the field is on its way out.
+    # Last, so nothing above has to know the fields are on their way out.
+    _strip_ranking_internals(results)
     _drop_derivable_page_ids(results)
     return response
 
@@ -998,7 +1041,7 @@ async def search_codebase(
             Any stored type filters (repo_overview, layer_page, scc_page,
             api_contract, infra_page, symbol_spotlight).
         kind: implementation | test | config | doc (concept/symbol modes).
-        repo: alias, or "all" for workspace-wide.
+        repo: alias, or "all" for workspace-wide (rows then carry `repo`).
         mode: auto | concept | symbol | path | hybrid.
         symbol_kind: filter symbol hits by kind (function|class|method|...).
     """
@@ -1009,11 +1052,35 @@ async def search_codebase(
     # default. Path queries stay on the stock resolver: a path is a filename
     # lookup, not a retrieval, and fusing it against a corpus can only blur it.
     if source_search_enabled() and resolved_mode != "path":
-        coordinator = await mcp_coordinator()
-        if coordinator is not None:
-            return await coordinator.search(
-                query, limit=limit, mode=resolved_mode, base_meta=_build_meta()
+        if _is_workspace_mode():
+            # A workspace has no corpus of its own — each member repo does.
+            # The singleton below binds to the served path (inert at a
+            # workspace root, one-corpus-answers-everything at a member repo),
+            # so workspace mode routes through per-repo coordinators instead:
+            # repo=<alias> scopes, repo="all" federates, repo=None means the
+            # default repo — the same resolution the wiki lane applies. None
+            # falls through to the stock path, same as single-repo mode.
+            from repowise.server.mcp_server._source_federation import (
+                workspace_source_search,
             )
+            from repowise.server.mcp_server import _state
+
+            ws_response = await workspace_source_search(
+                query,
+                limit=limit,
+                mode=resolved_mode,
+                repo=repo,
+                registry=_state._registry,
+                build_meta=_build_meta,
+            )
+            if ws_response is not None:
+                return ws_response
+        else:
+            coordinator = await mcp_coordinator()
+            if coordinator is not None:
+                return await coordinator.search(
+                    query, limit=limit, mode=resolved_mode, base_meta=_build_meta()
+                )
 
     # An unknown kind used to take the same ``return False`` as a kind that is
     # simply inapplicable, so a typo and a real empty result looked identical.
@@ -1104,6 +1171,7 @@ async def search_codebase(
     if grep_hint and not output:
         response["grep_hint"] = grep_hint
     attach_ignored_arguments(response, ignored)
-    # Last, so nothing above has to know the field is on its way out.
+    # Last, so nothing above has to know the fields are on their way out.
+    _strip_ranking_internals(output)
     _drop_derivable_page_ids(output)
     return response

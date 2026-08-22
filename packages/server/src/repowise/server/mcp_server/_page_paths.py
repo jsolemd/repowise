@@ -82,16 +82,28 @@ def file_candidates(hits: list[dict], *, limit: int) -> list[dict]:
     look. Pages that name no file are skipped rather than emitted as a path,
     which is what keeps the block's promise that every entry can be opened.
 
+    A hit tagged with a ``repo`` (workspace federation) keeps the tag on its
+    candidate, and dedup keys on ``(repo, path)``: the same relative path in
+    two repos is two different openable files, and collapsing them silently
+    dropped whichever repo ranked second. Untagged hits behave exactly as
+    before — the single-repo shape is unchanged.
+
     Nothing is fetched to build this. It reads the hits a search already has.
     """
     out: list[dict] = []
-    seen: set[str] = set()
+    seen: set[tuple[str | None, str]] = set()
     for hit in hits:
         path = hit_file_path(hit)
-        if not path or path in seen:
+        if not path:
             continue
-        seen.add(path)
-        out.append({"path": path})
+        repo = hit.get("repo")
+        if (repo, path) in seen:
+            continue
+        seen.add((repo, path))
+        entry: dict = {"path": path}
+        if repo is not None:
+            entry["repo"] = repo
+        out.append(entry)
         if len(out) >= limit:
             break
     return out
