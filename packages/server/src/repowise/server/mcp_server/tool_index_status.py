@@ -830,7 +830,9 @@ async def reindex_repository(
     Args:
         repo: Repository path, name, ID, or workspace alias.
         confirm: Explicitly authorize queueing after reviewing the preview.
-        force: Rebuild even when status is already trustworthy/current.
+        force: Queue the index_only job even when status is already
+            trustworthy/current. It does not change what the job does — there
+            is no rebuild mode behind it (see ``cost.force_effect``).
     """
     started = perf_counter()
     if repo == "all":

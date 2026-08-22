@@ -888,7 +888,14 @@ or starts a job.
 - Active generation id/sequence, indexed commit versus live HEAD, build/publication
   times, working-tree paths captured by the last index, and per-file stale reasons.
 - Exact pending/building/ready/blocked queue totals. Their stated unit is source-index
-  update rows after the active generation; there is no pagination or hidden cap.
+  update rows after the active generation; there is no pagination or hidden cap on the
+  totals themselves.
+- The variable-length arrays (`stale_files`, `uncommitted_indexed_paths`, active job
+  rows) are capped with the exact total disclosed beside the listed slice
+  (`*_count` / `*_listed`), and the dropped tail is restorable through the standard
+  `_meta.omitted` mechanism ("Reversible truncation" above). Path mode's eligibility
+  block names its `deciding_surface` — the ingestion traversal for the symbol lane,
+  `git ls-files` + window eligibility for the window lane.
 - Manifest symbol/file-window totals and file coverage, plus independently read FTS
   and vector counts and parity.
 - Indexed/runtime embedder and parser identities. A missing identity produces
