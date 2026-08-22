@@ -487,6 +487,18 @@ async def workspace_source_search(
         "repo_order": [alias for alias, _ in ranked],
         "repos": per_repo,
     }
+    # timing_ms is a field this layer owns and must override: the deep copy
+    # carried the WINNER leg's timing, and a 12ms winner beside an 880ms loser
+    # published 12ms for a call that took at least 880. The legs ran in
+    # parallel, so the call's floor is the slowest leg.
+    leg_timings = [
+        value
+        for _, env in envelopes
+        for value in [((env.get("_meta") or {}).get("timing_ms"))]
+        if isinstance(value, (int, float))
+    ]
+    if leg_timings:
+        meta["timing_ms"] = max(leg_timings)
     response["_meta"] = meta
 
     if conflict:

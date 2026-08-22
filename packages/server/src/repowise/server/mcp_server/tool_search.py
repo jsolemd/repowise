@@ -850,8 +850,18 @@ async def _federated_search(
     all_results.sort(key=_federated_rank_key_for(query))
     output = all_results[:limit]
 
-    # Derive confidence from relative position in the merged ranking.
-    _assign_confidence(output, "relevance_score", "confidence_score")
+    # Confidence derives from the MERGED position — which is what
+    # _assign_confidence's docstring promises. Keying it on raw
+    # relevance_score inverted it against the order the noise partition just
+    # fixed: the demoted class's scores are the highest in the window by
+    # construction (that is why the partition exists), so the top row read as
+    # the least confident, and a caller filtering or re-sorting on
+    # confidence_score got the decision records back on top.
+    for position, item in enumerate(output):
+        item["_merged_position_score"] = 1.0 / (position + 60)
+    _assign_confidence(output, "_merged_position_score", "confidence_score")
+    for item in output:
+        item.pop("_merged_position_score", None)
 
     response: dict = {
         "results": output,

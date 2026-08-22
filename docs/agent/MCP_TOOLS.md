@@ -492,9 +492,13 @@ not the workspace's.
 
 When the source-search lane is active, a
 federated response is composed from per-repo engines: the strongest repo's
-results lead, `confidence` is that repo's own (a workspace never upgrades a
-member repo's confidence), and when two repos are each confident of different
-owners the response says `caution` and lists them under `competing_owners`.
+results lead, and `confidence` is the winning repo's own class — never more
+than that repo itself asserted — demoted to `caution` when two repos are EACH
+confident of an owner (the same relative path in two repos is two distinct
+claims), with all claimants listed under `competing_owners` in ranked order
+with their evidence. A repo whose search read no corpus (`status: "error"`)
+is disclosed as broken in `_meta.source_search.repos`, never ranked as an
+answer.
 `competing_owners` also fires when the query names a kind of file rather than
 a repository — ask for "not found page" in a workspace where several repos
 have one and you get the rivals listed and `caution`, not one of them picked

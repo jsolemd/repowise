@@ -873,3 +873,44 @@ def test_changed_file_without_a_target_is_a_usage_error(monkeypatch, repo):
         risk_command, ["--changed-file", "a.py", "--path", str(repo)]
     )
     assert result.exit_code == 2
+
+
+def test_a_hybrid_fan_out_keeps_each_repos_interleave(monkeypatch, tmp_path, capsys):
+    """Mixed shapes merge on per-repo rank, never on their two score scales.
+
+    A symbol ``score`` is an additive feature scale (+100 for an exact name
+    alone); a page ``relevance_score`` is rank-derived and bounded by 6.0 by
+    construction. Comparing them directly sends every symbol above every page
+    regardless of either repo's own interleave — measured by the round-2
+    review: two repos each ranking a strong page above a weaker symbol came
+    back symbol, symbol, page, page. The tool already decided, per repo, where
+    symbols belong relative to pages; the per-repo rank is the record of that
+    decision, and it is what must survive the merge.
+    """
+    def page(path: str, score: float) -> dict:
+        return {**PAGE_HIT, "target_path": path, "relevance_score": score}
+
+    def symbol(name: str, score: float) -> dict:
+        return {
+            "type": "symbol",
+            "symbol_id": f"src/x.py::{name}",
+            "name": name,
+            "kind": "function",
+            "file": "src/x.py",
+            "start_line": 1,
+            "end_line": 2,
+            "score": score,
+        }
+
+    per_repo = {
+        "alpha": {"results": [page("alpha/strong.py", 5.9), symbol("alpha_sym", 45.0)]},
+        "beta": {"results": [page("beta/strong.py", 5.5), symbol("beta_sym", 41.0)]},
+    }
+    _fan(monkeypatch, tmp_path, per_repo, fmt="json")
+    out = capsys.readouterr().out
+    import json as _json
+
+    results = _json.loads(out)["results"]
+    kinds = ["symbol" if r.get("type") == "symbol" else "page" for r in results]
+    # Each repo put its page first; the merge must not invert that on scale.
+    assert kinds == ["page", "page", "symbol", "symbol"], kinds

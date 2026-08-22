@@ -391,14 +391,33 @@ def _fan_out(
     from repowise.server.mcp_server.tool_search import noise_classifier
 
     classify = noise_classifier(query)
-    merged.sort(
-        key=lambda pair: (
-            classify(pair[1]),
-            -_merge_score(pair[1]),
-            pair[0],
-            pair[1].get("repo") or "",
+    kinds = {_result_kind(item) for _, item in merged}
+    if len(kinds) > 1:
+        # A hybrid payload mixes symbol ``score`` (an additive feature scale —
+        # +100 for an exact name alone) with page ``relevance_score``
+        # (rank-derived, bounded by 6.0 by construction). Those are not one
+        # scale, and comparing them directly sends every symbol above every
+        # page regardless of either repo's own interleave — the tool already
+        # decided, per repo, where symbols belong relative to pages, and the
+        # per-repo rank is the only cross-repo-comparable record of that
+        # decision. Same-scale (concept-only) payloads keep the relevance
+        # merge below, where the bounded-scale argument genuinely holds.
+        merged.sort(
+            key=lambda pair: (
+                classify(pair[1]),
+                pair[0],
+                pair[1].get("repo") or "",
+            )
         )
-    )
+    else:
+        merged.sort(
+            key=lambda pair: (
+                classify(pair[1]),
+                -_merge_score(pair[1]),
+                pair[0],
+                pair[1].get("repo") or "",
+            )
+        )
     results = [item for _, item in merged[:limit]]
 
     fused: dict = {"results": results}
