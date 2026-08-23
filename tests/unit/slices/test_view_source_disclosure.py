@@ -114,3 +114,23 @@ def test_a_member_path_cannot_read_outside_the_repo(tmp_path) -> None:
         payload = render_member(_symbol(rel, 1, 1), "full", ViewContext(repo_root=repo))
         assert payload["source"] is None, rel
         assert "source_unavailable" in payload, rel
+
+
+def test_a_symlinked_repo_root_still_serves_its_own_files(tmp_path) -> None:
+    """The containment guard must not refuse the repo's own files.
+
+    The classic regression — comparing the resolved target against the
+    UNRESOLVED root — refuses every legitimate read under a symlinked
+    checkout, and it fails closed and silent (everything becomes
+    ``source_unavailable``). Resolving the root first is what this pins.
+    """
+    real = tmp_path / "real"
+    real.mkdir()
+    (real / "mod.py").write_text("line1\nline2\n")
+    link = tmp_path / "rootlink"
+    link.symlink_to(real, target_is_directory=True)
+
+    from repowise.core.slices.views import ViewContext
+
+    payload = render_member(_symbol("mod.py", 1, 2), "full", ViewContext(repo_root=link))
+    assert payload["source"] == "line1\nline2"

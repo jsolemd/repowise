@@ -1282,7 +1282,7 @@ indistinguishable from "this repository has none".
 | `limit` | integer | No | Matches per response (cap 30) |
 | `include_tests` | boolean | No | Include test files in scope |
 | `min_files` / `min_lines` / `min_callers` / `min_siblings` / `min_directories` | integer | No | Per-pattern thresholds; only the ones the chosen predicate uses apply (`min_directories` is `reuse_candidates`' one tunable) |
-| `percentile` | number | No | Percentile cutoff for rank-thresholded patterns; clamped 0–100 |
+| `percentile` | number | No | Percentile cutoff, `hub_functions` only (default 95); clamped 0–100 |
 
 ```
 find_patterns()                          # the catalogue, with each predicate
