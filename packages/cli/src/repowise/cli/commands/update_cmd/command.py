@@ -46,6 +46,7 @@ from .incremental import (
     _build_update_vector_store,
     _load_stored_function_mod_p80,
     _load_stored_git_meta,
+    _load_stored_performance_callers,
     _rebuild_graph_and_git,
     _refresh_knowledge_graph,
     _run_partial_analysis,
@@ -1262,6 +1263,7 @@ def run_update(
         file_diffs,
         source_map,
         stored_git_meta=_load_stored_git_meta(repo_path),
+        stored_performance_callers=_load_stored_performance_callers(repo_path, file_diffs),
         repo_function_mod_p80=_load_stored_function_mod_p80(repo_path),
     )
 

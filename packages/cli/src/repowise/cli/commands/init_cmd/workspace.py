@@ -171,6 +171,7 @@ def _run_workspace_generation(
         embedder_name_resolved=embedder_name_resolved,
         resume=resume,
         verbose=False,
+        test_run=test_run,
     )
 
 
@@ -393,7 +394,10 @@ def _ingest_and_generate_repo(repo: Any, idx: int, total: int, ctx: _WorkspaceCt
         )
 
     if ctx.dry_run:
-        console.print(f"    [{WARN}]Dry run — skipping generation for this repo.[/]\n")
+        console.print(
+            f"    [{WARN}]Dry run — `.repowise/` created; "
+            "no DB, state, or pages written for this repo.[/]\n"
+        )
         skip_reason = "dry run"
     elif ctx.run_mode == "fast":
         # Fast mode is a graph-and-git index by design; it skips the wiki so a
@@ -451,6 +455,18 @@ def _ingest_and_generate_repo(repo: Any, idx: int, total: int, ctx: _WorkspaceCt
         _render_from_templates()
 
     docs_outcome = (len(result.generated_pages or []), skip_reason)
+
+    # A dry run must not touch the database or write any state, mirroring
+    # single-repo init (which skips the resume controller and returns before
+    # persistence). The index was computed in memory above only so the plan
+    # and per-repo counts can be shown; nothing is written for this repo.
+    if ctx.dry_run:
+        return _RepoOutcome(
+            file_count=result.file_count,
+            symbol_count=result.symbol_count,
+            pages_generated=pages_generated,
+            docs_outcome=docs_outcome,
+        )
 
     # Persist to repo-local DB
     run_async(persist_result(result, repo.path))
@@ -738,8 +754,17 @@ def _workspace_init(
         repos=entries,
         default_repo=primary_alias,
     )
-    config_path = ws_config.save(root)
-    console.print(f"  [{OK}]✓[/] Created {config_path.name}")
+    if dry_run:
+        # ensure_repowise_dir still creates `.repowise/` per repo (needed so a
+        # later distill-hook decline can gate every selected path); dry-run
+        # only means nothing is *written* into those directories or the workspace.
+        console.print(
+            f"  [{WARN}]Dry run — `.repowise/` directories are created, "
+            "but no config, index, or pages are written.[/]"
+        )
+    else:
+        config_path = ws_config.save(root)
+        console.print(f"  [{OK}]✓[/] Created {config_path.name}")
     console.print()
 
     # Step 4: Index each selected repo (always generate_docs=False; generation is separate)
@@ -806,17 +831,20 @@ def _workspace_init(
         total_pages += outcome.pages_generated
         docs_outcomes[repo.alias] = outcome.docs_outcome
 
-    # Save workspace config with updated timestamps
-    ws_config.save(root)
+    # Save workspace config with updated timestamps. On a dry run nothing is
+    # written for any repo (see _ingest_and_generate_repo), so nothing is
+    # written at the workspace level either.
+    if not dry_run:
+        ws_config.save(root)
 
-    # Step 5: Cross-repo analysis (co-changes, package deps, contracts)
-    _run_cross_repo_analysis(ws_config, root, selected, errors)
+        # Step 5: Cross-repo analysis (co-changes, package deps, contracts)
+        _run_cross_repo_analysis(ws_config, root, selected, errors)
 
-    # Step 6: Register primary repo with configured editor clients
-    primary_entry = ws_config.get_primary()
-    if primary_entry:
-        primary_path = (root / primary_entry.path).resolve()
-        register_editor_clients(console, primary_path, no_editor_setup=not editor_setup)
+        # Step 6: Register primary repo with configured editor clients
+        primary_entry = ws_config.get_primary()
+        if primary_entry:
+            primary_path = (root / primary_entry.path).resolve()
+            register_editor_clients(console, primary_path, no_editor_setup=not editor_setup)
 
     # Step 7: Completion summary
     elapsed = time.monotonic() - start
@@ -833,9 +861,10 @@ def _workspace_init(
         docs_outcomes=docs_outcomes,
     )
 
-    # Offer to install post-commit hooks
+    # Offer to install post-commit hooks. Skipped on a dry run, which must
+    # not write anything.
     indexed_repos = [repo for repo in selected if repo.alias not in [e[0] for e in errors]]
-    if indexed_repos:
+    if indexed_repos and not dry_run:
         offer_hook_install(
             console,
             [r.path for r in indexed_repos],
@@ -848,13 +877,14 @@ def _workspace_init(
     # failed) because ensure_repowise_dir already created `.repowise/` in
     # each, and the hook treats any repo with `.repowise/` and no recorded
     # verdict as enabled — a decline must gate every one of them off.
-    offer_distill_rewrite_hook(
-        console,
-        [r.path for r in selected],
-        distill_hook,
-        yes=yes,
-        no_editor_setup=not editor_setup,
-    )
+    if not dry_run:
+        offer_distill_rewrite_hook(
+            console,
+            [r.path for r in selected],
+            distill_hook,
+            yes=yes,
+            no_editor_setup=not editor_setup,
+        )
     console.print()
     if hard_no_generative:
         console.print(NO_GENERATIVE_INIT_COMPLETE_MARKER)

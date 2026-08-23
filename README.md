@@ -37,7 +37,8 @@
   <a href="#the-eleven-mcp-tools">MCP tools</a> ·
   <a href="#measured-against-the-field">Benchmarks</a> ·
   <a href="#how-it-compares-on-capability">Comparison</a> ·
-  <a href="#for-teams--enterprises">Teams</a>
+  <a href="#for-teams-and-enterprises">Enterprise</a> ·
+  <a href="ROADMAP.md">Roadmap</a>
 </sub></p>
 
 ---
@@ -63,6 +64,11 @@ across 21 repos and 9 languages, leakage-free. Every layer computed with <strong
 calls</strong>. <strong>We publish the rows we lose</strong>, and we are the slowest indexer here.
 <a href="docs/BENCHMARKS.md"><strong>All of it, including the losses →</strong></a><br />
 Free and self-hosted, runs on your machine, and the first index needs no API key.</sub>
+
+<p align="center"><sub>
+Runs entirely on your infrastructure · <strong>zero LLM calls in every analysis layer</strong> ·
+AGPL-3.0 or commercial · <a href="#for-teams-and-enterprises"><strong>For enterprises →</strong></a>
+</sub></p>
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset=".github/assets/one-index-dark.svg" />
@@ -101,7 +107,7 @@ Because the exploration work is already done, that phase mostly disappears. Load
 one commit's context through `get_context` costs **393 tokens instead of 13,984**
 raw, 35.6x fewer. In a measured agent loop, across 43 questions on `django/django`,
 that is worth **-31.6% of the agent's own output tokens** (p&lt;0.0001), reached in
-**3.8 tool calls against a bare agent's 7.2** — roughly one answered question
+**3.8 tool calls against a bare agent's 7.2**, roughly one answered question
 replacing six greps. The saving grows with how much of the codebase the task
 touches. CodeGraph is a genuine second here at -24.4%: we lead a field in which
 more than one tool works.
@@ -128,7 +134,7 @@ queryable from the CLI, the MCP tools, and the local dashboard.
 
 | Layer | What it gives you | Edge |
 |---|---|---|
-| **◈ Graph** | Dependency graph across 19 languages · file + symbol nodes · 3-tier call resolution · Leiden communities · PageRank and execution flows · route→handler edges across 22 frameworks | A real graph most tools never build |
+| **◈ Graph** | Dependency graph across 19 languages · file + symbol nodes · confidence-scored call resolution · Leiden communities · PageRank and execution flows · route→handler edges across 22 frameworks | A real graph most tools never build |
 | **◈ Git** | Hotspots (decayed churn + activity floors) · ownership % · co-change pairs (hidden coupling) · bus factor · which files actually get bug-fixed, and how recently | Behavioural signals static analysis cannot see |
 | **◈ Docs** | A generated wiki page per module and file · rebuilt incrementally every commit · freshness and confidence scoring · hybrid search (full-text + vector) · selectable style and output language | Stays current instead of rotting |
 | **◈ Decisions** | Architectural decisions mined from five sources, evidence-backed, each traced to a verbatim source span and stamped exact / fuzzy / unverified | **★ Captured nowhere else** |
@@ -140,10 +146,14 @@ layers and renders every wiki page from your code's structure, with no API key a
 no spend. Convert any part of it to LLM-written prose whenever you want, one page,
 one directory, or a ranked coverage slice at a time, and pay only for what you pick,
 from the CLI or right in the dashboard with the cost shown before you confirm.
-(Seven of the eight decision sources are deterministic too; only the one harvested
-during doc generation needs a provider.)
+(Six of the seven decision sources are deterministic too; only comment
+archaeology, which reads rationale prose on high-centrality code, needs a
+provider.)
 
 Full detail on every layer: **[docs/layers/INTELLIGENCE_LAYERS.md →](docs/layers/INTELLIGENCE_LAYERS.md)**
+How the graph sees a call, how it resolves one, how much to trust the result, and
+what a compiler says when it grades the whole thing:
+**[docs/layers/GRAPH.md →](docs/layers/GRAPH.md)**
 
 ---
 
@@ -186,12 +196,41 @@ Three deterministic signals, all computed from the graph and git history, no LLM
   Doc, test and config commits are filtered out so the count means what it says, and a
   file with a run of recent fixes gets flagged as a bug magnet while you edit it.
   ([reference →](docs/layers/BUG_HISTORY.md))
-- **Test intelligence.** Ingest coverage, find untested hotspots, and run only the
-  tests a diff actually exercises with `repowise impacted-tests HEAD~1`.
+- **[Test intelligence](#which-tests-cover-this-file-without-a-coverage-report).** Which
+  tests reach a file and which ones a diff actually exercises, from the call graph,
+  with or without a coverage report.
   ([reference →](docs/layers/TEST_INTELLIGENCE.md))
 
 Plus the free **[Repowise PR Bot](#the-pr-bot)**, which puts all of it on every pull
 request. Zero LLM calls.
+
+---
+
+## Which tests cover this file, without a coverage report
+
+Ingest LCOV, Cobertura or Clover and you get the measured answer. **Most
+repositories never produce one**, so the graph answers instead: a test file that
+imports a source file *reaches* it, which is a recorded edge rather than the
+name-shaped guess everything else falls back to.
+
+That fallback fails in both directions, and this repo is the proof. Five of its
+six worst bug-magnet files have no test named for them and read as untested while
+the graph names 3 to 23 test files each. The sixth is worse: matching on basename
+paired the *health* engine with the *distill* engine's tests and called it tested.
+
+```bash
+repowise impacted-tests main..HEAD   # only the tests this diff actually exercises
+repowise health                      # untested hotspots, now graph-aware
+```
+
+<sub>Dogfooded against a real <code>coverage run --contexts=test</code>:
+<strong>95.7% precision</strong> on what reaches a file and <strong>97.5% on the
+run list</strong>, at a 100% hit rate, against 72.1% and 94.8% for the one-hop
+import walk this replaced. The two tiers are never averaged: rows are stamped
+<code>basis: "measured"</code> or <code>"inferred"</code>, measured wins outright
+where both can answer, and the inferred tier may never produce a percentage.
+Sound as a floor, unsound as a quantity, and labelled so.
+<a href="docs/layers/TEST_INTELLIGENCE.md"><strong>Test intelligence →</strong></a></sub>
 
 ---
 
@@ -249,14 +288,14 @@ every file, locates where the risk concentrates, and then names the specific fix
 Every file is scored 1-10 by **49 deterministic detectors** (McCabe complexity, brain
 methods, LCOM4 cohesion, god classes, native Rabin-Karp clone detection, untested
 hotspots, change entropy, prior-defect history and more), split into three lenses:
-**defect risk**, **maintainability**, and **performance** — static N+1 and I/O-in-loop
+**defect risk**, **maintainability**, and **performance**: static N+1 and I/O-in-loop
 risk traced *across* files through the call graph, where file-local linters found **0**
 of the cross-function cases and repowise surfaced ~90. Only **26** of the 49 are
 permitted to move the defect number, because that is the number carrying published
 accuracy claims.
 
 > **Zero LLM calls, zero cloud, zero new runtime dependencies.** Pure Python over
-> tree-sitter and git data, **under 30 seconds** on a 3,000-file repo — a budget
+> tree-sitter and git data, **under 30 seconds** on a 3,000-file repo, a budget
 > enforced by a CI test, not an estimate. Marker weights are **calibrated against a
 > real defect corpus, not hand-tuned**: every file scored at a commit preceding the
 > bug window so nothing leaks backward, and an L2-logistic fit with file size as an
@@ -267,7 +306,7 @@ accuracy claims.
 repowise checks its own flags against your git history and reports what it found:
 *"16 of the 20 lowest-health files had a bug fix in the last 6 months, 3.3x the 24%
 baseline."* If that number is bad on your codebase, you will see it. (It is an
-association on your indexed history, not a forward prediction — the leakage-free
+association on your indexed history, not a forward prediction, the leakage-free
 version is [in the benchmarks](docs/BENCHMARKS.md#5-code-health-predicts-defects).)
 
 Then it names the fix. Not "this class is too big", but **Extract Class**, **Extract
@@ -404,7 +443,11 @@ the orchestrators. Full matrix and the contributor recipe:
 
 ## Supported languages
 
-**19 languages parsed to AST · 13 at the Full tier · framework-aware across all of them.**
+**19 languages parsed to AST · 35 on a five-rung ladder · framework-aware across
+all of them.**
+
+"Do you support X" has five useful answers, not two, so languages land on a
+ladder and every rung says what it buys you.
 
 <p>
   <strong>Full tier &nbsp;</strong>
@@ -433,15 +476,38 @@ the orchestrators. Full matrix and the contributor recipe:
   <img src="https://img.shields.io/badge/Luau-00A2FF?style=flat-square&logo=lua&logoColor=white" alt="Luau" />
 </p>
 
+Below those two rungs the ladder keeps going, and a language on a lower rung is
+still doing real work rather than being ignored:
+
+| Rung | Languages | What you get |
+|---|---|---|
+| **Full** (13) | Python · TypeScript · JavaScript · Svelte · Vue · Java · Kotlin · Go · Rust · C++ · C# · Scala · Ruby | The whole pipeline: AST symbols, import resolution, a resolved call graph, heritage, docstrings, framework edges, **and code-health markers** |
+| **Good** (5) | C · Swift · PHP · Dart · Object Pascal | All of the above except the full health suite |
+| **Partial** (1) | Luau / Roblox | AST symbols and `require()` resolution, Rojo and `.luaurc` aware |
+| | | ⎯⎯ *tree-sitter parsing stops here; the rungs below come from git and imports* ⎯⎯ |
+| **Lightweight** (7) | Elixir · Clojure · Haskell · Lean 4 · Erlang · F# · HTML | A real file-to-file import graph, and no symbol-level claims |
+| **Structural** (9) | Objective-C · R · Zig · Julia · Elm · OCaml · Crystal · Nim · D | Git history: blame, hotspots, co-change, ownership, bug history |
+
+**Every language ships in the open-source distribution.** None is gated behind
+the commercial licence, and none will be. Languages on the way up the ladder,
+including **COBOL**, are on the
+**[roadmap →](ROADMAP.md#languages)**.
+
 SQL and dbt projects get real `ref()` / `source()` lineage, shell scripts get
 function-level symbols, HTML pages contribute their `<script src>` / `<link href>`
 dependencies (including `index.html` → `src/main.ts`), and OpenAPI, Protobuf,
 GraphQL, Dockerfile, Terraform and friends get dedicated handlers. Anything else is
 still tracked through git history: blame, hotspots, co-change.
 
-Adding a language takes **one `.scm` query file and one config entry**, with no changes
-to the parser core. Full matrix and the contributor recipe:
-**[docs/layers/LANGUAGE_SUPPORT.md →](docs/layers/LANGUAGE_SUPPORT.md)**
+Every call edge is stamped with **how it was resolved and how much to trust it**, from
+`same_file` at 0.95 down to a repo-wide name match at 0.50, labelled as the guess it is
+([how that works](docs/layers/GRAPH.md)).
+Adding a language takes five small steps and **no changes to the parser core**.
+
+Full matrix: **[docs/layers/LANGUAGE_SUPPORT.md →](docs/layers/LANGUAGE_SUPPORT.md)** ·
+The graph itself: **[docs/layers/GRAPH.md →](docs/layers/GRAPH.md)** ·
+Contributor recipe and internals:
+**[docs/architecture/language-support.md →](docs/architecture/language-support.md)**
 
 ---
 
@@ -616,7 +682,7 @@ The full page carries the rows we lose beside the rows we win.
   at -24.4%: more than one tool here works, and we lead the field rather than
   being alone in it.
 - **Fewer steps to get there.** 3.8 tool calls where the bare agent needed 7.2,
-  and 3.0 files opened instead of 7.2 — the mechanism behind the token saving,
+  and 3.0 files opened instead of 7.2, the mechanism behind the token saving,
   visible directly rather than inferred.
 
 **[The full results, the methodology, and the rows we lose →](docs/BENCHMARKS.md)**
@@ -644,6 +710,8 @@ agent over MCP.
 | **Output tokens vs a bare agent** *([measured](docs/BENCHMARKS.md#2-what-changes-in-a-real-agent-loop), n=43)* | ✅ **-31.6%** | -24.4% | -14.8% | not measured |
 | **Index time, django** *([measured](docs/BENCHMARKS.md#6-indexing-time-the-row-we-lose))* | ⚠️ **366.8s**, slowest here | ✅ **16.4s** | not measured | n/a, cloud |
 | | *one-time; updates after it are incremental* | | | |
+| **Call-edge precision** *([measured](docs/BENCHMARKS.md#7-edge-precision), 540 rows hand-graded from source)* | ✅ **84.8%** | 57.0% | not measured | not measured |
+| **Call-edge precision, judged by a compiler** *([measured](docs/BENCHMARKS.md#8-the-same-question-against-an-answer-key-we-do-not-control), 5 tools, 7 cells, 37,853 edges)* | ✅ **nothing that finds as much gets more of it right**, 7 of 7 | lower precision in 7, and lower recall in 5 | not measured | not measured |
 | Generated documentation | ✅ | ❌ | ❌ | ✅ |
 | Proactive agent hooks | ✅ Claude + Codex | ❌ | ❌ | ❌ |
 | Auto-generated AI instructions (`CLAUDE.md`, `AGENTS.md`) | ✅ | ❌ | ❌ | ❌ |
@@ -656,6 +724,25 @@ CodeGraph builds its index **22x faster than we do**, and if a call graph is all
 you need, that is the right trade. With prose generation on, which is what a
 default `repowise init` actually costs, it is **135x**. Graphify and
 code-review-graph were in the same measured field and are on the benchmarks page.
+
+The precision row cuts the other way and is worth stating as plainly: of the call
+edges we draw, **about fifteen percent are wrong**, and on `seastar` CodeGraph
+grades better than we do. Nine languages were read on both sides, four separate,
+five are statistical ties.
+
+The compiler row exists because we graded the hand-read one ourselves. On Go and
+TypeScript the answer key is the Go team's own RTA call graph and the `tsc`
+checker's own resolution, which we neither wrote nor can tune.
+
+**Read that row carefully, because it is a claim about two numbers.** Precision
+alone is easy to win by drawing almost nothing, and two of the five tools score
+above us that way, one of them at 0.997 from a graph holding 17% of the calls in
+the repository. Recall alone is easy to win by drawing everything, and the tool
+that leads it emits, on the largest repository measured, more than a third of its
+edges as calls that do not exist. What we claim is the pair: **in all seven cells,
+no tool that recovers as much of the call graph as we do gets more of it right.**
+The column we lose is still there and is still ours to lose: **the tool with the
+highest recall in every Go cell is not us.**
 
 <sub>Measured against CodeGraph 1.5.0, Graphify 0.9.31, Serena 1.6.2.dev0,
 code-review-graph 2.3.7, on repowise `081a59fa` (between v0.37.0 and v0.38.0),
@@ -671,7 +758,7 @@ August 2026. Unmarked rows are capability presence, not measurements.</sub>
 | **Defects found at a 20% review budget** *([measured](docs/BENCHMARKS.md#5-code-health-predicts-defects), 2,770 files)* | ✅ **0.173** | 0.074 |
 | **Effort-aware ranking, Popt** *(measured, p=0.003)* | ✅ **0.607** | 0.462 |
 | **Precision at that budget** *(measured)* | 0.580 | ✅ **0.636**, a shorter list |
-| **Discrimination, ROC AUC** *(measured, paired)* | 0.731 | 0.705 — *p=0.054, not significant* |
+| **Discrimination, ROC AUC** *(measured, paired)* | 0.731 | 0.705, *p=0.054, not significant* |
 | Defect-prediction AUC, published and reproducible | ✅ 0.737 over 21 repos, held-out 0.76-0.78 | ✅ Code Red study |
 | Business impact (resolution time) | ❌ *we could not replicate this on open data* | ✅ Code Red study |
 | Git intelligence (hotspots, ownership, co-change) | ✅ | ✅ |
@@ -734,26 +821,57 @@ one index, self-hostable and open source. Full side-by-side comparisons:
 | **Team leads** | Know which PRs to worry about before you merge: change-risk scoring plus the free [Repowise PR Bot](https://github.com/apps/repowise-bot). [For team leads →](https://www.repowise.dev/for/teams) |
 | **Engineering leaders** | See how much of your code AI wrote and whether it is healthy: agent provenance, health trends and bus factor, straight from git history. [For engineering leaders →](https://www.repowise.dev/for/engineering-leaders) |
 | **Security & compliance** | Reachability-aware CVE triage, secret detection across full git history, and SBOM, on your real dependency graph. [For security →](https://www.repowise.dev/for/security) · [security review →](docs/business/SECURITY_COMPLIANCE.md) |
-| **Enterprises** | On-prem and air-gapped, SSO/SCIM, commercial licensing with no AGPL obligation, IP indemnification. [For enterprise →](https://www.repowise.dev/for/enterprise) · [docs/business/COMMERCIAL.md](docs/business/COMMERCIAL.md) |
+| **Enterprises** | On-prem and air-gapped, SSO/SCIM, commercial licensing with no AGPL obligation, IP indemnification. [For enterprise →](https://www.repowise.dev/for/enterprise) · [what we're building next →](ROADMAP.md) · [docs/business/COMMERCIAL.md](docs/business/COMMERCIAL.md) |
 
 ---
 
-## For teams & enterprises
+<a id="for-teams-and-enterprises"></a>
+
+## For teams and enterprises
+
+The reason this passes a security review is structural rather than contractual:
+**every analysis layer computes with zero LLM calls.** The graph, git history,
+code health, change risk, dead code and the PR bot make no model calls at all, so
+in the deterministic path there is no provider to trust, no retention policy to
+read, and nothing to prompt-inject. Documentation prose is the one layer that
+uses a model, it is opt-in, and it runs on your key or fully offline through
+Ollama.
+
+| | |
+|---|---|
+| **Deployment** | Self-hosted from `pip install`, or containers on your own infrastructure: API server, indexer workers and dashboard, backed by Postgres and LanceDB or pgvector. Reference topology is Kubernetes, and the same containers run on Nomad or plain Docker. Air-gapped mode requires no outbound connectivity. *(Helm chart and air-gap bundle: [planned](ROADMAP.md#enterprise-operations))* |
+| **Data boundary** | Source never leaves your network. BYOK against your own Anthropic, OpenAI or Azure OpenAI contract, or fully offline. The provider choice is **per repository**, so sensitive repos run offline while others use a hosted model. Stored: the graph, non-reversible embeddings, wiki pages, git metadata. Raw source is processed transiently and never persisted. |
+| **Compliance and audit** | CycloneDX 1.6 SBOM with VEX export and per-snapshot diffs · PCI-DSS 4.0 and SOC 2 control-coverage reports with per-control evidence · insert-only audit trail with JSON/CSV export and a signed-webhook SIEM stream · CVE triage ranked by KEV, EPSS and whether your code actually imports the package. |
+| **Contract** | Commercial licence removes the AGPL obligation for embedding repowise in your own platform · IP indemnification · defensive patent grant · named support contact with a response-time SLA and a quarterly architecture review · per-seat, per-repo or enterprise-wide pricing. |
+
+**Past one repository.** Workspaces index an estate as one unit: API contracts
+matched producer to consumer so a breaking change is caught before it ships,
+cross-repo co-change, and one federated MCP endpoint that answers across all of
+it. *(Estate-scale dashboards: [in development](ROADMAP.md#multi-repo-and-workspace).)*
+
+**Not on git?** Only the history layer needs a commit log. Point `repowise init`
+at a plain directory, an export, or a Perforce or SVN workspace and the graph,
+documentation, decisions and code-health layers all build normally; what is
+missing is hotspots, ownership, co-change and bug history until the history layer
+learns to read your system.
+*([Perforce, SVN, Endevor and ChangeMan on the roadmap →](ROADMAP.md#source-control-beyond-git))*
+
+**Everything above is labelled GA, in development, or planned, line by line, in
+[COMMERCIAL.md](docs/business/COMMERCIAL.md).** Some of it is shipping today and
+some of it is not, and a comparison table that blurred the two would not survive
+the first procurement call. Sequencing against your timeline is part of the
+commercial conversation, so the items that matter most to you can be prioritized.
 
 [**repowise.dev**](https://www.repowise.dev) is the same engine, fully managed, at
-feature parity with self-hosted: every CLI command, every MCP tool, the whole
-dashboard. We run it on our own codebase in the open:
+feature parity with self-hosted. We run it on our own codebase in the open:
 [live snapshot →](https://www.repowise.dev/s/5a6b93fa9a69) ·
 [explore public repos →](https://www.repowise.dev/explore).
 
-On top of self-hosting: managed deploys and webhooks with auto re-index on every
-commit, a hosted MCP endpoint so any client can point at one URL with no local server,
-a CVE-aware security layer, cross-repo intelligence at scale, and integrations (Slack,
-Jira/Linear, Confluence/Notion, PagerDuty) *(rolling out)*.
-
-What is GA versus in development, on-prem topology, SSO/SCIM/RBAC and pricing:
-**[docs/business/COMMERCIAL.md](docs/business/COMMERCIAL.md)** ·
-[Get in touch →](https://www.repowise.dev/#contact)
+**[Commercial detail and pricing models →](docs/business/COMMERCIAL.md)** ·
+**[Security review pack →](docs/business/SECURITY_COMPLIANCE.md)** ·
+**[Roadmap →](ROADMAP.md)** ·
+[hello@repowise.dev](mailto:hello@repowise.dev) ·
+[security@repowise.dev](mailto:security@repowise.dev)
 
 ---
 

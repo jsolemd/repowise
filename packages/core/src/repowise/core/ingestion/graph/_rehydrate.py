@@ -80,11 +80,7 @@ class RehydrateMixin:
             node_id = node.get("node_id")
             if node_id is None:
                 continue
-            attrs = {
-                key: node[key]
-                for key in _NODE_ATTR_KEYS
-                if node.get(key) is not None
-            }
+            attrs = {key: node[key] for key in _NODE_ATTR_KEYS if node.get(key) is not None}
             graph.add_node(node_id, **attrs)
             node_count += 1
 
@@ -110,6 +106,9 @@ class RehydrateMixin:
             resolution_origin = edge.get("resolution_origin")
             if resolution_origin:
                 edge_attrs["resolution_origin"] = resolution_origin
+            call_lines = edge.get("call_lines")
+            if call_lines:
+                edge_attrs["call_lines"] = list(call_lines)
             graph.add_edge(source, target, **edge_attrs)
             edge_count += 1
 

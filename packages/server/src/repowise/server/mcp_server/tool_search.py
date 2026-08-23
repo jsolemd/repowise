@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import re
 from collections.abc import Callable
 from typing import Any
@@ -21,6 +22,7 @@ from repowise.core.source_search import source_search_enabled
 from repowise.core.test_paths import is_test_path, is_test_related_path
 from repowise.server.mcp_server._answer_pipeline import _RRF_K, _RRF_SCORE_SCALE
 from repowise.server.mcp_server._helpers import (
+    _VECTOR_TIMEOUT_ENV,
     _get_exclude_spec,
     _get_repo,
     _is_path,
@@ -30,6 +32,7 @@ from repowise.server.mcp_server._helpers import (
     attach_ignored_arguments,
     filter_dicts_by_key,
     resolve_enum_argument,
+    vector_search_timeout_s,
 )
 from repowise.server.mcp_server._meta import build_meta as _build_meta
 from repowise.server.mcp_server._meta import federated_freshness
@@ -41,6 +44,8 @@ from repowise.server.mcp_server.tool_search_symbols import (
     search_symbols_single,
 )
 from repowise.server.source_search_wiring import mcp_coordinator
+
+_log = logging.getLogger("repowise.mcp.search")
 
 # Minimum relevance score below which results are dropped. Prevents
 # returning semantically unrelated pages when the corpus has no real match.
@@ -306,11 +311,15 @@ async def _non_decision_fallback(ctx, query: str, fetch_limit: int) -> list[dict
     src = "vector"
     # Skipped on a keyless index, which then falls through to the FTS branch.
     if store_has_semantic_vectors(ctx.vector_store):
-        with contextlib.suppress(TimeoutError, Exception):
+        try:
             results = await asyncio.wait_for(
                 ctx.vector_store.search(query, limit=fetch_limit * 4),
-                timeout=8.0,
+                timeout=vector_search_timeout_s(),
             )
+        except TimeoutError:
+            _log.warning("Vector re-fetch timed out; falling back to full-text")
+        except Exception:
+            _log.debug("Vector re-fetch failed; falling back to full-text", exc_info=True)
     if not results:
         src = "fts"
         with contextlib.suppress(Exception):
@@ -638,8 +647,22 @@ async def _safe_vector(ctx, query: str, limit: int) -> list:
     """
     if ctx.vector_store is None or not store_has_semantic_vectors(ctx.vector_store):
         return []
-    with contextlib.suppress(Exception):
-        return await asyncio.wait_for(ctx.vector_store.search(query, limit=limit), timeout=8.0)
+    try:
+        return await asyncio.wait_for(
+            ctx.vector_store.search(query, limit=limit), timeout=vector_search_timeout_s()
+        )
+    except TimeoutError:
+        # Not suppressed silently: a timeout here drops the whole semantic leg
+        # and the caller returns full-text-only hits that look like a normal
+        # result set, which is how #1678 read as "semantic search finds nothing".
+        _log.warning(
+            "Vector search exceeded its %gs budget; returning no semantic hits. "
+            "Raise it with %s=<seconds>.",
+            vector_search_timeout_s(),
+            _VECTOR_TIMEOUT_ENV,
+        )
+    except Exception:
+        _log.debug("Vector search failed; returning no semantic hits", exc_info=True)
     return []
 
 
