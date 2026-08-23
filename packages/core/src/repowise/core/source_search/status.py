@@ -115,6 +115,14 @@ class SourceIndexStatus:
     #: :attr:`stale_files`, which is the build's own account of files it tried
     #: to chunk and could not.
     working_tree: WorkingTreeDivergence = UNCHECKED
+    #: The active generation's own record of the uncommitted bytes it ingested,
+    #: path -> content hash, straight off the manifest. Answers a different
+    #: question from :attr:`working_tree`: not "what has moved since the build"
+    #: but "which paths did this build read dirty at all". Every build writes
+    #: it, which is what makes it the surface a consumer must ask — a full
+    #: rebuild writes nothing to ``state.json``, so a consumer reading that
+    #: file instead reports the emptiest answer on the dirtiest build.
+    working_tree_ingest: dict[str, str] = field(default_factory=dict)
     expected_chunks: int = 0
     fts_chunks: int | None = None
     vector_chunks: int | None = None
@@ -471,6 +479,7 @@ async def inspect_source_index(
         files_covered=manifest.files_covered if manifest else 0,
         stale_files=dict(manifest.stale_files) if manifest else {},
         working_tree=working_tree,
+        working_tree_ingest=ingest_record,
         expected_chunks=expected,
         fts_chunks=fts_count,
         vector_chunks=vector_count,

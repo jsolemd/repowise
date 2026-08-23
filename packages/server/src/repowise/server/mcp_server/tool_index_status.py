@@ -87,7 +87,18 @@ _MAX_LISTED_JOBS = 20
 # grow after the build and says nothing about what happened since. The second
 # is read live, per call, and is the only field here that can see an edit or a
 # deletion made after the index was published.
-_RECORDED_WORKING_TREE_SURFACE = "state.json working_tree_paths, recorded when the index was built"
+#
+# The recorded half is a union because neither store holds all of it. The
+# manifest's ``working_tree_ingest`` is written by *every* source-index build
+# and is authoritative for the generation being served, but it is derived from
+# ``git diff HEAD`` and so can never name an untracked file. ``state.json``'s
+# ``working_tree_paths`` does carry untracked paths, but only the update path
+# writes it — a full rebuild leaves it untouched, and reading it alone reports
+# nothing at all on the build that ingested the most uncommitted work.
+_RECORDED_WORKING_TREE_SURFACE = (
+    "manifest working_tree_ingest for the active generation, unioned with "
+    "state.json working_tree_paths from the last update"
+)
 _LIVE_WORKING_TREE_SURFACE = (
     "live git diff against HEAD, intersected with the active generation's indexed paths"
 )
@@ -320,6 +331,29 @@ def _working_tree_payload(
     }
 
 
+def _recorded_working_tree_paths(
+    status: SourceIndexStatus,
+    repo_state: dict[str, Any],
+) -> list[str]:
+    """Every path a build is known to have read uncommitted bytes for.
+
+    Both stores are read because each one is blind where the other sees.
+    Taking either alone is a denial rather than an absence of evidence: the
+    manifest cannot name an untracked file, and ``state.json`` is written only
+    by the update path, so a full rebuild leaves it saying nothing about the
+    very files it just ingested dirty.
+
+    Status mode and path mode share this so the list and the per-path verdict
+    can never disagree about the same checkout.
+    """
+
+    recorded = set(status.working_tree_ingest)
+    recorded.update(
+        str(path) for path in (repo_state.get("working_tree_paths") or []) if isinstance(path, str)
+    )
+    return sorted(recorded)
+
+
 def _repo_facts(repo_path: Path) -> tuple[str | None, dict[str, Any]]:
     """The two blocking repo reads a status payload needs, in one hop.
 
@@ -340,9 +374,7 @@ async def _status_payload(ctx: Any, repository: Any, *, started: float) -> tuple
         verify_stores=True,
     )
     head_commit, repo_state = await asyncio.to_thread(_repo_facts, repo_path)
-    all_working_tree_paths = sorted(
-        str(path) for path in (repo_state.get("working_tree_paths") or []) if isinstance(path, str)
-    )
+    all_working_tree_paths = _recorded_working_tree_paths(status, repo_state)
     # A grammar regression can mark every file in the repo stale, and the
     # working tree can be arbitrarily large. Both arrays are capped, and both
     # caps are disclosed: the exact total sits beside the listed slice and the
@@ -649,10 +681,7 @@ def _path_mode_payload(
     else:
         window_policy = window_eligible(normalized, indexed_symbols=0)
 
-    working_tree_paths = {
-        str(path) for path in (repo_state.get("working_tree_paths") or []) if isinstance(path, str)
-    }
-    working_tree_indexed = normalized in working_tree_paths
+    working_tree_indexed = normalized in set(_recorded_working_tree_paths(status, repo_state))
     parser_lane = parser_policy and traversal_eligible is True
     if window_policy is True:
         if indexed is True or working_tree_indexed or tracked is True:
