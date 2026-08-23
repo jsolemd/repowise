@@ -267,6 +267,18 @@ COUNT_CLAIMS: tuple[tuple[str, str, str], ...] = (
         "plus {w} more by default",
     ),
     ("packages/cli/src/repowise/cli/commands/mcp_cmd.py", "opt_in", "{W} more are opt-in"),
+    # The opt-in count was published in four more places that no row guarded;
+    # they went stale silently in the B2 wave. The package docstring row pins
+    # the sentence that also enumerates the opt-in tools by name.
+    ("docs/agent/MCP_TOOLS.md", "opt_in", "{W} further tools are off by default everywhere"),
+    ("docs/agent/MCP_TOOLS.md", "opt_in", "(off by default everywhere, {n})"),
+    ("website/mcp-server.md", "opt_in", "and {w} opt-in tools."),
+    ("packages/server/README.md", "opt_in", "{w} further tools are opt-in"),
+    (
+        "packages/server/src/repowise/server/mcp_server/__init__.py",
+        "opt_in",
+        "{W} further tools (get_dependents,",
+    ),
     # The lean count is written twice in this file, in the --tools help and in
     # the worked example. One row matching either would let the other go stale,
     # so each occurrence is pinned by the text around it.

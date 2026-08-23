@@ -470,6 +470,60 @@ async def persist_incremental_symbols(
     await reconcile_symbols_for_files(session, repo_id, reconcile_paths, symbols)
 
 
+def _repo_root_from_parsed(parsed_files: list[Any]) -> Path | None:
+    """Recover the repo root from a ParsedFile's absolute/relative path pair."""
+    for parsed_file in parsed_files:
+        info = parsed_file.file_info
+        abs_path, rel = str(info.abs_path), str(info.path)
+        if rel and abs_path.endswith(rel):
+            return Path(abs_path[: -len(rel)])
+    return None
+
+
+async def persist_reference_sites(
+    session: Any,
+    repo_id: str,
+    parsed_files: list[Any],
+    repo_path: Path | str | None = None,
+) -> int:
+    """Refresh the reference-site store from the parse this run already did.
+
+    Rides the pipeline's own ``ParsedFile`` list through the
+    ``build_universe``/``extract_sites`` seams, so the store never pays for a
+    second parse; only the source bytes are re-read, because the callers that
+    hold them do not all thread them here. Always a full replace, never scoped
+    to changed files: a moved definition re-binds sites in files that did not
+    themselves change, which a per-file refresh would leave stale.
+
+    Returns the number of sites written.
+    """
+    from repowise.core.refsites.pipeline import extract_sites, measure_coverage
+    from repowise.core.refsites.records import ExtractionResult
+    from repowise.core.refsites.store import SqlReferenceSiteStore
+    from repowise.core.refsites.universe import build_universe
+
+    root = Path(repo_path) if repo_path is not None else _repo_root_from_parsed(parsed_files)
+    if root is None:
+        raise ValueError("reference-site refresh could not derive the repository root")
+
+    sources: dict[str, str] = {}
+    for parsed_file in parsed_files:
+        info = parsed_file.file_info
+        try:
+            raw = Path(info.abs_path).read_bytes()
+        except OSError:
+            continue
+        # Positions in the refsites package are character offsets, so this
+        # decode must match its lexer's: utf-8 with replacement, never bytes.
+        sources[info.path] = raw.decode("utf-8", errors="replace")
+
+    universe = build_universe(root, parsed_files)
+    sites = extract_sites(parsed_files, sources, universe)
+    result = ExtractionResult(sites=sites, coverage=measure_coverage(parsed_files, sites))
+    await SqlReferenceSiteStore(session).replace_repository(repo_id, result)
+    return len(sites)
+
+
 def _changed_file_edges(
     graph_builder: Any,
     parsed_files: list[Any] | None,
@@ -1836,6 +1890,14 @@ async def persist_pipeline_result(
     await persist_git(result, session, repo_id)
     await persist_analysis(result, session, repo_id)
     await persist_generation(result, session, repo_id)
+
+    # Refresh the reference-site store from this run's own parse. Best-effort:
+    # the store serves two opt-in tools, so its failure must degrade to a log
+    # line rather than fail the whole index.
+    try:
+        await persist_reference_sites(session, repo_id, result.parsed_files)
+    except Exception as exc:
+        logger.warning("reference_sites_persist_skipped", error=str(exc))
 
     # Sweep structurally-keyed generated pages (module/layer/scc) that this
     # run did not reproduce — their ids drift between runs, so without the

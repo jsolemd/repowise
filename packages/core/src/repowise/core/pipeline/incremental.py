@@ -1357,6 +1357,21 @@ async def persist_incremental_index(
                 _skip("Symbol persist", exc, range_scoped=True)
                 source_symbol_error = str(exc)
 
+            # Refresh the reference-site store from this rebuild's own parse.
+            # Deliberately a full replace, not scoped to changed_paths: a moved
+            # definition re-binds sites in files that did not themselves
+            # change. Whole-repo re-derive, so it heals on the next update and
+            # is not range-scoped.
+            if parsed_files:
+                try:
+                    from repowise.core.pipeline.persist import persist_reference_sites
+
+                    await persist_reference_sites(
+                        session, repo_id, parsed_files, repo_path=repo_path
+                    )
+                except Exception as exc:
+                    _skip("Reference sites persist", exc)
+
             # Refresh graph_edges for the changed files. The full-init path was
             # historically the only writer of edges, so adjacency froze at the
             # last full index: new imports/calls stayed invisible and dropped

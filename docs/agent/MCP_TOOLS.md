@@ -2,7 +2,7 @@
 
 repowise exposes a curated set of tools via the [Model Context Protocol](https://modelcontextprotocol.io) (MCP). These tools give AI coding assistants (Claude Code, Codex, Cursor, Cline, Windsurf) structured access to your codebase intelligence: dependency graph, git history, documentation, and architectural decisions.
 
-27 tools are registered in total. A single-repo server advertises 12 by default: the eleven flagship tools below plus `list_repos`. Workspace mode adds 2 more automatically (`get_architecture`, `get_blast_radius`), for 14. Thirteen further tools are off by default everywhere and must be opted in. The surface is configurable; see [Configuring the tool surface](#configuring-the-tool-surface).
+29 tools are registered in total. A single-repo server advertises 12 by default: the eleven flagship tools below plus `list_repos`. Workspace mode adds 2 more automatically (`get_architecture`, `get_blast_radius`), for 14. Fifteen further tools are off by default everywhere and must be opted in. The surface is configurable; see [Configuring the tool surface](#configuring-the-tool-surface).
 
 **Start the MCP server:**
 
@@ -38,7 +38,7 @@ repowise mcp --transport sse --port 7338 # legacy SSE transport
 [get_architecture](#get_architecture) &middot;
 [get_blast_radius](#get_blast_radius)
 
-**Opt-in tools (off by default everywhere, 13)**
+**Opt-in tools (off by default everywhere, 15)**
 [get_dependents](#get_dependents) &middot;
 [get_dependency_path](#get_dependency_path) &middot;
 [get_execution_flows](#get_execution_flows) &middot;
@@ -51,7 +51,9 @@ repowise mcp --transport sse --port 7338 # legacy SSE transport
 [find_clones](#find_clones) &middot;
 [find_patterns](#find_patterns) &middot;
 [get_query_quality](#get_query_quality) &middot;
-[manage_decision](#manage_decision)
+[manage_decision](#manage_decision) &middot;
+[get_reference_sites](#get_reference_sites) &middot;
+[preview_symbol_rename](#preview_symbol_rename)
 
 Also see [Configuring the tool surface](#configuring-the-tool-surface), [Reversible truncation](#reversible-truncation-_metaomitted) and [Unrecognised arguments](#unrecognised-arguments-ignored_arguments).
 
@@ -83,7 +85,7 @@ The default surface is deliberately small: fewer, richer tools mean fewer round-
 
 - **Default (single-repo):** 12 tools, the eleven flagship tools plus `list_repos`.
 - **Default (workspace):** those 12 plus `get_architecture` and `get_blast_radius`, added automatically when the server starts inside a workspace. They are never advertised outside one.
-- **Opt-in tools:** `get_dependents`, `get_dependency_path`, `get_execution_flows`, `generate_refactoring_code`, `get_conformance`, `reindex_repository`, `build_task_slice`, `get_task_slice`, `extend_task_slice`, `get_query_quality`, `find_clones`, `find_patterns`, and `manage_decision` are registered but off by default. Turn them on per repo; `get_conformance` only does useful work in workspace mode (name it there), and `manage_decision` only where a decision journal is configured. `reindex_repository` remains separate from the default read surface because it starts background work.
+- **Opt-in tools:** `get_dependents`, `get_dependency_path`, `get_execution_flows`, `generate_refactoring_code`, `get_conformance`, `reindex_repository`, `build_task_slice`, `get_task_slice`, `extend_task_slice`, `get_query_quality`, `find_clones`, `find_patterns`, `manage_decision`, `get_reference_sites`, and `preview_symbol_rename` are registered but off by default. Turn them on per repo; `get_conformance` only does useful work in workspace mode (name it there), and `manage_decision` only where a decision journal is configured. `reindex_repository` remains separate from the default read surface because it starts background work.
 
 **Configure it in `.repowise/config.yaml`** under an `mcp.tools` key. Four shapes are supported:
 
@@ -1395,6 +1397,59 @@ manage_decision(action="list", status="proposed")
 manage_decision(action="confirm", decision_id="dec-a1b2c3d4", actor="jon")
 manage_decision(action="supersede", decision_id="dec-a1b2c3d4",
                 superseded_by="dec-e5f6a7b8", actor="jon")
+```
+
+---
+
+#### `get_reference_sites`
+
+Every recorded occurrence of a symbol, with its position, kind and resolution confidence.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `target` | string | Yes | Symbol id (`path::Name`) or an unambiguous bare symbol name |
+| `repo` | string | No | *(workspace only)* Target repo alias; `"all"` is not supported |
+| `kinds` | list[string] | No | Restrict to these reference kinds (`call`, `definition`, `import`, `import_binding`, `receiver`, `reexport`, `type_ref`, `heritage`, `reference`, `identifier`, `string_ref`); omit for all |
+| `min_confidence` | float | No | Drop sites below this rubric confidence, 0.0-1.0 (default 0.0) |
+| `offset` | int | No | Zero-based result offset (default 0) |
+| `limit` | int | No | Page size, clamped to 1-500 (default 50) |
+
+**Returns:** one entry per *occurrence*, not per relation. Four calls in one file are four entries with distinct columns, where `get_dependents` reports a single aggregated edge. Each site carries `start_line`/`start_col`/`end_line`/`end_col`, `range_exact` (false means only the line is trusted), `kind`, `origin`, `confidence`, `tier` (`ast` or `textual`), and `occurrence_index` — non-zero marks a site the parse layer's same-line dedup would have dropped. Occurrences that could not be bound to a definition are returned at low confidence rather than omitted, and counted in `unbound`.
+
+`confidence` is the probability that renaming the resolved target must edit this site. It is not a relevance score and must not be compared against search ranking.
+
+Every response carries a `coverage` block: the languages this build declares, what was actually observed in this repository, and `uncovered_languages_present`. An empty `sites` list always comes with a `status` — `not_indexed`, `not_found`, `ambiguous`, or `coverage_limited` — so it is never ambiguous which of those reasons produced it.
+
+**When to use:** before a rename or a signature change, when you need the call sites themselves rather than the fact that a dependency exists.
+
+```
+get_reference_sites(target="src/calc.ts::computeTotal")
+get_reference_sites(target="computeTotal", kinds=["call"], min_confidence=0.9)
+```
+
+---
+
+#### `preview_symbol_rename`
+
+Every site a rename would touch, with per-site confidence. Reports only — it changes nothing.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `symbol` | string | Yes | Symbol id (`path::Name`) or an unambiguous bare symbol name |
+| `new_name` | string | No | Proposed name; used only to report collisions, never written |
+| `repo` | string | No | *(workspace only)* Target repo alias; `"all"` is not supported |
+| `min_confidence` | float | No | Drop sites below this rubric confidence, 0.0-1.0 (default 0.0) |
+| `limit` | int | No | Maximum sites to return, clamped to 1-500 |
+
+**Returns:** sites bound to the symbol first at their resolution confidence, then sites that merely spell the same name and bind to nothing — an ambiguous global, an unresolved call, a name inside a string literal. `mechanically_safe` marks the difference: true only when confidence clears 0.90 *and* the column range was verified, i.e. a rewriter could patch the site unattended. `summary.needs_review` counts the rest. `applies_changes` is `false` in the payload itself, so a caller cannot infer an apply path from a clean preview.
+
+**`caveats` is the part to read before acting.** It names any language present in the repository that produces no reference sites at all, any partial-coverage language, any site whose column range could not be verified, a missing definition site, and any collision with `new_name`.
+
+**When to use:** to size a rename before doing it, and to see which sites a mechanical rewrite cannot safely own.
+
+```
+preview_symbol_rename(symbol="src/calc.ts::computeTotal")
+preview_symbol_rename(symbol="computeTotal", new_name="totalOf")
 ```
 
 ---

@@ -1618,3 +1618,8 @@ class PipelineJob(Base):
     )
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     metadata_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+
+
+# Reference-site tables live in core.refsites.schema; importing it here puts
+# them in Base.metadata so init_db creates them like every other table.
+from repowise.core.refsites import schema as _refsites_schema  # noqa: E402,F401

@@ -290,6 +290,12 @@ def test_wiki_symbol_unique_constraint_defined():
 
 
 def test_base_includes_all_models():
+    # A table reaches ``Base.metadata`` only once its module is imported, and
+    # nothing in the persistence package imports refsites. Naming it here keeps
+    # this inventory deterministic: without the import the expected set would
+    # match or not depending on which other test module happened to load first.
+    from repowise.core.refsites import schema as _refsites_schema  # noqa: F401
+
     table_names = set(Base.metadata.tables.keys())
     expected = {
         "repositories",
@@ -331,5 +337,12 @@ def test_base_includes_all_models():
         # Source-search lifecycle ledger: the transactional outbox that records
         # every index update and its generation.
         "source_index_updates",
+        # Reference sites: one row per occurrence of a name, with its position
+        # and resolution confidence, plus the measured per-language coverage
+        # that keeps an unreadable language from reading as an unreferenced
+        # symbol. A separate store from the graph, deliberately not an
+        # extension of graph_edges.
+        "reference_sites",
+        "reference_site_coverage",
     }
     assert expected == table_names

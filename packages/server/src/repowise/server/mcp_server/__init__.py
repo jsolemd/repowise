@@ -4,10 +4,11 @@ By default a single-repo server exposes twelve tools (get_answer, get_context,
 get_symbol, search_codebase, get_overview, get_risk, get_change_risk, get_why,
 get_dead_code, get_health, get_index_status, list_repos); two more
 (get_blast_radius, get_architecture) are added automatically in workspace mode.
-Thirteen further tools (get_dependents, get_dependency_path,
+Fifteen further tools (get_dependents, get_dependency_path,
 get_execution_flows, generate_refactoring_code, get_conformance,
 reindex_repository, build_task_slice, get_task_slice, extend_task_slice,
-get_query_quality, find_clones, find_patterns, manage_decision) are registered
+get_query_quality, find_clones, find_patterns, manage_decision,
+get_reference_sites, preview_symbol_rename) are registered
 but off by default and can be opted in via the ``mcp.tools`` config block or the
 ``repowise mcp --tools`` flag; get_conformance only does useful work in workspace
 mode, and manage_decision only where a decision journal is configured. The
@@ -18,7 +19,7 @@ Supports stdio transport (Claude Code, Cursor, Cline), streamable HTTP, and
 legacy SSE transport.
 
 Tool modules load lazily (see :func:`ensure_full_surface`), so importing this
-package, or one tool out of it, does not drag in the other twenty-three modules.
+package, or one tool out of it, does not drag in the other twenty-four modules.
 
 Usage:
     repowise mcp --transport stdio  # for Claude Code / Cursor / Cline
@@ -75,12 +76,14 @@ _TOOL_MODULES: dict[str, str] = {
     "get_index_status": "tool_index_status",
     "get_overview": "tool_overview",
     "get_query_quality": "tool_query_report",
+    "get_reference_sites": "tool_refsites",
     "get_risk": "tool_risk",
     "get_symbol": "tool_symbol",
     "get_task_slice": "tool_slices",
     "get_why": "tool_why",
     "list_repos": "tool_repos",
     "manage_decision": "tool_decisions",
+    "preview_symbol_rename": "tool_refsites",
     "reindex_repository": "tool_index_status",
     "search_codebase": "tool_search",
 }
@@ -265,6 +268,7 @@ __all__ = [
     "get_index_status",
     "get_overview",
     "get_query_quality",
+    "get_reference_sites",
     "get_risk",
     "get_symbol",
     "get_task_slice",
@@ -272,6 +276,7 @@ __all__ = [
     "list_repos",
     "manage_decision",
     "mcp",
+    "preview_symbol_rename",
     "reindex_repository",
     "run_mcp",
     "search_codebase",
