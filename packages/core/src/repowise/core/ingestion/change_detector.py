@@ -125,8 +125,22 @@ class ChangeDetector:
     ) -> list[FileDiff]:
         """Return a list of FileDiff objects for files changed between *base_ref* and *until_ref*.
 
-        Falls back to an empty list if the directory is not a git repo or the
-        refs don't exist.
+        Falls back to an empty list if the directory is not a git repo, or if
+        either ref fails to resolve to a *commit* — which every caller reads as
+        "nothing changed", not as "I could not look".
+
+        That conflation has a sharp edge worth naming: git's empty-tree sha
+        (``4b825dc6…``) is the standard way to ask ``git diff`` for the whole
+        tree, but it is a tree, not a commit, so ``repo.commit()`` rejects it
+        and this reports a clean range. To force a full-tree diff, wrap it in a
+        commit first — ``git commit-tree 4b825dc6… -m x`` — and pass that.
+        ``tests/unit/ingestion/test_change_detector_since_refs.py`` pins both.
+
+        The fallback stays soft because the workspace updater and the server
+        job executor pass a *stored* pointer that a rebase or a gc can
+        legitimately invalidate, and both are written to self-heal rather than
+        fail. Making a person-supplied ``--since`` loud is worth doing, but it
+        belongs at the CLI boundary that can tell the two apart, not here.
         """
         repo = self._get_repo()
         if repo is None:
