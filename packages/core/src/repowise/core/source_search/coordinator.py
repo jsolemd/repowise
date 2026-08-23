@@ -76,6 +76,7 @@ __all__ = [
     "LEG_WIKI_DENSE",
     "LEG_WIKI_LEXICAL",
     "LEXICAL_WEIGHT",
+    "MAX_CONTAINED_SYMBOLS",
     "MIN_SUFFIX_SEGMENTS",
     "MIN_TAIL_CHARS",
     "NO_MATCH_CONCEPT_COVERAGE",
@@ -88,6 +89,7 @@ __all__ = [
     "SourceSearchCoordinator",
     "WikiFullTextSearch",
     "WikiVectorStore",
+    "symbol_path_of",
 ]
 
 log = logging.getLogger(__name__)
@@ -640,6 +642,50 @@ class QueryIntent:
         )
 
 
+#: A collision-disambiguated symbol id ends in ``~`` plus eight hex digits,
+#: optionally ``-N`` for a same-signature group (see the parser's
+#: ``_finalize_symbol_parentage``). Anchored at the end because that is where
+#: the parser appends it, and matched narrowly rather than splitting on the
+#: first ``~``: a C++ destructor is legitimately named ``~Foo``, and a naive
+#: split would erase it. The residual ambiguity — a destructor of a class
+#: whose name is itself eight hex characters — resolves toward dropping a name
+#: rather than inventing one, which is the direction this whole path errs in.
+_ID_DISCRIMINATOR_RE = re.compile(r"~[0-9a-f]{8}(?:-\d+)?$")
+
+#: How many contained symbol names one row may carry. A class chunk can
+#: enclose dozens of retrieved methods, and a response that listed all of them
+#: would bury the row it is annotating. Taken in rank order, so the cap keeps
+#: the most relevant names rather than the topmost ones.
+MAX_CONTAINED_SYMBOLS = 8
+
+
+def symbol_path_of(target_id: str, file_path: str) -> str:
+    """The ``Outer::inner`` chain *target_id* names, relative to its file.
+
+    A symbol chunk's id is ``path::Outer::inner`` (the parser builds it from
+    the lexical ancestry), so the chain is already present and only has to be
+    read off. The file half is dropped because the row serves it separately as
+    ``file``/``target_path``, and repeating it would make the field a second
+    spelling of the id rather than an answer to "which symbol is this".
+
+    Empty when the id names no symbol: a file window's id is
+    ``file:<path>:<start>-<end>``, which has no chain, and a wiki page outside
+    the symbol page types names a module or a repository rather than a symbol.
+    """
+    if not target_id:
+        return ""
+    head, sep, chain = target_id.partition("::")
+    if not sep or not chain:
+        return ""
+    # Guard against reading a chain out of an id that merely contains "::"
+    # without being file-qualified. The file half must be the file this row is
+    # already standing behind, or the two halves are describing different
+    # things and the chain is not this row's to serve.
+    if file_path and head != file_path:
+        return ""
+    return _ID_DISCRIMINATOR_RE.sub("", chain)
+
+
 @dataclass(slots=True, eq=False)
 class _Item:
     """One candidate, carrying every signal that ranked it.
@@ -685,6 +731,11 @@ class _Item:
     #: A wiki page's own primary key, carried verbatim from the retriever.
     #: Empty for a source chunk, which is identified by its file and lines.
     page_id: str = ""
+    #: Symbol chains this row's span *contains* but does not itself name —
+    #: the nested definitions a reader would otherwise have to find by eye.
+    #: Purely a citation: filled in after the owner is chosen, and never read
+    #: by ranking. See :meth:`SourceSearchCoordinator._name_contained_symbols`.
+    contains: tuple[str, ...] = ()
     fused_score: float = 0.0
     evidence_profile: _CandidateEvidence | None = None
 
@@ -720,6 +771,19 @@ class _Item:
         if self.start_line is not None and self.end_line is not None:
             out["start_line"] = self.start_line
             out["end_line"] = self.end_line
+        # Which symbol this row *is*. Present only when the id proves it, so a
+        # reader can tell "this row is the nested helper" from "this row is the
+        # function around it" without parsing a snippet. ``name`` alone cannot
+        # say that: a nested symbol and its enclosing one both serve a bare
+        # identifier, and for a file window ``name`` is the file's basename.
+        if symbol_path := symbol_path_of(self.target_id, self.file):
+            out["symbol_path"] = symbol_path
+        # Which symbols this row *contains*. A different claim from the one
+        # above and kept in a different key for that reason: a row that names
+        # its own symbol is standing behind it, and a row that lists what its
+        # span encloses is pointing further in.
+        if self.contains:
+            out["contains_symbols"] = list(self.contains)
         if self.lane == LANE_WIKI and self.page_id:
             # The only identity a page type outside ``_FILE_BACKED_PAGE_TYPES``
             # has. A module page, an SCC page or a repo overview serves
@@ -1097,6 +1161,8 @@ class SourceSearchCoordinator:
             confidence = CAUTION
         # Last, and after the owner: see :meth:`_upgrade_line_evidence`.
         self._upgrade_line_evidence(window, ranked)
+        # After the upgrade, so it annotates the rows that are actually served.
+        self._name_contained_symbols(window, ranked)
         latency_ms = (time.perf_counter() - started) * 1000.0
 
         response = self._envelope(
@@ -1534,6 +1600,66 @@ class SourceSearchCoordinator:
             candidate = best_with_lines.get(item.file) if item.file else None
             if candidate is not None and _shows_lines_better(item, candidate):
                 window[position] = candidate
+
+    @staticmethod
+    def _name_contained_symbols(window: Sequence[_Item], ranked: Sequence[_Item]) -> None:
+        """Name the nested symbols a served row encloses but does not itself name.
+
+        Deduplication keeps one row per file, so when a conceptual query
+        retrieves both a function and a helper defined inside it, the enclosing
+        chunk wins the fusion and the helper is dropped — and the row that
+        survives names only the outer function. The helper was retrieved, it is
+        why the file scored, and the reader is left to find it by eye.
+
+        This puts the discarded rival's name back onto the row that displaced
+        it. Only the name: the kept row, its position, and every ranking input
+        are untouched, exactly as :meth:`_upgrade_line_evidence` re-cites
+        without re-ranking. Within one file the deduplication keeps exactly one
+        item, so "every other retrieved item for this file" *is* the set of
+        discarded rivals — which is why this reads ``ranked`` rather than
+        tracking losers through the dedupe.
+
+        Runs after :meth:`_upgrade_line_evidence`, and that ordering matters:
+        the upgrade can re-seat a file onto a different item, and naming before
+        it would annotate a row that never reaches the caller.
+
+        Two proofs are required, never one. Line containment says the rival
+        lies inside the span this row is standing behind. When the row names a
+        symbol of its own, the rival's chain must also extend it, which is the
+        parser's own statement of lexical nesting — so a sibling whose span
+        merely overlaps cannot be claimed as something this row contains. A
+        file window names no symbol, so for one of those containment is the
+        only proof available, and it is the right one: a window's claim is
+        about its lines.
+        """
+        by_file: dict[str, list[_Item]] = {}
+        for item in ranked:
+            if item.lane == LANE_SOURCE and item.file and item.start_line is not None:
+                by_file.setdefault(item.file, []).append(item)
+
+        for served in window:
+            if not served.file or served.start_line is None or served.end_line is None:
+                continue
+            own = symbol_path_of(served.target_id, served.file)
+            names: list[str] = []
+            for rival in by_file.get(served.file, ()):
+                if rival is served or rival.start_line is None or rival.end_line is None:
+                    continue
+                chain = symbol_path_of(rival.target_id, rival.file)
+                if not chain or chain == own:
+                    continue
+                if not (
+                    served.start_line <= rival.start_line and rival.end_line <= served.end_line
+                ):
+                    continue
+                if own and not chain.startswith(f"{own}::"):
+                    continue
+                if chain not in names:
+                    names.append(chain)
+                if len(names) >= MAX_CONTAINED_SYMBOLS:
+                    break
+            if names:
+                served.contains = tuple(names)
 
     # -- owner and confidence ---------------------------------------------
 

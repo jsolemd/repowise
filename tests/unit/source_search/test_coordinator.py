@@ -141,14 +141,16 @@ def _hit(
     source: str = "symbol",
     snippet: str = "",
     chunk_id: str | None = None,
+    start_line: int = 1,
+    end_line: int = 9,
 ) -> SourceChunkHit:
     return SourceChunkHit(
         chunk_id=chunk_id or f"{path}::{name}",
         file_path=path,
         name=name,
         kind=kind,
-        start_line=1,
-        end_line=9,
+        start_line=start_line,
+        end_line=end_line,
         is_test=is_test,
         source=source,
         content_hash="h",
@@ -1974,3 +1976,367 @@ async def test_a_log_that_cannot_be_written_does_not_fail_the_search(tmp_path):
     (tmp_path / "log.jsonl").mkdir()
     response = await coordinator.search("how alpha works", limit=5)
     assert response["results"]
+
+
+# ---------------------------------------------------------------------------
+# Naming the symbol a row actually lands in
+# ---------------------------------------------------------------------------
+#
+# A nested definition is indexed as its own chunk with a full ``::`` chain, so
+# on a bare-identifier query it is promoted and served under its own name. On a
+# conceptual query it is not: the enclosing chunk wins the fusion, per-file
+# deduplication keeps one row, and the helper that made the file relevant
+# disappears from the answer. These lock the naming that puts it back — and
+# that it is only naming, with nothing kept or ordered differently.
+#
+# The fixture shapes are drawn from real cases: a helper closure inside a
+# ranking function, a local function inside a builder component, and a guard
+# closure inside a reducer.
+
+
+def _nested_pair(
+    path: str,
+    outer: str,
+    inner: str,
+    *,
+    outer_span: tuple[int, int] = (100, 140),
+    inner_span: tuple[int, int] = (110, 118),
+    outer_score: float = 0.72,
+    inner_score: float = 0.55,
+) -> tuple[SourceChunkHit, SourceChunkHit]:
+    """An enclosing symbol chunk and the nested one defined inside it.
+
+    Scored so the enclosing chunk wins the fusion, which is the conceptual-query
+    shape this section is about: both are retrieved, one survives dedupe.
+    """
+    enclosing = _hit(
+        outer,
+        path,
+        outer_score,
+        chunk_id=f"{path}::{outer}",
+        start_line=outer_span[0],
+        end_line=outer_span[1],
+        snippet=f"def {outer}(...):\n    def {inner}(...): ...",
+    )
+    nested = _hit(
+        inner,
+        path,
+        inner_score,
+        chunk_id=f"{path}::{outer}::{inner}",
+        start_line=inner_span[0],
+        end_line=inner_span[1],
+        snippet=f"def {inner}(...): ...",
+    )
+    return enclosing, nested
+
+
+def _row_for(response: dict, path: str) -> dict:
+    for row in response["results"]:
+        if row["file"] == path:
+            return row
+    raise AssertionError(f"no served row for {path}: {_files(response)}")
+
+
+async def test_a_symbol_row_names_the_symbol_it_is(tmp_path):
+    """``symbol_path`` carries the chain, so a nested row says which one it is."""
+    path = "codeatlas/code_search/diversify.py"
+    enclosing, nested = _nested_pair(path, "mmr_diversify", "_sim")
+    coordinator = _coordinator(
+        tmp_path,
+        source_dense=[nested, enclosing],
+        records={hit.chunk_id: _record(hit) for hit in (enclosing, nested)},
+    )
+
+    response = await coordinator.search("_sim", limit=5)
+
+    row = _row_for(response, path)
+    assert row["symbol_path"] == "mmr_diversify::_sim"
+    # The row *is* the helper, so it contains nothing further down.
+    assert "contains_symbols" not in row
+
+
+async def test_an_enclosing_row_names_the_nested_rival_it_displaced(tmp_path):
+    """The helper closure shape: `_sim` inside `mmr_diversify`, conceptual query.
+
+    Both chunks are retrieved and both are for one file, so deduplication keeps
+    the enclosing one and drops the helper. The served row has to say the
+    helper is in there.
+    """
+    path = "codeatlas/code_search/diversify.py"
+    enclosing, nested = _nested_pair(path, "mmr_diversify", "_sim")
+    coordinator = _coordinator(
+        tmp_path,
+        source_dense=[enclosing, nested],
+        source_lexical=[_FTSHit(enclosing.chunk_id, path), _FTSHit(nested.chunk_id, path)],
+        records={hit.chunk_id: _record(hit) for hit in (enclosing, nested)},
+    )
+
+    response = await coordinator.search(
+        "how are ranked results diversified to avoid near duplicates", limit=5
+    )
+
+    row = _row_for(response, path)
+    assert row["symbol_path"] == "mmr_diversify"
+    assert row["contains_symbols"] == ["mmr_diversify::_sim"]
+
+
+async def test_a_local_function_in_a_builder_is_named_on_the_builder(tmp_path):
+    """The tsx shape: `weaveTo` declared inside `buildThreads`."""
+    path = "src/features/about/ConnectiveThreads.tsx"
+    enclosing, nested = _nested_pair(
+        path, "buildThreads", "weaveTo", outer_span=(40, 90), inner_span=(55, 70)
+    )
+    coordinator = _coordinator(
+        tmp_path,
+        source_dense=[enclosing, nested],
+        source_lexical=[_FTSHit(enclosing.chunk_id, path), _FTSHit(nested.chunk_id, path)],
+        records={hit.chunk_id: _record(hit) for hit in (enclosing, nested)},
+    )
+
+    response = await coordinator.search(
+        "how are the connective threads between sections built", limit=5
+    )
+
+    assert _row_for(response, path)["contains_symbols"] == ["buildThreads::weaveTo"]
+
+
+async def test_a_guard_closure_in_a_reducer_is_named_on_the_reducer(tmp_path):
+    """The reducer shape: a `valid` closure inside `folderFanReducer`."""
+    path = "src/features/folders/folder-fan-state.ts"
+    enclosing, nested = _nested_pair(
+        path, "folderFanReducer", "valid", outer_span=(10, 80), inner_span=(20, 30)
+    )
+    coordinator = _coordinator(
+        tmp_path,
+        source_dense=[enclosing, nested],
+        source_lexical=[_FTSHit(enclosing.chunk_id, path), _FTSHit(nested.chunk_id, path)],
+        records={hit.chunk_id: _record(hit) for hit in (enclosing, nested)},
+    )
+
+    response = await coordinator.search("what keeps the folder fan state consistent", limit=5)
+
+    assert _row_for(response, path)["contains_symbols"] == ["folderFanReducer::valid"]
+
+
+async def test_a_file_window_names_the_definitions_inside_its_span(tmp_path):
+    """A window names no symbol of its own, so containment is the only proof."""
+    path = "codeatlas/code_search/queries_flows.py"
+    window = _hit(
+        "queries_flows.py",
+        path,
+        0.71,
+        kind="file_window",
+        source="file_window",
+        chunk_id=f"file:{path}:1-160",
+        start_line=1,
+        end_line=160,
+        snippet="# file_window: 1-160",
+    )
+    nested = _hit(
+        "_choose_flow_name",
+        path,
+        0.5,
+        chunk_id=f"{path}::detect_and_persist_flows::_choose_flow_name",
+        start_line=110,
+        end_line=118,
+    )
+    coordinator = _coordinator(
+        tmp_path,
+        source_dense=[window, nested],
+        source_lexical=[_FTSHit(window.chunk_id, path), _FTSHit(nested.chunk_id, path)],
+        records={hit.chunk_id: _record(hit) for hit in (window, nested)},
+    )
+
+    response = await coordinator.search("how is a flow given its name", limit=5)
+
+    row = _row_for(response, path)
+    assert "symbol_path" not in row
+    assert row["contains_symbols"] == ["detect_and_persist_flows::_choose_flow_name"]
+
+
+async def test_a_nested_row_that_already_wins_keeps_its_own_name(tmp_path):
+    """The already-passing shape must not regress into being called its parent."""
+    path = "codeatlas/code_search/queries_flows.py"
+    enclosing, nested = _nested_pair(
+        path,
+        "detect_and_persist_flows",
+        "_choose_flow_name",
+        outer_score=0.4,
+        inner_score=0.9,
+    )
+    coordinator = _coordinator(
+        tmp_path,
+        source_dense=[nested, enclosing],
+        source_lexical=[_FTSHit(nested.chunk_id, path)],
+        records={hit.chunk_id: _record(hit) for hit in (enclosing, nested)},
+    )
+
+    response = await coordinator.search("_choose_flow_name", limit=5)
+
+    row = _row_for(response, path)
+    assert row["name"] == "_choose_flow_name"
+    assert row["symbol_path"] == "detect_and_persist_flows::_choose_flow_name"
+
+
+async def test_a_ts_local_function_that_already_wins_keeps_its_own_name(tmp_path):
+    """The other already-passing shape: `gaussian` inside `clusterBallSampler`."""
+    path = "src/graph/layout/position-initializers.ts"
+    enclosing, nested = _nested_pair(
+        path, "clusterBallSampler", "gaussian", outer_score=0.4, inner_score=0.9
+    )
+    coordinator = _coordinator(
+        tmp_path,
+        source_dense=[nested, enclosing],
+        source_lexical=[_FTSHit(nested.chunk_id, path)],
+        records={hit.chunk_id: _record(hit) for hit in (enclosing, nested)},
+    )
+
+    response = await coordinator.search("gaussian", limit=5)
+
+    row = _row_for(response, path)
+    assert row["symbol_path"] == "clusterBallSampler::gaussian"
+
+
+async def test_a_disambiguated_id_does_not_carry_its_discriminator(tmp_path):
+    """Two same-named nested symbols get ``~<hash>`` ids; the name is the name."""
+    path = "src/a.py"
+    nested = _hit(
+        "inner",
+        path,
+        0.8,
+        chunk_id=f"{path}::outer::inner~deadbeef",
+        start_line=10,
+        end_line=20,
+    )
+    coordinator = _coordinator(
+        tmp_path, source_dense=[nested], records={nested.chunk_id: _record(nested)}
+    )
+
+    response = await coordinator.search("inner", limit=5)
+
+    assert _row_for(response, path)["symbol_path"] == "outer::inner"
+
+
+async def test_a_destructor_keeps_its_leading_tilde(tmp_path):
+    """``~Foo`` is a name, not a discriminator: stripping it would erase the symbol."""
+    path = "src/a.cpp"
+    dtor = _hit("~Foo", path, 0.8, chunk_id=f"{path}::Foo::~Foo", start_line=10, end_line=20)
+    coordinator = _coordinator(
+        tmp_path, source_dense=[dtor], records={dtor.chunk_id: _record(dtor)}
+    )
+
+    response = await coordinator.search("how is Foo torn down", limit=5)
+
+    assert _row_for(response, path)["symbol_path"] == "Foo::~Foo"
+
+
+async def test_a_neighbour_is_not_claimed_as_something_the_row_contains(tmp_path):
+    """Line containment alone is not enough when the row names a symbol of its own."""
+    path = "src/a.py"
+    outer = _hit("Outer", path, 0.8, chunk_id=f"{path}::Outer", start_line=10, end_line=50)
+    # Inside Outer's lines, but the parser says it belongs to Other. One of the
+    # two facts must be wrong; naming it anyway would publish the wrong one.
+    stranger = _hit(
+        "thing", path, 0.5, chunk_id=f"{path}::Other::thing", start_line=20, end_line=30
+    )
+    coordinator = _coordinator(
+        tmp_path,
+        source_dense=[outer, stranger],
+        source_lexical=[_FTSHit(outer.chunk_id, path), _FTSHit(stranger.chunk_id, path)],
+        records={hit.chunk_id: _record(hit) for hit in (outer, stranger)},
+    )
+
+    response = await coordinator.search("what does the outer thing do", limit=5)
+
+    assert "contains_symbols" not in _row_for(response, path)
+
+
+async def test_the_contained_list_is_capped_in_rank_order(tmp_path):
+    """A class chunk can enclose more retrieved methods than a row should list."""
+    from repowise.core.source_search.coordinator import MAX_CONTAINED_SYMBOLS
+
+    path = "src/big.py"
+    outer = _hit("Big", path, 0.99, chunk_id=f"{path}::Big", start_line=1, end_line=500)
+    members = [
+        _hit(
+            f"m{index}",
+            path,
+            0.9 - index / 100.0,
+            chunk_id=f"{path}::Big::m{index}",
+            start_line=10 + index,
+            end_line=11 + index,
+        )
+        for index in range(MAX_CONTAINED_SYMBOLS + 4)
+    ]
+    coordinator = _coordinator(
+        tmp_path,
+        source_dense=[outer, *members],
+        source_lexical=[_FTSHit(hit.chunk_id, path) for hit in (outer, *members)],
+        records={hit.chunk_id: _record(hit) for hit in (outer, *members)},
+    )
+
+    response = await coordinator.search("what does the big class hold", limit=5)
+
+    contained = _row_for(response, path)["contains_symbols"]
+    assert len(contained) == MAX_CONTAINED_SYMBOLS
+    # Rank order, so the cap keeps the most relevant names rather than the
+    # topmost lines in the file.
+    assert contained[0] == "Big::m0"
+
+
+async def test_naming_changes_nothing_about_which_rows_are_kept_or_their_order(
+    tmp_path, monkeypatch
+):
+    """The pin: strip the two added keys and the response is the one it was.
+
+    Ranking calibration is measured, and this path is only allowed to *name*.
+    Running the same fused candidate set with the naming pass disabled and then
+    enabled must differ in nothing else — not the rows, not their order, not a
+    score, not the owner.
+    """
+    hits = [
+        *_nested_pair("codeatlas/code_search/diversify.py", "mmr_diversify", "_sim"),
+        *_nested_pair(
+            "src/features/about/ConnectiveThreads.tsx",
+            "buildThreads",
+            "weaveTo",
+            outer_span=(40, 90),
+            inner_span=(55, 70),
+            outer_score=0.61,
+            inner_score=0.5,
+        ),
+        _hit("rank_files", "codeatlas/code_search/rank.py", 0.44, start_line=1, end_line=30),
+    ]
+    records = {hit.chunk_id: _record(hit) for hit in hits}
+    query = "how are ranked results diversified to avoid near duplicates"
+
+    def _strip(response: dict) -> dict:
+        for row in response["results"]:
+            row.pop("symbol_path", None)
+            row.pop("contains_symbols", None)
+        response["_meta"].pop("timing_ms", None)
+        return response
+
+    monkeypatch.setattr(
+        SourceSearchCoordinator, "_name_contained_symbols", staticmethod(lambda *_: None)
+    )
+    without = _strip(
+        await _coordinator(
+            tmp_path,
+            source_dense=hits,
+            source_lexical=[_FTSHit(hit.chunk_id, hit.file_path) for hit in hits],
+            records=records,
+        ).search(query, limit=5)
+    )
+    monkeypatch.undo()
+    live = await _coordinator(
+        tmp_path,
+        source_dense=hits,
+        source_lexical=[_FTSHit(hit.chunk_id, hit.file_path) for hit in hits],
+        records=records,
+    ).search(query, limit=5)
+    # Proves the fixture actually exercises the naming path, so the equality
+    # below is a statement about a live case rather than about two no-ops.
+    assert any("contains_symbols" in row for row in live["results"])
+
+    assert _strip(live) == without
