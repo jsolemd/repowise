@@ -147,8 +147,14 @@ async def test_rename_preview_declares_that_it_changes_nothing(indexed):
     assert preview["old_name"] == "computeTotal"
     assert preview["new_name"] == "totalOf"
     assert preview["summary"]["total"] == 11
-    assert preview["summary"]["mechanically_safe"] == 10
-    assert preview["summary"]["needs_review"] == 1
+    # This fixture's repository row points at a directory that is not a git
+    # checkout, so working-tree freshness cannot be established — and an
+    # unverifiable position is never asserted mechanically safe. The
+    # verified-tree split (10 safe / 1 review) lives in
+    # ``test_tool_freshness.py`` against a real committed checkout.
+    assert preview["summary"]["mechanically_safe"] == 0
+    assert preview["summary"]["needs_review"] == 11
+    assert preview["_meta"]["working_tree"]["checked"] is False
     assert preview["files_touched"] == ["calc.ts", "legacy.js", "panel.tsx", "widget.ts"]
 
 
