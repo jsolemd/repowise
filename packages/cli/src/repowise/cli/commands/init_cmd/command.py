@@ -271,6 +271,7 @@ def _run_generation_phase(
     skip_infra: bool,
     embedder_name_resolved: str,
     resume: bool,
+    test_run: bool,
 ) -> tuple[bool, bool]:
     """Run the LLM generation phase for a single-repo init.
 
@@ -398,6 +399,7 @@ def _run_generation_phase(
         embedder_name_resolved=embedder_name_resolved,
         resume=resume,
         verbose=True,
+        test_run=test_run,
     )
     return False, False
 
@@ -415,7 +417,7 @@ def _run_generation_phase(
     default=None,
     help=(
         "LLM provider name (anthropic, openai, openrouter, gemini, "
-        "deepseek, kimi, ollama, litellm, codex_cli, opencode, mock)."
+        "deepseek, kimi, ollama, litellm, codex_cli, opencode, edenai, mock)."
     ),
 )
 @click.option("--model", default=None, help="Model identifier override.")
@@ -423,8 +425,11 @@ def _run_generation_phase(
     "--embedder",
     "embedder_name",
     default=None,
-    type=click.Choice(["gemini", "openai", "openrouter", "ollama", "mock"]),
-    help="Embedder for RAG: gemini | openai | openrouter | ollama | mock (default: auto-detect).",
+    type=click.Choice(["gemini", "openai", "openrouter", "ollama", "edenai", "mock"]),
+    help=(
+        "Embedder for RAG: gemini | openai | openrouter | ollama | edenai | mock "
+        "(default: auto-detect)."
+    ),
 )
 @click.option("--skip-tests", is_flag=True, default=False, help="Skip test files.")
 @click.option("--skip-infra", is_flag=True, default=False, help="Skip infrastructure files.")
@@ -1445,6 +1450,7 @@ def init_command(
             # file. Resuming against it would skip the entire model run and
             # say nothing, so a template wiki is never a run to continue.
             resume=resume and _prior_docs_mode != "deterministic",
+            test_run=test_run,
         )
         if gen_stop:
             return

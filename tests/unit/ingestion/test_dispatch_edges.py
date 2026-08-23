@@ -392,6 +392,6 @@ def test_a_csharp_overload_set_resolves_to_the_matching_fetchable_id(tmp_path: P
     two_arg_id = next(
         node_id
         for node_id, data in overloads.items()
-        if data["signature"] == "func Given(int a, int b)"
+        if data["signature"] == "Given(int a, int b) -> int"
     )
     assert ("Test.cs::Test::Run", two_arg_id) in _calls_by_origin(graph, "enclosing_inherited")
