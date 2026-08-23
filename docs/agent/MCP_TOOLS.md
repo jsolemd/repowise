@@ -1418,7 +1418,7 @@ Every recorded occurrence of a symbol, with its position, kind and resolution co
 
 `confidence` is the probability that renaming the resolved target must edit this site. It is not a relevance score and must not be compared against search ranking.
 
-Every response carries a `coverage` block: the languages this build declares, what was actually observed in this repository, and `uncovered_languages_present`. An empty `sites` list always comes with a `status` — `not_indexed`, `not_found`, `ambiguous`, or `coverage_limited` — so it is never ambiguous which of those reasons produced it.
+Every response carries a `coverage` block: the languages this build declares, what was actually observed in this repository, and `uncovered_languages_present`. An empty `sites` list always comes with a `status` — `not_indexed`, `not_found`, `ambiguous`, or `coverage_limited` — so it is never ambiguous which of those reasons produced it. Served positions are exactly as fresh as the last index; `_meta.working_tree` discloses any drift on the cited files (absent = checked-and-clean; see `preview_symbol_rename` below for both shapes of the block).
 
 **When to use:** before a rename or a signature change, when you need the call sites themselves rather than the fact that a dependency exists.
 
@@ -1441,9 +1441,11 @@ Every site a rename would touch, with per-site confidence. Reports only — it c
 | `min_confidence` | float | No | Drop sites below this rubric confidence, 0.0-1.0 (default 0.0) |
 | `limit` | int | No | Maximum sites to return, clamped to 1-500 |
 
-**Returns:** sites bound to the symbol first at their resolution confidence, then sites that merely spell the same name and bind to nothing — an ambiguous global, an unresolved call, a name inside a string literal. `mechanically_safe` marks the difference: true only when confidence clears 0.90 *and* the column range was verified, i.e. a rewriter could patch the site unattended. `summary.needs_review` counts the rest. `applies_changes` is `false` in the payload itself, so a caller cannot infer an apply path from a clean preview.
+**Returns:** sites bound to the symbol first at their resolution confidence, then sites that merely spell the same name and bind to nothing — an ambiguous global, an unresolved call, a name inside a string literal. `mechanically_safe` marks the difference: true only when confidence clears 0.90, the column range was verified, *and* the file's working-tree freshness could be verified with the file undiverged since the index was built — i.e. a rewriter could patch the site unattended. A file with uncommitted changes newer than the index demotes every one of its sites, and a working tree that could not be checked at all (no git repository, a diff failure or timeout) demotes all of them. `summary.needs_review` counts the rest. `applies_changes` is `false` in the payload itself, so a caller cannot infer an apply path from a clean preview.
 
-**`caveats` is the part to read before acting.** It names any language present in the repository that produces no reference sites at all, any partial-coverage language, any site whose column range could not be verified, a missing definition site, and any collision with `new_name`.
+**`caveats` is the part to read before acting.** A freshness problem always leads the list: either the named files changed after the index was built (positions may have shifted; re-index before a mechanical rewrite) or working-tree freshness could not be established at all, with the reason. After that it names any language present in the repository that produces no reference sites, any partial-coverage language, any site whose column range could not be verified, a missing definition site, and any collision with `new_name`.
+
+**`_meta.working_tree`** carries the freshness evidence in both tools. Absent means checked-and-clean — the live comparison ran and found no served file diverged. Present in one of two shapes: `{checked: true, served_modified: [...], served_deleted: [...], note}` when served files have uncommitted changes newer than the index, or `{checked: false, reason, note}` when the working tree could not be read (`not_a_git_repository` is permanent for a corpus indexed from a non-git directory; `git_diff_failed`/`git_diff_timeout` are transient). The commit-scoped fields (`index_age_days`, `indexed_commit`, `stale_warning`) ride `_meta` as on every tool.
 
 **When to use:** to size a rename before doing it, and to see which sites a mechanical rewrite cannot safely own.
 

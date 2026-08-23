@@ -187,7 +187,17 @@ COMPUTE_TOTAL_GROUND_TRUTH: tuple[tuple[str, int, str], ...] = (
 
 @pytest.fixture
 def toy_repo(tmp_path: Path) -> Path:
-    """Write the toy repository to disk and return its root."""
+    """Write the toy repository to disk and return its root.
+
+    The bare ``.git`` directory gives the traverser a repo root WITHOUT being
+    a real repository, and that non-git-ness is load-bearing: every tool test
+    on this fixture exercises the permanent working-tree-unverifiable path
+    (``not_a_git_repository``), which is why
+    ``test_rename_preview_declares_that_it_changes_nothing`` asserts full
+    demotion. Do not "fix" this into a real checkout — the verified-tree
+    semantics have their own owner in ``test_tool_freshness.py``, against a
+    genuinely committed repo.
+    """
     for name, body in TOY_REPO.items():
         (tmp_path / name).write_text(body)
     (tmp_path / ".git").mkdir()
