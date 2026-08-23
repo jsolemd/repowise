@@ -22,7 +22,7 @@ Connect repowise to Claude Code, Codex, Cursor, Cline, or any MCP-compatible edi
 
 ## Overview
 
-The MCP (Model Context Protocol) server is how repowise talks to AI coding assistants. It registers 20 tools: a curated 12-tool default surface in a single repository (eleven flagship tools plus `list_repos`), two additional default tools in workspace mode, and six opt-in tools. Once connected, your editor's AI can query your codebase wiki for synthesized answers, symbols, docs, ownership, file and change-risk signals, code health, architectural decisions, and source-index trust.
+The MCP (Model Context Protocol) server is how repowise talks to AI coding assistants. It registers 27 tools: a curated 12-tool default surface in a single repository (eleven flagship tools plus `list_repos`), two additional default tools in workspace mode, and thirteen opt-in tools. Once connected, your editor's AI can query your codebase wiki for synthesized answers, symbols, docs, ownership, file and change-risk signals, code health, architectural decisions, and source-index trust.
 
 Start the server with:
 

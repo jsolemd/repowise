@@ -4,18 +4,21 @@ By default a single-repo server exposes twelve tools (get_answer, get_context,
 get_symbol, search_codebase, get_overview, get_risk, get_change_risk, get_why,
 get_dead_code, get_health, get_index_status, list_repos); two more
 (get_blast_radius, get_architecture) are added automatically in workspace mode.
-Six further tools (get_dependents, get_dependency_path, get_execution_flows,
-generate_refactoring_code, get_conformance, reindex_repository) are registered
+Thirteen further tools (get_dependents, get_dependency_path,
+get_execution_flows, generate_refactoring_code, get_conformance,
+reindex_repository, build_task_slice, get_task_slice, extend_task_slice,
+get_query_quality, find_clones, find_patterns, manage_decision) are registered
 but off by default and can be opted in via the ``mcp.tools`` config block or the
 ``repowise mcp --tools`` flag; get_conformance only does useful work in workspace
-mode. The selection layer lives in :mod:`._tool_selection`.
+mode, and manage_decision only where a decision journal is configured. The
+selection layer lives in :mod:`._tool_selection`.
 
 Exposes the full repowise wiki as queryable tools via the MCP protocol.
 Supports stdio transport (Claude Code, Cursor, Cline), streamable HTTP, and
 legacy SSE transport.
 
 Tool modules load lazily (see :func:`ensure_full_surface`), so importing this
-package, or one tool out of it, does not drag in the other eighteen modules.
+package, or one tool out of it, does not drag in the other twenty-three modules.
 
 Usage:
     repowise mcp --transport stdio  # for Claude Code / Cursor / Cline
@@ -53,6 +56,10 @@ from repowise.server.mcp_server import _state
 #: ``tool name -> submodule``. The full set is what ``ensure_full_surface``
 #: imports; individually they are what a single-tool consumer pays for.
 _TOOL_MODULES: dict[str, str] = {
+    "build_task_slice": "tool_slices",
+    "extend_task_slice": "tool_slices",
+    "find_clones": "tool_clones",
+    "find_patterns": "tool_patterns",
     "generate_refactoring_code": "tool_refactoring",
     "get_answer": "tool_answer",
     "get_architecture": "tool_architecture",
@@ -67,10 +74,13 @@ _TOOL_MODULES: dict[str, str] = {
     "get_health": "tool_health",
     "get_index_status": "tool_index_status",
     "get_overview": "tool_overview",
+    "get_query_quality": "tool_query_report",
     "get_risk": "tool_risk",
     "get_symbol": "tool_symbol",
+    "get_task_slice": "tool_slices",
     "get_why": "tool_why",
     "list_repos": "tool_repos",
+    "manage_decision": "tool_decisions",
     "reindex_repository": "tool_index_status",
     "search_codebase": "tool_search",
 }
@@ -235,7 +245,11 @@ __all__ = [
     "_get_repo",
     "_is_path",
     "create_mcp_server",
+    "build_task_slice",
     "ensure_full_surface",
+    "extend_task_slice",
+    "find_clones",
+    "find_patterns",
     "generate_refactoring_code",
     "get_answer",
     "get_architecture",
@@ -250,10 +264,13 @@ __all__ = [
     "get_health",
     "get_index_status",
     "get_overview",
+    "get_query_quality",
     "get_risk",
     "get_symbol",
+    "get_task_slice",
     "get_why",
     "list_repos",
+    "manage_decision",
     "mcp",
     "reindex_repository",
     "run_mcp",

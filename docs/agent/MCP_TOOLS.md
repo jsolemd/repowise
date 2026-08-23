@@ -2,7 +2,7 @@
 
 repowise exposes a curated set of tools via the [Model Context Protocol](https://modelcontextprotocol.io) (MCP). These tools give AI coding assistants (Claude Code, Codex, Cursor, Cline, Windsurf) structured access to your codebase intelligence: dependency graph, git history, documentation, and architectural decisions.
 
-20 tools are registered in total. A single-repo server advertises 12 by default: the eleven flagship tools below plus `list_repos`. Workspace mode adds 2 more automatically (`get_architecture`, `get_blast_radius`), for 14. Six further tools are off by default everywhere and must be opted in. The surface is configurable; see [Configuring the tool surface](#configuring-the-tool-surface).
+27 tools are registered in total. A single-repo server advertises 12 by default: the eleven flagship tools below plus `list_repos`. Workspace mode adds 2 more automatically (`get_architecture`, `get_blast_radius`), for 14. Thirteen further tools are off by default everywhere and must be opted in. The surface is configurable; see [Configuring the tool surface](#configuring-the-tool-surface).
 
 **Start the MCP server:**
 
@@ -38,13 +38,20 @@ repowise mcp --transport sse --port 7338 # legacy SSE transport
 [get_architecture](#get_architecture) &middot;
 [get_blast_radius](#get_blast_radius)
 
-**Opt-in tools (off by default everywhere, 6)**
+**Opt-in tools (off by default everywhere, 13)**
 [get_dependents](#get_dependents) &middot;
 [get_dependency_path](#get_dependency_path) &middot;
 [get_execution_flows](#get_execution_flows) &middot;
 [generate_refactoring_code](#generate_refactoring_code) &middot;
 [get_conformance](#get_conformance) &middot;
-[reindex_repository](#reindex_repository)
+[reindex_repository](#reindex_repository) &middot;
+[build_task_slice](#build_task_slice) &middot;
+[get_task_slice](#get_task_slice) &middot;
+[extend_task_slice](#extend_task_slice) &middot;
+[find_clones](#find_clones) &middot;
+[find_patterns](#find_patterns) &middot;
+[get_query_quality](#get_query_quality) &middot;
+[manage_decision](#manage_decision)
 
 Also see [Configuring the tool surface](#configuring-the-tool-surface), [Reversible truncation](#reversible-truncation-_metaomitted) and [Unrecognised arguments](#unrecognised-arguments-ignored_arguments).
 
@@ -1147,6 +1154,244 @@ already-current no-op; it does not change the executor into a full rebuild mode.
 reindex_repository()                    # preview only
 reindex_repository(confirm=true)        # queue when stale/unknown
 reindex_repository(confirm=true, force=true)
+```
+
+---
+
+#### `build_task_slice`
+
+Cuts a *task slice* — the part of the codebase one task needs — and stores it
+under an id that survives the call. Entry points resolve from the task text,
+the slice grows along the symbol graph (downstream calls, upstream callers),
+members are ranked, and the whole result serializes inside `budget_tokens`.
+Members the budget drops are disclosed and recoverable through the shared
+omission store, never silently gone.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `task` | string | Yes | The task, phrased as work: "add retry to the sync client" |
+| `repo` | string | No | *(workspace only)* Target repo alias; `"all"` is not supported |
+| `view` | string | No | `card` (default here: `skeleton`), `skeleton`, or `full` fidelity per member |
+| `budget_tokens` | integer | No | Serialization budget; drops are ranked and disclosed |
+| `downstream_depth` / `upstream_depth` | integer | No | Walk depth from the entry points (defaults 2 / 1) |
+| `include_tests` | boolean | No | Include test files as members |
+| `max_members` | integer | No | Hard member cap before the budget pass |
+| `include_edges` | boolean | No | Carry the member-to-member edges in the response |
+
+A build that matches nothing is a shaped failure naming what was tried — never
+an empty member list, which would read as "this task needs no code".
+
+```
+build_task_slice(task="wire the freshness envelope into the CLI status table")
+```
+
+---
+
+#### `get_task_slice`
+
+Re-reads a stored slice by id, possibly at a different fidelity or budget than
+it was built with. The three views are per-member fidelity levels: `card`
+(name, path, role, one line), `skeleton` (signatures and docstrings), `full`
+(bounded source). A wrong id is a shaped error, not an empty slice.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `slice_id` | string | Yes | The id `build_task_slice` returned |
+| `repo` | string | No | *(workspace only)* Target repo alias; `"all"` is not supported |
+| `view` | string | No | `card`, `skeleton` (default), or `full` |
+| `budget_tokens` | integer | No | Serialization budget for this read |
+| `max_source_lines` | integer | No | Per-member source cap in `full` view |
+| `include_edges` | boolean | No | Carry the member-to-member edges |
+
+```
+get_task_slice(slice_id="slice-3f9a", view="full", budget_tokens=12000)
+```
+
+---
+
+#### `extend_task_slice`
+
+Grows an existing slice when the first cut was too narrow — deeper along the
+graph, or from new entry points, without re-walking what is already there.
+Extension is additive: members never leave a slice by extension, and the
+response discloses what the extension added versus what the budget then had to
+drop. Extending a fully-expanded slice says so rather than pretending growth.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `slice_id` | string | Yes | The slice to grow |
+| `repo` | string | No | *(workspace only)* Target repo alias; `"all"` is not supported |
+| `extra_downstream` / `extra_upstream` | integer | No | Additional depth from the current frontier (defaults 1 / 0) |
+| `entry_points` | string[] | No | New entry symbols or paths to walk from |
+| `task_addendum` | string | No | Extra task text to resolve new entry points from |
+| `view` | string | No | Fidelity of the returned members (default `card`) |
+| `budget_tokens` | integer | No | Serialization budget for this read |
+
+```
+extend_task_slice(slice_id="slice-3f9a", extra_downstream=1,
+                  entry_points=["src/sync/client.py::SyncClient"])
+```
+
+---
+
+#### `find_clones`
+
+Duplicated regions — exact by construction, near-duplicates on request. The
+tool is a thin adapter over the clone service boundary; the detector's on-disk
+caches stay behind it and are never exposed or required reading. Near-clones
+(dense-similarity pairs over the source index) are off by default and never
+mixed silently into exact results: every finding names which detector produced
+it. A degraded leg (cold cache, missing source index) is disclosed in the
+response, never folded into "no clones".
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `repo` | string | No | *(workspace only)* Target repo alias; `"all"` is not supported |
+| `path` | string | No | Confine findings to one file or directory |
+| `min_lines` | integer | No | Minimum region size to report |
+| `limit` | integer | No | Findings per response (cap 40) |
+| `include_near` | boolean | No | Add semantic near-clones from the source index (off by default) |
+| `near_threshold` | number | No | Cosine floor for a near pair |
+| `cross_directory_only` | boolean | No | Only pairs that span directories |
+| `include_intra_file` | boolean | No | Keep same-file pairs (on by default) |
+| `include_tests` | boolean | No | Include test files in scope |
+
+```
+find_clones(min_lines=15, cross_directory_only=true)
+find_clones(include_near=true, near_threshold=0.86)
+```
+
+---
+
+#### `find_patterns`
+
+Six named structural queries over the symbol graph: `duplicate_signatures`,
+`orphan_exports`, `hub_functions`, `isolated_siblings`, `reuse_candidates`,
+`bridge_functions`. Each response carries the predicate that produced it, so
+the list is read against the rule that ran rather than whatever the name
+suggests. Called with no pattern — or an unknown one — it returns the
+catalogue instead of an empty match list, because an empty list is
+indistinguishable from "this repository has none".
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `pattern` | string | No | One of the six; omit for the catalogue |
+| `repo` | string | No | *(workspace only)* Target repo alias; `"all"` is not supported |
+| `limit` | integer | No | Matches per response (cap 30) |
+| `include_tests` | boolean | No | Include test files in scope |
+| `min_files` / `min_lines` / `min_callers` / `min_siblings` | integer | No | Per-pattern thresholds; only the ones the chosen predicate uses apply |
+
+```
+find_patterns()                          # the catalogue, with each predicate
+find_patterns(pattern="hub_functions", min_callers=12)
+```
+
+---
+
+#### `get_query_quality`
+
+Reports what source-search retrieval got wrong, and turns a bucket of it into a
+runnable eval suite. Off by default. `report` and `export` read
+`.repowise/source_search/query_log.jsonl` and open no index at all, so they work
+on a repository whose index is broken — which is when the error bucket is worth
+reading. Only `run` needs a working index.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `mode` | string | No | `report` (default), `export`, or `run` |
+| `bucket` | string | For export | `error`, `wrong_owner`, `no_match`, or `low_confidence` |
+| `window` | string | No | Trend granularity: `hour`, `day` (default), `week` |
+| `intent` | string | No | `goal` (default) asserts the fixed behaviour; `guard` asserts today's as a floor |
+| `limit` | integer | No | Offenders per bucket in report mode; cases in export mode |
+| `write_to` | string | No | Filename for the exported suite, confined to `.repowise/source_search/eval/` |
+| `suite` | string | For run | Filename of the suite to execute, read from that same directory |
+| `verdicts` | string | No | JSON object of query to correct owner, read from that same directory |
+| `repo` | string | No | *(workspace only)* Target repo alias; `"all"` is not supported |
+
+Four quality buckets, each row counted under exactly one so the rates partition
+the log: **error** (the search reached no corpus), **wrong_owner** (a later signal
+contradicts the served owner), **no_match** (the corpus was read and declared to
+have no answer), **low_confidence** (served with the caution flag). Rows the pass
+could not use — unparseable lines, undated rows, rows with no corpus generation —
+are declared under `caveats` rather than dropped.
+
+Export never invents ground truth. Where the log does not establish the right
+answer the case is emitted as `expect.kind = "todo"` and reports as `pending`,
+neither a pass nor a failure, until a human answers it. Writing the observed owner
+into the expectation would freeze the defect into a test that passes forever
+because it asserts the bug.
+
+Reads and writes are confined to `.repowise/source_search/eval/`; a path outside it
+is refused rather than followed.
+
+```
+get_query_quality()                                             # report
+get_query_quality(mode="report", window="week", verdicts="v.json")
+get_query_quality(mode="export", bucket="no_match", write_to="week31.json")
+get_query_quality(mode="run", suite="week31.json")
+```
+
+---
+
+#### `manage_decision`
+
+Record, review, confirm, and retire this repository's architectural decisions. Five verbs
+over one store: a git-tracked JSONL journal at `$REPOWISE_DECISIONS_JOURNAL`, whose diff a
+person reviews and commits.
+
+**Recording is not confirming.** `record` always lands `proposed` — an agent that inferred a
+decision from a diff has not reviewed it, and the store has to tell that apart from a rule
+the team stands behind. `confirm` is the separate verb that promotes it, re-hashing the
+anchors so staleness restarts from that moment. No parameter on `record` can promote a
+record on the way in.
+
+**Nothing is ever deleted.** `supersede` flips the old record to `superseded`, links it to
+its successor in both directions, and leaves it readable. `get` returns the whole chain from
+either end.
+
+**Writes require the journal.** With `REPOWISE_DECISIONS_JOURNAL` unset, pointing outside the
+repository, or naming an unwritable path, every mutating verb returns
+`{"error": ..., "journal_available": false}` rather than falling back to the derived SQLite
+table — a decision written only to a local derived store never reaches git, so no teammate
+ever sees it. `list` and `get` keep serving the last projected state and say so.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `action` | string | Yes | `record`, `list`, `get`, `confirm`, or `supersede` |
+| `decision_id` | string | For get/confirm/supersede | The `dec-xxxxxxxx` id |
+| `title` | string | For record | Short name |
+| `decision` | string | For record | What was chosen |
+| `why` | string | For record | What forced the choice — the part not re-derivable from the code |
+| `anchors` | string[] | For record | Repo-relative files this governs: `path` or `path::Symbol`. At least one, and each must exist on disk |
+| `supersedes` | string | No | Id this new record replaces, retired in the same write (record) |
+| `superseded_by` | string | For supersede | Id of the successor |
+| `actor` | string | For writes | Who is asking. Reported in the server log; durable attribution is the git commit that lands the diff |
+| `status` | string | No | Filter: `proposed`, `active`, `superseded` (list) |
+| `query` | string | No | Case-insensitive match over title, decision, and why (list) |
+| `recorded_after` / `recorded_before` | string | No | ISO-8601 instant or bare date (list) |
+| `limit` / `offset` | int | No | Page size (capped at 200) and offset (list) |
+| `repo` | string | No | *(workspace only)* Target repo alias; `"all"` is not supported |
+
+Rows come back in a total order: confirmed rules first, then proposals, then history; newest
+within each, with the id as a final tiebreak (the journal stamps whole seconds, so
+same-second records are routine). An unrecognised `status` is dropped and named in
+`ignored_arguments`; an unparseable time bound is an error, because a dropped bound returns
+*more* rows than were asked for.
+
+**When to use:** after you had to reason out a non-obvious choice the next reader would
+otherwise re-derive. Not for summarising what the code already says. Call `confirm` only when
+a person asks you to.
+
+```
+manage_decision(action="record", title="Project unconfirmed rows as proposed",
+                decision="Map confirmed_at=null to status=proposed in the projection.",
+                why="An unconfirmed row projected as active enrols in every reader that counts governance.",
+                anchors=["packages/core/src/repowise/core/analysis/decisions/journal_projection.py"],
+                actor="claude")
+manage_decision(action="list", status="proposed")
+manage_decision(action="confirm", decision_id="dec-a1b2c3d4", actor="jon")
+manage_decision(action="supersede", decision_id="dec-a1b2c3d4",
+                superseded_by="dec-e5f6a7b8", actor="jon")
 ```
 
 ---

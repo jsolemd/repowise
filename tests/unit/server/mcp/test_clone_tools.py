@@ -17,40 +17,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from repowise.core.persistence.models import GraphEdge, GraphNode
 from tests.unit.analysis import toy_clone_repo as toy
 
-# --- Registration has not landed yet ---------------------------------------
-#
-# Both tool modules self-register on import, but they are not yet in
-# ``mcp_server.__init__._TOOL_MODULES``, so ``ensure_full_surface()`` does
-# not know to import them. Registering a tool the full-surface builder
-# cannot see leaves ``describe_tool_surface`` reporting a row with no
-# description, which ``tests/unit/server/test_mcp_tools_router.py`` rightly
-# fails on — but only when something built the surface before this module
-# was imported, which makes it an ordering-dependent failure in the full
-# suite and invisible on its own.
-#
-# So this module restores the registry it perturbs. Landing the four-file
-# registration change (see REGISTRATION.md) is what makes both the fixture
-# and ``test_registration_has_not_landed_yet`` below unnecessary; that test
-# fails the moment it does, which is the reminder to delete them.
-
-
-@pytest.fixture(scope="module", autouse=True)
-def _restore_tool_registry():
-    from repowise.core.registry import mcp_tool_registry
-
-    before = list(mcp_tool_registry._entries)
-    yield
-    mcp_tool_registry._entries[:] = before
-
-
-def test_registration_has_not_landed_yet() -> None:
-    """When this fails, registration landed — delete it and the fixture above."""
-    from repowise.server.mcp_server import _TOOL_MODULES
-
-    assert "find_clones" not in _TOOL_MODULES
-    assert "find_patterns" not in _TOOL_MODULES
-
-
 @pytest.fixture
 async def indexed_toy_repo(tmp_path: Path, session: AsyncSession, factory, repo_id: str) -> Path:
     """Plant the tree, index it for real, persist the graph, wire MCP state."""

@@ -133,7 +133,7 @@ def mcp_command(
 
     Exposes a curated set of tools for querying the repowise wiki via the MCP
     protocol: twelve by default in single-repo mode, plus two more by default
-    in workspace mode. Six more are opt-in via ``--tools`` or the
+    in workspace mode. Thirteen more are opt-in via ``--tools`` or the
     ``mcp.tools`` config block. Supports stdio
     (for Claude Code, Codex, Cursor), streamable HTTP, and legacy SSE
     transports.
