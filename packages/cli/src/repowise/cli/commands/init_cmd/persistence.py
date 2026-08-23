@@ -185,6 +185,30 @@ async def persist_result(result: Any, repo_path: Path, progress: Any | None = No
                 getattr(result, "authoritative_page_types", None),
                 getattr(result, "preserved_page_ids", None),
             )
+            # Same bypass, same repair: persist_pipeline_result also owns the
+            # reference-site refresh, so on this branch a fresh index finished
+            # with the store empty and the two tools that read it dark. A
+            # later no-change ``update`` does not heal it — it skips the
+            # re-parse, so the sites never appear at all.
+            #
+            # ``parsed_files`` is the whole tree on both routes into this
+            # branch (a checkpointed run parsed it; a rehydrated resume
+            # re-parses it), which is the precondition the seam requires. The
+            # guard is for the degenerate empty parse, where a full replace
+            # would delete every site rather than re-derive it. Best-effort for
+            # the same reason as the other call site: the store serves two
+            # opt-in tools, so its failure degrades to a log line.
+            parsed_files = getattr(result, "parsed_files", None)
+            if parsed_files:
+                from repowise.core.pipeline.persist import persist_reference_sites
+
+                try:
+                    await persist_reference_sites(
+                        session, repo.id, parsed_files, repo_path=repo_path
+                    )
+                except Exception as exc:
+                    logger.warning("reference_sites_persist_skipped", error=str(exc))
+
             # The resume controller already committed the symbol phase, so it
             # bypasses persist_pipeline_result's source-search hook. Capture a
             # full reconcile here, in the final authoritative transaction.

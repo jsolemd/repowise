@@ -498,12 +498,18 @@ async def persist_reference_sites(
     PRECONDITION: *parsed_files* must be the WHOLE tree's parse, never a
     changed-file slice. The replace deletes every row the list does not
     reproduce, so a partial list silently wipes the sites of every file it
-    omits. Both callers satisfy this by construction — init's
-    ``PipelineResult.parsed_files`` and the update path's full-tree rebuild
-    (``build_repo_graph`` walks everything; its parse cache spares
-    tree-sitter work, not coverage) — and
+    omits. Every caller satisfies this by construction — both persisters below
+    pass ``PipelineResult.parsed_files``, and the update path passes its
+    full-tree rebuild (``build_repo_graph`` walks everything; its parse cache
+    spares tree-sitter work, not coverage) — and
     ``tests/unit/refsites/test_pipeline_wiring.py`` pins the hazard so a
     future scoped-rebuild refactor cannot re-route a slice here unnoticed.
+
+    Three call sites, not two: ``persist_pipeline_result`` below covers the
+    server and full-index paths, but the CLI's ``persist_result`` bypasses it
+    whenever the resume controller already checkpointed the INDEX phase — which
+    is every normal ``repowise init`` — so that branch calls this directly. A
+    single call site here would leave the store empty on every fresh index.
 
     Returns the number of sites written.
     """
