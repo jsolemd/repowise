@@ -76,7 +76,7 @@ def _fixed(monkeypatch, generation=_G1):
 
     monkeypatch.setattr(w, "_manifest_key", lambda path: state["gen"])
 
-    def fake_build(path, wiki_vectors, wiki_fts):
+    def fake_build(path, wiki_vectors, wiki_fts, session_factory=None):
         built.append(_FakeCoordinator(f"c{len(built)}"))
         return built[-1]
 

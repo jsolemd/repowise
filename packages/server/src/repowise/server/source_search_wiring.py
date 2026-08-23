@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 import weakref
 from collections import OrderedDict
@@ -63,17 +64,43 @@ def _served_paths(response: dict[str, Any]) -> set[str]:
     return paths
 
 
+def _identifier_token(name: str) -> Any:
+    """A matcher for *name* standing alone rather than inside a longer word.
+
+    Bounded by identifier characters rather than by ``\\b``, because a name may
+    legitimately begin or end with punctuation — a C++ destructor ``~Foo``, a
+    Ruby predicate ``valid?`` — and ``\\b`` anchors against the punctuation
+    instead of against the word, which either fails to match or matches inside
+    ``invalid?``.
+    """
+    escaped = re.escape(name)
+    return re.compile(rf"(?<![0-9A-Za-z_]){escaped}(?![0-9A-Za-z_])")
+
+
 class _StatusCoordinator:
     """Add live queue health without changing the ranking coordinator."""
 
-    def __init__(self, inner: Any, repo: Path, source_vectors: Any, source_fts: Any) -> None:
+    def __init__(
+        self,
+        inner: Any,
+        repo: Path,
+        source_vectors: Any,
+        source_fts: Any,
+        session_factory: Any = None,
+    ) -> None:
         self._inner = inner
         self._repo = repo
         self._source_vectors = source_vectors
         self._source_fts = source_fts
+        self._session_factory = session_factory
+        #: Resolved once per coordinator, which is once per repository — the
+        #: cache is safe precisely because a coordinator never spans repos.
+        #: ``False`` is "not looked up yet", ``None`` is "looked up, no row".
+        self._repository_id: Any = False
 
     async def search(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
         response = await self._inner.search(*args, **kwargs)
+        divergence: Any = None
         try:
             from repowise.core.source_search.status import inspect_source_index
             from repowise.core.source_search.worktree import HOT_PATH_CACHE_TTL
@@ -123,7 +150,115 @@ class _StatusCoordinator:
                 meta.setdefault("degraded_reason", status.last_error or status.state)
         except Exception:
             log.debug("source-search: status enrichment failed", exc_info=True)
+        try:
+            await self._name_contained_definitions(response, divergence)
+        except Exception:
+            log.debug("source-search: definition naming failed", exc_info=True)
         return response
+
+    async def _repo_id(self, session: Any) -> Any:
+        """This repository's id, resolved once and remembered."""
+        if self._repository_id is False:
+            from repowise.server.mcp_server import _get_repo
+
+            try:
+                self._repository_id = (await _get_repo(session)).id
+            except Exception:
+                log.debug("source-search: no repository row to name definitions from")
+                self._repository_id = None
+        return self._repository_id
+
+    async def _name_contained_definitions(self, response: dict[str, Any], divergence: Any) -> None:
+        """Name nested definitions on served rows that still name none.
+
+        The coordinator can only name a nested symbol that retrieval happened
+        to surface as a rival for the same file. The residue is real: a file
+        window names no symbol at all, and an enclosing chunk whose helper
+        never entered the candidate set has nothing to be re-cited from. Both
+        are exactly the rows whose span the reference-site index can describe,
+        so this asks it — from the wiring, because the coordinator holds no
+        database handle and is not going to start.
+
+        **Silence is never evidence.** Reference sites are replaced repo-wide
+        while chunks update incrementally, so the two can sit at different
+        generations and an absent DEFINITION row means "not recorded", never
+        "not there". Nothing here removes or contradicts a name the coordinator
+        already established; it only adds, and a row it cannot speak for is
+        left exactly as it arrived.
+
+        Two gates decide whether it can speak for a row.
+
+        **Freshness.** A file the working-tree check flags as modified or
+        deleted has moved out from under both indexes, so no position in it can
+        be asserted. An *unchecked* tree is treated the same way: the check not
+        having run is not a finding of cleanliness, and enriching on it would
+        be reading silence as evidence in the other direction.
+
+        **Corroboration.** The name has to appear in the snippet this very
+        response is serving. That snippet comes from the current chunk
+        generation, so a name that survives the check is one the reader can see
+        in the row in front of them — which turns the residual
+        generation-skew question from a correctness risk into a coverage
+        limit. Snippets are capped, so a definition deep inside a long window
+        goes unnamed rather than unverified.
+        """
+        if self._session_factory is None or divergence is None or not divergence.checked:
+            return
+        rows = [
+            row
+            for row in (response.get("results") or [])
+            if isinstance(row, dict)
+            and not row.get("contains_symbols")
+            and row.get("file")
+            and isinstance(row.get("start_line"), int)
+            and isinstance(row.get("end_line"), int)
+            and row.get("snippet")
+        ]
+        diverged = frozenset(divergence.modified) | frozenset(divergence.deleted)
+        rows = [row for row in rows if str(row["file"]) not in diverged]
+        if not rows:
+            return
+
+        from repowise.core.persistence.database import get_session
+        from repowise.core.refsites.store import SqlReferenceSiteStore
+        from repowise.core.source_search.coordinator import (
+            MAX_CONTAINED_SYMBOLS,
+            symbol_path_of,
+        )
+
+        async with get_session(self._session_factory) as session:
+            repository_id = await self._repo_id(session)
+            if not repository_id:
+                return
+            store = SqlReferenceSiteStore(session)
+            for row in rows:
+                file_path = str(row["file"])
+                own = str(row.get("symbol_path") or "")
+                sites = await store.definitions_in_range(
+                    repository_id,
+                    file_path,
+                    int(row["start_line"]),
+                    int(row["end_line"]),
+                )
+                snippet = str(row["snippet"])
+                names: list[str] = []
+                for site in sites:
+                    chain = symbol_path_of(site.target_symbol_id or "", file_path)
+                    if not chain or chain == own:
+                        continue
+                    # The same nesting proof the coordinator applies: when the
+                    # row names a symbol, what it contains must extend that
+                    # name, or it is a neighbour rather than an inhabitant.
+                    if own and not chain.startswith(f"{own}::"):
+                        continue
+                    if not _identifier_token(site.name).search(snippet):
+                        continue
+                    if chain not in names:
+                        names.append(chain)
+                    if len(names) >= MAX_CONTAINED_SYMBOLS:
+                        break
+                if names:
+                    row["contains_symbols"] = names
 
     async def close(self) -> None:
         await self._source_vectors.close()
@@ -179,12 +314,22 @@ def _embedder_identity_mismatch(embedder: Any, stored: Any) -> str | None:
     return None
 
 
-def _build(repo_path: Path | str, wiki_vectors: Any, wiki_fts: Any) -> Any:
+def _build(
+    repo_path: Path | str,
+    wiki_vectors: Any,
+    wiki_fts: Any,
+    session_factory: Any = None,
+) -> Any:
     """A coordinator over *repo_path*, or None when it has no source index.
 
     The embedder is taken from the wiki vector store rather than resolved
     again, because the two corpora are only comparable when one embedder wrote
     both — the dense fusion is arithmetic on that assumption.
+
+    *session_factory* is the wiki database this repository's reference sites
+    live in, used only by the post-retrieval naming pass. Optional, and its
+    absence costs nothing but that pass: it never reaches the coordinator,
+    which takes no database handle by contract.
     """
     from repowise.core.providers.embedding import store_has_semantic_vectors
     from repowise.core.source_search.coordinator import SourceSearchCoordinator
@@ -252,7 +397,7 @@ def _build(repo_path: Path | str, wiki_vectors: Any, wiki_fts: Any) -> Any:
         wiki_vectors=wiki_vectors,
         wiki_fts=wiki_fts,
     )
-    return _StatusCoordinator(coordinator, repo, source_vectors, source_fts)
+    return _StatusCoordinator(coordinator, repo, source_vectors, source_fts, session_factory)
 
 
 async def mcp_coordinator() -> Any:
@@ -297,7 +442,9 @@ async def mcp_coordinator() -> Any:
         _retire(old)
         await _sweep_retired()
         try:
-            _mcp_coordinator = _build(repo_path, _state._vector_store, _state._fts)
+            _mcp_coordinator = _build(
+                repo_path, _state._vector_store, _state._fts, _state._session_factory
+            )
         except Exception:
             log.debug("source-search: MCP coordinator construction failed", exc_info=True)
             _mcp_coordinator = None
@@ -332,6 +479,7 @@ async def rest_coordinator(app_state: Any) -> Any:
                 repo_path,
                 getattr(app_state, "vector_store", None),
                 getattr(app_state, "fts", None),
+                getattr(app_state, "session_factory", None),
             )
         except Exception:
             log.debug("source-search: REST coordinator construction failed", exc_info=True)
@@ -568,7 +716,12 @@ async def context_coordinator(ctx: Any) -> Any:
             return cached[0]
         _evict(repo_path)
         try:
-            built = _build(repo_path, wiki_vs, getattr(ctx, "fts", None))
+            built = _build(
+                repo_path,
+                wiki_vs,
+                getattr(ctx, "fts", None),
+                getattr(ctx, "session_factory", None),
+            )
         except Exception:
             log.debug(
                 "source-search: workspace coordinator construction failed for %s",

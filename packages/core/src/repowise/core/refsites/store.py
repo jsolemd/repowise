@@ -266,6 +266,44 @@ class SqlReferenceSiteStore:
         result = await self._session.execute(query)
         return [_to_record(row) for row in result.scalars().all()]
 
+    async def definitions_in_range(
+        self,
+        repository_id: str,
+        file_path: str,
+        start_line: int,
+        end_line: int,
+        *,
+        limit: int | None = None,
+    ) -> list[ReferenceSiteRecord]:
+        """Definition sites whose declaration falls inside *start_line*..*end_line*.
+
+        Answers "what is defined in this span" for a caller holding a region of
+        a file and no parse of it — a search result naming its lines, say. Runs
+        off ``ix_reference_sites_repo_file``, which is why the file is filtered
+        in SQL and the range is a narrowing on top of it rather than a scan.
+
+        The bound is on where the definition *starts*, not on the whole body
+        being enclosed. A span that opens inside the range and runs past its
+        end is still declared here, and it is the declaration this answers
+        about; requiring containment of the body would drop exactly the symbol
+        a window happens to cut through, which is the common case rather than
+        an edge one.
+
+        Both ends are inclusive, matching how every span in this codebase is
+        written (1-indexed, both ends in).
+        """
+        query = self._base(repository_id).where(
+            ReferenceSite.file_path == file_path,
+            ReferenceSite.kind == str(ReferenceKind.DEFINITION),
+            ReferenceSite.start_line >= start_line,
+            ReferenceSite.start_line <= end_line,
+        )
+        query = self._ordered(query)
+        if limit is not None:
+            query = query.limit(limit)
+        result = await self._session.execute(query)
+        return [_to_record(row) for row in result.scalars().all()]
+
     async def coverage(self, repository_id: str) -> list[CoverageRecord]:
         query = (
             select(ReferenceSiteCoverage)
