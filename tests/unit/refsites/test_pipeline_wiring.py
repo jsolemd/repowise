@@ -73,3 +73,28 @@ async def test_a_second_refresh_replaces_rather_than_accumulates(async_session, 
         .where(ReferenceSite.repository_id == repo_id)
     )
     assert rows.scalar_one() == first
+
+
+async def test_a_partial_list_wipes_which_is_why_callers_must_pass_the_whole_tree(
+    async_session, repo_id, toy_repo
+):
+    """Documentation of the hazard, pinned.
+
+    The seam is a full replace: rows for files absent from *parsed_files* are
+    deleted. That is correct only because both production callers pass the
+    whole tree's parse (init's PipelineResult, the update path's full-tree
+    rebuild). If a future refactor routes a changed-file slice here, this is
+    the data loss it causes — and this test is the tripwire that names the
+    precondition it broke.
+    """
+    parsed = _pipeline_parse(toy_repo)
+    full = await persist_reference_sites(async_session, repo_id, parsed, repo_path=toy_repo)
+    await async_session.commit()
+
+    partial = [pf for pf in parsed if pf.file_info.path == "widget.ts"]
+    after = await persist_reference_sites(async_session, repo_id, partial, repo_path=toy_repo)
+    await async_session.commit()
+
+    assert after < full
+    store = SqlReferenceSiteStore(async_session)
+    assert await store.count(repo_id) == after

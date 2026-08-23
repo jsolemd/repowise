@@ -83,18 +83,51 @@ def test_upgrade_creates_the_tables_and_indexes(migrated: Path):
     assert set(_INDEXES) <= indexes
 
 
-def test_migration_columns_match_the_orm_models(migrated: Path):
+def _table_shape(conn: sqlite3.Connection, name: str) -> dict[str, object]:
+    """Everything PRAGMA can say about a table: columns with type/null/pk,
+    foreign keys with their delete rule, and every index with its columns
+    and uniqueness. Name-set equality alone would bless a Float column that
+    one path created as Text, or a NOT NULL the other path dropped."""
+    columns = {
+        row[1]: {"type": row[2].upper(), "notnull": bool(row[3]), "pk": bool(row[5])}
+        for row in conn.execute(f"PRAGMA table_info({name})")
+    }
+    foreign_keys = {
+        (row[2], row[3], row[4], row[6])  # (target table, from, to, on_delete)
+        for row in conn.execute(f"PRAGMA foreign_key_list({name})")
+    }
+    indexes = {}
+    for index_row in conn.execute(f"PRAGMA index_list({name})"):
+        index_name, unique = index_row[1], bool(index_row[2])
+        if index_name.startswith("sqlite_autoindex"):
+            continue
+        cols = tuple(r[2] for r in conn.execute(f"PRAGMA index_info({index_name})"))
+        indexes[index_name] = {"unique": unique, "columns": cols}
+    return {"columns": columns, "foreign_keys": foreign_keys, "indexes": indexes}
+
+
+def test_migration_schema_matches_the_orm_models(migrated: Path, tmp_path: Path):
     """A managed upgrade and ``Base.metadata.create_all`` must agree.
 
     Both are live paths — Alembic for a managed database, ``ensure_schema``
-    for a runtime one — so a column present in only one of them produces a
-    store that works on one machine and not the next.
+    for a runtime one — so a divergence produces a store that works on one
+    machine and not the next. Compared shape-for-shape, not name-for-name:
+    types, nullability, primary keys, foreign keys (including the CASCADE
+    the delete path relies on), and every index with its uniqueness.
     """
-    with sqlite3.connect(migrated) as conn:
+    from sqlalchemy import create_engine as _sync_engine
+
+    orm_db = tmp_path / "orm.db"
+    engine = _sync_engine(f"sqlite:///{orm_db}")
+    for table in REFSITE_TABLES:
+        table.create(engine)
+    engine.dispose()
+
+    with sqlite3.connect(migrated) as via_migration, sqlite3.connect(orm_db) as via_orm:
         for table in REFSITE_TABLES:
-            migrated_columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table.name})")}
-            model_columns = {column.name for column in table.columns}
-            assert migrated_columns == model_columns, table.name
+            assert _table_shape(via_migration, table.name) == _table_shape(via_orm, table.name), (
+                table.name
+            )
 
 
 def test_position_uniqueness_is_enforced_by_the_database(migrated: Path):

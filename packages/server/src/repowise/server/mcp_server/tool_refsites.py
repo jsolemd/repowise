@@ -27,7 +27,9 @@ below is the registration order.
 
 from __future__ import annotations
 
+import time
 from collections import Counter
+from pathlib import Path
 from typing import Any
 
 from sqlalchemy.exc import OperationalError
@@ -41,11 +43,13 @@ from repowise.core.refsites.taxonomy import (
     ReferenceKind,
 )
 from repowise.core.registry import mcp_tool_registry
+from repowise.core.source_search.worktree import DIVERGENCE_DELETED, working_tree_candidates
 from repowise.server.mcp_server._helpers import (
     _get_repo,
     _resolve_repo_context,
     _unsupported_repo_all,
 )
+from repowise.server.mcp_server._meta import build_meta as _build_meta
 
 _DEFAULT_LIMIT = 50
 _MAX_LIMIT = 500
@@ -60,6 +64,52 @@ _NOT_INDEXED = (
     "reference-site extraction pass, which is separate from graph indexing — an empty "
     "result here does not mean the symbol is unreferenced."
 )
+
+
+def _served_divergence(repository: Any, files: set[str]) -> dict[str, str]:
+    """Live uncommitted divergence, narrowed to the files whose positions we serve.
+
+    Served line/column positions are exactly as fresh as the last index, and
+    an uncommitted edit moves them without moving HEAD — the one staleness the
+    commit-scoped ``_meta`` freshness cannot see. One live ``git diff``
+    against the files this response actually cites, on the same machinery
+    (and at the same cost) as the source-search envelope's working-tree read.
+    Any failure to look reads as "nothing to report": the commit-scoped
+    freshness fields still ride the response, so silence here never becomes
+    the only signal.
+    """
+    local_path = getattr(repository, "local_path", None)
+    if not local_path or not files:
+        return {}
+    try:
+        candidates, error = working_tree_candidates(Path(local_path))
+    except Exception:
+        return {}
+    if error is not None:
+        return {}
+    return {path: kind for path, kind in candidates.items() if path in files}
+
+
+def _working_tree_block(divergence: dict[str, str]) -> dict[str, Any]:
+    return {
+        "served_modified": sorted(
+            path for path, kind in divergence.items() if kind != DIVERGENCE_DELETED
+        ),
+        "served_deleted": sorted(
+            path for path, kind in divergence.items() if kind == DIVERGENCE_DELETED
+        ),
+        "note": (
+            "These files changed after the index was built; the line/column "
+            "positions served for them may have shifted."
+        ),
+    }
+
+
+def _empty_meta(started: float, repository: Any) -> dict[str, Any]:
+    """The `_meta` for a response that serves no file content (targets=[])."""
+    return _build_meta(
+        timing_ms=(time.perf_counter() - started) * 1000, repository=repository, targets=[]
+    )
 
 
 def _serialize_site(site: Any) -> dict[str, Any]:
@@ -183,6 +233,7 @@ async def get_reference_sites(
 
     effective_offset = max(0, offset)
     effective_limit = max(1, min(limit, _MAX_LIMIT))
+    started = time.perf_counter()
     wanted = {kind.strip().lower() for kind in kinds} if kinds else None
 
     ctx = await _resolve_repo_context(repo)
@@ -205,6 +256,7 @@ async def get_reference_sites(
                     "sites": [],
                     "total": 0,
                     "explanation": _NOT_INDEXED,
+                    "_meta": _empty_meta(started, repository),
                 }
             symbol_id, matched_by, candidates = await _resolve_target(store, repository.id, target)
             if symbol_id is None:
@@ -220,6 +272,7 @@ async def get_reference_sites(
                         if candidates
                         else f"No definition named '{target}' is recorded."
                     ),
+                    "_meta": _empty_meta(started, repository),
                 }
 
             bound = await store.sites_for_target(
@@ -248,6 +301,7 @@ async def get_reference_sites(
                 "sites": [],
                 "total": 0,
                 "explanation": _NOT_INDEXED,
+                "_meta": _empty_meta(started, repository),
             }
 
     sites = [*bound, *unbound]
@@ -259,7 +313,17 @@ async def get_reference_sites(
     returned = len(page)
     has_more = effective_offset + returned < len(sites)
 
+    served_files = {site.file_path for site in sites}
+    divergence = _served_divergence(repository, served_files)
+    meta_extra = {"working_tree": _working_tree_block(divergence)} if divergence else None
+
     return {
+        "_meta": _build_meta(
+            timing_ms=(time.perf_counter() - started) * 1000,
+            repository=repository,
+            targets=sorted(served_files),
+            extra=meta_extra,
+        ),
         "status": _coverage_status(coverage, sites),
         "target": {
             "query": target,
@@ -313,6 +377,7 @@ async def preview_symbol_rename(
         return _unsupported_repo_all("preview_symbol_rename")
 
     effective_limit = max(1, min(limit, _MAX_LIMIT))
+    started = time.perf_counter()
     ctx = await _resolve_repo_context(repo)
 
     async with get_session(ctx.session_factory) as session:
@@ -327,6 +392,7 @@ async def preview_symbol_rename(
                     "sites": [],
                     "applies_changes": False,
                     "explanation": _NOT_INDEXED,
+                    "_meta": _empty_meta(started, repository),
                 }
             symbol_id, matched_by, candidates = await _resolve_target(store, repository.id, symbol)
             if symbol_id is None:
@@ -357,18 +423,50 @@ async def preview_symbol_rename(
                 "sites": [],
                 "applies_changes": False,
                 "explanation": _NOT_INDEXED,
+                "_meta": _empty_meta(started, repository),
             }
 
     page = preview.sites[:effective_limit]
-    safe = sum(1 for site in preview.sites if site.mechanically_safe)
+
+    # ``mechanically_safe`` is a positive safety assertion — "a rewriter could
+    # patch this site unattended" — and it holds only while the served
+    # positions are current. A file with uncommitted changes newer than the
+    # index demotes every one of its sites: the column range was verified
+    # against bytes the disk may no longer hold.
+    served_files = {site.file_path for site in preview.sites}
+    divergence = _served_divergence(repository, served_files)
+    caveats = list(preview.caveats)
+    if divergence:
+        touched = sorted(divergence)
+        listed = ", ".join(touched[:5]) + ("…" if len(touched) > 5 else "")
+        caveats.insert(
+            0,
+            f"{len(touched)} file(s) holding sites changed after the index was "
+            f"built ({listed}); served positions may have shifted. Re-index "
+            "before any mechanical rewrite.",
+        )
+    safe = sum(
+        1 for site in preview.sites if site.mechanically_safe and site.file_path not in divergence
+    )
+    meta_extra = {"working_tree": _working_tree_block(divergence)} if divergence else None
 
     return {
+        "_meta": _build_meta(
+            timing_ms=(time.perf_counter() - started) * 1000,
+            repository=repository,
+            targets=sorted(served_files),
+            extra=meta_extra,
+        ),
         "status": _coverage_status(list(preview.coverage), list(preview.sites)),
         "symbol": {"query": symbol, "symbol_id": symbol_id, "matched_by": matched_by},
         "old_name": preview.old_name,
         "new_name": preview.new_name,
         "sites": [
-            {**_serialize_site(site), "mechanically_safe": site.mechanically_safe} for site in page
+            {
+                **_serialize_site(site),
+                "mechanically_safe": site.mechanically_safe and site.file_path not in divergence,
+            }
+            for site in page
         ],
         "files_touched": list(preview.files_touched),
         "summary": {
@@ -378,7 +476,7 @@ async def preview_symbol_rename(
             "needs_review": len(preview.sites) - safe,
             "safe_threshold": CONFIDENCE_CERTAIN,
         },
-        "caveats": list(preview.caveats),
+        "caveats": caveats,
         "coverage": _serialize_coverage(list(preview.coverage)),
         "confidence_scale": _CONFIDENCE_SCALE,
         # Stated in the payload, not only in the docstring: this tool has no

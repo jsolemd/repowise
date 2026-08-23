@@ -271,6 +271,7 @@ COUNT_CLAIMS: tuple[tuple[str, str, str], ...] = (
     # they went stale silently in the B2 wave. The package docstring row pins
     # the sentence that also enumerates the opt-in tools by name.
     ("docs/agent/MCP_TOOLS.md", "opt_in", "{W} further tools are off by default everywhere"),
+    ("docs/agent/MCP_TOOLS.md", "flagship", "part of the {w}-tool headline set"),
     ("docs/agent/MCP_TOOLS.md", "opt_in", "(off by default everywhere, {n})"),
     ("website/mcp-server.md", "opt_in", "and {w} opt-in tools."),
     ("packages/server/README.md", "opt_in", "{w} further tools are opt-in"),

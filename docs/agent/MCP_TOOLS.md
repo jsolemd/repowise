@@ -976,8 +976,8 @@ action only after reviewing its preview.
 
 ## Supplementary tools
 
-These are registered and on by default (in the modes noted) but are not part
-of the ten-tool headline set.
+These are registered and on by default (in the modes noted) but are not
+part of the eleven-tool headline set.
 
 ### `list_repos`
 

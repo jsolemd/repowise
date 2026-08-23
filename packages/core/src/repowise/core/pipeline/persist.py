@@ -495,6 +495,16 @@ async def persist_reference_sites(
     to changed files: a moved definition re-binds sites in files that did not
     themselves change, which a per-file refresh would leave stale.
 
+    PRECONDITION: *parsed_files* must be the WHOLE tree's parse, never a
+    changed-file slice. The replace deletes every row the list does not
+    reproduce, so a partial list silently wipes the sites of every file it
+    omits. Both callers satisfy this by construction — init's
+    ``PipelineResult.parsed_files`` and the update path's full-tree rebuild
+    (``build_repo_graph`` walks everything; its parse cache spares
+    tree-sitter work, not coverage) — and
+    ``tests/unit/refsites/test_pipeline_wiring.py`` pins the hazard so a
+    future scoped-rebuild refactor cannot re-route a slice here unnoticed.
+
     Returns the number of sites written.
     """
     from repowise.core.refsites.pipeline import extract_sites, measure_coverage
