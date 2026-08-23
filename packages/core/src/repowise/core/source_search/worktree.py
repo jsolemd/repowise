@@ -325,7 +325,10 @@ def build_ingest_record(
     it opens the one ghost route this record could create: the disk later
     returns to the recorded bytes, the hash coincides, and the refinement
     clears a path git correctly flagged. Dropped entries fall back to the
-    plain git verdict, which is the honest direction.
+    plain git verdict, which is the honest direction. A FULL rebuild under
+    the same failure drops the whole carry: it re-ingested every file, so
+    every prior hash is the known-wrong case — and its ``replaced`` is empty
+    by construction, which is exactly why the per-path pop cannot cover it.
     """
 
     from repowise.core.ingestion.models import compute_content_hash
@@ -333,6 +336,8 @@ def build_ingest_record(
     repo = Path(repo_path)
     candidates, error = working_tree_candidates(repo)
     if error is not None:
+        if full:
+            return {}
         record = dict(prior)
         for path, _content_hash in replaced:
             record.pop(path, None)

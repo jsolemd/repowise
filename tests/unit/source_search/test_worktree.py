@@ -554,3 +554,25 @@ async def test_the_failed_diff_ghost_route_is_closed_end_to_end(indexed_repo):
     status = await inspect_source_index(indexed_repo)
 
     assert status.working_tree.modified == ("src/alpha.py",)
+
+
+def test_a_failed_diff_during_a_full_rebuild_drops_every_carry(tmp_path):
+    """G1b: the same ghost through the full-plan door.
+
+    A full plan's ``replaced`` is empty by construction, so the per-path pop
+    has nothing to pop — while the rebuild re-ingested EVERY file, making
+    every carried hash the known-wrong case. Under a failed diff a full
+    build must return an empty record, or the four-step ghost replays with
+    the whole prior record as ammunition.
+    """
+    from repowise.core.source_search.worktree import build_ingest_record
+
+    record = build_ingest_record(
+        tmp_path,  # not a git repository -> error branch
+        prior={"src/alpha.py": "aa", "src/beta.py": "bb"},
+        full=True,
+        replaced=(),
+        covered={"src/alpha.py", "src/beta.py"},
+    )
+
+    assert record == {}
