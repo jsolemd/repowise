@@ -66,32 +66,49 @@ _NOT_INDEXED = (
 )
 
 
-def _served_divergence(repository: Any, files: set[str]) -> dict[str, str]:
-    """Live uncommitted divergence, narrowed to the files whose positions we serve.
+def _served_divergence(repository: Any, files: set[str]) -> tuple[dict[str, str], str | None]:
+    """Live uncommitted divergence for the served files, or why we could not look.
 
     Served line/column positions are exactly as fresh as the last index, and
     an uncommitted edit moves them without moving HEAD — the one staleness the
     commit-scoped ``_meta`` freshness cannot see. One live ``git diff``
     against the files this response actually cites, on the same machinery
     (and at the same cost) as the source-search envelope's working-tree read.
-    Any failure to look reads as "nothing to report": the commit-scoped
-    freshness fields still ride the response, so silence here never becomes
-    the only signal.
+
+    The error is part of the answer, never swallowed: an unreadable tree is
+    NOT a clean one, and a caller who reported an empty divergence from it
+    would be asserting freshness on the strength of a diff that never ran.
+    ``not_a_git_repository`` in particular is permanent for a corpus indexed
+    from a non-git directory, so discarding it would silently disable this
+    whole surface there. An empty *files* set is the one genuinely clean
+    short-circuit — no positions served, nothing to be stale.
     """
     local_path = getattr(repository, "local_path", None)
-    if not local_path or not files:
-        return {}
+    if not files:
+        return {}, None
+    if not local_path:
+        return {}, "repository_has_no_local_path"
     try:
         candidates, error = working_tree_candidates(Path(local_path))
-    except Exception:
-        return {}
+    except Exception as exc:
+        return {}, f"working_tree_unavailable: {type(exc).__name__}"
     if error is not None:
-        return {}
-    return {path: kind for path, kind in candidates.items() if path in files}
+        return {}, error
+    return {path: kind for path, kind in candidates.items() if path in files}, None
 
 
-def _working_tree_block(divergence: dict[str, str]) -> dict[str, Any]:
+def _working_tree_block(divergence: dict[str, str], error: str | None) -> dict[str, Any]:
+    if error is not None:
+        return {
+            "checked": False,
+            "reason": error,
+            "note": (
+                "Working-tree freshness could not be established; served "
+                "line/column positions are exactly as fresh as the last index."
+            ),
+        }
     return {
+        "checked": True,
         "served_modified": sorted(
             path for path, kind in divergence.items() if kind != DIVERGENCE_DELETED
         ),
@@ -314,8 +331,12 @@ async def get_reference_sites(
     has_more = effective_offset + returned < len(sites)
 
     served_files = {site.file_path for site in sites}
-    divergence = _served_divergence(repository, served_files)
-    meta_extra = {"working_tree": _working_tree_block(divergence)} if divergence else None
+    divergence, wt_error = _served_divergence(repository, served_files)
+    meta_extra = (
+        {"working_tree": _working_tree_block(divergence, wt_error)}
+        if divergence or wt_error
+        else None
+    )
 
     return {
         "_meta": _build_meta(
@@ -431,12 +452,24 @@ async def preview_symbol_rename(
     # ``mechanically_safe`` is a positive safety assertion — "a rewriter could
     # patch this site unattended" — and it holds only while the served
     # positions are current. A file with uncommitted changes newer than the
-    # index demotes every one of its sites: the column range was verified
-    # against bytes the disk may no longer hold.
+    # index demotes every one of its sites, and a tree we COULD NOT CHECK
+    # demotes all of them: an unverifiable position is not a safe one, and a
+    # git failure must never read like a clean tree.
     served_files = {site.file_path for site in preview.sites}
-    divergence = _served_divergence(repository, served_files)
+    divergence, wt_error = _served_divergence(repository, served_files)
+
+    def _still_safe(site: Any) -> bool:
+        return site.mechanically_safe and wt_error is None and site.file_path not in divergence
+
     caveats = list(preview.caveats)
-    if divergence:
+    if wt_error is not None:
+        caveats.insert(
+            0,
+            f"Working-tree freshness could not be established ({wt_error}); "
+            "served positions are exactly as fresh as the last index, so no "
+            "site is marked mechanically safe.",
+        )
+    elif divergence:
         touched = sorted(divergence)
         listed = ", ".join(touched[:5]) + ("…" if len(touched) > 5 else "")
         caveats.insert(
@@ -445,10 +478,12 @@ async def preview_symbol_rename(
             f"built ({listed}); served positions may have shifted. Re-index "
             "before any mechanical rewrite.",
         )
-    safe = sum(
-        1 for site in preview.sites if site.mechanically_safe and site.file_path not in divergence
+    safe = sum(1 for site in preview.sites if _still_safe(site))
+    meta_extra = (
+        {"working_tree": _working_tree_block(divergence, wt_error)}
+        if divergence or wt_error
+        else None
     )
-    meta_extra = {"working_tree": _working_tree_block(divergence)} if divergence else None
 
     return {
         "_meta": _build_meta(
@@ -462,11 +497,7 @@ async def preview_symbol_rename(
         "old_name": preview.old_name,
         "new_name": preview.new_name,
         "sites": [
-            {
-                **_serialize_site(site),
-                "mechanically_safe": site.mechanically_safe and site.file_path not in divergence,
-            }
-            for site in page
+            {**_serialize_site(site), "mechanically_safe": _still_safe(site)} for site in page
         ],
         "files_touched": list(preview.files_touched),
         "summary": {

@@ -25,10 +25,13 @@ hard wrap, so re-flowing one of those docstrings turns this red. That is cheap t
 fix and the failure names the file and the exact phrase, which is a better trade
 than matching loosely enough to miss a real stale count.
 
-Phrases rather than a regex on purpose: several artifacts correctly say "the ten
-flagship tools", which is a deliberate subset of the eleven-tool default surface
-and not a stale count. A pattern loose enough to catch drift is loose enough to
-condemn those, and a test that cries wolf gets its assertion deleted.
+Phrases rather than a regex on purpose: a pattern loose enough to catch every
+drift is loose enough to condemn deliberate subsets and historical text, and a
+test that cries wolf gets its assertion deleted. The cost is that every new
+count sentence needs its own row — which is the intended pressure. (The old
+version of this paragraph defended artifacts saying "the ten flagship tools";
+that count went stale everywhere it appeared, so no phrasing is grandfathered
+any more.)
 """
 
 from __future__ import annotations
@@ -219,9 +222,7 @@ def test_the_hooks_column_cannot_lie() -> None:
 #: capitalised. Keys name the count from :func:`gen_agent_matrix.tool_counts`.
 #:
 #: Deliberately not exhaustive over the repo: release changelogs record what was
-#: true at the time and must not be retro-edited, and the several artifacts that
-#: say "the ten flagship tools" are describing a documented subset rather than
-#: the default surface.
+#: true at the time and must not be retro-edited.
 COUNT_CLAIMS: tuple[tuple[str, str, str], ...] = (
     # The README and the image at the top of it count the flagship tools, a
     # narrower claim than the advertised surface. See NON_FLAGSHIP_TOOLS.
@@ -272,6 +273,9 @@ COUNT_CLAIMS: tuple[tuple[str, str, str], ...] = (
     # the sentence that also enumerates the opt-in tools by name.
     ("docs/agent/MCP_TOOLS.md", "opt_in", "{W} further tools are off by default everywhere"),
     ("docs/agent/MCP_TOOLS.md", "flagship", "part of the {w}-tool headline set"),
+    ("packages/cli/README.md", "total", "Exposes {n} registered MCP tools"),
+    ("packages/cli/README.md", "single_repo", "({n} advertised by default"),
+    ("packages/cli/README.md", "flagship", "the {w} flagship tools plus"),
     ("docs/agent/MCP_TOOLS.md", "opt_in", "(off by default everywhere, {n})"),
     ("website/mcp-server.md", "opt_in", "and {w} opt-in tools."),
     ("packages/server/README.md", "opt_in", "{w} further tools are opt-in"),

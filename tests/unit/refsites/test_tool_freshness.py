@@ -138,3 +138,66 @@ async def test_an_empty_answer_still_carries_meta(committed_indexed):
 
     assert result["status"] == "not_found"
     assert "_meta" in result
+
+
+async def test_an_unreadable_tree_never_reads_as_a_clean_one(committed_indexed, monkeypatch):
+    """R1: a git failure must not silently re-acquire the original defect.
+
+    Every error code lands the same way: `_meta.working_tree.checked: false`
+    with the reason, the caveats lead with why, and NO site asserts
+    `mechanically_safe` — an unverifiable position is not a safe one.
+    """
+    import repowise.server.mcp_server.tool_refsites as tool_mod
+
+    for code in ("git_diff_failed", "git_diff_timeout", "not_a_git_repository"):
+        monkeypatch.setattr(
+            tool_mod, "working_tree_candidates", lambda _repo, code=code: ({}, code)
+        )
+
+        preview = await preview_symbol_rename(TARGET_SYMBOL_ID)
+
+        assert preview["_meta"]["working_tree"] == {
+            "checked": False,
+            "reason": code,
+            "note": (
+                "Working-tree freshness could not be established; served "
+                "line/column positions are exactly as fresh as the last index."
+            ),
+        }
+        assert "could not be established" in preview["caveats"][0]
+        assert code in preview["caveats"][0]
+        assert preview["summary"]["mechanically_safe"] == 0
+        assert all(site["mechanically_safe"] is False for site in preview["sites"])
+
+        sites = await get_reference_sites(TARGET_SYMBOL_ID)
+        assert sites["_meta"]["working_tree"]["checked"] is False
+        assert sites["_meta"]["working_tree"]["reason"] == code
+
+
+async def test_a_non_git_corpus_discloses_permanently_not_silently(
+    committed_indexed, async_engine, tmp_path
+):
+    """The permanent case: a corpus indexed from a directory with no repository."""
+    import shutil
+
+    plain = tmp_path / "exported"
+    shutil.copytree(committed_indexed, plain)
+    shutil.rmtree(plain / ".git")
+
+    import repowise.server.mcp_server as mcp_mod
+
+    mcp_mod._repo_path = str(plain)
+    from sqlalchemy import update as sa_update
+
+    from repowise.core.persistence.models import Repository
+
+    factory = mcp_mod._session_factory
+    async with factory() as session:
+        await session.execute(sa_update(Repository).values(local_path=str(plain)))
+        await session.commit()
+
+    preview = await preview_symbol_rename(TARGET_SYMBOL_ID)
+
+    assert preview["_meta"]["working_tree"]["checked"] is False
+    assert preview["_meta"]["working_tree"]["reason"] == "not_a_git_repository"
+    assert preview["summary"]["mechanically_safe"] == 0
