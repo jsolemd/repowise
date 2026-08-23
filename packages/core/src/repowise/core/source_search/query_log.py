@@ -3,8 +3,13 @@
 One JSON object per query, appended to ``.repowise/source_search/query_log.jsonl``.
 It records the *evidence* behind a result — which leg found it, at what cosine,
 at what lexical rank — rather than the result text, so a later reader can ask
-why retrieval was confident without re-running anything. There is no reporting
-interface yet; this unit only writes the trail.
+why retrieval was confident without re-running anything. The reader is
+:mod:`.query_report`.
+
+The record grows by addition only. A field may be appended with a default that
+reproduces the old behaviour; no field may be removed, renamed, or have its
+meaning changed, because lines written by an older build stay in the file
+forever and the reporter has to keep understanding them.
 
 Every write is fire-and-forget. A search that succeeded and then failed to
 record itself has still succeeded, and a full disk, a read-only checkout or a
@@ -29,7 +34,10 @@ from typing import Any
 from .fts import SOURCE_SEARCH_DIRNAME
 
 __all__ = [
+    "FAILED_LEGS_LOGGED",
     "QUERY_LOG_FILENAME",
+    "STATUS_ERROR",
+    "STATUS_OK",
     "TOP_EVENTS_LOGGED",
     "QueryEvent",
     "QueryLog",
@@ -39,11 +47,26 @@ __all__ = [
 
 QUERY_LOG_FILENAME = "query_log.jsonl"
 
+#: A search that reached at least one corpus, whatever it then found.
+STATUS_OK = "ok"
+
+#: A search that reached no corpus at all, so its empty result set is a
+#: statement about the retrieval stack and not about the repository. Mirrors
+#: the ``status`` key the coordinator's error envelope puts on the response:
+#: the log has to be able to tell the two apart, because on the wire they are
+#: otherwise the same record — ``caution``, zero results, no owner.
+STATUS_ERROR = "error"
+
 #: How many ranked results each record keeps. Enough to see whether the right
 #: answer was in the window and merely mis-ranked — the distinction between a
 #: retrieval problem and a ranking problem — and bounded so one query cannot
 #: write a kilobyte per call.
 TOP_EVENTS_LOGGED = 10
+
+#: How many failed legs one record keeps. There are six named legs, so this
+#: cannot truncate a real incident; the bound exists so a caller passing an
+#: unbounded list cannot make one line arbitrarily large.
+FAILED_LEGS_LOGGED = 8
 
 _log = logging.getLogger(__name__)
 
@@ -99,6 +122,27 @@ class QueryEvent:
     no_match: bool = False
     ts: str = field(default_factory=lambda: datetime.now(UTC).isoformat(timespec="milliseconds"))
 
+    #: Whether this search read a corpus at all. Defaults to :data:`STATUS_OK`
+    #: so an existing caller is unchanged and an existing line — which has no
+    #: such key — reads back as the healthy value it was written under.
+    status: str = STATUS_OK
+
+    #: The coordinator's error code when *status* is :data:`STATUS_ERROR`.
+    error_code: str | None = None
+
+    #: The legs that hard-failed, as ``{"leg", "error", "detail"}`` dicts. A
+    #: search can serve results with some legs dead, so this is not implied by
+    #: *status*: it is the difference between "answered from half a corpus" and
+    #: "answered from all of it", which nothing else in the record can express.
+    failed_legs: list[dict[str, Any]] = field(default_factory=list)
+
+    #: The corpus generation this answer was served from. It is what lets a
+    #: reader tell an unstable ranker from a corpus that legitimately moved:
+    #: two different owners for one query mean a defect only if the corpus
+    #: underneath them was the same. ``None`` when the producer did not supply
+    #: one, which every line written before this field existed did not.
+    generation: str | None = None
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "ts": self.ts,
@@ -112,6 +156,10 @@ class QueryEvent:
             "selected_owner_file": self.selected_owner_file,
             "selected_owner_evidence": self.selected_owner_evidence,
             "no_match": self.no_match,
+            "status": self.status,
+            "error_code": self.error_code,
+            "failed_legs": list(self.failed_legs[:FAILED_LEGS_LOGGED]),
+            "generation": self.generation,
         }
 
 

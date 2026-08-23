@@ -243,7 +243,18 @@ async def refresh_decision_journal(
             record = DecisionRecord(id=decision.id, repository_id=repository.id)
             session.add(record)
         record.title = decision.title
-        record.status = decision.status
+        # An unconfirmed row is a proposal, not a rule. Projecting it as
+        # ``active`` would enrol it in every reader that counts governance —
+        # the health summary, the decision block ``get_answer`` injects, the
+        # alignment score — so the missing confirmation has to survive the
+        # projection rather than being flattened away here. Only ``active`` is
+        # remapped: a superseded record is history whether or not anyone ever
+        # confirmed it.
+        record.status = (
+            "proposed"
+            if decision.status == "active" and decision.confirmed_at is None
+            else decision.status
+        )
         record.context = ""
         record.decision = decision.decision
         record.rationale = decision.why
@@ -383,6 +394,7 @@ async def record_journal_decision(
     why: str,
     anchors: Sequence[Mapping[str, Any]],
     supersedes: str | None = None,
+    confirmed: bool = True,
     vector_store: Any | None = None,
     crash_hook: CrashHook | None = None,
 ) -> DecisionRecord:
@@ -394,6 +406,7 @@ async def record_journal_decision(
         why=why,
         anchors=anchors,
         supersedes=supersedes,
+        confirmed=confirmed,
         crash_hook=crash_hook,
     )
     await refresh_decision_journal(

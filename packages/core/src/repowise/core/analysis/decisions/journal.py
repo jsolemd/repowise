@@ -416,9 +416,17 @@ class DecisionJournal:
         anchors: Sequence[Mapping[str, Any]],
         supersedes: str | None = None,
         decision_id: str | None = None,
+        confirmed: bool = True,
         crash_hook: CrashHook | None = None,
     ) -> JournalDecision:
-        """Append a confirmed decision, optionally superseding an older one."""
+        """Append a decision, optionally superseding an older one.
+
+        ``confirmed`` defaults to true because the callers that predate this
+        parameter — the interactive CLI prompts and the REST create endpoint —
+        record what a person has just reviewed. An agent-driven caller passes
+        false, which leaves ``confirmed_at`` null: the state :meth:`confirm`
+        exists to stamp, and the one the projection reads as ``proposed``.
+        """
 
         title = _required_text(title, "title")
         decision_text = _required_text(decision, "decision")
@@ -447,7 +455,7 @@ class DecisionJournal:
                 supersedes=supersedes_id,
                 superseded_by=None,
                 recorded_at=timestamp,
-                confirmed_at=timestamp,
+                confirmed_at=timestamp if confirmed else None,
             )
             if supersedes_id is not None:
                 old = existing[supersedes_id]

@@ -134,15 +134,24 @@ async def fetch_relevant_decisions(
     target_paths: a decision touching three of the top hits is more relevant
     than one touching only the fifth. Ties broken by status preference
     (active > proposed) and confidence.
+
+    In journal mode only confirmed decisions qualify. A journal ``proposed``
+    row is an agent's own unratified text, and injecting it here would let an
+    agent cite its own proposal as if it were a rule — the loop the curated
+    journal exists to prevent. SQLite ``proposed`` rows (machine-extracted,
+    no journal) keep the established behaviour.
     """
     if not target_paths:
         return []
+    from repowise.core.persistence.crud.decisions import _journal_mode_enabled
+
+    statuses = ("active",) if _journal_mode_enabled() else ("active", "proposed")
     targets_set = set(target_paths)
     async with get_session(ctx.session_factory) as session:
         res = await session.execute(
             select(DecisionRecord).where(
                 DecisionRecord.repository_id == repo_id,
-                DecisionRecord.status.in_(("active", "proposed")),
+                DecisionRecord.status.in_(statuses),
             )
         )
         all_decisions = list(res.scalars().all())

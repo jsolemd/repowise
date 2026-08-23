@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 
 from repowise.core.source_search.query_log import (
+    FAILED_LEGS_LOGGED,
     QUERY_LOG_FILENAME,
     TOP_EVENTS_LOGGED,
     QueryEvent,
@@ -76,6 +77,10 @@ def test_the_record_carries_the_evidence_not_the_prose(tmp_path):
         "selected_owner_file",
         "selected_owner_evidence",
         "no_match",
+        "status",
+        "error_code",
+        "failed_legs",
+        "generation",
     }
     assert record["top"][0] == {
         "file": "src/a.py",
@@ -126,6 +131,36 @@ def test_an_unwritable_log_reports_failure_rather_than_raising(tmp_path):
     blocked = tmp_path / "query_log.jsonl"
     blocked.mkdir()
     assert QueryLog(blocked).append(_event()) is False
+
+
+def test_a_caller_that_knows_nothing_of_the_new_fields_writes_the_old_meaning(tmp_path):
+    """Additive means additive: the defaults reproduce the previous record.
+
+    Every field added since the first version has to default to the value the
+    old behaviour implied, because lines written under it stay in the file
+    forever and the reporter reads them alongside today's.
+    """
+    log = QueryLog(tmp_path / "query_log.jsonl")
+    log.append(_event())
+    record = json.loads(log.path.read_text(encoding="utf-8"))
+    assert record["status"] == "ok"
+    assert record["error_code"] is None
+    assert record["failed_legs"] == []
+    assert record["generation"] is None
+
+
+def test_the_failed_leg_list_is_bounded_like_the_top_list(tmp_path):
+    log = QueryLog(tmp_path / "query_log.jsonl")
+    log.append(
+        _event(
+            failed_legs=[
+                {"leg": f"leg {i}", "error": "E", "detail": "d"}
+                for i in range(FAILED_LEGS_LOGGED + 4)
+            ]
+        )
+    )
+    record = json.loads(log.path.read_text(encoding="utf-8"))
+    assert len(record["failed_legs"]) == FAILED_LEGS_LOGGED
 
 
 def test_an_unserialisable_event_is_swallowed_too(tmp_path):
