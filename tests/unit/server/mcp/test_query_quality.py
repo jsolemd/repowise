@@ -14,18 +14,6 @@ from repowise.core.source_search.query_log import QueryEvent, QueryLog, TopEntry
 from repowise.server.mcp_server import tool_query_report
 from repowise.server.mcp_server.tool_query_report import get_query_quality
 
-# Importing the module runs its ``@mcp.tool`` decorator, which appends to the
-# process-wide registry. The tool is not in ``mcp_server.__init__._TOOL_MODULES``
-# yet, so nothing in production imports it and ``ensure_full_surface`` does not
-# know it exists — but this import does, and a registry carrying a tool the
-# surface never registered breaks ``test_mcp_docs_drift`` for the rest of the
-# session. Undo it here so the pollution cannot outlive this module, and see
-# REGISTRATION.md for the atomic change that registers it for real: the entry
-# and its ``docs/agent/MCP_TOOLS.md`` section have to land together, which is
-# precisely what that drift test exists to enforce.
-mcp_tool_registry._entries = [
-    entry for entry in mcp_tool_registry.entries() if entry.name != "get_query_quality"
-]
 
 
 async def _wire(*, monkeypatch, session, factory, repo_id: str, repo_path: Path):
