@@ -21,7 +21,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import delete
+from sqlalchemy import delete, update
 
 from repowise.core.persistence.database import get_session
 from repowise.core.refsites.pipeline import extract_repository
@@ -329,6 +329,35 @@ async def test_a_diverged_file_is_never_named_from_the_index(
 
 
 # -- corroboration and fail-soft --------------------------------------------
+
+
+async def test_an_empty_site_name_does_not_corroborate_against_everything(
+    monkeypatch, extracted, async_session, repo_id, session_factory, nested_repo
+):
+    """An empty name would otherwise pass the check trivially.
+
+    The pattern an empty name compiles to is zero-width, so it matches at the
+    first position it is tried and every snippet "shows" it. ``name`` is
+    ``nullable=False`` but not constrained non-empty, so this is a state the
+    column permits and the check has to refuse rather than assume away — the
+    row it would produce names a symbol spelled nothing at all.
+    """
+    await async_session.execute(
+        update(ReferenceSite)
+        .where(
+            ReferenceSite.repository_id == repo_id,
+            ReferenceSite.target_symbol_id == f"{DIVERSIFY_PATH}::mmr_diversify::_sim",
+        )
+        .values(name="")
+    )
+    await async_session.commit()
+    _patch_status(monkeypatch, CLEAN)
+    coordinator = _coordinator(_window_response(), session_factory, nested_repo)
+
+    response = await coordinator.search("how are near duplicates dropped")
+
+    # The nameless site contributes nothing; the one real name still lands.
+    assert response["results"][0]["contains_symbols"] == ["mmr_diversify"]
 
 
 async def test_a_name_the_served_snippet_does_not_show_is_not_asserted(

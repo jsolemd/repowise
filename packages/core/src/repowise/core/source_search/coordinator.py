@@ -647,15 +647,27 @@ class QueryIntent:
 #: ``_finalize_symbol_parentage``). Anchored at the end because that is where
 #: the parser appends it, and matched narrowly rather than splitting on the
 #: first ``~``: a C++ destructor is legitimately named ``~Foo``, and a naive
-#: split would erase it. The residual ambiguity — a destructor of a class
-#: whose name is itself eight hex characters — resolves toward dropping a name
-#: rather than inventing one, which is the direction this whole path errs in.
-_ID_DISCRIMINATOR_RE = re.compile(r"~[0-9a-f]{8}(?:-\d+)?$")
+#: split would erase it.
+#:
+#: The lookbehind is what separates a discriminator from a destructor whose
+#: class is *itself* named in eight hex characters. ``Foo::deadbeef::~deadbeef``
+#: is a real symbol whose last segment begins at a ``::`` boundary; a
+#: discriminator never does, because the parser appends it to a complete id.
+#: Without the lookbehind that name is not dropped but *mangled* — the tail is
+#: eaten and ``deadbeef::`` is served as a symbol path, which is the one
+#: outcome this path is not allowed to produce.
+_ID_DISCRIMINATOR_RE = re.compile(r"(?<=[^:])~[0-9a-f]{8}(?:-\d+)?$")
 
 #: How many contained symbol names one row may carry. A class chunk can
 #: enclose dozens of retrieved methods, and a response that listed all of them
-#: would bury the row it is annotating. Taken in rank order, so the cap keeps
-#: the most relevant names rather than the topmost ones.
+#: would bury the row it is annotating.
+#:
+#: The two producers cut at this bound under different orders, and neither is
+#: wrong for its source. The coordinator walks its own fused ranking, so its
+#: cap keeps the most relevant names. The reference-site path takes the store's
+#: ordering — confidence descending, then file and line — and every definition
+#: site carries the same confidence, so in practice it keeps the *earliest*
+#: declarations in the span. A consumer that needs one order must sort.
 MAX_CONTAINED_SYMBOLS = 8
 
 
@@ -681,7 +693,13 @@ def symbol_path_of(target_id: str, file_path: str) -> str:
     # without being file-qualified. The file half must be the file this row is
     # already standing behind, or the two halves are describing different
     # things and the chain is not this row's to serve.
-    if file_path and head != file_path:
+    #
+    # A row with no file at all fails this rather than skipping it. A module
+    # page, an SCC page or a repo overview serves ``file: ""`` by design, and
+    # its target is a group key or a hash — so a ``::`` in one of those is not
+    # a symbol chain, and reading a name out of it would invent a symbol the
+    # page never claimed to be about.
+    if not file_path or head != file_path:
         return ""
     return _ID_DISCRIMINATOR_RE.sub("", chain)
 

@@ -251,7 +251,11 @@ class _StatusCoordinator:
                     # name, or it is a neighbour rather than an inhabitant.
                     if own and not chain.startswith(f"{own}::"):
                         continue
-                    if not _identifier_token(site.name).search(snippet):
+                    # An empty name corroborates against anything: the pattern
+                    # it compiles to is zero-width and matches at the first
+                    # position it is tried. The column is not empty-constrained,
+                    # so the check has to be made rather than assumed.
+                    if not site.name or not _identifier_token(site.name).search(snippet):
                         continue
                     if chain not in names:
                         names.append(chain)

@@ -2340,3 +2340,112 @@ async def test_naming_changes_nothing_about_which_rows_are_kept_or_their_order(
     assert any("contains_symbols" in row for row in live["results"])
 
     assert _strip(live) == without
+
+
+async def test_a_hex_named_destructor_is_not_mistaken_for_a_discriminator(tmp_path):
+    """``deadbeef::~deadbeef`` is a destructor, not an eight-hex discriminator.
+
+    The pathological overlap between the two spellings. Getting it wrong here
+    does not drop the name, which would be survivable — it *mangles* it, eating
+    the tail and serving ``deadbeef::`` as though a trailing separator were a
+    symbol path. What separates the two is the boundary: the parser appends a
+    discriminator to a complete id, so it never follows a ``::``.
+    """
+    path = "src/a.cpp"
+    dtor = _hit(
+        "~deadbeef",
+        path,
+        0.8,
+        chunk_id=f"{path}::deadbeef::~deadbeef",
+        start_line=10,
+        end_line=20,
+    )
+    coordinator = _coordinator(
+        tmp_path, source_dense=[dtor], records={dtor.chunk_id: _record(dtor)}
+    )
+
+    response = await coordinator.search("how is deadbeef torn down", limit=5)
+
+    assert _row_for(response, path)["symbol_path"] == "deadbeef::~deadbeef"
+
+
+async def test_a_disambiguated_destructor_keeps_the_destructor(tmp_path):
+    """Both spellings at once: the discriminator goes, the tilde name stays."""
+    path = "src/a.cpp"
+    dtor = _hit(
+        "~Foo",
+        path,
+        0.8,
+        chunk_id=f"{path}::Foo::~Foo~cafebabe",
+        start_line=10,
+        end_line=20,
+    )
+    coordinator = _coordinator(
+        tmp_path, source_dense=[dtor], records={dtor.chunk_id: _record(dtor)}
+    )
+
+    response = await coordinator.search("how is Foo torn down", limit=5)
+
+    assert _row_for(response, path)["symbol_path"] == "Foo::~Foo"
+
+
+async def test_a_page_that_names_no_file_never_yields_a_symbol_path(tmp_path):
+    """A module or SCC page's target is a group key, and a ``::`` in it is not a chain.
+
+    These serve ``file: ""`` by design. Reading a name out of such a target
+    would invent a symbol the page never claimed to be about, so the missing
+    file is a reason to refuse rather than a check to skip.
+    """
+    from repowise.core.source_search.coordinator import symbol_path_of
+
+    assert symbol_path_of("nofile::Foo", "") == ""
+    assert symbol_path_of("group::key::thing", "") == ""
+    # Still read when the row does stand behind the file the id names.
+    assert symbol_path_of("a/b.py::Outer::inner", "a/b.py") == "Outer::inner"
+
+
+async def test_a_re_seated_row_is_the_one_that_gets_named(tmp_path):
+    """The ordering pin: naming runs after the line-evidence upgrade.
+
+    A wiki page for the file outranks both chunks, so deduplication keeps the
+    page and the served slot belongs to it. ``_upgrade_line_evidence`` then
+    re-seats that slot onto the enclosing chunk, because a page carries prose
+    and no line bounds. Only after that is the served row the one a reader
+    opens — so only after that can it be named.
+
+    Naming one statement earlier still passes every other test in this file:
+    the page it would annotate has no span, the annotation is skipped, and the
+    chunk that actually reaches the caller arrives bare. This is the case that
+    tells the difference.
+    """
+    path = "codeatlas/code_search/diversify.py"
+    enclosing, nested = _nested_pair(path, "mmr_diversify", "_sim")
+    page = _PageHit(
+        page_id=f"file_page:{path}",
+        target_path=path,
+        score=0.99,
+        page_type="file_page",
+        title=f"File: {path}",
+        snippet="How ranked results are diversified.",
+    )
+    # No lexical hits for the chunks, deliberately. With them the chunks
+    # outrank the page on the fusion, dedupe keeps a chunk outright, and there
+    # is no re-seat left to order anything against.
+    coordinator = _coordinator(
+        tmp_path,
+        source_dense=[enclosing, nested],
+        wiki_dense=[page],
+        records={hit.chunk_id: _record(hit) for hit in (enclosing, nested)},
+    )
+
+    response = await coordinator.search(
+        "how are ranked results diversified to avoid near duplicates", limit=5
+    )
+
+    row = _row_for(response, path)
+    # The re-seat happened: dedupe kept the page, which carries no lines, and
+    # the slot now holds the chunk.
+    assert row["start_line"] == 100
+    assert row["symbol_path"] == "mmr_diversify"
+    # And the row that survived the re-seat is the one carrying the name.
+    assert row["contains_symbols"] == ["mmr_diversify::_sim"]
