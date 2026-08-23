@@ -5,9 +5,15 @@ lets performance analysis bind a loop/lock call to that resolved edge instead
 of repeating a bare-name lookup. Existing rows default to an empty list and use
 the documented compatibility fallback until the next index refresh.
 
-Revision ID: 0055
-Revises: 0054
+Revision ID: 0059
+Revises: 0058
 Create Date: 2026-08-20
+
+Re-headed from 0055/0054 at integration: upstream v0.45.0 and the fork both
+minted revision 0055 under different filenames, which git merges without
+conflict while alembic gains a second head. The fork's 0055 keeps its id;
+this upstream migration moves to the tail. Safe to reorder — it only adds
+graph_edges.call_lines_json; 0055-0058 touch unrelated tables.
 """
 
 from __future__ import annotations
@@ -17,8 +23,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0055"
-down_revision: str | None = "0054"
+revision: str = "0059"
+down_revision: str | None = "0058"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
