@@ -347,3 +347,161 @@ async def test_a_clean_envelope_says_it_looked(indexed_repo):
         "served_deleted": [],
         "unavailable_reason": None,
     }
+
+
+# ---------------------------------------------------------------------------
+# F25 — the build's ingest record corrects the git-only verdict
+# ---------------------------------------------------------------------------
+
+
+def _content_hash(data: bytes) -> str:
+    from repowise.core.ingestion.models import compute_content_hash
+
+    return compute_content_hash(data)
+
+
+def _record_ingest(repo: Path, record: dict[str, str]) -> None:
+    """Re-publish the fixture manifest with a working-tree ingest record."""
+    import dataclasses
+
+    from repowise.core.source_search.manifest import read_manifest
+
+    manifest = read_manifest(default_manifest_path(repo))
+    assert manifest is not None
+    write_manifest(
+        default_manifest_path(repo),
+        dataclasses.replace(manifest, working_tree_ingest=record),
+    )
+
+
+async def test_a_reconciled_edit_is_fresh_not_forever_modified(indexed_repo):
+    """The F25 defect: git says dirty, but the corpus serves exactly these bytes.
+
+    Pre-record, this exact scenario is the first test in this file — modified
+    forever, converging only on commit. With the build's record naming the
+    ingested hash, the live check compares disk against what is served and
+    the verdict converges the moment the reconcile publishes.
+    """
+    edited = b"def alpha():\n    return 2\n"
+    (indexed_repo / "src/alpha.py").write_bytes(edited)
+    _record_ingest(indexed_repo, {"src/alpha.py": _content_hash(edited)})
+
+    status = await inspect_source_index(indexed_repo)
+
+    assert status.working_tree.checked is True
+    assert status.working_tree.modified == ()
+    assert status.working_tree.deleted == ()
+
+
+async def test_an_edit_after_reconciliation_is_modified_again(indexed_repo):
+    ingested = b"def alpha():\n    return 2\n"
+    (indexed_repo / "src/alpha.py").write_bytes(ingested)
+    _record_ingest(indexed_repo, {"src/alpha.py": _content_hash(ingested)})
+    (indexed_repo / "src/alpha.py").write_bytes(b"def alpha():\n    return 3\n")
+
+    status = await inspect_source_index(indexed_repo)
+
+    assert status.working_tree.modified == ("src/alpha.py",)
+
+
+async def test_a_revert_after_reconciliation_is_stale_though_git_is_clean(indexed_repo):
+    """The direction git is structurally blind to.
+
+    The corpus ingested an edit; the developer then reverted the file to its
+    committed content. ``git diff HEAD`` is clean, yet every served chunk for
+    the path holds bytes the disk no longer does. Only the build's own record
+    can see this.
+    """
+    _record_ingest(
+        indexed_repo, {"src/alpha.py": _content_hash(b"def alpha():\n    return 2\n")}
+    )
+
+    status = await inspect_source_index(indexed_repo)
+
+    assert status.working_tree.checked is True
+    assert status.working_tree.modified == ("src/alpha.py",)
+
+
+async def test_a_recorded_path_that_vanished_is_a_deletion_not_a_modification(indexed_repo):
+    edited = b"def alpha():\n    return 2\n"
+    (indexed_repo / "src/alpha.py").write_bytes(edited)
+    _record_ingest(indexed_repo, {"src/alpha.py": _content_hash(edited)})
+    (indexed_repo / "src/alpha.py").unlink()
+
+    status = await inspect_source_index(indexed_repo)
+
+    assert status.working_tree.deleted == ("src/alpha.py",)
+    assert "src/alpha.py" not in status.working_tree.modified
+
+
+async def test_a_record_for_an_unserved_path_changes_nothing(indexed_repo):
+    """A stale record entry for a path the generation retired must be inert."""
+    (indexed_repo / "notes.md").write_bytes(b"# rewritten\n")
+    _record_ingest(indexed_repo, {"notes.md": _content_hash(b"# something else\n")})
+
+    status = await inspect_source_index(indexed_repo)
+
+    assert status.working_tree.modified == ()
+    assert status.working_tree.deleted == ()
+
+
+def test_refinement_never_turns_an_unchecked_read_into_a_verdict(tmp_path):
+    from repowise.core.source_search.worktree import refine_with_ingest_record
+
+    out = refine_with_ingest_record(UNCHECKED, {"src/x.py": "aa"}, {"src/x.py"}, tmp_path)
+
+    assert out.checked is False
+    assert out.modified == () and out.deleted == ()
+
+
+def test_ingest_record_keeps_verified_hashes_for_dirty_paths_only(indexed_repo):
+    """Incremental record: dirty replacements enter, clean ones drop out."""
+    from repowise.core.source_search.worktree import build_ingest_record
+
+    (indexed_repo / "src/alpha.py").write_bytes(b"def alpha():\n    return 2\n")
+
+    record = build_ingest_record(
+        indexed_repo,
+        prior={"src/beta.py": "carried-from-a-prior-generation"},
+        full=False,
+        replaced=[("src/alpha.py", "verified-hash-a"), ("src/beta.py", "verified-hash-b")],
+        covered=set(_INDEXED),
+    )
+
+    # alpha is dirty against HEAD, so its verified hash is recorded; beta was
+    # re-ingested at commit-clean content, so its carried entry drops out —
+    # git alone is again the right judge for it.
+    assert record == {"src/alpha.py": "verified-hash-a"}
+
+
+def test_a_full_build_records_covered_dirty_files_from_disk(indexed_repo):
+    from repowise.core.source_search.worktree import build_ingest_record
+
+    edited = b"def alpha():\n    return 2\n"
+    (indexed_repo / "src/alpha.py").write_bytes(edited)
+    (indexed_repo / "notes.md").write_bytes(b"# dirty but uncovered\n")
+
+    record = build_ingest_record(
+        indexed_repo,
+        prior={},
+        full=True,
+        replaced=(),
+        covered=set(_INDEXED),
+    )
+
+    assert record == {"src/alpha.py": _content_hash(edited)}
+
+
+def test_an_unreadable_diff_carries_the_prior_record_forward(tmp_path):
+    from repowise.core.source_search.worktree import build_ingest_record
+
+    prior = {"src/alpha.py": "aa"}
+    record = build_ingest_record(
+        tmp_path,  # not a git repository
+        prior=prior,
+        full=False,
+        replaced=[("src/alpha.py", "bb")],
+        covered=(),
+    )
+
+    assert record == prior

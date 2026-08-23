@@ -165,6 +165,12 @@ class SourceIndexManifest:
     lance_table: str = "source_chunks"
     fts_path: str = ".repowise/source_search/source_fts.db"
     stale_files: dict[str, str] = field(default_factory=dict)
+    #: Path -> content hash of the bytes this generation ingested for it, for
+    #: every path that was dirty against HEAD at build time. The live
+    #: freshness check compares disk bytes against THIS, not against git:
+    #: a reconciled edit is fresh while it still matches, and a post-build
+    #: revert is stale even though ``git diff HEAD`` is clean.
+    working_tree_ingest: dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -199,6 +205,12 @@ class SourceIndexManifest:
                 str(path): str(reason) for path, reason in (raw.get("stale_files") or {}).items()
             }
             if isinstance(raw.get("stale_files") or {}, dict)
+            else {},
+            working_tree_ingest={
+                str(path): str(digest)
+                for path, digest in (raw.get("working_tree_ingest") or {}).items()
+            }
+            if isinstance(raw.get("working_tree_ingest") or {}, dict)
             else {},
         )
 

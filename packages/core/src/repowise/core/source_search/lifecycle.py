@@ -57,6 +57,7 @@ from .outbox import (
     mark_updates_ready,
 )
 from .vector_store import SourceChunkVectorStore
+from .worktree import build_ingest_record
 
 __all__ = [
     "SourceIndexDeferredError",
@@ -799,6 +800,13 @@ async def _reconcile_source_index_unlocked(
             lance_table=table_name,
             fts_path=_relative_to_repo(repo, fts_path),
             stale_files=stale_files,
+            working_tree_ingest=build_ingest_record(
+                repo,
+                prior=active.working_tree_ingest if active is not None else {},
+                full=plan.full,
+                replaced=[(change.path, change.content_hash) for change in plan.replace],
+                covered={chunk.file_path for chunk in chunks},
+            ),
         )
         await _set_state(
             repo,

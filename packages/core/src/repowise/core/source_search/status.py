@@ -17,6 +17,7 @@ from .worktree import (
     UNCHECKED,
     WorkingTreeDivergence,
     divergence_from_candidates,
+    refine_with_ingest_record,
     working_tree_candidates,
 )
 
@@ -335,16 +336,22 @@ async def inspect_source_index(
         candidates, candidate_error = await asyncio.to_thread(
             working_tree_candidates, repo, max_age=working_tree_max_age
         )
+    # The ingest record widens the membership probe: a recorded path with no
+    # live git divergence (a post-build revert) still needs its served-or-not
+    # answer before the refinement below may flag it.
+    ingest_record = dict(manifest.working_tree_ingest) if manifest is not None else {}
+    probe_paths = sorted(set(candidates) | set(ingest_record))
     if manifest is not None and fts is not None:
         # The caller's store, so its connection stays on the caller's thread —
         # ``sqlite3`` refuses cross-thread use, and the query is bounded by the
         # change set rather than the corpus.
         try:
-            probe: set[str] | None = fts.indexed_among(sorted(candidates))
+            probe: set[str] | None = fts.indexed_among(probe_paths)
         except Exception as exc:
             probe = None
             candidate_error = candidate_error or f"lexical_store_unreadable: {type(exc).__name__}"
         working_tree = divergence_from_candidates(candidates, probe, error=candidate_error)
+        working_tree = refine_with_ingest_record(working_tree, ingest_record, probe, repo)
     if manifest is not None and verify_stores:
         generation = GenerationRef(manifest.generation_id, manifest.generation_sequence)
         fts_path = repo / manifest.fts_path
@@ -356,13 +363,16 @@ async def inspect_source_index(
             )
         else:
             fts_count, indexed_probe, fts_error = await asyncio.to_thread(
-                _read_fts_facts, fts_path, generation, sorted(candidates)
+                _read_fts_facts, fts_path, generation, probe_paths
             )
             if fts is None:
                 working_tree = divergence_from_candidates(
                     candidates,
                     indexed_probe,
                     error=candidate_error,
+                )
+                working_tree = refine_with_ingest_record(
+                    working_tree, ingest_record, indexed_probe, repo
                 )
             if fts_error is not None:
                 findings.append(

@@ -32,7 +32,9 @@ __all__ = [
     "HOT_PATH_CACHE_TTL",
     "UNCHECKED",
     "WorkingTreeDivergence",
+    "build_ingest_record",
     "divergence_from_candidates",
+    "refine_with_ingest_record",
     "reset_cache_for_tests",
     "working_tree_candidates",
 ]
@@ -287,4 +289,121 @@ def divergence_from_candidates(
         checked=True,
         modified=tuple(sorted(modified)),
         deleted=tuple(sorted(deleted)),
+    )
+
+
+def build_ingest_record(
+    repo_path: Path | str,
+    *,
+    prior: Mapping[str, str],
+    full: bool,
+    replaced: Iterable[tuple[str, str | None]],
+    covered: Iterable[str],
+) -> dict[str, str]:
+    """What a build ingested from a dirty working tree, path -> content hash.
+
+    The record's consumer is :func:`refine_with_ingest_record`: it lets the
+    live freshness check compare disk bytes against what is actually served
+    instead of against HEAD, so a reconciled edit converges to fresh and a
+    post-build revert is caught as stale.
+
+    Incremental generations record each replaced path's outbox ``content_hash``
+    — the hash the reconcile verified against the bytes it actually chunked,
+    so the entry is race-free. A path re-ingested at commit-clean content
+    drops out of the carried record: the corpus no longer serves working-tree
+    bytes for it, and git alone is again the right judge.
+
+    Full builds (``full=True``) hash the covered dirty files at publication
+    instead — the build read them moments earlier without keeping hashes. A
+    file edited inside that window is recorded at its newer bytes and reads
+    fresh until the next save event re-queues it; accepting that beat
+    threading per-file hashes through every full-build path.
+
+    A failed live diff carries *prior* forward unchanged: a stale entry can
+    only re-flag a path as modified (hash mismatch), never clear one git
+    flagged, so the error direction stays honest.
+    """
+
+    from repowise.core.ingestion.models import compute_content_hash
+
+    repo = Path(repo_path)
+    candidates, error = working_tree_candidates(repo)
+    if error is not None:
+        return dict(prior)
+
+    if full:
+        served = set(covered)
+        record: dict[str, str] = {}
+        for path, kind in candidates.items():
+            if kind != DIVERGENCE_MODIFIED or path not in served:
+                continue
+            try:
+                record[path] = compute_content_hash((repo / path).read_bytes())
+            except OSError:
+                continue
+        return record
+
+    record = dict(prior)
+    for path, content_hash in replaced:
+        if candidates.get(path) == DIVERGENCE_MODIFIED and content_hash:
+            record[path] = content_hash
+        else:
+            record.pop(path, None)
+    return record
+
+
+def refine_with_ingest_record(
+    divergence: WorkingTreeDivergence,
+    record: Mapping[str, str],
+    indexed: Iterable[str] | None,
+    repo_path: Path | str,
+) -> WorkingTreeDivergence:
+    """Correct the divergence with the build's record of what it ingested dirty.
+
+    ``git diff HEAD`` answers "does this file differ from the last commit",
+    but staleness is "does this file differ from what the corpus *serves*".
+    The two disagree in both directions once a build has ingested uncommitted
+    content: a reconciled edit stays dirty against HEAD forever while the
+    corpus serves exactly its bytes (a false ``indexed_files_modified`` that
+    never converges), and an edit *reverted* after ingestion is clean against
+    HEAD while the corpus serves bytes the disk no longer holds (a real
+    divergence git cannot see).
+
+    *record* is the manifest's ``working_tree_ingest`` — path to the content
+    hash of the bytes the active generation ingested for it. For each recorded
+    path still served by the generation, the live bytes decide: matching hash
+    clears the path, a differing hash flags it modified, a missing file flags
+    it deleted. Paths the record does not cover keep the git verdict
+    unchanged, and an unchecked divergence stays unchecked — this narrows an
+    answer, it never invents one.
+    """
+
+    if not divergence.checked or not record:
+        return divergence
+    from repowise.core.ingestion.models import compute_content_hash
+
+    served = frozenset(indexed) if indexed is not None else frozenset()
+    repo = Path(repo_path)
+    modified = set(divergence.modified)
+    deleted = set(divergence.deleted)
+    for path, ingested_hash in record.items():
+        if path not in served or not isinstance(path, str) or not ingested_hash:
+            continue
+        try:
+            live = compute_content_hash((repo / path).read_bytes())
+        except OSError:
+            deleted.add(path)
+            modified.discard(path)
+            continue
+        if live == ingested_hash:
+            modified.discard(path)
+            deleted.discard(path)
+        else:
+            modified.add(path)
+            deleted.discard(path)
+    return WorkingTreeDivergence(
+        checked=True,
+        modified=tuple(sorted(modified)),
+        deleted=tuple(sorted(deleted)),
+        unavailable_reason=divergence.unavailable_reason,
     )

@@ -184,6 +184,8 @@ async def build_source_index(
     embed_seconds = time.perf_counter() - embed_started
     await store.close()
 
+    from .worktree import build_ingest_record
+
     write_manifest(
         manifest_path,
         SourceIndexManifest(
@@ -195,6 +197,13 @@ async def build_source_index(
             indexed_commit=indexed_commit,
             built_at=datetime.now(UTC).isoformat(timespec="seconds"),
             embedder=embedder_identity,
+            working_tree_ingest=build_ingest_record(
+                repo,
+                prior={},
+                full=True,
+                replaced=(),
+                covered={chunk.file_path for chunk in chunks},
+            ),
         ),
     )
 

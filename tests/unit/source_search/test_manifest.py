@@ -145,6 +145,30 @@ def test_write_then_read_round_trips(tmp_path):
     assert read_manifest(path) == _manifest()
 
 
+def test_the_ingest_record_round_trips(tmp_path):
+    path = tmp_path / "source_index.json"
+    manifest = _manifest(working_tree_ingest={"src/alpha.py": "abc123"})
+    write_manifest(path, manifest)
+    loaded = read_manifest(path)
+    assert loaded is not None
+    assert loaded.working_tree_ingest == {"src/alpha.py": "abc123"}
+
+
+def test_a_manifest_without_the_ingest_record_reads_as_empty(tmp_path):
+    """Every pre-F25 manifest on disk lacks the field and must stay readable."""
+    import dataclasses
+
+    path = tmp_path / "source_index.json"
+    write_manifest(path, _manifest())
+    raw = json.loads(path.read_text())
+    raw.pop("working_tree_ingest")
+    path.write_text(json.dumps(raw))
+    loaded = read_manifest(path)
+    assert loaded is not None
+    assert loaded.working_tree_ingest == {}
+    assert dataclasses.replace(loaded, working_tree_ingest={}) == loaded
+
+
 def test_the_written_document_carries_every_field(tmp_path):
     path = tmp_path / "source_index.json"
     write_manifest(path, _manifest())
@@ -163,6 +187,7 @@ def test_the_written_document_carries_every_field(tmp_path):
         "recipe_fingerprint",
         "stale_files",
         "symbol_chunks",
+        "working_tree_ingest",
     }
     assert raw["embedder"] == {
         "provider": "ollama",
