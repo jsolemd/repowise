@@ -140,25 +140,39 @@ def _declares_subject(env: dict[str, Any]) -> int:
       broker wired to Redis with retry middleware and shutdown notifications"
       away from the real broker on the token "retry", and a search component
       takes an infra ranking-helper query on the token "search".
-    * The owner's **basename** carries a token the query matched — read from
-      the evidence's per-concept breakdown, compared word-level with the same
-      tokenizer as the rival gate. The basename, not the path: a directory
-      segment names an area of the tree, not a file's subject. Measured,
-      ``infra/zotero/service/api_sync.py`` took make's BetterBibTeX
-      JSON-RPC-client query on the directory token "zotero" alone, away from
-      ``bbt.py`` — whose content matched *betterbibtex itself*, the one token
-      infra never matched at all.
+    * The owner's **stem** — the basename minus its extension — carries the
+      subject, in one of two ways, both read against the matched tokens of
+      the per-concept breakdown with the same tokenizer as the rival gate:
+      **two or more matched tokens in the stem** (``mantine-theme.ts`` for a
+      Mantine-theme query — a multi-token name match is the subject spelled
+      out), or **one matched token together with**
+      ``concept_coverage > content_concept_coverage`` (``routes/health.py``
+      for a health-check query — the name carries subject the body does not).
+      The stem, not the path, and not the extension: a directory segment
+      names an area of the tree (measured, ``infra/zotero/service/``'s
+      ``api_sync.py`` took make's BetterBibTeX query on the token "zotero"
+      alone, away from ``bbt.py`` whose content matched *betterbibtex
+      itself*), and an extension names a file format ("config.json" must not
+      declare a json query).
 
-    The earlier form of the second condition —
-    ``concept_coverage > content_concept_coverage``, "the name carries part
-    of the subject the content does not" — had an inversion measured on both
-    sealed and open sets: an owner whose content fully carries every matched
-    concept has coverage equal to content and could never declare, so
-    web's ``mantine-theme.ts`` (every token content-carried, the stronger
-    dense) lost to graph's twin, which declared on a name-only "mantine".
-    Being named for the subject cannot be suppressed by *also* containing it.
-    Envelopes without a per-concept breakdown keep the difference test as the
-    fallback — it is the only name signal on that wire shape.
+    The single-token arm's coverage-difference requirement is what stops one
+    incidental name word from outranking a confidence class: a search
+    component whose body also carries "search" has coverage equal to content
+    and does not declare on that one token. An earlier form used the
+    difference test as the ONLY name signal, and that had a measured
+    inversion on both sealed and open sets — an owner whose content fully
+    carries every matched concept could never declare, so web's
+    ``mantine-theme.ts`` (every token content-carried, the stronger dense)
+    lost to graph's twin declaring on a name-only "mantine". Being named for
+    the subject, in full, cannot be suppressed by also containing it — that
+    is the multi-token arm.
+
+    Envelopes without a per-concept breakdown keep the bare difference test
+    as the fallback. In production that branch is unreachable — the
+    coordinator always emits ``concepts``, and an empty tuple zeroes
+    ``concept_coverage`` below the floor first — so its only exercisers are
+    the legacy-shape stub tests; if a future wire shape drops the key, the
+    weaker rule goes live silently, which this comment exists to flag.
 
     This does not contradict A3, it answers a different question. A3 governs
     whether a claim inside one corpus may be called *confident*, and there a
@@ -175,6 +189,7 @@ def _declares_subject(env: dict[str, Any]) -> int:
     if coverage < NO_MATCH_CONCEPT_COVERAGE:
         return 0
     concepts = evidence.get("concepts")
+    content = _coverage(evidence, "content_concept_coverage")
     if isinstance(concepts, list) and concepts:
         matched = {
             str(concept.get("token", "")).lower()
@@ -182,12 +197,22 @@ def _declares_subject(env: dict[str, Any]) -> int:
             if isinstance(concept, dict) and concept.get("matched")
         }
         basename = ((env.get("selected_owner") or {}).get("file") or "").rsplit("/", 1)[-1]
-        return 1 if matched & _name_tokens(basename) else 0
-    content = _coverage(evidence, "content_concept_coverage")
+        # The stem, not the full basename: "config.json" must not declare a
+        # json/config query on its extension — json/sql/yaml/css are all
+        # plausible query concepts AND extensions, and a declaration outranks
+        # a whole confidence class. The rival gate keeps extensions: a *.json
+        # twin collision across repos is real, and there the comparison is
+        # symmetric so the extension cancels. The [1:] guard keeps dotfiles
+        # (".env") whole.
+        stem = basename.rsplit(".", 1)[0] if "." in basename[1:] else basename
+        named = matched & _name_tokens(stem)
+        if len(named) >= 2:
+            return 1
+        return 1 if named and coverage > content else 0
     return 1 if coverage > content else 0
 
 
-def _envelope_strength(env: dict[str, Any]) -> tuple[int, int, int, float]:
+def _envelope_strength(env: dict[str, Any]) -> tuple[int, int, int, int, float]:
     """What one repo's answer asserts, in cross-corpus-comparable terms only.
 
     1. ``exact_name`` — the query named the artifact. The coordinator returns
@@ -200,7 +225,10 @@ def _envelope_strength(env: dict[str, Any]) -> tuple[int, int, int, float]:
        Ranking confidence first cannot see that, because both classes are
        honestly earned inside their own corpus.
     3. ``confidence`` — the class the repo committed to.
-    4. ``dense_cosine`` — the last resort, and the only magnitude here.
+    4. ``has_owner`` — an envelope that selected no owner asserts no
+       ownership, and at equal class must not beat one that did on a cosine
+       coin flip (see the inline comment at the return).
+    5. ``dense_cosine`` — the last resort, and the only magnitude here.
 
     What is deliberately *absent* is any coverage magnitude. Coverage looks
     cross-corpus comparable and is not: each corpus derives its own concept

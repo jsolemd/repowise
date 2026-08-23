@@ -1618,3 +1618,120 @@ async def test_the_docx_archetype_survives_with_concepts_on_the_wire(monkeypatch
 
     assert resp["selected_owner"]["file"] == "src/make/engines/docx_template.py"
     assert resp["confidence"] == "caution"
+
+
+@pytest.mark.asyncio
+async def test_an_extension_is_not_a_subject_declaration(monkeypatch):
+    """"config.json" must not declare a json/config query on its extension —
+    a declaration outranks a whole confidence class, and json/sql/yaml are
+    all plausible query concepts AND file formats."""
+    registry = _StubRegistry(["infra", "graph"], default="infra")
+    infra = _StubCoordinator(
+        _envelope_with_concepts(
+            [("data/config.json", 0.02)],
+            "caution",
+            owner="data/config.json",
+            cosine=0.40,
+            coverage=(1.0, 1.0),
+            concepts=[("json", True, True), ("config", True, True)],
+        )
+    )
+    graph = _StubCoordinator(
+        _envelope_with_concepts(
+            [("core/settings_loader.py", 0.02)],
+            "confident",
+            owner="core/settings_loader.py",
+            cosine=0.80,
+            coverage=(1.0, 1.0),
+            concepts=[("json", True, True), ("config", True, True)],
+        )
+    )
+    _wire(monkeypatch, {"infra": infra, "graph": graph})
+
+    resp = await workspace_source_search(
+        "json config loading", limit=10, mode="concept", repo="all",
+        registry=registry, build_meta=_META,
+    )
+
+    assert resp["selected_owner"]["file"] == "core/settings_loader.py"
+
+
+@pytest.mark.asyncio
+async def test_one_incidental_name_token_does_not_outrank_a_confidence_class(monkeypatch):
+    """The docstring's own counterexample, kept true: a search component whose
+    body also carries "search" has one matched stem token and no
+    path-over-content coverage — it must not take a ranking query from the
+    confident real owner."""
+    registry = _StubRegistry(["web", "infra"], default="web")
+    web = _StubCoordinator(
+        _envelope_with_concepts(
+            [("ui/components/search.tsx", 0.02)],
+            "caution",
+            owner="ui/components/search.tsx",
+            cosine=0.42,
+            coverage=(0.6, 0.6),
+            concepts=[("search", True, True), ("ranking", True, False)],
+        )
+    )
+    infra = _StubCoordinator(
+        _envelope_with_concepts(
+            [("core/rank/scorer.py", 0.02)],
+            "confident",
+            owner="core/rank/scorer.py",
+            cosine=0.78,
+            coverage=(1.0, 1.0),
+            concepts=[("search", True, True), ("ranking", True, True)],
+        )
+    )
+    _wire(monkeypatch, {"web": web, "infra": infra})
+
+    resp = await workspace_source_search(
+        "search result ranking", limit=10, mode="concept", repo="all",
+        registry=registry, build_meta=_META,
+    )
+
+    assert resp["selected_owner"]["file"] == "core/rank/scorer.py"
+
+
+@pytest.mark.asyncio
+async def test_a_single_token_name_with_path_carried_subject_still_declares(monkeypatch):
+    """The health archetype in the per-concept shape: one matched stem token
+    plus coverage above content — the name carries subject the body does not,
+    and that single token is a real declaration."""
+    registry = _StubRegistry(["graph", "infra"], default="infra")
+    infra = _StubCoordinator(
+        _envelope_with_concepts(
+            [("codeatlas/code_search/transport/handlers.py", 0.02)],
+            "confident",
+            owner="codeatlas/code_search/transport/handlers.py",
+            cosine=0.5287,
+            coverage=(1.0, 1.0),
+            concepts=[
+                ("health", True, True),
+                ("check", True, True),
+                ("endpoint", True, True),
+            ],
+        )
+    )
+    graph = _StubCoordinator(
+        _envelope_with_concepts(
+            [("apps/api/app/routes/health.py", 0.02)],
+            "caution",
+            owner="apps/api/app/routes/health.py",
+            cosine=0.5034,
+            coverage=(0.6412, 0.2507),
+            concepts=[
+                ("health", True, False),
+                ("check", True, False),
+                ("endpoint", False, False),
+            ],
+        )
+    )
+    _wire(monkeypatch, {"graph": graph, "infra": infra})
+
+    resp = await workspace_source_search(
+        "health check endpoint", limit=10, mode="concept", repo="all",
+        registry=registry, build_meta=_META,
+    )
+
+    assert resp["selected_owner"]["file"] == "apps/api/app/routes/health.py"
