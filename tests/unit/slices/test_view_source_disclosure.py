@@ -91,3 +91,26 @@ def test_card_and_skeleton_never_read_source_at_all(tmp_path) -> None:
         payload = render_member(member, view, _ctx(tmp_path))
         assert "source" not in payload
         assert "source_unavailable" not in payload
+
+
+def test_a_member_path_cannot_read_outside_the_repo(tmp_path) -> None:
+    """An index row is not a trust boundary.
+
+    A checked-in symlink to a file outside the repo is listed by the walker
+    and indexed under its repo-relative name; ``..`` segments and absolute
+    paths can only come from a hostile index. All three must read as gone,
+    never as the target's bytes.
+    """
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("SECRET\n")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "leak.py").symlink_to(outside / "secret.txt")
+
+    from repowise.core.slices.views import ViewContext
+
+    for rel in ("leak.py", "../outside/secret.txt", str(outside / "secret.txt")):
+        payload = render_member(_symbol(rel, 1, 1), "full", ViewContext(repo_root=repo))
+        assert payload["source"] is None, rel
+        assert "source_unavailable" in payload, rel

@@ -234,7 +234,7 @@ Job progress events (`JobProgressEvent`) carry: `event` type, `file` currently b
 
 repowise registers 27 MCP tools and advertises **12 by default** in single-repo
 mode (the eleven flagship tools plus `list_repos`). Workspace mode adds two more;
-six further tools are opt-in. See [`docs/agent/MCP_TOOLS.md`](../../docs/agent/MCP_TOOLS.md).
+thirteen further tools are opt-in. See [`docs/agent/MCP_TOOLS.md`](../../docs/agent/MCP_TOOLS.md).
 Start the MCP server via:
 
 ```bash

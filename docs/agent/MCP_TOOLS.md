@@ -83,7 +83,7 @@ The default surface is deliberately small: fewer, richer tools mean fewer round-
 
 - **Default (single-repo):** 12 tools, the eleven flagship tools plus `list_repos`.
 - **Default (workspace):** those 12 plus `get_architecture` and `get_blast_radius`, added automatically when the server starts inside a workspace. They are never advertised outside one.
-- **Opt-in tools:** `get_dependents`, `get_dependency_path`, `get_execution_flows`, `generate_refactoring_code`, `get_conformance`, and `reindex_repository` are registered but off by default. Turn them on per repo; `get_conformance` only does useful work in workspace mode (name it there). `reindex_repository` remains separate from the default read surface because it starts background work.
+- **Opt-in tools:** `get_dependents`, `get_dependency_path`, `get_execution_flows`, `generate_refactoring_code`, `get_conformance`, `reindex_repository`, `build_task_slice`, `get_task_slice`, `extend_task_slice`, `get_query_quality`, `find_clones`, `find_patterns`, and `manage_decision` are registered but off by default. Turn them on per repo; `get_conformance` only does useful work in workspace mode (name it there), and `manage_decision` only where a decision journal is configured. `reindex_repository` remains separate from the default read surface because it starts background work.
 
 **Configure it in `.repowise/config.yaml`** under an `mcp.tools` key. Four shapes are supported:
 
@@ -1170,12 +1170,13 @@ omission store, never silently gone.
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `task` | string | Yes | The task, phrased as work: "add retry to the sync client" |
+| `entry_points` | string[] | No | Explicit starting nodes — file paths, `path::Symbol` ids, or unambiguous symbol names. Naming them suppresses nomination from the task text |
 | `repo` | string | No | *(workspace only)* Target repo alias; `"all"` is not supported |
 | `view` | string | No | `card` (default here: `skeleton`), `skeleton`, or `full` fidelity per member |
 | `budget_tokens` | integer | No | Serialization budget; drops are ranked and disclosed |
 | `downstream_depth` / `upstream_depth` | integer | No | Walk depth from the entry points (defaults 2 / 1) |
 | `include_tests` | boolean | No | Include test files as members |
-| `max_members` | integer | No | Hard member cap before the budget pass |
+| `max_members` | integer | No | Member cap before the budget pass (seed members are always kept) |
 | `include_edges` | boolean | No | Carry the member-to-member edges in the response |
 
 A build that matches nothing is a shaped failure naming what was tried — never
@@ -1204,7 +1205,7 @@ it was built with. The three views are per-member fidelity levels: `card`
 | `include_edges` | boolean | No | Carry the member-to-member edges |
 
 ```
-get_task_slice(slice_id="slice-3f9a", view="full", budget_tokens=12000)
+get_task_slice(slice_id="sl_3f9a2b7c1d0e", view="full", budget_tokens=12000)
 ```
 
 ---
@@ -1226,9 +1227,10 @@ drop. Extending a fully-expanded slice says so rather than pretending growth.
 | `task_addendum` | string | No | Extra task text to resolve new entry points from |
 | `view` | string | No | Fidelity of the returned members (default `card`) |
 | `budget_tokens` | integer | No | Serialization budget for this read |
+| `include_edges` | boolean | No | Carry the member-to-member edges in the response |
 
 ```
-extend_task_slice(slice_id="slice-3f9a", extra_downstream=1,
+extend_task_slice(slice_id="sl_3f9a2b7c1d0e", extra_downstream=1,
                   entry_points=["src/sync/client.py::SyncClient"])
 ```
 
@@ -1279,7 +1281,8 @@ indistinguishable from "this repository has none".
 | `repo` | string | No | *(workspace only)* Target repo alias; `"all"` is not supported |
 | `limit` | integer | No | Matches per response (cap 30) |
 | `include_tests` | boolean | No | Include test files in scope |
-| `min_files` / `min_lines` / `min_callers` / `min_siblings` | integer | No | Per-pattern thresholds; only the ones the chosen predicate uses apply |
+| `min_files` / `min_lines` / `min_callers` / `min_siblings` / `min_directories` | integer | No | Per-pattern thresholds; only the ones the chosen predicate uses apply (`min_directories` is `reuse_candidates`' one tunable) |
+| `percentile` | number | No | Percentile cutoff for rank-thresholded patterns; clamped 0–100 |
 
 ```
 find_patterns()                          # the catalogue, with each predicate

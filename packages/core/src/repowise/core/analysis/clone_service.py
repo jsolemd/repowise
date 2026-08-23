@@ -437,6 +437,7 @@ async def pair_near_clones(
     max_chunks: int = DEFAULT_NEAR_MAX_CHUNKS,
     time_budget_secs: float = DEFAULT_NEAR_TIME_BUDGET_SECS,
     include_tests: bool = False,
+    path_prefix: str | None = None,
     exclude: Sequence[CloneFinding] = (),
 ) -> tuple[list[CloneFinding], bool]:
     """Pair chunks above *threshold* that the exact leg did not already report.
@@ -448,10 +449,21 @@ async def pair_near_clones(
     make that impossible, and either one firing is disclosed rather than
     quietly shortening the answer.
 
+    ``path_prefix`` confines the pass the way the exact leg is confined: a
+    chunk outside the prefix is never offered, so a pair cannot span the
+    scope boundary — and a pair the exact leg dropped as out of scope
+    cannot come back mislabeled ``near``.
+
     Pairs are symmetric, so each is emitted once, in canonical site order.
     """
     all_chunks = list(await index.chunks())
-    eligible = [c for c in all_chunks if c.lines >= min_lines and (include_tests or not c.is_test)]
+    eligible = [
+        c
+        for c in all_chunks
+        if _in_scope(c.file, path_prefix)
+        and c.lines >= min_lines
+        and (include_tests or not c.is_test)
+    ]
     truncated = len(eligible) > max_chunks
     eligible = eligible[:max_chunks]
     by_id = {c.id: c for c in eligible}
@@ -694,6 +706,7 @@ class CloneService:
                 max_chunks=max_chunks,
                 time_budget_secs=time_budget_secs,
                 include_tests=include_tests,
+                path_prefix=path_prefix,
                 exclude=base.findings,
             )
         except Exception as exc:

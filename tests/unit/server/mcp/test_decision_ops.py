@@ -589,7 +589,7 @@ async def test_a_proposal_never_reaches_answer_context_until_confirmed(journal_r
     from repowise.core.persistence.crud.decisions import count_decisions_by_status
     from repowise.server.mcp_server._answer_context import fetch_relevant_decisions
 
-    root, repo_id, _db = journal_repo
+    _root, repo_id, _db = journal_repo
     recorded = await _record()
     decision_id = recorded["decision"]["id"]
     await _call(action="list")  # runs the journal projection

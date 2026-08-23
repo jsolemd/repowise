@@ -233,6 +233,23 @@ async def test_near_leg_drops_pairs_the_exact_leg_already_reported(repo: Path) -
     assert {"alpha/report.py", "beta/report.py"} not in reported
 
 
+async def test_near_pass_respects_the_path_prefix(repo: Path) -> None:
+    """The prefix confines BOTH legs.
+
+    The near pass pairing the whole index leaked out-of-scope findings — and
+    re-emitted the exact plant the prefix had dropped, mislabeled ``near``,
+    because the exclusion list is computed from the already-filtered exact leg.
+    """
+    report = await _service(repo).scan_with_near_clones(
+        toy.oracle_index(repo), path_prefix="alpha"
+    )
+
+    assert all(s.file.startswith("alpha/") for f in report.findings for s in f.sites)
+    reported = [{s.file for s in f.sites} for f in report.findings]
+    assert {"alpha/report.py", "beta/report.py"} not in reported
+    assert {"core/util.py", "gamma/paraphrase.py"} not in reported
+
+
 async def test_below_threshold_pairs_are_not_reported(repo: Path) -> None:
     report = await _service(repo).scan_with_near_clones(toy.oracle_index(repo))
 

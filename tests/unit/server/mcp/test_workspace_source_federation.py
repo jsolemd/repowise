@@ -1449,3 +1449,18 @@ def test_rival_gate_needs_a_whole_name_token_not_a_substring():
         ("b", env("web/createPageMetadata.ts", [])),
     ]
     assert _same_name_rivals("a", "src/createPageMetadata.ts", envelopes) != []
+
+    # An acronym prefix is still a boundary: "HTTPServer" is http + server,
+    # not one opaque word that no concept token can ever match.
+    envelopes = [
+        ("a", env("src/HTTPServer.ts", ["server"])),
+        ("b", env("gateway/HTTPServer.ts", [])),
+    ]
+    assert _same_name_rivals("a", "src/HTTPServer.ts", envelopes) != []
+
+    # Interior acronym: "userIDMap" is user + id + map.
+    envelopes = [
+        ("a", env("src/userIDMap.ts", ["id"])),
+        ("b", env("core/userIDMap.ts", [])),
+    ]
+    assert _same_name_rivals("a", "src/userIDMap.ts", envelopes) != []

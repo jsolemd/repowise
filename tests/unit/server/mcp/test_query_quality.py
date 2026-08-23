@@ -9,11 +9,9 @@ from types import SimpleNamespace
 import pytest
 
 from repowise.core.persistence.models import Repository
-from repowise.core.registry import mcp_tool_registry
 from repowise.core.source_search.query_log import QueryEvent, QueryLog, TopEntry
 from repowise.server.mcp_server import tool_query_report
 from repowise.server.mcp_server.tool_query_report import get_query_quality
-
 
 
 async def _wire(*, monkeypatch, session, factory, repo_id: str, repo_path: Path):

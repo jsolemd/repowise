@@ -226,3 +226,31 @@ def test_health_reports_a_lock_held_by_another_writer(journal_repo: Path) -> Non
     finally:
         fcntl.flock(descriptor, fcntl.LOCK_UN)
         os.close(descriptor)
+
+
+def test_replacing_anchors_does_not_ratify_a_proposal(journal_repo: Path) -> None:
+    """Re-anchoring is not the confirm verb.
+
+    ``replace_anchor_files`` re-stamps ``confirmed_at`` on a confirmed row —
+    the caller has just re-attested which files the decision governs — but a
+    proposed row must come out of the same edit still proposed, or a dashboard
+    PATCH of the affected files silently ratifies an agent's text.
+    """
+    journal = DecisionJournal(journal_repo)
+    proposal = journal.record(
+        title="Proposed rule",
+        decision="Agents may propose.",
+        why="The git diff stays the human gate.",
+        anchors=[{"file": "src/service.py", "symbol": "VALUE"}],
+        confirmed=False,
+    )
+    assert proposal.confirmed_at is None
+
+    updated = journal.replace_anchor_files(proposal.id, ["src/service.py"])
+
+    assert updated.confirmed_at is None
+    assert journal.get(proposal.id).confirmed_at is None
+
+    confirmed = _record(journal, "Confirmed rule")
+    restamped = journal.replace_anchor_files(confirmed.id, ["src/service.py"])
+    assert restamped.confirmed_at is not None

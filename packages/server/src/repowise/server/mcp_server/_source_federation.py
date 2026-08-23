@@ -248,11 +248,16 @@ def _same_name_rivals(
         return []
     tokens = _query_concept_tokens(envelopes)
     # Whole-token comparison on both sides: concept tokens are word-level, so a
-    # substring test lets "db" open the gate against "dashboard.py".
+    # substring test lets "db" open the gate against "dashboard.py". The second
+    # camelCase boundary handles acronym prefixes — without it "HTTPServer"
+    # tokenizes as one word and "server" no longer opens the gate.
     name_tokens = {
         part
         for part in re.split(
-            r"[^a-z0-9]+", re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", raw_name).lower()
+            r"[^a-z0-9]+",
+            re.sub(
+                r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])", " ", raw_name
+            ).lower(),
         )
         if part
     }

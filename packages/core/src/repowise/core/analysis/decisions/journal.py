@@ -556,7 +556,12 @@ class DecisionJournal:
                 normalized = str(_validate_relative_anchor(file))
                 requested.append({"file": file, "symbol": symbols.get(normalized)})
             anchors = self._stamp_anchors(requested)
-            updated = replace(current, anchors=anchors, confirmed_at=_utc_now_iso())
+            # Re-anchoring re-attests a CONFIRMED decision's anchors, but it is
+            # not the confirm verb: a proposed row (confirmed_at null) must
+            # stay proposed, or a dashboard edit of the governed files would
+            # silently ratify it.
+            stamped = _utc_now_iso() if current.confirmed_at is not None else None
+            updated = replace(current, anchors=anchors, confirmed_at=stamped)
             document.replace_record(updated)
             return updated
 

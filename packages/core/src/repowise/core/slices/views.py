@@ -69,9 +69,15 @@ class ViewContext:
             return self._source_cache[rel_path]
         lines: list[str] | None = None
         if self.repo_root is not None:
+            # An index row is not a trust boundary: a checked-in symlink (the
+            # walker lists symlinked files), a ``..`` segment, or an absolute
+            # path in a member's rel_path must not read outside the repo.
             try:
-                data = (self.repo_root / rel_path).read_bytes()
-            except OSError:
+                root = self.repo_root.resolve()
+                target = (root / rel_path).resolve()
+                target.relative_to(root)
+                data = target.read_bytes()
+            except (OSError, ValueError):
                 data = None
             if data is not None:
                 lines = decode_source(data).splitlines()

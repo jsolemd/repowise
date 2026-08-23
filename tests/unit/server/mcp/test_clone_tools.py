@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from repowise.core.persistence.models import GraphEdge, GraphNode
 from tests.unit.analysis import toy_clone_repo as toy
 
+
 @pytest.fixture
 async def indexed_toy_repo(tmp_path: Path, session: AsyncSession, factory, repo_id: str) -> Path:
     """Plant the tree, index it for real, persist the graph, wire MCP state."""
