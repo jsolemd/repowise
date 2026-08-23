@@ -319,9 +319,13 @@ def build_ingest_record(
     fresh until the next save event re-queues it; accepting that beat
     threading per-file hashes through every full-build path.
 
-    A failed live diff carries *prior* forward unchanged: a stale entry can
-    only re-flag a path as modified (hash mismatch), never clear one git
-    flagged, so the error direction stays honest.
+    A failed live diff carries *prior* forward for paths this build did NOT
+    touch — minus every path in *replaced*. A just-re-ingested path's prior
+    hash is known-wrong (the corpus now serves different bytes), and carrying
+    it opens the one ghost route this record could create: the disk later
+    returns to the recorded bytes, the hash coincides, and the refinement
+    clears a path git correctly flagged. Dropped entries fall back to the
+    plain git verdict, which is the honest direction.
     """
 
     from repowise.core.ingestion.models import compute_content_hash
@@ -329,7 +333,10 @@ def build_ingest_record(
     repo = Path(repo_path)
     candidates, error = working_tree_candidates(repo)
     if error is not None:
-        return dict(prior)
+        record = dict(prior)
+        for path, _content_hash in replaced:
+            record.pop(path, None)
+        return record
 
     if full:
         served = set(covered)

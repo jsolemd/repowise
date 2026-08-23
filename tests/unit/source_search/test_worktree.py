@@ -492,16 +492,65 @@ def test_a_full_build_records_covered_dirty_files_from_disk(indexed_repo):
     assert record == {"src/alpha.py": _content_hash(edited)}
 
 
-def test_an_unreadable_diff_carries_the_prior_record_forward(tmp_path):
+def test_an_unreadable_diff_carries_untouched_paths_and_drops_replaced_ones(tmp_path):
+    """The error branch must never keep a hash the corpus no longer serves.
+
+    A path this build re-ingested has a prior hash that is known-wrong. If it
+    survives a failed diff, the disk can later return to exactly those bytes
+    and the refinement would clear a path git correctly flags — the ghost
+    route G1. Untouched paths keep their carry; replaced ones fall back to
+    the plain git verdict.
+    """
     from repowise.core.source_search.worktree import build_ingest_record
 
-    prior = {"src/alpha.py": "aa"}
     record = build_ingest_record(
         tmp_path,  # not a git repository
-        prior=prior,
+        prior={"src/alpha.py": "aa", "src/beta.py": "carried"},
         full=False,
         replaced=[("src/alpha.py", "bb")],
         covered=(),
     )
 
-    assert record == prior
+    assert record == {"src/beta.py": "carried"}
+
+
+async def test_the_failed_diff_ghost_route_is_closed_end_to_end(indexed_repo):
+    """G1's full four-step scenario, with the error branch in the middle.
+
+    Edit ingested at H1 → revert re-ingested at C under a FAILED live diff →
+    the same edit re-applied. Disk is H1 again; git says modified; the corpus
+    serves C. A record that survived step two would hash-match H1 and clear
+    the path. The fixed producer drops the entry at step two, so the git
+    verdict stands.
+    """
+    edited = b"def alpha():\n    return 2\n"
+    (indexed_repo / "src/alpha.py").write_bytes(edited)
+
+    from repowise.core.source_search.worktree import build_ingest_record
+
+    after_dirty_build = build_ingest_record(
+        indexed_repo,
+        prior={},
+        full=False,
+        replaced=[("src/alpha.py", _content_hash(edited))],
+        covered=set(_INDEXED),
+    )
+    assert after_dirty_build == {"src/alpha.py": _content_hash(edited)}
+
+    # The revert is re-ingested while the live diff FAILS (index.lock, timeout).
+    committed_hash = _content_hash(b"def alpha():\n    return 1\n")
+    after_failed_diff_build = build_ingest_record(
+        indexed_repo / "does-not-exist",  # unreadable → error branch
+        prior=after_dirty_build,
+        full=False,
+        replaced=[("src/alpha.py", committed_hash)],
+        covered=set(_INDEXED),
+    )
+    assert after_failed_diff_build == {}
+
+    # The same edit returns; git flags it; nothing may clear it.
+    _record_ingest(indexed_repo, after_failed_diff_build)
+
+    status = await inspect_source_index(indexed_repo)
+
+    assert status.working_tree.modified == ("src/alpha.py",)
