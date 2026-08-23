@@ -40,7 +40,8 @@ import asyncio
 import copy
 import logging
 import re
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from repowise.core.source_search.coordinator import NO_MATCH_CONCEPT_COVERAGE
 
@@ -107,6 +108,26 @@ def _coverage(evidence: dict[str, Any], key: str) -> float:
     return float(value) if isinstance(value, (int, float)) else 0.0
 
 
+def _name_tokens(raw_name: str) -> set[str]:
+    """Word-level tokens of a file name, separator- and camelCase-split.
+
+    The second camelCase boundary handles acronym prefixes — without it
+    "HTTPServer" tokenizes as one word and "server" never matches it. Shared
+    by the rival gate and the subject declaration so the two surfaces cannot
+    disagree about what a name says.
+    """
+    return {
+        part
+        for part in re.split(
+            r"[^a-z0-9]+",
+            re.sub(
+                r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])", " ", raw_name
+            ).lower(),
+        )
+        if part
+    }
+
+
 def _declares_subject(env: dict[str, Any]) -> int:
     """Whether this repo's owner is *named* for the subject it was asked about.
 
@@ -119,13 +140,25 @@ def _declares_subject(env: dict[str, Any]) -> int:
       broker wired to Redis with retry middleware and shutdown notifications"
       away from the real broker on the token "retry", and a search component
       takes an infra ranking-helper query on the token "search".
-    * ``concept_coverage > content_concept_coverage`` — some of that subject
-      is carried by the path and not by the body. This is the *difference*
-      between A3's permissive and strict coverage, so it needs nothing that is
-      not already on the wire.
+    * The owner's **basename** carries a token the query matched — read from
+      the evidence's per-concept breakdown, compared word-level with the same
+      tokenizer as the rival gate. The basename, not the path: a directory
+      segment names an area of the tree, not a file's subject. Measured,
+      ``infra/zotero/service/api_sync.py`` took make's BetterBibTeX
+      JSON-RPC-client query on the directory token "zotero" alone, away from
+      ``bbt.py`` — whose content matched *betterbibtex itself*, the one token
+      infra never matched at all.
 
-    Together they read: the engine considers this owner a plausible subject,
-    and its name declares part of that subject its content does not.
+    The earlier form of the second condition —
+    ``concept_coverage > content_concept_coverage``, "the name carries part
+    of the subject the content does not" — had an inversion measured on both
+    sealed and open sets: an owner whose content fully carries every matched
+    concept has coverage equal to content and could never declare, so
+    web's ``mantine-theme.ts`` (every token content-carried, the stronger
+    dense) lost to graph's twin, which declared on a name-only "mantine".
+    Being named for the subject cannot be suppressed by *also* containing it.
+    Envelopes without a per-concept breakdown keep the difference test as the
+    fallback — it is the only name signal on that wire shape.
 
     This does not contradict A3, it answers a different question. A3 governs
     whether a claim inside one corpus may be called *confident*, and there a
@@ -139,9 +172,19 @@ def _declares_subject(env: dict[str, Any]) -> int:
     """
     evidence = _owner_evidence(env)
     coverage = _coverage(evidence, "concept_coverage")
+    if coverage < NO_MATCH_CONCEPT_COVERAGE:
+        return 0
+    concepts = evidence.get("concepts")
+    if isinstance(concepts, list) and concepts:
+        matched = {
+            str(concept.get("token", "")).lower()
+            for concept in concepts
+            if isinstance(concept, dict) and concept.get("matched")
+        }
+        basename = ((env.get("selected_owner") or {}).get("file") or "").rsplit("/", 1)[-1]
+        return 1 if matched & _name_tokens(basename) else 0
     content = _coverage(evidence, "content_concept_coverage")
-    declares = coverage >= NO_MATCH_CONCEPT_COVERAGE and coverage > content
-    return 1 if declares else 0
+    return 1 if coverage > content else 0
 
 
 def _envelope_strength(env: dict[str, Any]) -> tuple[int, int, int, float]:
@@ -248,20 +291,8 @@ def _same_name_rivals(
         return []
     tokens = _query_concept_tokens(envelopes)
     # Whole-token comparison on both sides: concept tokens are word-level, so a
-    # substring test lets "db" open the gate against "dashboard.py". The second
-    # camelCase boundary handles acronym prefixes — without it "HTTPServer"
-    # tokenizes as one word and "server" no longer opens the gate.
-    name_tokens = {
-        part
-        for part in re.split(
-            r"[^a-z0-9]+",
-            re.sub(
-                r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])", " ", raw_name
-            ).lower(),
-        )
-        if part
-    }
-    if not (tokens & name_tokens):
+    # substring test lets "db" open the gate against "dashboard.py".
+    if not (tokens & _name_tokens(raw_name)):
         return []
     rivals: list[dict[str, Any]] = []
     for alias, env in envelopes:

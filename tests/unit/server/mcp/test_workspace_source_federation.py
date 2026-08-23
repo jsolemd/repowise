@@ -17,7 +17,6 @@ import pytest
 
 from repowise.server.mcp_server._source_federation import workspace_source_search
 
-
 # ---------------------------------------------------------------------------
 # Stubs
 # ---------------------------------------------------------------------------
@@ -1464,3 +1463,158 @@ def test_rival_gate_needs_a_whole_name_token_not_a_substring():
         ("b", env("core/userIDMap.ts", [])),
     ]
     assert _same_name_rivals("a", "src/userIDMap.ts", envelopes) != []
+
+
+@pytest.mark.asyncio
+async def test_a_directory_token_is_not_a_subject_declaration(monkeypatch):
+    """F26: make's ``bbt.py`` content-matches *betterbibtex itself*; infra's
+    ``api_sync.py`` never matches it, but sits under ``infra/zotero/`` and the
+    query says Zotero. A directory names an area of the tree, not a file's
+    subject — with neither basename named for the query, the stronger dense
+    evidence decides, and that is make's."""
+    registry = _StubRegistry(["infra", "make"], default="infra")
+    infra = _StubCoordinator(
+        _envelope_with_concepts(
+            [("infra/zotero/service/api_sync.py", 0.02)],
+            "caution",
+            owner="infra/zotero/service/api_sync.py",
+            cosine=0.569,
+            coverage=(0.6856, 0.5369),
+            concepts=[
+                ("betterbibtex", False, False),
+                ("rpc", True, True),
+                ("live", True, True),
+                ("citation", True, True),
+                ("zotero", True, False),
+            ],
+        )
+    )
+    make = _StubCoordinator(
+        _envelope_with_concepts(
+            [("src/make/citations/bbt.py", 0.02)],
+            "caution",
+            owner="src/make/citations/bbt.py",
+            cosine=0.7171,
+            coverage=(0.7807, 0.7807),
+            concepts=[
+                ("betterbibtex", True, True),
+                ("rpc", True, True),
+                ("live", False, False),
+            ],
+        )
+    )
+    _wire(monkeypatch, {"infra": infra, "make": make})
+
+    resp = await workspace_source_search(
+        "BetterBibTeX JSON-RPC client for live citation search against Zotero",
+        limit=10, mode="concept", repo="all",
+        registry=registry, build_meta=_META,
+    )
+
+    assert resp["selected_owner"]["file"] == "src/make/citations/bbt.py"
+    assert resp["selected_owner"]["repo"] == "make"
+
+
+@pytest.mark.asyncio
+async def test_containing_the_subject_does_not_suppress_being_named_for_it(monkeypatch):
+    """F27: both twins are named ``mantine-theme.ts``. Web's carries every
+    matched token in its content too — under the old difference test that
+    ZEROED its declaration while graph declared on a name-only "mantine",
+    handing the answer to the weaker twin. Being named for the subject cannot
+    be suppressed by also containing it: both declare, dense decides, and the
+    rival disclosure still names the loser."""
+    registry = _StubRegistry(["graph", "web"], default="graph")
+    graph = _StubCoordinator(
+        _envelope_with_concepts(
+            [("apps/web/lib/mantine-theme.ts", 0.02)],
+            "caution",
+            owner="apps/web/lib/mantine-theme.ts",
+            cosine=0.5451,
+            coverage=(0.6284, 0.5132),
+            concepts=[
+                ("mantine", True, False),
+                ("theme", True, True),
+                ("autocontrast", False, False),
+                ("button", True, True),
+                ("card", True, True),
+                ("radius", True, True),
+                ("xl", True, True),
+            ],
+        )
+    )
+    web = _StubCoordinator(
+        _envelope_with_concepts(
+            [("src/lib/mantine-theme.ts", 0.02)],
+            "caution",
+            owner="src/lib/mantine-theme.ts",
+            cosine=0.6327,
+            coverage=(0.6477, 0.6477),
+            concepts=[
+                ("mantine", True, True),
+                ("theme", True, True),
+                ("autocontrast", False, False),
+                ("button", True, True),
+                ("card", True, True),
+                ("radius", True, True),
+                ("xl", True, True),
+            ],
+        )
+    )
+    _wire(monkeypatch, {"graph": graph, "web": web})
+
+    resp = await workspace_source_search(
+        "Mantine theme with autoContrast and Button and Card extended to radius xl",
+        limit=10, mode="concept", repo="all",
+        registry=registry, build_meta=_META,
+    )
+
+    assert resp["selected_owner"]["file"] == "src/lib/mantine-theme.ts"
+    assert resp["selected_owner"]["repo"] == "web"
+    rival_files = [r["file"] for r in (resp.get("competing_owners") or [])]
+    assert "apps/web/lib/mantine-theme.ts" in rival_files
+
+
+@pytest.mark.asyncio
+async def test_the_docx_archetype_survives_with_concepts_on_the_wire(monkeypatch):
+    """The G4-measured win the declaration bit exists for, now pinned in the
+    per-concept shape: the term sponge matches everything in its body but its
+    basename says nothing about docx; ``docx_template.py`` is named for the
+    subject and takes the answer at caution over infra's confident."""
+    registry = _StubRegistry(["infra", "make"], default="infra")
+    infra = _StubCoordinator(
+        _envelope_with_concepts(
+            [("codeatlas/code_search/boost_make.py", 0.02)],
+            "confident",
+            owner="codeatlas/code_search/boost_make.py",
+            cosine=0.6326,
+            coverage=(1.0, 1.0),
+            concepts=[
+                ("docx", True, True),
+                ("template", True, True),
+                ("engine", True, True),
+            ],
+        )
+    )
+    make = _StubCoordinator(
+        _envelope_with_concepts(
+            [("src/make/engines/docx_template.py", 0.02)],
+            "caution",
+            owner="src/make/engines/docx_template.py",
+            cosine=0.5736,
+            coverage=(0.7105, 0.0),
+            concepts=[
+                ("docx", True, False),
+                ("template", True, False),
+                ("engine", False, False),
+            ],
+        )
+    )
+    _wire(monkeypatch, {"infra": infra, "make": make})
+
+    resp = await workspace_source_search(
+        "docx template engine", limit=10, mode="concept", repo="all",
+        registry=registry, build_meta=_META,
+    )
+
+    assert resp["selected_owner"]["file"] == "src/make/engines/docx_template.py"
+    assert resp["confidence"] == "caution"
