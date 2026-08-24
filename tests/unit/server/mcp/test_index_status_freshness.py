@@ -10,6 +10,7 @@ tool over a real repository, mutate it, and ask.
 from __future__ import annotations
 
 import importlib
+import json
 import subprocess
 from dataclasses import replace
 from pathlib import Path
@@ -98,6 +99,22 @@ def _build_repo(root: Path, paths: list[str]) -> tuple[Path, str]:
         ),
     )
     return root, indexed_commit
+
+
+def _ingest_dirty(root: Path, path: str, body: str) -> str:
+    """Write uncommitted *body* to *path* and return the hash a build would record."""
+
+    from repowise.core.ingestion.models import compute_content_hash
+
+    (root / path).write_text(body, encoding="utf-8")
+    return compute_content_hash((root / path).read_bytes())
+
+
+def _write_state(root: Path, state: dict) -> None:
+    """Write ``.repowise/state.json``, the record only the update path keeps."""
+
+    (root / ".repowise").mkdir(parents=True, exist_ok=True)
+    (root / ".repowise" / "state.json").write_text(json.dumps(state), encoding="utf-8")
 
 
 def _healthy(indexed_commit: str, chunks: int) -> SourceIndexStatus:
@@ -315,3 +332,209 @@ async def test_a_branch_sized_divergence_is_capped_with_the_exact_total(
         restored = "\n".join(store.get(ref) or "" for ref in omitted["refs"])
     assert "src/mod_0119.py" in restored
     assert "src/mod_0000.py" not in restored
+
+
+
+# --- The build's own record of what it read out of the working tree ---------
+#
+# ``uncommitted_indexed_paths`` answers a different question from the
+# ``working_tree`` block above it. That block is live: what has the checkout
+# done to the corpus *since* the build. This one is historical: which paths did
+# the build read uncommitted bytes for at all. A reader uses it to decide
+# whether indexed answers describe committed code or someone's unsaved work,
+# so it has to name every such path — and a full source-index rebuild records
+# them in the manifest, never in ``state.json``.
+
+
+def _rebuilt_dirty(root: Path, paths: list[str], dirty: list[str]) -> tuple[str, dict[str, str]]:
+    """A corpus over *paths* whose build read uncommitted bytes for *dirty*.
+
+    Exactly what ``repowise source-index`` leaves behind: the manifest carries
+    the ingest record for every path it read dirty, and nothing writes
+    ``state.json`` — that is the update path's file, and no update ran.
+    """
+
+    _build_repo(root, paths)
+    record = {
+        path: _ingest_dirty(root, path, f"def {Path(path).stem}():\n    return 999\n")
+        for path in dirty
+    }
+    manifest_path = default_manifest_path(root)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["working_tree_ingest"] = record
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    return str(manifest["indexed_commit"]), record
+
+
+async def _bind(module, monkeypatch, session, factory, repo_id, vector_store, fts, repo_path,
+                indexed_commit, chunks):
+    """Bind ``get_index_status`` to *repo_path* with only the working tree live."""
+
+    repository = await session.get(Repository, repo_id)
+    repository.local_path = str(repo_path)
+    repository.name = repo_path.name
+    await session.commit()
+    context = SimpleNamespace(
+        alias="default",
+        path=repo_path,
+        session_factory=factory,
+        vector_store=vector_store,
+        fts=fts,
+    )
+    real_inspect = module.inspect_source_index
+
+    async def inspect(path, **kwargs):
+        live = await real_inspect(path, **kwargs)
+        return replace(
+            _healthy(indexed_commit, chunks),
+            working_tree=live.working_tree,
+            working_tree_ingest=live.working_tree_ingest,
+        )
+
+    async def resolve(_repo: str | None) -> SimpleNamespace:
+        return context
+
+    monkeypatch.setattr(module, "_resolve_repo_context", resolve)
+    monkeypatch.setattr(module, "inspect_source_index", inspect)
+    monkeypatch.setattr(module, "_runtime_identities", lambda _ctx: (_EMBEDDER, "parser-1", None))
+
+
+@pytest.fixture
+async def rebuilt_tool(tmp_path, monkeypatch, session, factory, repo_id, vector_store, fts):
+    """``get_index_status`` over a repo rebuilt whole from one dirty file."""
+
+    module = importlib.import_module("repowise.server.mcp_server.tool_index_status")
+    repo_path = tmp_path / "repo"
+    indexed_commit, _record = _rebuilt_dirty(
+        repo_path, ["src/alpha.py", "src/beta.py"], ["src/beta.py"]
+    )
+    await _bind(module, monkeypatch, session, factory, repo_id, vector_store, fts,
+                repo_path, indexed_commit, 2)
+    return module, repo_path
+
+
+async def test_a_full_rebuild_discloses_the_dirty_bytes_it_ingested(rebuilt_tool):
+    """The freshness surface must not deny content it is actively serving.
+
+    A full rebuild writes its working-tree record to the manifest and leaves
+    ``state.json`` alone. A payload sourced from ``state.json`` therefore
+    reports an empty list on exactly the build that read the most uncommitted
+    work — and reports it as a fact, not as an absence of evidence.
+    """
+
+    module, _repo = rebuilt_tool
+
+    result = await module.get_index_status()
+
+    generation = result["generation"]
+    assert generation["uncommitted_indexed_paths"] == ["src/beta.py"]
+    assert generation["uncommitted_indexed_path_count"] == 1
+    assert generation["uncommitted_indexed_paths_listed"] == 1
+
+
+async def test_the_disclosed_basis_names_the_manifest_it_read(rebuilt_tool):
+    """A basis line that names the wrong store is its own defect.
+
+    The payload publishes where its answer came from so a reader can judge it.
+    Naming ``state.json`` while serving the manifest's record leaves the field
+    unfalsifiable by the person it exists to inform.
+    """
+
+    module, _repo = rebuilt_tool
+
+    result = await module.get_index_status()
+
+    basis = result["generation"]["uncommitted_indexed_paths_basis"]
+    assert "working_tree_ingest" in basis
+    assert "manifest" in basis
+
+
+async def test_path_mode_admits_the_file_was_indexed_from_the_working_tree(rebuilt_tool):
+    """``working_tree_indexed`` is asked about one path and must not answer false.
+
+    Path mode is where a reader takes the fine-grained answer, and it read the
+    same empty ``state.json`` list the status block did.
+    """
+
+    module, _repo = rebuilt_tool
+
+    result = await module.get_index_status(mode="path", path="src/beta.py")
+
+    assert result["path"]["working_tree_indexed"] is True
+    assert result["path"]["indexed"] is True
+
+
+async def test_ingested_bytes_still_on_disk_are_not_also_called_stale(rebuilt_tool):
+    """Disclosure and staleness are separate claims about the same file.
+
+    The corpus serves exactly the bytes on disk, so the live block is right to
+    stay quiet. Reporting the path as modified to compensate for the missing
+    disclosure would trade one wrong answer for another.
+    """
+
+    module, _repo = rebuilt_tool
+
+    result = await module.get_index_status()
+
+    working_tree = result["generation"]["working_tree"]
+    assert working_tree["checked"] is True
+    assert working_tree["modified"] == []
+    assert "indexed_files_modified" not in result["trust"]["reasons"]
+
+
+async def test_a_dirty_checkout_rebuilt_whole_discloses_every_ingested_file(
+    tmp_path, monkeypatch, session, factory, repo_id, vector_store, fts
+):
+    """The B4 scenario: several uncommitted edits, then one full rebuild.
+
+    ``state.json`` is present and syntactically fine — it simply carries no
+    ``working_tree_paths`` key, because the build that ingested this work was a
+    source-index rebuild rather than an update. Every ingested path has to be
+    named, not only the one that sorts first.
+    """
+
+    module = importlib.import_module("repowise.server.mcp_server.tool_index_status")
+    repo_path = tmp_path / "repo"
+    paths = ["src/alpha.py", "src/beta.py", "src/gamma.py"]
+    indexed_commit, _record = _rebuilt_dirty(repo_path, paths, paths)
+    _write_state(repo_path, {"last_sync_commit": indexed_commit})
+    await _bind(module, monkeypatch, session, factory, repo_id, vector_store, fts,
+                repo_path, indexed_commit, 3)
+
+    result = await module.get_index_status()
+
+    generation = result["generation"]
+    assert generation["uncommitted_indexed_paths"] == paths
+    assert generation["uncommitted_indexed_path_count"] == 3
+    assert generation["working_tree"]["modified"] == []
+
+
+async def test_an_untracked_path_recorded_only_in_state_json_survives(
+    tmp_path, monkeypatch, session, factory, repo_id, vector_store, fts
+):
+    """The manifest cannot hold every uncommitted path, so it cannot be the only source.
+
+    ``working_tree_ingest`` is built from ``git diff HEAD``, which never lists
+    an untracked file; the update path records those in ``state.json``. Serving
+    the manifest *instead of* that list would fix the rebuild case by dropping
+    every untracked file the watcher indexed — the same defect pointed the
+    other way.
+    """
+
+    module = importlib.import_module("repowise.server.mcp_server.tool_index_status")
+    repo_path = tmp_path / "repo"
+    indexed_commit, _record = _rebuilt_dirty(
+        repo_path, ["src/alpha.py", "src/beta.py"], ["src/beta.py"]
+    )
+    (repo_path / "src/scratch.py").write_text("def scratch():\n    return 1\n", encoding="utf-8")
+    _write_state(repo_path, {"working_tree_paths": ["src/scratch.py"]})
+    await _bind(module, monkeypatch, session, factory, repo_id, vector_store, fts,
+                repo_path, indexed_commit, 2)
+
+    result = await module.get_index_status()
+
+    generation = result["generation"]
+    assert generation["uncommitted_indexed_paths"] == ["src/beta.py", "src/scratch.py"]
+    assert generation["uncommitted_indexed_path_count"] == 2
+    path_result = await module.get_index_status(mode="path", path="src/scratch.py")
+    assert path_result["path"]["working_tree_indexed"] is True
