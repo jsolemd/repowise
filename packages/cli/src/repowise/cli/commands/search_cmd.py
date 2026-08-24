@@ -297,11 +297,11 @@ def _warn_if_lexical_only(payload: dict, requested: str, notices) -> None:
     """Say when ``--mode semantic`` was answered lexically, and why.
 
     ``_meta`` carries ``semantic_search: false`` whenever the vector leg could
-    not be ranked on — a keyless index, or a pinned embedder that would not
-    build — which is the condition this command used to detect for itself
-    before the tool did it. Rendering those rows without saying so is how
-    someone concludes semantic retrieval is bad when what they have is no
-    embedder.
+    not be ranked on — a keyless index, a pinned embedder that would not build,
+    or a leg that fell over on this one query — which is the condition this
+    command used to detect for itself before the tool did it. Rendering those
+    rows without saying so is how someone concludes semantic retrieval is bad
+    when what they have is no embedder.
 
     Only ``--mode semantic`` is warned about: it is the spelling that promises
     semantic matching. ``fulltext`` never claimed it, and the tool's own
@@ -312,16 +312,24 @@ def _warn_if_lexical_only(payload: dict, requested: str, notices) -> None:
     meta = payload.get("_meta") or {}
     if meta.get("semantic_search") is not False:
         return
-    # Worded for both states. A repo pinned to a real embedder whose key has
-    # gone away carries the tool's own reason, which names it; telling that
-    # user "no embedder configured" would contradict their own config.
-    why = meta.get("embedder_warning") or (
-        "No embedder configured for this repo, so there is no semantic index to search."
+    # Worded for all three states, most specific first. A repo pinned to a real
+    # embedder whose key has gone away carries the tool's own reason, which
+    # names it; telling that user "no embedder configured" would contradict
+    # their own config. A leg that failed *this query* is not a configuration at
+    # all, so it gets neither that sentence nor the reindex remedy: the index is
+    # fine and the next query re-tries the leg on its own.
+    transient = meta.get("retrieval_degraded_reason")
+    why = (
+        transient
+        or meta.get("embedder_warning")
+        or ("No embedder configured for this repo, so there is no semantic index to search.")
     )
-    notices.print(
-        f"[yellow]{why}[/yellow]\nShowing full-text results instead. Set an embedder "
-        "key and run [cyan]repowise reindex[/cyan] for semantic search."
+    fix = (
+        "Run the search again once the embedding backend answers."
+        if transient
+        else "Set an embedder key and run [cyan]repowise reindex[/cyan] for semantic search."
     )
+    notices.print(f"[yellow]{why}[/yellow]\nShowing full-text results instead. {fix}")
 
 
 def _fan_out(

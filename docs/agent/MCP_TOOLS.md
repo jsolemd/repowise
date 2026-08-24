@@ -159,8 +159,11 @@ Resolve refs with `repowise expand <ref>` from a shell, or
 | `live_head` | Only when it differs from `indexed_commit` |
 | `stale_warning` | Only on a real signal: HEAD mismatch **that actually changed files**, or age over ~90 days when git is unreachable. Two commits with identical trees (an empty commit, a no-op merge) report `index_behind` with no warning |
 | `index_behind` | Whenever the live-vs-indexed comparison ran: `true` if HEAD has moved (alongside `stale_warning` when served content actually changed), `false` if the commits match. Absent means the comparison could not run (no git, or a repo-level tool that serves no file content) |
-| `embedder_degraded` | Whenever an embedder is resolved, `true` or `false`. Absent means none was initialised |
+| `embedder_degraded` | Whenever an embedder is resolved, `true` or `false`. Absent means none was initialised. An **install-level** claim, latched when the embedder was built: it does not move when one query's retrieval fails |
 | `embedder`, `embedder_warning` | Only when the embedder fell back to a mock/degraded mode |
+| `semantic_search` | Only when `false`, meaning these results are full-text only — either the index is keyless, or the semantic leg did not run for this request |
+| `retrieval_degraded` | Only when a retrieval leg fell over on **this** request (`["vector"]`). The results are still served, and a miss in them is not evidence of absence. Nothing to restart: the leg is retried per request, and the key disappears on the next whole one |
+| `retrieval_degraded_reason` | Alongside `retrieval_degraded`: what failed, and the cause it reported |
 
 Silence on `stale_warning` means the index is current; don't infer staleness from its absence. `list_repos`, `get_architecture`, `get_blast_radius`, and `get_conformance` don't carry a freshness envelope at all.
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 import logging
 import re
 from collections.abc import Callable
@@ -20,7 +21,14 @@ from repowise.core.providers.embedding import store_has_semantic_vectors
 from repowise.core.registry import mcp_tool_registry as mcp
 from repowise.core.source_search import source_search_enabled
 from repowise.core.test_paths import is_test_path, is_test_related_path
-from repowise.server.mcp_server._answer_pipeline import _RRF_K, _RRF_SCORE_SCALE
+from repowise.server.mcp_server._answer_pipeline import (
+    _RRF_K,
+    _RRF_SCORE_SCALE,
+    _record_leg,
+    begin_leg_record,
+    degraded_legs,
+    retrieval_legs,
+)
 from repowise.server.mcp_server._helpers import (
     _VECTOR_TIMEOUT_ENV,
     _get_exclude_spec,
@@ -634,6 +642,119 @@ async def _safe_fts(ctx, query: str, limit: int) -> list:
     return []
 
 
+# Why the vector leg died, for the request that is being served right now.
+#
+# The leg *outcome* travels in the shared leg record (see below); this carries
+# the cause, which is the half a reader acts on — "ollama is not listening" and
+# "the store's schema does not match the index" call for different repairs and
+# neither is guessable from the word "error". fd466d79 established the shape for
+# the source-search coordinator: a failed leg is named, and the cause travels in
+# a detail string beside it. Per-request like the record itself, so it cannot
+# outlive the failure it describes.
+#
+# A dict rather than the string itself, and for the reason ``begin_leg_record``
+# spells out: the legs run under ``asyncio.gather``, which copies the context
+# into each task, and a copy rebinds names rather than objects. A ``set()``
+# inside the vector task would be invisible to the caller building the
+# response; a mutation of one shared dict is not.
+_VECTOR_LEG_DETAIL: contextvars.ContextVar[dict[str, str] | None] = contextvars.ContextVar(
+    "repowise_search_vector_leg_detail", default=None
+)
+
+#: Leg outcomes that mean the semantic lane did not run. ``keyless`` is absent
+#: deliberately — see ``degraded_legs``: a keyless index has no vectors by
+#: construction, which ``_meta`` already reports once per response.
+_VECTOR_LEG_FAILURES = ("timeout", "error")
+
+# Longest cause we will put in a response. Long enough for a connection error
+# with a URL in it, short enough that a driver dumping a stack trace into its
+# message cannot bloat every degraded response.
+_VECTOR_DETAIL_MAX = 200
+
+
+def _begin_retrieval_record() -> None:
+    """Start collecting this request's retrieval-leg outcomes.
+
+    Called once per served search, so a leg failure disclosed in a response is
+    this request's failure and nothing older. Recovery needs nothing else: the
+    next request starts from an empty record, and embedding is per-call, so a
+    backend that answers again clears the disclosure without a restart.
+
+    Callers that reach the internals directly (``_fused_retrieve``,
+    ``_search_single_repo``) collect nothing unless they call this first, which
+    is the same "if anyone is collecting" contract ``_record_leg`` has on the
+    get_answer side.
+    """
+    begin_leg_record()
+    _VECTOR_LEG_DETAIL.set({})
+
+
+def _record_vector_leg(outcome: str, detail: str | None = None) -> None:
+    """Note how the vector leg ended, without letting a success bury a failure.
+
+    ``_record_leg`` is last-wins, which is right for get_answer (one corpus, one
+    leg, one outcome) and wrong for a federated search: repo A's failure would
+    be overwritten by repo B's success, and the response would say the semantic
+    lane ran when it ran over part of the workspace. A failure therefore sticks
+    for the rest of the request.
+    """
+    if outcome == "ok" and retrieval_legs().get("vector") in _VECTOR_LEG_FAILURES:
+        return
+    _record_leg("vector", outcome)
+    details = _VECTOR_LEG_DETAIL.get()
+    if detail and details is not None:
+        details.setdefault("vector", detail[:_VECTOR_DETAIL_MAX])
+
+
+def _retrieval_disclosure() -> dict[str, Any]:
+    """`_meta` keys saying a retrieval leg did not run for *this* request.
+
+    Empty when retrieval was whole, so a healthy response is byte-identical to
+    what it was before this existed.
+
+    The deployment this was written for runs an embedder that lives in a
+    container which is down at boot: nothing fails at init, so the process-level
+    ``embedder_degraded`` stays false and every query embeds against a socket
+    that is not listening. The leg then returned ``[]`` and the caller served
+    full-text hits in the ordinary envelope — a result set with no mark on it,
+    from a search that read half of what it says it reads.
+
+    Three keys, none of them new vocabulary:
+
+    * ``retrieval_degraded`` names the legs, computed by the same
+      ``degraded_legs`` get_answer uses, so an agent reading both surfaces
+      learns one contract rather than two spellings of it.
+    * ``semantic_search: false`` is the existing search-surface claim that
+      these results are full-text only; a caller that already checks it for a
+      keyless index catches the transient case for free.
+    * ``retrieval_degraded_reason`` carries the cause and the fact that it is
+      per-query, because the consumer is an agent that will otherwise report a
+      lexical miss to a person as an absence.
+
+    ``embedder_degraded`` is deliberately left alone. It is an install-level
+    claim latched at initialisation and read as one (telemetry buckets on it);
+    a leg that failed this call and may well answer the next one is a different
+    fact and gets a different key.
+    """
+    degraded = degraded_legs(retrieval_legs())
+    if not degraded:
+        return {}
+    detail = (_VECTOR_LEG_DETAIL.get() or {}).get("vector")
+    reason = "Semantic (vector) retrieval did not run for this query"
+    if detail:
+        reason += f" ({detail})"
+    reason += (
+        ", so these results are full-text only and a miss is not evidence of "
+        "absence. The leg is retried per query: no restart is needed once the "
+        "embedding backend answers again."
+    )
+    return {
+        "retrieval_degraded": degraded,
+        "retrieval_degraded_reason": reason,
+        "semantic_search": False,
+    }
+
+
 async def _safe_vector(ctx, query: str, limit: int) -> list:
     """Vector search, bounded and failure-swallowing (returns [] on error/timeout).
 
@@ -644,25 +765,43 @@ async def _safe_vector(ctx, query: str, limit: int) -> list:
     why the mock's vectors cannot be ranked on; the reason this is enforced here
     rather than in ``_fused_retrieve`` is that this function is the only place
     the vector leg is entered, so a later caller inherits the guard.
+
+    Failure stays soft — full-text results are still served — but no longer
+    stays quiet: the outcome goes on this request's leg record, which
+    ``_retrieval_disclosure`` turns into ``_meta`` keys. Neither early return
+    above records anything, because both are configuration rather than failure
+    and ``_meta`` reports a keyless index on its own.
     """
     if ctx.vector_store is None or not store_has_semantic_vectors(ctx.vector_store):
         return []
     try:
-        return await asyncio.wait_for(
+        results = await asyncio.wait_for(
             ctx.vector_store.search(query, limit=limit), timeout=vector_search_timeout_s()
         )
     except TimeoutError:
         # Not suppressed silently: a timeout here drops the whole semantic leg
         # and the caller returns full-text-only hits that look like a normal
         # result set, which is how #1678 read as "semantic search finds nothing".
+        _record_vector_leg("timeout", f"timed out after {vector_search_timeout_s():g}s")
         _log.warning(
             "Vector search exceeded its %gs budget; returning no semantic hits. "
             "Raise it with %s=<seconds>.",
             vector_search_timeout_s(),
             _VECTOR_TIMEOUT_ENV,
         )
-    except Exception:
-        _log.debug("Vector search failed; returning no semantic hits", exc_info=True)
+    except Exception as exc:
+        # WARNING, not DEBUG: the connection refused by a stopped embedding
+        # container is the whole semantic lane going missing, and a level
+        # nobody runs at is indistinguishable from the silence it replaced.
+        _record_vector_leg("error", f"{type(exc).__name__}: {exc}".strip())
+        _log.warning(
+            "Vector search failed (%s); returning no semantic hits for this query.",
+            type(exc).__name__,
+            exc_info=True,
+        )
+    else:
+        _record_vector_leg("ok")
+        return results
     return []
 
 
@@ -888,7 +1027,9 @@ async def _federated_search(
 
     response: dict = {
         "results": output,
-        "_meta": _build_meta(extra=await _federated_freshness(contexts, output)),
+        "_meta": _build_meta(
+            extra={**await _federated_freshness(contexts, output), **_retrieval_disclosure()}
+        ),
     }
     # Drawn from every repo's ranked list, not the merged cut: a workspace
     # search that spends its window on module pages should still be able to
@@ -1076,7 +1217,11 @@ async def _structured_search(
     response: dict = {
         "results": results,
         "mode": mode,
-        "_meta": _build_meta(repository=repository, targets=_result_paths(results)),
+        "_meta": _build_meta(
+            repository=repository,
+            targets=_result_paths(results),
+            extra=_retrieval_disclosure(),
+        ),
     }
     # Symbols first, then everything else the window holds: in symbol and
     # hybrid modes the ranked pool leads with symbol hits, and those are the
@@ -1156,6 +1301,9 @@ async def search_codebase(
         mode: auto | concept | symbol | path | hybrid.
         symbol_kind: filter symbol hits by kind (function|class|method|...).
     """
+    # Before any branch: every lane below that reaches the vector leg reports
+    # into this record, and the response it builds reads it back.
+    _begin_retrieval_record()
     grep_hint = _grep_hint_for(query)
     resolved_mode = _resolve_mode(query, mode)
 
@@ -1300,7 +1448,11 @@ async def search_codebase(
 
     response: dict = {
         "results": output,
-        "_meta": _build_meta(repository=repository, targets=_result_paths(output)),
+        "_meta": _build_meta(
+            repository=repository,
+            targets=_result_paths(output),
+            extra=_retrieval_disclosure(),
+        ),
     }
     if candidates := file_candidates(ranked, limit=limit):
         response["candidates"] = candidates
