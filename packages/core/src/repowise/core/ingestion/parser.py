@@ -942,7 +942,9 @@ class ASTParser:
             ]
             symbols = deduped
 
-        return self._finalize_symbol_parentage(symbols, symbol_nodes, config, file_info, src)
+        return self._finalize_symbol_parentage(
+            symbols, symbol_nodes, config, file_info, src, cpp_export_type_parents
+        )
 
     @staticmethod
     def _bound_callable_node(node: Node, symbol: Symbol, src: str) -> Node | None:
@@ -998,6 +1000,7 @@ class ASTParser:
         config: LanguageConfig,
         file_info: FileInfo,
         src: str,
+        cpp_export_type_parents: dict[int, str] | None = None,
     ) -> list[Symbol]:
         """Classify lexical locals and assign exact immediate-parent IDs.
 
@@ -1070,6 +1073,24 @@ class ASTParser:
                     "lexical_declaration",
                     "variable_declarator",
                 } and config.symbol_node_types.get(ancestor.type) in {"function", "method"}:
+                    # ``class EXPORT Name { ... }`` reaches tree-sitter as a
+                    # function_definition whose declarator is the real type
+                    # name, so its members' nearest "callable" ancestor is the
+                    # class itself. Suppressing them here deletes every member
+                    # of an export-macro class; resolve the owner by the name
+                    # the cpp extractor recorded for that node instead.
+                    owner_name = (cpp_export_type_parents or {}).get(ancestor.id)
+                    if owner_name is not None:
+                        owner_indices = [
+                            candidate
+                            for candidate, other in enumerate(symbols)
+                            if other.name == owner_name
+                            and other.kind in {"class", "interface", "struct"}
+                            and candidate != index
+                        ]
+                        if nearest_parent is None and len(owner_indices) == 1:
+                            nearest_parent = owner_indices[0]
+                        break
                     # A callable node with no candidate representation is an
                     # anonymous/unparsed scope. Do not leap across it to a
                     # more distant named owner.
@@ -1120,11 +1141,21 @@ class ASTParser:
                 return [symbols[index].name]
             trail.add(index)
             parent = parents[index]
-            names = (
-                [*lexical_names(parent, trail), symbols[index].name]
-                if parent is not None and keep[parent]
-                else [symbols[index].name]
-            )
+            if parent is not None and keep[parent]:
+                names = [*lexical_names(parent, trail), symbols[index].name]
+            else:
+                # An out-of-line definition (C++ ``int Peer::sendMessage(int)``)
+                # or a receiver method names an owner that is not an AST
+                # ancestor, and that owner is often declared in another file, so
+                # no candidate index resolves it. The extractor already put the
+                # qualifier on ``parent_name``; keep it in the id. Dropping it
+                # gives the definition a different identity from its
+                # declaration, and every call resolved to ``Class::method``
+                # then points at a node that does not exist. This is also what
+                # the pre-A3 contract emitted, which the block below claims to
+                # preserve for top-level ids.
+                owner = symbols[index].parent_name
+                names = [owner, symbols[index].name] if owner else [symbols[index].name]
             trail.remove(index)
             return names
 
