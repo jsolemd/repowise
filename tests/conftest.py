@@ -77,6 +77,69 @@ def _no_real_editor_setup():
     mp.undo()
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _no_real_home_config_writes(tmp_path_factory: pytest.TempPathFactory):
+    """Guarantee no test writes the developer's real ``~/.codex`` or ``~/.claude``.
+
+    ``_no_real_editor_setup`` above covers ``init``/``doctor`` through the
+    ``REPOWISE_SKIP_EDITOR_SETUP`` gate, but the explicit installers do not read
+    that gate — ``repowise hook rewrite install`` is a user asking for the hook,
+    so it installs. Driven through ``CliRunner`` on a machine that has Codex
+    (``~/.codex`` exists, ``codex --version`` passes the version gate),
+    ``tests/unit/distill/test_allow_rule.py`` was writing the distill rewrite
+    hook into the developer's real ``~/.codex/hooks.json`` on every suite run
+    (2026-08-29): that file's ``settings_path`` fixture isolates only the Claude
+    half. Codex then hash-checks the file and asks the user to re-trust a hook
+    they had removed on purpose.
+
+    The three user-level writer paths are wrapped, not replaced: each still
+    resolves through ``Path.home()``, so a test that moves ``HOME`` (the
+    ``agents``/``doctor`` tests do) keeps seeing its own temp home, and a test
+    that patches the same name at function scope still wins and restores to
+    this wrapper. Only when ``Path.home()`` is still the *real* home — i.e. the
+    test isolated nothing — does the path land in a session temp dir instead.
+    ``HOME`` itself is left alone: git identity, ``uv``, and the telemetry spool
+    guard above all resolve through it.
+    """
+    from _pytest.monkeypatch import MonkeyPatch
+
+    mp = MonkeyPatch()
+    real_home = Path.home()
+    guard_home = tmp_path_factory.mktemp("home")
+
+    def _guarded(*parts: str):
+        def resolve() -> Path:
+            home = Path.home()
+            if home == real_home:
+                home = guard_home
+            return home.joinpath(*parts)
+
+        return resolve
+
+    try:
+        from repowise.cli.editor_integrations import codex_config
+
+        mp.setattr(codex_config, "_codex_hooks_path", _guarded(".codex", "hooks.json"))
+    except Exception:
+        pass
+    try:
+        from repowise.cli.editor_integrations import claude_config
+
+        mp.setattr(
+            claude_config, "_claude_code_settings_path", _guarded(".claude", "settings.json")
+        )
+    except Exception:
+        pass
+    try:
+        from repowise.cli.agent_targets.targets import codex as codex_target
+
+        mp.setattr(codex_target, "user_prompts_dir", _guarded(".codex", "prompts"))
+    except Exception:
+        pass
+    yield
+    mp.undo()
+
+
 @pytest.fixture(autouse=True)
 def _isolate_structlog_config():
     """Restore structlog's global configuration after every test.
