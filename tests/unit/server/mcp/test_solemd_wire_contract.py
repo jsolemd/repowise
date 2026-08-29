@@ -80,8 +80,32 @@ def test_solemd_served_tool_names_are_exact(monkeypatch: pytest.MonkeyPatch):
     )
 
 
+#: The one served tool that changes state — it appends to (and retires entries
+#: in) the git-tracked decisions journal. Everything else served answers from
+#: the index and the working tree without touching either.
+EXPECTED_WRITER_TOOLS = frozenset({"manage_decision"})
+
+#: Hints every served reader must advertise.
+READER_ANNOTATIONS = {
+    "readOnlyHint": True,
+    "destructiveHint": False,
+    "idempotentHint": True,
+    "openWorldHint": False,
+}
+
+#: Hints the served writer must advertise: not read-only, but additive (a
+#: decision is superseded, never deleted) and not idempotent (a second record
+#: appends a second entry).
+WRITER_ANNOTATIONS = {
+    "readOnlyHint": False,
+    "destructiveHint": False,
+    "idempotentHint": False,
+    "openWorldHint": False,
+}
+
+
 @pytest.mark.asyncio
-async def test_served_tools_have_no_title_or_annotations_and_wrap_result(
+async def test_served_tools_carry_title_and_annotations_and_wrap_result(
     monkeypatch: pytest.MonkeyPatch,
 ):
     from repowise.server.mcp_server import ensure_full_surface
@@ -90,15 +114,20 @@ async def test_served_tools_have_no_title_or_annotations_and_wrap_result(
     advertised = {tool.name: tool for tool in await ensure_full_surface().list_tools()}
     assert served_names <= advertised.keys()
 
-    metadata_drift = {
-        name: {"title": advertised[name].title, "annotations": advertised[name].annotations}
-        for name in sorted(served_names)
-        if advertised[name].title is not None or advertised[name].annotations is not None
-    }
-    assert not metadata_drift, (
-        "served tools gained title/annotations; unit 4.1 must change these pins "
-        f"with the wire contract: {metadata_drift}"
+    missing_titles = sorted(name for name in served_names if not advertised[name].title)
+    assert not missing_titles, f"served tools with no tools/list title: {missing_titles}"
+
+    annotation_drift = {}
+    for name in sorted(served_names):
+        expected = WRITER_ANNOTATIONS if name in EXPECTED_WRITER_TOOLS else READER_ANNOTATIONS
+        annotations = advertised[name].annotations
+        actual = annotations.model_dump(exclude_none=True) if annotations else None
+        if actual != expected:
+            annotation_drift[name] = {"expected": expected, "actual": actual}
+    assert not annotation_drift, (
+        f"served tool annotations drifted from the 24-reader + 1-writer split: {annotation_drift}"
     )
+    assert len(served_names - EXPECTED_WRITER_TOOLS) == 24
 
     wrapper_drift = {
         name: schema
