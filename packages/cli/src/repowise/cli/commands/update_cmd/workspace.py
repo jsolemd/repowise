@@ -61,6 +61,7 @@ def _workspace_update(
     concurrency: int = 10,
     no_cost_tracking: bool = False,
     progress: str = "rich",
+    include_working_tree: bool = False,
 ) -> None:
     """Update stale repos in a workspace.
 
@@ -77,6 +78,7 @@ def _workspace_update(
     """
     from repowise.cli.helpers import load_state
     from repowise.core.docs_mode import resolve_docs_mode
+    from repowise.core.ingestion.change_detector import has_working_tree_changes
     from repowise.core.workspace import (
         check_repo_staleness,
         reconcile_repo_head_commit,
@@ -111,12 +113,27 @@ def _workspace_update(
             continue
         abs_path = (ws_root / entry.path).resolve()
         stored = entry.last_commit_at_index
-        is_stale, head, behind = check_repo_staleness(abs_path, stored)
+        commit_stale, head, behind = check_repo_staleness(abs_path, stored)
         indexed = (abs_path / ".repowise").is_dir()
+        repo_state = load_state(abs_path) if indexed and include_working_tree else None
+        has_uncommitted_changes = (
+            include_working_tree and indexed and has_working_tree_changes(abs_path)
+        )
+        has_working_tree_cleanup = bool(
+            include_working_tree and indexed and repo_state and repo_state.get("working_tree_paths")
+        )
+        is_stale = commit_stale or has_uncommitted_changes or has_working_tree_cleanup
         if not indexed:
             status = "[dim]not indexed[/dim]"
         elif is_stale:
-            status = f"[yellow]{behind} new commit(s)[/yellow]"
+            reasons: list[str] = []
+            if commit_stale:
+                reasons.append(f"{behind} new commit(s)")
+            if has_uncommitted_changes:
+                reasons.append("uncommitted changes")
+            elif has_working_tree_cleanup:
+                reasons.append("working-tree cleanup")
+            status = f"[yellow]{', '.join(reasons)}[/yellow]"
         else:
             status = "[green]up to date[/green]"
         # Default to a focused list (stale + not-indexed); up-to-date repos
@@ -124,7 +141,8 @@ def _workspace_update(
         if is_stale:
             stale_count += 1
             if indexed:
-                repo_state = load_state(abs_path)
+                if repo_state is None:
+                    repo_state = load_state(abs_path)
                 if not _resolve_index_only_mode(
                     index_only=index_only, docs_flag=docs_flag, state=repo_state
                 ):
@@ -204,6 +222,7 @@ def _workspace_update(
             concurrency=concurrency,
             no_cost_tracking=no_cost_tracking,
             progress=progress,
+            include_working_tree=include_working_tree,
         )
         return
 
@@ -220,6 +239,7 @@ def _workspace_update(
             dry_run=False,
             on_repo_start=_on_start,
             on_repo_done=_print_repo_result,
+            include_working_tree=include_working_tree,
         )
     )
 
@@ -296,6 +316,7 @@ def _workspace_docs_update(
     concurrency: int,
     no_cost_tracking: bool,
     progress: str,
+    include_working_tree: bool,
 ) -> None:
     """Update a workspace where at least one stale repo wants docs.
 
@@ -347,6 +368,7 @@ def _workspace_docs_update(
                 dry_run=False,
                 on_repo_start=_on_start,
                 on_repo_done=_print_repo_result,
+                include_working_tree=include_working_tree,
             )
         )
         changed_aliases.extend(r.alias for r in core_results if r.updated)
@@ -396,6 +418,7 @@ def _workspace_docs_update(
                 # corrupt it. The per-repo rich output goes to stderr there.
                 progress="rich",
                 skip_cross_repo_hooks=True,
+                include_working_tree=include_working_tree,
             )
         except Exception as exc:
             docs_failed += 1

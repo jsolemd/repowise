@@ -713,6 +713,7 @@ async def update_workspace(
         import json
 
         state_path = abs_path / ".repowise" / "state.json"
+        state: dict[str, Any] = {}
         stored_commit = None
         if state_path.is_file():
             try:
@@ -726,11 +727,11 @@ async def update_workspace(
             stored_commit,
         )
 
-        # A watched repo's changes are uncommitted by definition, so the
-        # commit-to-commit staleness check above says "up to date" for exactly
-        # the work the watcher woke up for.
-        if not is_stale and include_working_tree and has_working_tree_changes(abs_path):
-            is_stale = True
+        # Working-tree changes are not represented by a new commit, and paths
+        # indexed by an earlier working-tree run need one final pass after they
+        # become clean so stale symbols/pages can be retired.
+        if not is_stale and include_working_tree:
+            is_stale = has_working_tree_changes(abs_path) or bool(state.get("working_tree_paths"))
 
         if not is_stale:
             # Nothing to regenerate, but the DB freshness stamp can still be

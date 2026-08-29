@@ -439,6 +439,47 @@ class TestUpdateWorkspace:
         updated = [r for r in results if r.updated]
         assert len(updated) == 0
 
+    def test_recorded_working_tree_paths_trigger_cleanup(self, tmp_path: Path) -> None:
+        """A clean repo still runs once to retire previously indexed dirty paths."""
+        repo = _make_git_repo(tmp_path, "backend")
+        head = get_head_commit(repo)
+        assert head is not None
+        _write_state(repo, head)
+        state_path = repo / ".repowise" / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["working_tree_paths"] = ["README.md"]
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+
+        ws_config = WorkspaceConfig(
+            repos=[RepoEntry(path="backend", alias="backend", last_commit_at_index=head)],
+        )
+        mock_result = RepoUpdateResult(
+            alias="backend",
+            updated=True,
+            working_tree_paths=[],
+        )
+
+        async def _run():
+            with patch(
+                "repowise.core.workspace.update.update_single_repo_index",
+                new_callable=AsyncMock,
+                return_value=mock_result,
+            ) as mocked_update:
+                results = await update_workspace(
+                    tmp_path,
+                    ws_config,
+                    include_working_tree=True,
+                )
+                return results, mocked_update
+
+        import asyncio
+
+        results, mocked_update = asyncio.run(_run())
+        assert results[0].updated is True
+        assert mocked_update.await_args.kwargs["include_working_tree"] is True
+        saved_state = json.loads(state_path.read_text(encoding="utf-8"))
+        assert saved_state["working_tree_paths"] == []
+
 
 # ---------------------------------------------------------------------------
 # Cross-repo hooks placeholder

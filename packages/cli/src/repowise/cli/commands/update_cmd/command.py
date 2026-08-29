@@ -268,6 +268,12 @@ def _surface_reindex_recommendation(repo_path, verdict, *, emitter: Any, dry_run
     ),
 )
 @click.option(
+    "--include-working-tree",
+    is_flag=True,
+    default=False,
+    help="Include staged, unstaged, and untracked source files in this update.",
+)
+@click.option(
     "--docs/--no-docs",
     "docs_flag",
     default=None,
@@ -354,6 +360,7 @@ def update_command(
     no_workspace: bool,
     repo_alias: str | None,
     index_only: bool = False,
+    include_working_tree: bool = False,
     docs_flag: bool | None = None,
     full: bool = False,
     yes: bool = False,
@@ -383,6 +390,7 @@ def update_command(
         no_workspace=no_workspace,
         repo_alias=repo_alias,
         index_only=index_only,
+        include_working_tree=include_working_tree,
         docs_flag=docs_flag,
         full=full,
         yes=yes,
@@ -625,6 +633,7 @@ def run_update(
                 verbose=verbose,
                 docs_flag=docs_flag,
                 index_only=index_only,
+                include_working_tree=include_working_tree,
                 since=since,
                 provider_name=provider_name,
                 model=model,
