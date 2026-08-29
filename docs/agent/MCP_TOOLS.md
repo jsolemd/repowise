@@ -2,7 +2,7 @@
 
 repowise exposes a curated set of tools via the [Model Context Protocol](https://modelcontextprotocol.io) (MCP). These tools give AI coding assistants (Claude Code, Codex, Cursor, Cline, Windsurf) structured access to your codebase intelligence: dependency graph, git history, documentation, and architectural decisions.
 
-29 tools are registered in total. A single-repo server advertises 11 by default: the canonical tools below plus `get_index_status`. Workspace mode adds the `list_repos` discovery utility, for 12. 17 specialist tools are opt-in where eligible. The surface is configurable; see [Configuring the tool surface](#configuring-the-tool-surface).
+29 tools are registered in total. A single-repo server advertises 11 by default: exactly the canonical tools. Workspace mode adds the `list_repos` discovery utility, for 12. 17 specialist tools are opt-in where eligible. The surface is configurable; see [Configuring the tool surface](#configuring-the-tool-surface).
 
 **Start the MCP server:**
 
