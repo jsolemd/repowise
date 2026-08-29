@@ -193,6 +193,7 @@ from .workspace import (
     WorkspaceCoChangesResponse,
     WorkspaceConformanceResponse,
     WorkspaceConformanceViolation,
+    WorkspaceContractDetail,
     WorkspaceContractEntry,
     WorkspaceContractLinkEntry,
     WorkspaceContractsResponse,
@@ -220,7 +221,6 @@ from .zoom import (
     ZoomMapResponse,
     ZoomMetricsResponse,
     ZoomNodeResponse,
-    ZoomRectResponse,
     ZoomRelationResponse,
 )
 
@@ -370,6 +370,7 @@ __all__ = [
     "WorkspaceCoChangesResponse",
     "WorkspaceConformanceResponse",
     "WorkspaceConformanceViolation",
+    "WorkspaceContractDetail",
     "WorkspaceContractEntry",
     "WorkspaceContractLinkEntry",
     "WorkspaceContractSummary",
@@ -395,6 +396,5 @@ __all__ = [
     "ZoomMapResponse",
     "ZoomMetricsResponse",
     "ZoomNodeResponse",
-    "ZoomRectResponse",
     "ZoomRelationResponse",
 ]

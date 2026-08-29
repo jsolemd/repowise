@@ -1,18 +1,18 @@
 """repowise MCP Server — a curated, configurable tool surface for AI agents.
 
-By default a single-repo server exposes twelve tools (get_answer, get_context,
+By default a single-repo server exposes eleven tools (get_answer, get_context,
 get_symbol, search_codebase, get_overview, get_risk, get_change_risk, get_why,
-get_dead_code, get_health, get_index_status, list_repos); two more
-(get_blast_radius, get_architecture) are added automatically in workspace mode.
-Fifteen further tools (get_dependents, get_dependency_path,
+get_dead_code, get_health, get_index_status). Workspace mode also exposes the
+``list_repos`` discovery utility, ``get_blast_radius`` and ``get_architecture``
+by default. Fifteen further tools (get_dependents, get_dependency_path,
 get_execution_flows, generate_refactoring_code, get_conformance,
 reindex_repository, build_task_slice, get_task_slice, extend_task_slice,
 get_query_quality, find_clones, find_patterns, manage_decision,
-get_reference_sites, preview_symbol_rename) are registered
-but off by default and can be opted in via the ``mcp.tools`` config block or the
-``repowise mcp --tools`` flag; get_conformance only does useful work in workspace
-mode, and manage_decision only where a decision journal is configured. The
-selection layer lives in :mod:`._tool_selection`.
+get_reference_sites, preview_symbol_rename) are registered but off by default
+and can be opted in via the ``mcp.tools`` config block or the
+``repowise mcp --tools`` flag; architecture, blast radius and conformance are
+workspace-only, and manage_decision only does useful work where a decision
+journal is configured. The selection layer lives in :mod:`._tool_selection`.
 
 Exposes the full repowise wiki as queryable tools via the MCP protocol.
 Supports stdio transport (Claude Code, Cursor, Cline), streamable HTTP, and
@@ -111,21 +111,67 @@ def tool_middleware(fn: Any) -> Any:
     1. ``shield`` — no exception may escape to FastMCP as a protocol-level
        isError (an early isError teaches the agent to abandon the server for
        the whole session), so it must see the raw tool.
-    2. ``quantize`` — rounds every float in the response. Outside the shield so
+    2. ``trust`` — adds the final transport trust envelope.
+    3. ``quantize`` — rounds every float in the response. Outside the shield so
        shaped error responses are covered too, and inside the savings layer so
        the ledger measures the payload as actually delivered.
-    3. ``instrument`` — savings/telemetry, outermost, so shaped error responses
-       are still dead-end-debited in the ledger.
+    4. ``budget`` — caps the delivered shape before savings are measured.
+    5. ``instrument`` — records the bounded result and adds savings metadata.
+    6. ``budget`` — accounts for those final middleware fields and rechecks.
 
     Named rather than inlined at the ``apply`` call so tests can wrap a tool in
     the real composition; ``tests/unit/server/mcp/test_number_precision.py``
     relies on that to prove no raw double reaches an agent.
     """
+    import inspect
+    from functools import wraps
+
+    from repowise.server.mcp_server._budget import (
+        enforce_response_budget,
+        resolve_response_budget_repo_root,
+    )
     from repowise.server.mcp_server._failure_shield import shield
+    from repowise.server.mcp_server._meta import finalize_trust_envelope
     from repowise.server.mcp_server._rounding import quantize
     from repowise.server.mcp_server._savings import instrument
 
-    return instrument(quantize(shield(fn)))
+    evidence_kind = getattr(fn, "__repowise_trust_kind__", None)
+    signature = inspect.signature(fn)
+
+    def trust(inner: Any) -> Any:
+        @wraps(inner)
+        async def wrapped(*args: Any, **kwargs: Any) -> Any:
+            return finalize_trust_envelope(
+                await inner(*args, **kwargs), evidence_kind=evidence_kind
+            )
+
+        return wrapped
+
+    def budget(inner: Any) -> Any:
+        @wraps(inner)
+        async def wrapped(*args: Any, **kwargs: Any) -> Any:
+            repo_root = await resolve_response_budget_repo_root(signature, args, kwargs)
+            result = enforce_response_budget(
+                fn.__name__,
+                await inner(*args, **kwargs),
+                signature=signature,
+                args=args,
+                kwargs=kwargs,
+                repo_root=repo_root,
+            )
+            result = finalize_trust_envelope(result, evidence_kind=evidence_kind)
+            return enforce_response_budget(
+                fn.__name__,
+                result,
+                signature=signature,
+                args=args,
+                kwargs=kwargs,
+                repo_root=repo_root,
+            )
+
+        return wrapped
+
+    return budget(instrument(budget(quantize(trust(shield(fn))))))
 
 
 def ensure_full_surface() -> Any:

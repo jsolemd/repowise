@@ -11,7 +11,7 @@ FastAPI REST API, webhook handlers, MCP server, and background job scheduler for
 | Component | Description |
 |-----------|-------------|
 | **REST API** | FastAPI application with full CRUD for repos, pages (with version history), symbols, jobs, git analytics, dead code, decisions, graph intelligence, blast radius, costs, knowledge map, security findings, providers, chat, CLAUDE.md generation, and multi-repo workspace |
-| **MCP Server** | 29 registered MCP tools (12 advertised by default in single-repo mode: eleven flagship + `list_repos`) for AI coding assistants (Claude Code, Cursor, Cline) |
+| **MCP Server** | 29 registered MCP tools (11 advertised by default in single-repo mode: the canonical set plus `get_index_status`) for AI coding assistants (Claude Code, Cursor, Cline) |
 | **Webhooks** | GitHub and GitLab push event handlers — trigger sync jobs automatically on push |
 | **Scheduler** | APScheduler background jobs — polling fallback (auto-syncs diverged repos), stale page detection |
 
@@ -161,7 +161,7 @@ Job progress events (`JobProgressEvent`) carry: `event` type, `file` currently b
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `POST` | `/api/repos/{repo_id}/blast-radius` | Estimate PR impact for a list of changed files — returns overall risk score, direct/transitive risks, co-change warnings, recommended reviewers, and test gaps |
+| `POST` | `/api/repos/{repo_id}/blast-radius` | Structural PR impact for changed files — returns an uncalibrated 0-10 structural heuristic, raw direct weights, transitive reach, historical co-change, reviewers, and typed test state |
 
 ### Costs
 
@@ -232,9 +232,10 @@ Job progress events (`JobProgressEvent`) carry: `event` type, `file` currently b
 
 ## MCP Server
 
-repowise registers 29 MCP tools and advertises **12 by default** in single-repo
-mode (the eleven flagship tools plus `list_repos`). Workspace mode adds two more;
-fifteen further tools are opt-in. See [`docs/agent/MCP_TOOLS.md`](../../docs/agent/MCP_TOOLS.md).
+repowise registers 29 MCP tools and advertises **11 by default** in single-repo
+mode (the canonical set plus `get_index_status`). Workspace mode adds
+`list_repos`; seventeen further tools are opt-in where eligible. See
+[`docs/agent/MCP_TOOLS.md`](../../docs/agent/MCP_TOOLS.md).
 Start the MCP server via:
 
 ```bash
@@ -251,7 +252,7 @@ repowise mcp --transport sse          # legacy SSE transport on port 7338
 | `get_symbol(symbol_id)` | Source body, signature, docstring for a qualified symbol | When the question names a specific function or class |
 | `search_codebase(query, mode?)` | Hybrid symbol / path / concept search (auto-routes by query shape) | When locating a symbol, a file, or code by topic |
 | `get_risk(targets)` | Hotspot score, dependents, co-change partners, risk summary | Before modifying files — assess what could break |
-| `get_change_risk(revspec?)` | Whole-change defect-risk score for a commit or `base..head` range | Before merging a commit or PR range |
+| `get_change_risk(revspec?)` | Benchmarked repo-relative review percentile/classification plus a supporting live diff-shape score | Before merging a commit or PR range |
 | `get_why(query?)` | Architectural decisions, rationale, constraints | Before making architectural changes — understand existing intent |
 | `get_dead_code` | Unused/unreachable code sorted by cleanup impact | Before cleanup tasks |
 | `get_health` | 1–10 code-health scores and marker findings | Before refactoring — find the worst files |

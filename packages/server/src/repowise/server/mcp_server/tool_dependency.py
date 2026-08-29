@@ -135,7 +135,7 @@ async def _attach_co_change_signal(
         return
 
 
-@mcp.tool(default=False)
+@mcp.tool(default=False, surface_order=220, trust_kind="structural")
 async def get_dependency_path(
     source: str,
     target: str,

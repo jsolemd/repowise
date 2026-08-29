@@ -99,7 +99,15 @@ log = structlog.get_logger(__name__)
 # 5: raw performance findings gain stable causal linkage and structured
 # performance-fix plans; incremental execution slices widen to preserve those
 # interprocedural interpretations.
-HEALTH_ANALYZER_VERSION = 5
+# 6: five complexity and test-detection inputs changed at once, so the stored
+# metrics disagree with what the current analyzer would compute. Python ``match``
+# arms now count toward cyclomatic complexity and Pascal else-if chains flatten
+# instead of nesting, moving ``max_ccn`` and ``max_nesting``; a comment inside a
+# parameter list is no longer counted as a parameter; and two test-detection
+# fixes (a pairing heuristic the name match could not see, and Delphi's
+# ``Test<Stem>.dpr`` convention) move ``has_test_file`` in the direction that
+# stops accusing a tested file.
+HEALTH_ANALYZER_VERSION = 6
 
 # Method-level smells that make the dataflow / Extract Method pass worthwhile.
 # Only files carrying one of these get a CFG + def/use + reaching pass built.
@@ -276,6 +284,9 @@ def _path_basenames(all_paths: set[str]) -> set[str]:
     return {p.rsplit("/", 1)[-1] for p in all_paths}
 
 
+_PASCAL_UNIT_SUFFIXES = frozenset({".pas", ".pp", ".dpr", ".dpk", ".lpr"})
+
+
 def _has_paired_test_file(rel_path: str, path_basenames: set[str]) -> bool:
     """Heuristic: does any other file look like a test for *rel_path*?
 
@@ -299,6 +310,20 @@ def _has_paired_test_file(rel_path: str, path_basenames: set[str]) -> bool:
         f"{stem}.spec.mts",
         f"{stem}.spec.cts",
     }
+    if p.suffix.lower() in _PASCAL_UNIT_SUFFIXES:
+        # Delphi/FPC's lowercase "u" unit-name prefix (uFoo.pas) has no
+        # test-file convention of its own; real-world projects pair it with
+        # a standalone console test program named Test<Foo>.dpr (the "u" is
+        # dropped, the extension is .dpr since a runnable test program is a
+        # project file, not a unit). Only a lowercase "u" is stripped -- a
+        # stem that merely starts with capital "U" (Utils.pas) is a
+        # different word, not this naming convention. Confirmed against a
+        # real ~150-file Delphi codebase: uKeymap.pas <-> TestKeymap.dpr,
+        # uANSIParser.pas <-> TestANSIParser.dpr, uConsoleBuffer.pas <->
+        # TestConsoleBuffer.dpr, etc. -- src/tools/Test*.dpr, not next to
+        # the unit.
+        pascal_stem = stem[1:] if stem[:1] == "u" else stem
+        candidates.add(f"Test{pascal_stem}.dpr")
     return not candidates.isdisjoint(path_basenames)
 
 

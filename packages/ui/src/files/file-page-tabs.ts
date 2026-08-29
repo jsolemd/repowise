@@ -102,16 +102,12 @@ export function fileTabsFor(data: FileDetailResponse): FileTabDef[] {
   });
 }
 
-/**
- * Narrow a `?tab=` string to a tab this page actually renders.
+/** Narrow a `?tab=` string to a tab this page actually renders.
  *
- * Here rather than beside the `FilePage` shell it seeds, because the shell is
- * a client component and this runs on the server: a function exported from a
- * `"use client"` module is a client reference, and calling one during a server
- * render throws "Attempted to call asFilePageTab() from the server". The
- * bundler only draws that boundary in a production build, so a dev server
- * renders the route fine and `next build` output does not.
- */
+ *  Lives here rather than beside `FilePage`: that module is `"use client"`, so
+ *  every export of it is a client reference, and a server component that
+ *  imported this one got "it's not possible to invoke a client function from
+ *  the server" instead of a tab id. */
 export function asFilePageTab(value: string | undefined): FilePageTab | undefined {
   return value && (FILE_PAGE_TABS as readonly string[]).includes(value)
     ? (value as FilePageTab)
