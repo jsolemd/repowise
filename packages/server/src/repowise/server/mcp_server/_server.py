@@ -11,6 +11,8 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
 from repowise.core.persistence.database import (
     create_engine,
@@ -575,6 +577,32 @@ mcp = FastMCP(
 # attribute (mcp/server/lowlevel/server.py:151), read on each
 # ``create_initialization_options`` call rather than captured at construction.
 mcp._mcp_server.version = _fork_version()
+
+
+@mcp.custom_route("/healthz", methods=["GET"])
+async def _healthz(request: Request) -> JSONResponse:
+    """Liveness probe for the HTTP transports.
+
+    The MCP protocol has no GET endpoint, so until now the only way to ask a
+    running server whether it was up was to complete an ``initialize``
+    handshake. This answers the same question with a plain GET, which is what
+    systemd, a shell loop, and a monitoring check can actually use.
+
+    Deliberately cheap and side-effect free: it reports what the process
+    already knows and touches neither the database nor the vector store, so it
+    stays truthful (and fast) while the background index load is still running.
+    ``custom_route`` handlers are unauthenticated by design in the SDK; nothing
+    here is more sensitive than the tool list the same port already serves
+    unauthenticated.
+    """
+    return JSONResponse(
+        {
+            "status": "ok",
+            "version": _fork_version(),
+            "tools": len(mcp._tool_manager.list_tools()),
+            "workspace": _state._workspace_root is not None,
+        }
+    )
 
 
 # ---------------------------------------------------------------------------

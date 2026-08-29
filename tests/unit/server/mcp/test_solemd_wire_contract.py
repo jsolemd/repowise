@@ -157,6 +157,32 @@ def test_server_info_version_is_the_fork_version():
     assert options.server_version != version("mcp")
 
 
+@pytest.mark.asyncio
+async def test_healthz_answers_on_the_streamable_http_app():
+    """The HTTP transport carries a plain GET liveness probe.
+
+    MCP itself has no GET endpoint, so without this the only way to ask a
+    running server whether it is up is a full ``initialize`` handshake.
+    """
+    import httpx
+
+    from repowise.server.mcp_server import ensure_full_surface
+
+    mcp = ensure_full_surface()
+    app = mcp.streamable_http_app()
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:7350") as client:
+        response = await client.get("/healthz")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "ok"
+    assert body["version"] == version("repowise")
+    assert body["tools"] == len(await mcp.list_tools())
+    assert isinstance(body["workspace"], bool)
+
+
 def test_search_symbol_rows_keep_the_solemd_identity_keys():
     from repowise.core.source_search.coordinator import _Item
 
