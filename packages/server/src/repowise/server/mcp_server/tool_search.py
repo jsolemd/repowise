@@ -44,9 +44,8 @@ from repowise.server.mcp_server._helpers import (
     resolve_enum_argument,
     vector_search_timeout_s,
 )
-from repowise.server.mcp_server._meta import EXHAUSTIVE_SWEEP_HINT
+from repowise.server.mcp_server._meta import EXHAUSTIVE_SWEEP_HINT, federated_freshness
 from repowise.server.mcp_server._meta import build_meta as _build_meta
-from repowise.server.mcp_server._meta import federated_freshness
 from repowise.server.mcp_server._page_paths import file_candidates, hit_file_path
 from repowise.server.mcp_server._prose_symbols import symbol_backed_pages
 from repowise.server.mcp_server._references import path_identity, symbol_identity
