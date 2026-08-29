@@ -705,6 +705,30 @@ def _configure_transport_security(host: str) -> None:
     )
 
 
+def _warn_unauthenticated_bind(transport: str, host: str) -> None:
+    """Warn that a wide MCP bind is unauthenticated, and that no key fixes it.
+
+    The MCP transports are built from a ``FastMCP`` created with no ``auth``
+    and no ``token_verifier``, so every tool on this port is callable by
+    anything that can reach it. ``REPOWISE_API_KEY`` is not a mitigation: it is
+    read by ``repowise.server.deps.verify_api_key``, which is a FastAPI
+    dependency on the dashboard's ``/api/*`` routers under ``repowise serve``
+    — a different process on a different port. This warning used to name that
+    key as the fix and used to fall silent once it was set, which told an
+    operator the port was protected when nothing about it had changed.
+    """
+    _log.warning(
+        "SECURITY WARNING: MCP server (%s) is binding to %s. The MCP "
+        "transports carry no authentication, so every tool on this port is "
+        "callable by anything that can reach it. REPOWISE_API_KEY does not "
+        "change that — it guards the dashboard API served by `repowise serve`, "
+        "not this server. Bind to 127.0.0.1, or put an authenticating proxy in "
+        "front of this port.",
+        transport,
+        host,
+    )
+
+
 def _run_transport(transport: str) -> None:
     """Run the server, raising the cause of a task-group failure rather than the group.
 
@@ -755,25 +779,15 @@ def run_mcp(
         mcp.settings.host = host
         mcp.settings.port = port
         _configure_transport_security(host)
-        if host in ("0.0.0.0", "::") and not os.environ.get("REPOWISE_API_KEY"):
-            _log.warning(
-                "SECURITY WARNING: MCP server (sse) is binding to %s without "
-                "REPOWISE_API_KEY. All tools are unauthenticated and "
-                "network-accessible. Set REPOWISE_API_KEY or bind to 127.0.0.1.",
-                host,
-            )
+        if host in ("0.0.0.0", "::"):
+            _warn_unauthenticated_bind("sse", host)
         _run_transport("sse")
     elif transport == "streamable-http":
         mcp.settings.host = host
         mcp.settings.port = port
         _configure_transport_security(host)
-        if host in ("0.0.0.0", "::") and not os.environ.get("REPOWISE_API_KEY"):
-            _log.warning(
-                "SECURITY WARNING: MCP server (streamable-http) is binding to %s without "
-                "REPOWISE_API_KEY. All tools are unauthenticated and "
-                "network-accessible. Set REPOWISE_API_KEY or bind to 127.0.0.1.",
-                host,
-            )
+        if host in ("0.0.0.0", "::"):
+            _warn_unauthenticated_bind("streamable-http", host)
         _run_transport("streamable-http")
     else:
         # stdout is the JSON-RPC channel on stdio, so every log line written

@@ -57,12 +57,18 @@ def _print_network_startup(
         f"URL: http://{host}:{port}/{endpoint}"
     )
 
-    if not os.environ.get("REPOWISE_API_KEY") and host in ("0.0.0.0", "::"):
+    # No REPOWISE_API_KEY check: the key does not protect this port, so its
+    # presence must not silence the warning. It is read only by the dashboard
+    # API's `verify_api_key` dependency under `repowise serve`; the MCP
+    # transports are served by a FastMCP built with no auth at all.
+    if host in ("0.0.0.0", "::"):
         console.print(
             "[bold yellow]SECURITY WARNING:[/bold yellow] MCP server is binding to "
-            f"[bold]{host}[/bold] without REPOWISE_API_KEY set. "
-            "All tools are unauthenticated and network-accessible. "
-            "Set REPOWISE_API_KEY or bind to 127.0.0.1."
+            f"[bold]{host}[/bold]. The MCP transports carry no authentication, so "
+            "every tool on this port is callable by anything that can reach it. "
+            "REPOWISE_API_KEY does not change that — it guards the dashboard API "
+            "served by `repowise serve`, not this server. "
+            "Bind to 127.0.0.1, or put an authenticating proxy in front of this port."
         )
 
     if workspace is not None:
@@ -100,7 +106,8 @@ def _print_network_startup(
     help=(
         "Host to bind for HTTP/SSE transports. Defaults to the REPOWISE_HOST "
         "environment variable, or 127.0.0.1. Use 0.0.0.0 to listen on all "
-        "interfaces (without REPOWISE_API_KEY a security warning will be printed)."
+        "interfaces (the MCP transports are unauthenticated, so a security "
+        "warning will be printed)."
     ),
 )
 @click.option(
