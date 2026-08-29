@@ -198,9 +198,10 @@ def ensure_full_surface() -> Any:
         importlib.import_module(f"{__name__}.{module}")
 
     from repowise.core.registry import mcp_tool_registry
+    from repowise.server.mcp_server._tool_metadata import resolve_tool_metadata
     from repowise.server.mcp_server._tool_selection import snapshot_full_surface
 
-    mcp_tool_registry.apply(_mcp, middleware=tool_middleware)
+    mcp_tool_registry.apply(_mcp, middleware=tool_middleware, metadata=resolve_tool_metadata)
 
     # Snapshot the full registered surface so per-server tool selection
     # (single-repo vs workspace, config/CLI overrides) can rebuild from it.

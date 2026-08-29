@@ -243,7 +243,7 @@ def test_mcp_cli_inherits_repowise_host_env(monkeypatch, tmp_path: Path) -> None
 
 
 def test_mcp_cli_prints_security_warning_on_wide_bind(monkeypatch, tmp_path: Path) -> None:
-    """--host 0.0.0.0 without REPOWISE_API_KEY → security warning in output."""
+    """--host 0.0.0.0 → security warning in output."""
     (tmp_path / ".repowise").mkdir()
     monkeypatch.setattr("repowise.server.mcp_server.run_mcp", lambda **kw: None)
     monkeypatch.delenv("REPOWISE_API_KEY", raising=False)
@@ -259,8 +259,15 @@ def test_mcp_cli_prints_security_warning_on_wide_bind(monkeypatch, tmp_path: Pat
     assert "REPOWISE_API_KEY" in result.output
 
 
-def test_mcp_cli_no_warning_with_api_key(monkeypatch, tmp_path: Path) -> None:
-    """--host 0.0.0.0 WITH REPOWISE_API_KEY → no security warning."""
+def test_mcp_cli_warns_on_wide_bind_even_with_api_key(monkeypatch, tmp_path: Path) -> None:
+    """--host 0.0.0.0 WITH REPOWISE_API_KEY → still warned.
+
+    The key used to silence this warning, which said the port was protected
+    when it was not: ``REPOWISE_API_KEY`` is read by the dashboard API's
+    ``verify_api_key`` dependency, and the MCP transports are served by a
+    ``FastMCP`` built with no auth. Setting it changes nothing about this port,
+    so it must not change what the operator is told about it.
+    """
     (tmp_path / ".repowise").mkdir()
     monkeypatch.setattr("repowise.server.mcp_server.run_mcp", lambda **kw: None)
     monkeypatch.setenv("REPOWISE_API_KEY", "some-key")
@@ -271,7 +278,8 @@ def test_mcp_cli_no_warning_with_api_key(monkeypatch, tmp_path: Path) -> None:
     )
 
     assert result.exit_code == 0
-    assert "SECURITY WARNING" not in result.output
+    assert "SECURITY WARNING" in result.output
+    assert "dashboard" in result.output
 
 
 def test_run_mcp_sets_host_on_settings(monkeypatch) -> None:

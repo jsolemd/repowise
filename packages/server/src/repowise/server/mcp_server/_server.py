@@ -11,6 +11,8 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
 from repowise.core.persistence.database import (
     create_engine,
@@ -528,6 +530,29 @@ async def _lifespan(server: FastMCP):
 # Create the MCP server
 # ---------------------------------------------------------------------------
 
+
+def _fork_version() -> str:
+    """The version of the installed ``repowise`` distribution.
+
+    Falls back to the in-tree ``repowise.core.__version__`` when the
+    distribution metadata is missing (a source tree on ``sys.path`` without an
+    install), and to ``"0"`` only if even that cannot be read — a served
+    ``serverInfo.version`` is worth more than a startup crash.
+    """
+    try:
+        from importlib.metadata import version as _dist_version
+
+        return _dist_version("repowise")
+    except Exception:
+        try:
+            from repowise.core import __version__
+
+            return __version__
+        except Exception:  # pragma: no cover - defensive
+            _log.debug("Could not resolve the repowise version", exc_info=True)
+            return "0"
+
+
 mcp = FastMCP(
     "repowise",
     instructions=(
@@ -542,6 +567,51 @@ mcp = FastMCP(
     ),
     lifespan=_lifespan,
 )
+
+# ``FastMCP.__init__`` takes no ``version``, so the low-level ``Server`` it
+# builds keeps ``version=None`` and ``create_initialization_options`` falls back
+# to ``importlib.metadata.version("mcp")`` (mcp/server/lowlevel/server.py:183).
+# Every client therefore learned the SDK's version where the protocol asks for
+# the *server's*. Setting the attribute the constructor would have set is the
+# only path the SDK offers at 1.28.x; ``Server.version`` is a plain public
+# attribute (mcp/server/lowlevel/server.py:151), read on each
+# ``create_initialization_options`` call rather than captured at construction.
+mcp._mcp_server.version = _fork_version()
+
+
+@mcp.custom_route("/healthz", methods=["GET"])
+async def _healthz(request: Request) -> JSONResponse:
+    """Liveness probe for the HTTP transports.
+
+    The MCP protocol has no GET endpoint, so until now the only way to ask a
+    running server whether it was up was to complete an ``initialize``
+    handshake. This answers the same question with a plain GET, which is what
+    systemd, a shell loop, and a monitoring check can actually use.
+
+    Deliberately cheap and side-effect free: it reports what the process
+    already knows and touches neither the database nor the vector store, so it
+    stays truthful (and fast) while the background index load is still running.
+    ``custom_route`` handlers are unauthenticated by design in the SDK; nothing
+    here is more sensitive than the tool list the same port already serves
+    unauthenticated.
+    """
+    from repowise.server.mcp_server._tool_selection import _is_workspace
+
+    # Workspace mode is read back from the repo path, not from
+    # ``_state._workspace_root``: on the HTTP transports FastMCP enters the
+    # server lifespan once an MCP *session* initializes, not when the ASGI app
+    # starts, so that global is still ``None`` for every probe that arrives
+    # before the first client connects. ``_is_workspace`` is the same check the
+    # tool-selection layer already made to pick the surface being reported
+    # alongside it, and it is a short walk up the tree for the config file.
+    return JSONResponse(
+        {
+            "status": "ok",
+            "version": _fork_version(),
+            "tools": len(mcp._tool_manager.list_tools()),
+            "workspace": _is_workspace(_state._repo_path),
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -644,6 +714,30 @@ def _configure_transport_security(host: str) -> None:
     )
 
 
+def _warn_unauthenticated_bind(transport: str, host: str) -> None:
+    """Warn that a wide MCP bind is unauthenticated, and that no key fixes it.
+
+    The MCP transports are built from a ``FastMCP`` created with no ``auth``
+    and no ``token_verifier``, so every tool on this port is callable by
+    anything that can reach it. ``REPOWISE_API_KEY`` is not a mitigation: it is
+    read by ``repowise.server.deps.verify_api_key``, which is a FastAPI
+    dependency on the dashboard's ``/api/*`` routers under ``repowise serve``
+    — a different process on a different port. This warning used to name that
+    key as the fix and used to fall silent once it was set, which told an
+    operator the port was protected when nothing about it had changed.
+    """
+    _log.warning(
+        "SECURITY WARNING: MCP server (%s) is binding to %s. The MCP "
+        "transports carry no authentication, so every tool on this port is "
+        "callable by anything that can reach it. REPOWISE_API_KEY does not "
+        "change that — it guards the dashboard API served by `repowise serve`, "
+        "not this server. Bind to 127.0.0.1, or put an authenticating proxy in "
+        "front of this port.",
+        transport,
+        host,
+    )
+
+
 def _run_transport(transport: str) -> None:
     """Run the server, raising the cause of a task-group failure rather than the group.
 
@@ -694,25 +788,15 @@ def run_mcp(
         mcp.settings.host = host
         mcp.settings.port = port
         _configure_transport_security(host)
-        if host in ("0.0.0.0", "::") and not os.environ.get("REPOWISE_API_KEY"):
-            _log.warning(
-                "SECURITY WARNING: MCP server (sse) is binding to %s without "
-                "REPOWISE_API_KEY. All tools are unauthenticated and "
-                "network-accessible. Set REPOWISE_API_KEY or bind to 127.0.0.1.",
-                host,
-            )
+        if host in ("0.0.0.0", "::"):
+            _warn_unauthenticated_bind("sse", host)
         _run_transport("sse")
     elif transport == "streamable-http":
         mcp.settings.host = host
         mcp.settings.port = port
         _configure_transport_security(host)
-        if host in ("0.0.0.0", "::") and not os.environ.get("REPOWISE_API_KEY"):
-            _log.warning(
-                "SECURITY WARNING: MCP server (streamable-http) is binding to %s without "
-                "REPOWISE_API_KEY. All tools are unauthenticated and "
-                "network-accessible. Set REPOWISE_API_KEY or bind to 127.0.0.1.",
-                host,
-            )
+        if host in ("0.0.0.0", "::"):
+            _warn_unauthenticated_bind("streamable-http", host)
         _run_transport("streamable-http")
     else:
         # stdout is the JSON-RPC channel on stdio, so every log line written

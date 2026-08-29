@@ -102,6 +102,58 @@ def test_apply_supports_multiple_servers(registry):
     assert t1 in b.registered
 
 
+class _MetadataMCP:
+    """Stand-in that records the ``title``/``annotations`` each tool arrives with."""
+
+    def __init__(self) -> None:
+        self.registered: dict[str, dict[str, Any]] = {}
+
+    def tool(self, **options: Any) -> Any:
+        def _decorator(fn: Any) -> Any:
+            self.registered[fn.__name__] = options
+            return fn
+
+        return _decorator
+
+
+def test_apply_fills_metadata_from_the_resolver(registry):
+    @registry.register
+    async def t1() -> dict:
+        return {}
+
+    mcp = _MetadataMCP()
+    registry.apply(mcp, metadata=lambda entry: (f"Title {entry.name}", {"readOnlyHint": True}))
+    assert mcp.registered["t1"] == {
+        "title": "Title t1",
+        "annotations": {"readOnlyHint": True},
+    }
+
+
+def test_entry_metadata_wins_over_the_resolver(registry):
+    @registry.register(title="Declared", annotations={"readOnlyHint": False})
+    async def t1() -> dict:
+        return {}
+
+    mcp = _MetadataMCP()
+    registry.apply(mcp, metadata=lambda entry: ("Resolved", {"readOnlyHint": True}))
+    assert mcp.registered["t1"] == {
+        "title": "Declared",
+        "annotations": {"readOnlyHint": False},
+    }
+
+
+def test_apply_without_metadata_passes_no_options(registry):
+    """A tool with nothing to say still reaches the server as ``mcp.tool()``."""
+
+    @registry.register
+    async def t1() -> dict:
+        return {}
+
+    mcp = _MetadataMCP()
+    registry.apply(mcp)
+    assert mcp.registered["t1"] == {}
+
+
 def test_reset_clears_tools(registry):
     @registry.register
     async def t1() -> dict:

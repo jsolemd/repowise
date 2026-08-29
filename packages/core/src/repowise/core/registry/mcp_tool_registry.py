@@ -31,8 +31,8 @@ Usage::
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
 from typing import Any
 
 TOOL_TIERS = frozenset({"canonical", "utility", "specialist"})
@@ -56,6 +56,13 @@ class ToolEntry:
     marks whether the tool is part of the curated default surface; opt-in tools
     set it ``False``. ``requires_workspace`` marks tools that only do useful
     work in workspace mode, so they are hidden from single-repo servers.
+
+    ``title`` and ``annotations`` are the MCP ``tools/list`` display name and
+    behaviour hints (``readOnlyHint`` and friends). Both are optional here: a
+    tool that declares neither falls back to whatever resolver :meth:`apply`
+    was given, which is where the built-in surface gets its values. A tool that
+    declares its own always wins, so a third-party tool module can describe
+    itself without going through that resolver.
     """
 
     fn: Callable[..., Any]
@@ -66,6 +73,11 @@ class ToolEntry:
     surface_order: int = 1000
     trust_kind: str | None = None
     recipes: tuple[ToolRecipe, ...] = ()
+    title: str | None = None
+    # Compared/hashed out because a mapping is unhashable and ``ToolEntry`` is a
+    # frozen dataclass, i.e. hashable today; annotations are descriptive
+    # metadata, never identity.
+    annotations: Mapping[str, Any] | None = field(default=None, compare=False)
 
 
 class MCPToolRegistry:
@@ -84,6 +96,8 @@ class MCPToolRegistry:
         surface_order: int = 1000,
         trust_kind: str | None = None,
         recipes: tuple[ToolRecipe, ...] = (),
+        title: str | None = None,
+        annotations: Mapping[str, Any] | None = None,
         **kwargs: Any,
     ) -> Callable[[Callable[..., Any]], Callable[..., Any]] | Callable[..., Any]:
         """Decorator that schedules a function for FastMCP registration.
@@ -123,6 +137,8 @@ class MCPToolRegistry:
                     surface_order=surface_order,
                     trust_kind=trust_kind,
                     recipes=recipes,
+                    title=title,
+                    annotations=annotations,
                 )
             )
             fn.__dict__["__repowise_trust_kind__"] = trust_kind
@@ -145,6 +161,7 @@ class MCPToolRegistry:
         self,
         mcp: Any,
         middleware: Callable[[Callable[..., Any]], Callable[..., Any]] | None = None,
+        metadata: Callable[[ToolEntry], tuple[str | None, Mapping[str, Any] | None]] | None = None,
     ) -> None:
         """Attach every registered tool to *mcp* via ``mcp.tool()``.
 
@@ -158,12 +175,29 @@ class MCPToolRegistry:
         this way so the registry stays decoupled from it. A signature-
         preserving wrapper is the caller's responsibility (FastMCP reads
         each tool's signature to build its schema). Defaults to identity.
+
+        *metadata*, when given, supplies the ``tools/list`` display name and
+        behaviour annotations for entries that did not declare their own. It is
+        a hook rather than a table so the surface owner (the server package)
+        keeps that policy, and the registry stays a pure collection.
         """
         if mcp in self._applied_to:
             return
         for entry in self._entries:
             wrapped = middleware(entry.fn) if middleware is not None else entry.fn
-            mcp.tool()(wrapped)
+            title, annotations = entry.title, entry.annotations
+            if metadata is not None and (title is None or annotations is None):
+                resolved_title, resolved_annotations = metadata(entry)
+                title = title if title is not None else resolved_title
+                annotations = annotations if annotations is not None else resolved_annotations
+            # Passed only when present, so a tool with no metadata still reaches
+            # the server as the bare ``mcp.tool()`` call it always was.
+            options: dict[str, Any] = {}
+            if title is not None:
+                options["title"] = title
+            if annotations is not None:
+                options["annotations"] = annotations
+            mcp.tool(**options)(wrapped)
         self._applied_to.append(mcp)
 
     def reset(self) -> None:

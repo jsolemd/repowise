@@ -80,8 +80,32 @@ def test_solemd_served_tool_names_are_exact(monkeypatch: pytest.MonkeyPatch):
     )
 
 
+#: The one served tool that changes state — it appends to (and retires entries
+#: in) the git-tracked decisions journal. Everything else served answers from
+#: the index and the working tree without touching either.
+EXPECTED_WRITER_TOOLS = frozenset({"manage_decision"})
+
+#: Hints every served reader must advertise.
+READER_ANNOTATIONS = {
+    "readOnlyHint": True,
+    "destructiveHint": False,
+    "idempotentHint": True,
+    "openWorldHint": False,
+}
+
+#: Hints the served writer must advertise: not read-only, but additive (a
+#: decision is superseded, never deleted) and not idempotent (a second record
+#: appends a second entry).
+WRITER_ANNOTATIONS = {
+    "readOnlyHint": False,
+    "destructiveHint": False,
+    "idempotentHint": False,
+    "openWorldHint": False,
+}
+
+
 @pytest.mark.asyncio
-async def test_served_tools_have_no_title_or_annotations_and_wrap_result(
+async def test_served_tools_carry_title_and_annotations_and_wrap_result(
     monkeypatch: pytest.MonkeyPatch,
 ):
     from repowise.server.mcp_server import ensure_full_surface
@@ -90,15 +114,20 @@ async def test_served_tools_have_no_title_or_annotations_and_wrap_result(
     advertised = {tool.name: tool for tool in await ensure_full_surface().list_tools()}
     assert served_names <= advertised.keys()
 
-    metadata_drift = {
-        name: {"title": advertised[name].title, "annotations": advertised[name].annotations}
-        for name in sorted(served_names)
-        if advertised[name].title is not None or advertised[name].annotations is not None
-    }
-    assert not metadata_drift, (
-        "served tools gained title/annotations; unit 4.1 must change these pins "
-        f"with the wire contract: {metadata_drift}"
+    missing_titles = sorted(name for name in served_names if not advertised[name].title)
+    assert not missing_titles, f"served tools with no tools/list title: {missing_titles}"
+
+    annotation_drift = {}
+    for name in sorted(served_names):
+        expected = WRITER_ANNOTATIONS if name in EXPECTED_WRITER_TOOLS else READER_ANNOTATIONS
+        annotations = advertised[name].annotations
+        actual = annotations.model_dump(exclude_none=True) if annotations else None
+        if actual != expected:
+            annotation_drift[name] = {"expected": expected, "actual": actual}
+    assert not annotation_drift, (
+        f"served tool annotations drifted from the 24-reader + 1-writer split: {annotation_drift}"
     )
+    assert len(served_names - EXPECTED_WRITER_TOOLS) == 24
 
     wrapper_drift = {
         name: schema
@@ -113,13 +142,70 @@ async def test_served_tools_have_no_title_or_annotations_and_wrap_result(
     )
 
 
-def test_server_info_version_is_the_mcp_sdk_version():
+def test_server_info_version_is_the_fork_version():
+    """``serverInfo.version`` names repowise, not the SDK that transports it.
+
+    ``FastMCP.__init__`` takes no version, so the low-level ``Server`` keeps
+    ``version=None`` and ``create_initialization_options`` falls back to
+    ``importlib.metadata.version("mcp")``. Every client used to be told the SDK
+    version where the protocol asks for the server's.
+    """
     from repowise.server.mcp_server import ensure_full_surface
 
     options = ensure_full_surface()._mcp_server.create_initialization_options()
-    assert options.server_version == version("mcp")
-    # Unit 4.1 deliberately changes serverInfo.version to the fork version.
-    assert options.server_version != version("repowise")
+    assert options.server_version == version("repowise")
+    assert options.server_version != version("mcp")
+
+
+@pytest.mark.asyncio
+async def test_healthz_answers_on_the_streamable_http_app():
+    """The HTTP transport carries a plain GET liveness probe.
+
+    MCP itself has no GET endpoint, so without this the only way to ask a
+    running server whether it is up is a full ``initialize`` handshake.
+    """
+    import httpx
+
+    from repowise.server.mcp_server import ensure_full_surface
+
+    mcp = ensure_full_surface()
+    app = mcp.streamable_http_app()
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:7350") as client:
+        response = await client.get("/healthz")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "ok"
+    assert body["version"] == version("repowise")
+    assert body["tools"] == len(await mcp.list_tools())
+    assert body["workspace"] is False
+
+
+@pytest.mark.asyncio
+async def test_healthz_reports_workspace_mode_before_any_session(tmp_path, monkeypatch):
+    """``workspace`` is read from the repo path, not from lifespan state.
+
+    On the HTTP transports FastMCP enters the server lifespan when an MCP
+    session initializes, not when the ASGI app starts, so ``_state``'s
+    ``_workspace_root`` is still ``None`` for every probe that lands before the
+    first client connects — which is exactly when a startup probe runs.
+    """
+    import httpx
+
+    from repowise.server.mcp_server import _state, ensure_full_surface
+
+    (tmp_path / ".repowise-workspace.yaml").write_text("repos: []\n", encoding="utf-8")
+    monkeypatch.setattr(_state, "_repo_path", str(tmp_path))
+    monkeypatch.setattr(_state, "_workspace_root", None)
+
+    app = ensure_full_surface().streamable_http_app()
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:7350") as client:
+        response = await client.get("/healthz")
+
+    assert response.json()["workspace"] is True
 
 
 def test_search_symbol_rows_keep_the_solemd_identity_keys():
