@@ -528,6 +528,29 @@ async def _lifespan(server: FastMCP):
 # Create the MCP server
 # ---------------------------------------------------------------------------
 
+
+def _fork_version() -> str:
+    """The version of the installed ``repowise`` distribution.
+
+    Falls back to the in-tree ``repowise.core.__version__`` when the
+    distribution metadata is missing (a source tree on ``sys.path`` without an
+    install), and to ``"0"`` only if even that cannot be read — a served
+    ``serverInfo.version`` is worth more than a startup crash.
+    """
+    try:
+        from importlib.metadata import version as _dist_version
+
+        return _dist_version("repowise")
+    except Exception:
+        try:
+            from repowise.core import __version__
+
+            return __version__
+        except Exception:  # pragma: no cover - defensive
+            _log.debug("Could not resolve the repowise version", exc_info=True)
+            return "0"
+
+
 mcp = FastMCP(
     "repowise",
     instructions=(
@@ -542,6 +565,16 @@ mcp = FastMCP(
     ),
     lifespan=_lifespan,
 )
+
+# ``FastMCP.__init__`` takes no ``version``, so the low-level ``Server`` it
+# builds keeps ``version=None`` and ``create_initialization_options`` falls back
+# to ``importlib.metadata.version("mcp")`` (mcp/server/lowlevel/server.py:183).
+# Every client therefore learned the SDK's version where the protocol asks for
+# the *server's*. Setting the attribute the constructor would have set is the
+# only path the SDK offers at 1.28.x; ``Server.version`` is a plain public
+# attribute (mcp/server/lowlevel/server.py:151), read on each
+# ``create_initialization_options`` call rather than captured at construction.
+mcp._mcp_server.version = _fork_version()
 
 
 # ---------------------------------------------------------------------------

@@ -142,13 +142,19 @@ async def test_served_tools_carry_title_and_annotations_and_wrap_result(
     )
 
 
-def test_server_info_version_is_the_mcp_sdk_version():
+def test_server_info_version_is_the_fork_version():
+    """``serverInfo.version`` names repowise, not the SDK that transports it.
+
+    ``FastMCP.__init__`` takes no version, so the low-level ``Server`` keeps
+    ``version=None`` and ``create_initialization_options`` falls back to
+    ``importlib.metadata.version("mcp")``. Every client used to be told the SDK
+    version where the protocol asks for the server's.
+    """
     from repowise.server.mcp_server import ensure_full_surface
 
     options = ensure_full_surface()._mcp_server.create_initialization_options()
-    assert options.server_version == version("mcp")
-    # Unit 4.1 deliberately changes serverInfo.version to the fork version.
-    assert options.server_version != version("repowise")
+    assert options.server_version == version("repowise")
+    assert options.server_version != version("mcp")
 
 
 def test_search_symbol_rows_keep_the_solemd_identity_keys():
