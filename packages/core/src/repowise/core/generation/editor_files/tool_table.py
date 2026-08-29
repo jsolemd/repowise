@@ -111,6 +111,13 @@ TOOL_TABLE_ROWS: dict[str, tuple[str, str]] = {
         "get_overview()",
         "Architecture map. Call once, first, in an unfamiliar repo; skip it after that.",
     ),
+    # Fork: get_index_status is canonical here (B1/F20 — an index status a reader
+    # can act on), so the editor-file table carries it like the other ten.
+    "get_index_status": (
+        "get_index_status(mode?, path?, repo?)",
+        "Is the index current? `trust.search_results` and `working_tree` say whether "
+        "results reflect HEAD and uncommitted edits; `mode=\"path\"` inspects one file.",
+    ),
 }
 
 

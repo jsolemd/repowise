@@ -1065,7 +1065,12 @@ async def test_single_repo_mode_still_uses_the_singleton(monkeypatch):
 async def test_wiki_federated_merge_ranks_by_relevance_not_config_order(monkeypatch):
     from repowise.server.mcp_server import tool_search
 
-    contexts = [SimpleNamespace(alias="alpha"), SimpleNamespace(alias="beta")]
+    # v0.46.0: _federated_search hands contexts[0].path to the response-budget
+    # omissions ledger, so the stubs need a path like a real RepoContext.
+    contexts = [
+        SimpleNamespace(alias="alpha", path="/tmp/alpha"),
+        SimpleNamespace(alias="beta", path="/tmp/beta"),
+    ]
 
     canned = {
         "alpha": [
@@ -1099,7 +1104,12 @@ async def test_wiki_federated_merge_ranks_by_relevance_not_config_order(monkeypa
 async def test_wiki_federated_rrf_tie_breaks_on_raw_evidence(monkeypatch):
     from repowise.server.mcp_server import tool_search
 
-    contexts = [SimpleNamespace(alias="alpha"), SimpleNamespace(alias="beta")]
+    # v0.46.0: _federated_search hands contexts[0].path to the response-budget
+    # omissions ledger, so the stubs need a path like a real RepoContext.
+    contexts = [
+        SimpleNamespace(alias="alpha", path="/tmp/alpha"),
+        SimpleNamespace(alias="beta", path="/tmp/beta"),
+    ]
 
     # Equal fused scores — the structural cross-repo tie. Beta's hit carries
     # the stronger dense cosine, so beta must lead; config-order fusion (or a

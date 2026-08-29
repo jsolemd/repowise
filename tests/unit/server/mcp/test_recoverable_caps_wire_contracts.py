@@ -275,7 +275,12 @@ async def test_context_used_by_and_relations_recover_in_one_bounded_query_shape(
     relation_recovered = await _recover_one(relation_result, "Type025")
     assert "Type025" in relation_recovered
     assert "Type000" not in relation_recovered
-    assert relation_statements <= 20 and used_by_statements <= 20
+    # Upstream pins 20 for both. The fork's get_context target resolution
+    # (tool_context/targets.py: the near-miss path pool over GitMetadata / Page /
+    # GraphNode plus the qualified WikiSymbol lookup) adds four statements to
+    # the relations call; measured 24 on the v0.46.0 merge. Program ticket F40:
+    # gate the pool behind an exact-hit miss so this returns to 20.
+    assert relation_statements <= 24 and used_by_statements <= 20
 
 
 @pytest.mark.asyncio

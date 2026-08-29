@@ -49,7 +49,11 @@ _HEALTHY_ROSTER = [
         "title": "DB Models",
         "page_type": "file_page",
         "snippet": "DB Models",
-        "relevance_score": 2.9508,
+        # 2.9508 before v0.46.0; upstream's rerank_by_context_coverage(floor=0.5)
+        # now halves a fused score whose row covers none of the query's terms
+        # ("authentication service" vs a DB-models page). Order unchanged; the
+        # fork's disclosure code is not what moved it (program ticket F37).
+        "relevance_score": 1.4754,
         "sources": ["vector"],
         "target_path": "src/db/models.py",
         "confidence_score": 0.98,
