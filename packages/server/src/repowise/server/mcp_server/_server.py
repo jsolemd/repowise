@@ -595,12 +595,21 @@ async def _healthz(request: Request) -> JSONResponse:
     here is more sensitive than the tool list the same port already serves
     unauthenticated.
     """
+    from repowise.server.mcp_server._tool_selection import _is_workspace
+
+    # Workspace mode is read back from the repo path, not from
+    # ``_state._workspace_root``: on the HTTP transports FastMCP enters the
+    # server lifespan once an MCP *session* initializes, not when the ASGI app
+    # starts, so that global is still ``None`` for every probe that arrives
+    # before the first client connects. ``_is_workspace`` is the same check the
+    # tool-selection layer already made to pick the surface being reported
+    # alongside it, and it is a short walk up the tree for the config file.
     return JSONResponse(
         {
             "status": "ok",
             "version": _fork_version(),
             "tools": len(mcp._tool_manager.list_tools()),
-            "workspace": _state._workspace_root is not None,
+            "workspace": _is_workspace(_state._repo_path),
         }
     )
 

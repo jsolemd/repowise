@@ -180,7 +180,32 @@ async def test_healthz_answers_on_the_streamable_http_app():
     assert body["status"] == "ok"
     assert body["version"] == version("repowise")
     assert body["tools"] == len(await mcp.list_tools())
-    assert isinstance(body["workspace"], bool)
+    assert body["workspace"] is False
+
+
+@pytest.mark.asyncio
+async def test_healthz_reports_workspace_mode_before_any_session(tmp_path, monkeypatch):
+    """``workspace`` is read from the repo path, not from lifespan state.
+
+    On the HTTP transports FastMCP enters the server lifespan when an MCP
+    session initializes, not when the ASGI app starts, so ``_state``'s
+    ``_workspace_root`` is still ``None`` for every probe that lands before the
+    first client connects — which is exactly when a startup probe runs.
+    """
+    import httpx
+
+    from repowise.server.mcp_server import _state, ensure_full_surface
+
+    (tmp_path / ".repowise-workspace.yaml").write_text("repos: []\n", encoding="utf-8")
+    monkeypatch.setattr(_state, "_repo_path", str(tmp_path))
+    monkeypatch.setattr(_state, "_workspace_root", None)
+
+    app = ensure_full_surface().streamable_http_app()
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:7350") as client:
+        response = await client.get("/healthz")
+
+    assert response.json()["workspace"] is True
 
 
 def test_search_symbol_rows_keep_the_solemd_identity_keys():
