@@ -177,20 +177,34 @@ def snapshot_full_surface(mcp: Any) -> None:
     manager = getattr(mcp, "_tool_manager", None)
     registered = getattr(manager, "_tools", None)
     if registered:
-        _purge_generative(registered)
+        _purge_generative(mcp, registered)
     if _full_surface is not None:
         return
     if registered:
         _full_surface = dict(registered)
 
 
-def _purge_generative(registered: dict[str, Any]) -> None:
-    """Drop the generative tools from a live FastMCP tool mapping, in place."""
+def _purge_generative(mcp: Any, registered: dict[str, Any]) -> None:
+    """Drop the generative tools from a live FastMCP server, in place.
+
+    Removal goes through ``FastMCP.remove_tool`` when the server offers it
+    (mcp 1.28's public unregistration path, added after this code was written),
+    so the one part of the trim that *is* a plain removal no longer depends on
+    the private ``_tool_manager._tools`` mapping. The rebuild in
+    :func:`apply_tool_selection` still does, because restoring a previously
+    trimmed tool means re-adding a built ``Tool`` object and the SDK exposes no
+    public call for that — ``ToolManager.add_tool`` takes a function and
+    re-derives the schema, and ``FastMCP(tools=...)`` is constructor-only.
+    """
     if not no_generative_tools_enabled():
         return
     removed = sorted(GENERATIVE_TOOL_NAMES & registered.keys())
+    remove_tool = getattr(mcp, "remove_tool", None)
     for name in removed:
-        del registered[name]
+        if callable(remove_tool):
+            remove_tool(name)
+        else:
+            del registered[name]
     if removed:
         _log.info(
             "Generative MCP tools excluded from the served surface (%s): %s",
