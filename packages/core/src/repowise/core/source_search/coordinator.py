@@ -47,7 +47,7 @@ import logging
 import math
 import re
 import time
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -1110,6 +1110,7 @@ class SourceSearchCoordinator:
         source_fts: SourceFTSIndex,
         wiki_vectors: WikiVectorStore | None = None,
         wiki_fts: WikiFullTextSearch | None = None,
+        wiki_tombstones: Callable[[], Awaitable[frozenset[str]]] | None = None,
         query_log: QueryLog | None = None,
     ) -> None:
         self.repo_path = Path(repo_path)
@@ -1118,6 +1119,7 @@ class SourceSearchCoordinator:
         self._source_fts = source_fts
         self._wiki_vectors = wiki_vectors
         self._wiki_fts = wiki_fts
+        self._wiki_tombstones = wiki_tombstones
         self._query_log = query_log or QueryLog(default_query_log_path(self.repo_path))
         self._manifest_meta: dict[str, Any] | None = None
         self._path_token_files: dict[str, frozenset[str]] | None = None
@@ -1216,9 +1218,45 @@ class SourceSearchCoordinator:
 
     async def _retrieve(self, query: str) -> tuple[dict[str, _Item], list[LegFailure]]:
         """Both legs, fused. Returns candidates and every leg that did not answer."""
-        dense_source, dense_wiki, dense_failures = await self._dense_legs(query)
-        lexical_source, lexical_wiki, lexical_failures = await self._lexical_legs(query)
-        failures = [*dense_failures, *lexical_failures]
+        tombstones: frozenset[str] = frozenset()
+        tombstone_failures: list[LegFailure] = []
+        wiki_verified = True
+        if self._wiki_tombstones is not None and (
+            self._wiki_vectors is not None or self._wiki_fts is not None
+        ):
+            try:
+                tombstones = await self._wiki_tombstones()
+            except Exception as exc:
+                # The source legs remain independently useful. The wiki legs
+                # do not: without this read they cannot distinguish a live page
+                # from one deliberately retired from serving.
+                wiki_verified = False
+                for leg, store in (
+                    (LEG_WIKI_DENSE, self._wiki_vectors),
+                    (LEG_WIKI_LEXICAL, self._wiki_fts),
+                ):
+                    if store is None:
+                        continue
+                    failure = _classify_failure(leg, exc)
+                    tombstone_failures.append(
+                        LegFailure(
+                            leg=failure.leg,
+                            error=failure.error,
+                            detail=f"wiki tombstone lookup failed: {failure.detail}",
+                            hard=True,
+                        )
+                    )
+        dense_source, dense_wiki, dense_failures = await self._dense_legs(
+            query,
+            wiki_tombstones=tombstones,
+            wiki_verified=wiki_verified,
+        )
+        lexical_source, lexical_wiki, lexical_failures = await self._lexical_legs(
+            query,
+            wiki_tombstones=tombstones,
+            wiki_verified=wiki_verified,
+        )
+        failures = [*tombstone_failures, *dense_failures, *lexical_failures]
 
         items: dict[str, _Item] = {}
         records, records_failure = await self._chunk_records(dense_source, lexical_source)
@@ -1249,7 +1287,13 @@ class SourceSearchCoordinator:
             item.fused_score = _rrf(item.dense_rank, item.lexical_rank)
         return items, failures
 
-    async def _dense_legs(self, query: str) -> tuple[list[Any], list[Any], list[LegFailure]]:
+    async def _dense_legs(
+        self,
+        query: str,
+        *,
+        wiki_tombstones: frozenset[str] = frozenset(),
+        wiki_verified: bool = True,
+    ) -> tuple[list[Any], list[Any], list[LegFailure]]:
         """Top-*LEG_FETCH* from each vector store, on one embedding of *query*.
 
         An embedder that raises takes both dense legs with it, so the failure
@@ -1261,7 +1305,9 @@ class SourceSearchCoordinator:
             vectors = await self._embedder.embed([query])
         except Exception as exc:
             failure = _classify_failure("query embedding", exc)
-            legs = [LEG_SOURCE_DENSE] + ([LEG_WIKI_DENSE] if self._wiki_vectors else [])
+            legs = [LEG_SOURCE_DENSE] + (
+                [LEG_WIKI_DENSE] if self._wiki_vectors is not None and wiki_verified else []
+            )
             return (
                 [],
                 [],
@@ -1278,20 +1324,28 @@ class SourceSearchCoordinator:
         if not vectors:
             return [], [], []
         vector = [float(v) for v in vectors[0]]
+        wiki_limit = LEG_FETCH + len(wiki_tombstones)
         (source, source_failure), (wiki, wiki_failure) = await asyncio.gather(
             _run_leg(
                 self._source_vectors.search_by_vector(vector, limit=LEG_FETCH), LEG_SOURCE_DENSE
             ),
             _run_leg(
-                self._wiki_vectors.search_by_vector(vector, limit=LEG_FETCH)
-                if self._wiki_vectors is not None
+                self._wiki_vectors.search_by_vector(vector, limit=wiki_limit)
+                if self._wiki_vectors is not None and wiki_verified
                 else None,
                 LEG_WIKI_DENSE,
             ),
         )
+        wiki = [hit for hit in wiki if hit.page_id not in wiki_tombstones][:LEG_FETCH]
         return source, wiki, [f for f in (source_failure, wiki_failure) if f is not None]
 
-    async def _lexical_legs(self, query: str) -> tuple[list[Any], list[Any], list[LegFailure]]:
+    async def _lexical_legs(
+        self,
+        query: str,
+        *,
+        wiki_tombstones: frozenset[str] = frozenset(),
+        wiki_verified: bool = True,
+    ) -> tuple[list[Any], list[Any], list[LegFailure]]:
         """Top-*LEG_FETCH* from each BM25 index.
 
         The source index tokenizes *query* with the same function that built
@@ -1301,10 +1355,14 @@ class SourceSearchCoordinator:
         source, source_failure = _run_sync_leg(
             lambda: self._source_fts.query(query, limit=LEG_FETCH), LEG_SOURCE_LEXICAL
         )
+        wiki_limit = LEG_FETCH + len(wiki_tombstones)
         wiki, wiki_failure = await _run_leg(
-            self._wiki_fts.search(query, limit=LEG_FETCH) if self._wiki_fts is not None else None,
+            self._wiki_fts.search(query, limit=wiki_limit)
+            if self._wiki_fts is not None and wiki_verified
+            else None,
             LEG_WIKI_LEXICAL,
         )
+        wiki = [hit for hit in wiki if hit.page_id not in wiki_tombstones][:LEG_FETCH]
         return source, wiki, [f for f in (source_failure, wiki_failure) if f is not None]
 
     async def _chunk_records(

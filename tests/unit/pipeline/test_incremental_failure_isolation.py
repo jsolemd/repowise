@@ -90,8 +90,16 @@ async def test_prune_spares_every_file_node_the_rebuilt_graph_still_holds(repo, 
 
     seen: dict = {}
 
-    async def spy(session, repo_id, repo_path, *, live_hint=None):
+    async def spy(
+        session,
+        repo_id,
+        repo_path,
+        *,
+        live_hint=None,
+        accept_mass_deletion=False,
+    ):
         seen["hint"] = live_hint
+        seen["accept_mass_deletion"] = accept_mass_deletion
         return 0, []
 
     monkeypatch.setattr(persist_mod, "prune_deleted_file_rows", spy)
@@ -111,6 +119,7 @@ async def test_prune_spares_every_file_node_the_rebuilt_graph_still_holds(repo, 
     assert "external:github.com/spf13/cobra" in seen["hint"]
     assert "src/kept.py" in seen["hint"]
     assert "src/gone.py" not in seen["hint"]
+    assert seen["accept_mass_deletion"] is False
     # Symbol nodes are not file paths and must not widen the hint.
     assert "src/kept.py::main" not in seen["hint"]
 

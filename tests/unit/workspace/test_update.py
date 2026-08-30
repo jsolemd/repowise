@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from repowise.core.pipeline.prune_state import DeletedFilePruneOutcome, PruneRefusal
 from repowise.core.workspace.config import RepoEntry, WorkspaceConfig
 from repowise.core.workspace.update import (
     RepoUpdateResult,
@@ -37,11 +38,13 @@ class TestSyncWorkspaceStateFromDisk:
         _write_state(repo, new_sha)
 
         ws_config = WorkspaceConfig(
-            repos=[RepoEntry(
-                path="backend",
-                alias="backend",
-                last_commit_at_index="stale-sha",
-            )],
+            repos=[
+                RepoEntry(
+                    path="backend",
+                    alias="backend",
+                    last_commit_at_index="stale-sha",
+                )
+            ],
         )
         ws_config.save(tmp_path)
 
@@ -54,9 +57,13 @@ class TestSyncWorkspaceStateFromDisk:
         sha = "a" * 40
         _write_state(repo, sha)
         ws_config = WorkspaceConfig(
-            repos=[RepoEntry(
-                path="backend", alias="backend", last_commit_at_index=sha,
-            )],
+            repos=[
+                RepoEntry(
+                    path="backend",
+                    alias="backend",
+                    last_commit_at_index=sha,
+                )
+            ],
         )
         ws_config.save(tmp_path)
         assert sync_workspace_state_from_disk(tmp_path, ws_config) == []
@@ -70,9 +77,13 @@ class TestSyncWorkspaceStateFromDisk:
     def test_missing_state_json_skipped(self, tmp_path: Path) -> None:
         _make_git_repo(tmp_path, "backend")
         ws_config = WorkspaceConfig(
-            repos=[RepoEntry(
-                path="backend", alias="backend", last_commit_at_index="old",
-            )],
+            repos=[
+                RepoEntry(
+                    path="backend",
+                    alias="backend",
+                    last_commit_at_index="old",
+                )
+            ],
         )
         # No state.json written → entry preserved unchanged
         assert sync_workspace_state_from_disk(tmp_path, ws_config) == []
@@ -107,17 +118,20 @@ def _make_git_repo(tmp_path: Path, name: str) -> Path:
     subprocess.run(["git", "init"], cwd=str(repo), capture_output=True)
     subprocess.run(
         ["git", "config", "user.email", "test@test.com"],
-        cwd=str(repo), capture_output=True,
+        cwd=str(repo),
+        capture_output=True,
     )
     subprocess.run(
         ["git", "config", "user.name", "Test"],
-        cwd=str(repo), capture_output=True,
+        cwd=str(repo),
+        capture_output=True,
     )
     (repo / "README.md").write_text("hello")
     subprocess.run(["git", "add", "."], cwd=str(repo), capture_output=True)
     subprocess.run(
         ["git", "commit", "-m", "initial"],
-        cwd=str(repo), capture_output=True,
+        cwd=str(repo),
+        capture_output=True,
     )
     return repo
 
@@ -129,7 +143,9 @@ def _add_commit(repo: Path, filename: str = "change.txt", msg: str = "update") -
     subprocess.run(["git", "commit", "-m", msg], cwd=str(repo), capture_output=True)
     result = subprocess.run(
         ["git", "rev-parse", "HEAD"],
-        cwd=str(repo), capture_output=True, text=True,
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
     )
     return result.stdout.strip()
 
@@ -247,6 +263,7 @@ class TestUpdateWorkspace:
             return await update_workspace(tmp_path, ws_config)
 
         import asyncio
+
         results = asyncio.run(_run())
         assert len(results) == 1
         assert results[0].updated is False
@@ -330,7 +347,9 @@ class TestUpdateWorkspace:
         ws_config.save(tmp_path)
 
         # Mock update_single_repo_index to avoid running the full pipeline
-        mock_result = RepoUpdateResult(alias="backend", updated=True, file_count=10, symbol_count=50)
+        mock_result = RepoUpdateResult(
+            alias="backend", updated=True, file_count=10, symbol_count=50
+        )
 
         async def _run():
             with patch(
@@ -341,10 +360,68 @@ class TestUpdateWorkspace:
                 return await update_workspace(tmp_path, ws_config)
 
         import asyncio
+
         results = asyncio.run(_run())
         updated = [r for r in results if r.updated]
         assert len(updated) == 1
         assert updated[0].alias == "backend"
+
+    def test_refused_workspace_prune_persists_and_acceptance_reopens_it(
+        self, tmp_path: Path
+    ) -> None:
+        repo = _make_git_repo(tmp_path, "backend")
+        old_head = get_head_commit(repo)
+        _write_state(repo, old_head)
+        _add_commit(repo, "new_file.txt")
+        new_head = get_head_commit(repo)
+        ws_config = WorkspaceConfig(
+            repos=[RepoEntry(path="backend", alias="backend", last_commit_at_index=old_head)],
+            default_repo="backend",
+        )
+        ws_config.save(tmp_path)
+        refusal = PruneRefusal("graph_nodes", 30, 40)
+        refused = RepoUpdateResult(
+            alias="backend",
+            updated=True,
+            prune_outcome=DeletedFilePruneOutcome(attempted=True, refusals=(refusal,)),
+        )
+        healed = RepoUpdateResult(
+            alias="backend",
+            updated=True,
+            prune_outcome=DeletedFilePruneOutcome(attempted=True, pruned_paths=30),
+        )
+
+        async def _run():
+            with patch(
+                "repowise.core.workspace.update.update_single_repo_index",
+                new_callable=AsyncMock,
+                side_effect=[refused, healed],
+            ) as update_one:
+                await update_workspace(tmp_path, ws_config)
+                first_state = json.loads(
+                    (repo / ".repowise" / "state.json").read_text(encoding="utf-8")
+                )
+                await update_workspace(tmp_path, ws_config, accept_mass_deletion=True)
+                return first_state, update_one
+
+        import asyncio
+
+        first_state, update_one = asyncio.run(_run())
+        assert first_state["last_sync_commit"] == new_head
+        assert first_state["prune_refusals"] == {
+            "from_commit": old_head,
+            "findings": [
+                {
+                    "table": "graph_nodes",
+                    "candidate_paths": 30,
+                    "persisted_paths": 40,
+                }
+            ],
+        }
+        final_state = json.loads((repo / ".repowise" / "state.json").read_text(encoding="utf-8"))
+        assert "prune_refusals" not in final_state
+        assert update_one.await_count == 2
+        assert update_one.await_args_list[1].kwargs["accept_mass_deletion"] is True
 
     def test_repo_filter(self, tmp_path: Path) -> None:
         """--repo flag should only update the specified repo."""
@@ -377,6 +454,7 @@ class TestUpdateWorkspace:
                 return await update_workspace(tmp_path, ws_config, repo_filter="backend")
 
         import asyncio
+
         results = asyncio.run(_run())
         # Only backend should appear (frontend filtered out)
         assert len(results) == 1
@@ -391,6 +469,7 @@ class TestUpdateWorkspace:
             return await update_workspace(tmp_path, ws_config, repo_filter="nonexistent")
 
         import asyncio
+
         with pytest.raises(ValueError, match="Unknown repo"):
             asyncio.run(_run())
 
@@ -408,6 +487,7 @@ class TestUpdateWorkspace:
             return await update_workspace(tmp_path, ws_config)
 
         import asyncio
+
         results = asyncio.run(_run())
         assert len(results) == 1
         # The pipeline ran (may have errored due to empty repo, but the
@@ -434,6 +514,7 @@ class TestUpdateWorkspace:
             return await update_workspace(tmp_path, ws_config, dry_run=True)
 
         import asyncio
+
         results = asyncio.run(_run())
         # Stale repos detected but not updated
         updated = [r for r in results if r.updated]
@@ -492,6 +573,7 @@ class TestCrossRepoHooks:
         ws_config = WorkspaceConfig(repos=[])
 
         import asyncio
+
         asyncio.run(run_cross_repo_hooks(ws_config, tmp_path, ["backend"]))
 
 

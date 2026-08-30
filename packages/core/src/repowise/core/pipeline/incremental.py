@@ -26,6 +26,8 @@ from typing import Any
 
 import structlog
 
+from repowise.core.pipeline.prune_state import DeletedFilePruneOutcome
+
 logger = structlog.get_logger(__name__)
 
 LogFn = Callable[[str], None]
@@ -498,9 +500,7 @@ async def load_stored_function_mod_p80(repo_path: Any, *, log: LogFn | None = No
         return None
 
 
-async def load_stored_coverage_map(
-    repo_path: Any, *, log: LogFn | None = None
-) -> dict[str, dict]:
+async def load_stored_coverage_map(repo_path: Any, *, log: LogFn | None = None) -> dict[str, dict]:
     """Load the persisted coverage map for health scoring on an incremental run.
 
     The incremental health pass re-scores changed files only, but if it builds
@@ -545,9 +545,7 @@ async def load_stored_coverage_map(
         coverage_map: dict[str, dict] = {}
         for row in rows:
             try:
-                covered = (
-                    json.loads(row.covered_lines_json) if row.covered_lines_json else []
-                )
+                covered = json.loads(row.covered_lines_json) if row.covered_lines_json else []
             except (ValueError, TypeError):
                 covered = []
             coverage_map[row.file_path] = {
@@ -1398,7 +1396,8 @@ async def persist_incremental_index(
     log: LogFn | None = None,
     degraded: list[str] | None = None,
     failed_steps: list[str] | None = None,
-) -> None:
+    accept_mass_deletion: bool = False,
+) -> DeletedFilePruneOutcome:
     """Persist an incremental index refresh (graph + symbols + git + dead-code + health).
 
     Upsert-only: unchanged files keep their existing rows, unlike
@@ -1451,6 +1450,7 @@ async def persist_incremental_index(
     # Same contract, for rows of a page that has been retired outright.
     swept_page_ids: list[str] = []
     source_symbol_error: str | None = None
+    prune_outcome = DeletedFilePruneOutcome()
     try:
         await init_db(engine)
         sf = create_session_factory(engine)
@@ -1702,14 +1702,23 @@ async def persist_incremental_index(
                     if data.get("node_type", "file") == "file"
                 }
                 pruned, refusals = await prune_deleted_file_rows(
-                    session, repo_id, repo_path, live_hint=live_hint
+                    session,
+                    repo_id,
+                    repo_path,
+                    live_hint=live_hint,
+                    accept_mass_deletion=accept_mass_deletion,
+                )
+                prune_outcome = DeletedFilePruneOutcome(
+                    attempted=True,
+                    pruned_paths=pruned,
+                    refusals=tuple(refusals),
                 )
                 if pruned:
                     log(f"Pruned rows for [cyan]{pruned}[/cyan] deleted file(s)")
                 for refusal in refusals:
-                    log(f"[yellow]{refusal}[/yellow]")
+                    log(f"[yellow]{refusal.message}[/yellow]")
                     if degraded is not None:
-                        degraded.append(refusal)
+                        degraded.append(refusal.message)
             except Exception as exc:
                 _skip("Deleted-file prune", exc)
 
@@ -1772,3 +1781,4 @@ async def persist_incremental_index(
         # (which does delete it) or a reindex.
     finally:
         await engine.dispose()
+    return prune_outcome

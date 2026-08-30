@@ -19,6 +19,7 @@ from repowise.core.generation.models import (
     STRUCTURALLY_KEYED_PAGE_TYPES,
     STUB_FALLBACK_ERROR,
 )
+from repowise.core.pipeline.prune_state import PruneRefusal
 
 logger = structlog.get_logger(__name__)
 
@@ -33,6 +34,17 @@ _log = logging.getLogger(__name__)
 # Max page ids per UPDATE ... IN (...) so a large cascade cannot exceed
 # SQLite's bound-variable limit on the local CLI store.
 _STALE_ID_CHUNK = 500
+
+# Page types whose target is one repository-relative file.  A spotlight adds
+# ``::<symbol>`` after the path; the others store the path directly.  Keep the
+# classification explicit here so a structural page whose grouping key happens
+# to equal a deleted path cannot be retired as if it documented that file.
+_FILE_DERIVED_PAGE_TYPES = (
+    "file_page",
+    "symbol_spotlight",
+    "api_contract",
+    "infra_page",
+)
 
 
 def tombstone_candidates(file_diffs: list[Any]) -> list[tuple[str, list[str]]]:
@@ -54,7 +66,7 @@ def tombstone_candidates(file_diffs: list[Any]) -> list[tuple[str, list[str]]]:
 async def mark_tombstone_pages(
     session: Any, repo_id: str, candidates: list[tuple[str, list[str]]]
 ) -> list[str]:
-    """Mark file pages for deleted/renamed files as tombstones.
+    """Mark every file-derived page for deleted/renamed files as a tombstone.
 
     A ``freshness_status="fresh"`` page for a file that no longer exists is
     an active trap: retrieval serves it, agents cite it, and the index-age
@@ -76,13 +88,23 @@ async def mark_tombstone_pages(
 
     from repowise.core.persistence.models import Page
 
-    page_ids = {f"file_page:{path}": (path, successors) for path, successors in candidates}
+    dead_paths = dict(candidates)
     res = await session.execute(
-        select(Page).where(Page.repository_id == repo_id, Page.id.in_(page_ids))
+        select(Page).where(
+            Page.repository_id == repo_id,
+            Page.page_type.in_(_FILE_DERIVED_PAGE_TYPES),
+        )
     )
     marked: list[str] = []
     for page in res.scalars().all():
-        _, successors = page_ids[page.id]
+        # File pages carry ``<path>``; symbol spotlights carry
+        # ``<path>::<symbol>``. Split once because a qualified symbol may itself
+        # contain ``::``. The query above excludes structural page types whose
+        # target is a grouping key rather than a file.
+        target_file = (page.target_path or "").partition("::")[0]
+        if target_file not in dead_paths:
+            continue
+        successors = dead_paths[target_file]
         page.freshness_status = "tombstone"
         try:
             meta = json.loads(page.metadata_json or "{}")
@@ -94,9 +116,8 @@ async def mark_tombstone_pages(
     if marked:
         logger.info("pages_tombstoned", repo_id=repo_id, count=len(marked))
     elif candidates:
-        # Candidates existed but no page matched — the id scheme drifted from
-        # ``file_page:{path}`` or the paths don't line up. Silent success here
-        # would let stale pages keep serving, so surface it.
+        # Candidates existed but no target matched. Silent success here would
+        # let stale pages keep serving, so surface the path-scheme mismatch.
         logger.debug(
             "tombstone_no_match",
             repo_id=repo_id,
@@ -109,7 +130,7 @@ async def mark_tombstone_pages(
 async def tombstone_absent_file_pages(
     session: Any, repo_id: str, repo_path: Path | str
 ) -> list[str]:
-    """Tombstone every file page whose file is no longer on disk.
+    """Tombstone every file-derived page whose file is no longer on disk.
 
     :func:`mark_tombstone_pages` works from a diff, so it only ever sees a
     file that was deleted or renamed *between two commits this run compared*.
@@ -138,7 +159,7 @@ async def tombstone_absent_file_pages(
     res = await session.execute(
         select(Page).where(
             Page.repository_id == repo_id,
-            Page.page_type == "file_page",
+            Page.page_type.in_(_FILE_DERIVED_PAGE_TYPES),
             Page.freshness_status != "tombstone",
         )
     )
@@ -146,7 +167,9 @@ async def tombstone_absent_file_pages(
     if not live:
         return []
 
-    absent = [p for p in live if not (root / (p.target_path or "")).exists()]
+    absent = [
+        page for page in live if not (root / (page.target_path or "").partition("::")[0]).exists()
+    ]
     if not absent:
         return []
 
@@ -158,8 +181,8 @@ async def tombstone_absent_file_pages(
     # rest of the run proceed.
     if len(absent) == len(live):
         _log.error(
-            "tombstone_sweep_refused repo_id=%s file_pages=%d root=%s: every file "
-            "page's path is missing from the checkout, which reads as a wrong "
+            "tombstone_sweep_refused repo_id=%s file_pages=%d root=%s: every "
+            "file-derived page's path is missing from the checkout, which reads as a wrong "
             "root rather than a deleted repository. Nothing was tombstoned.",
             repo_id,
             len(live),
@@ -924,7 +947,8 @@ async def prune_deleted_file_rows(
     repo_path: Any,
     *,
     live_hint: set[str] | None = None,
-) -> tuple[int, list[str]]:
+    accept_mass_deletion: bool = False,
+) -> tuple[int, list[PruneRefusal]]:
     """Delete file-scoped rows for files that are gone, on an incremental update.
 
     The incremental path never pruned anything: deleting a file tombstoned its
@@ -948,8 +972,9 @@ async def prune_deleted_file_rows(
     file, so it fails every liveness test there is, and only the fact that the
     graph build just re-minted it says it is not a deletion.
 
-    Returns ``(deleted_path_count, refusals)``, where a refusal is a one-line
-    explanation of a floor guard that fired, for the caller's degraded report.
+    Returns ``(deleted_path_count, refusals)``. ``accept_mass_deletion`` is
+    one-run authority to cross the ratio floor; it does not change the default
+    or any persisted configuration.
     """
     from sqlalchemy import delete, or_, select
 
@@ -981,7 +1006,7 @@ async def prune_deleted_file_rows(
 
     hint = live_hint or set()
     liveness = _FileLiveness(repo_path)
-    refusals: list[str] = []
+    refusals: list[PruneRefusal] = []
     deleted: set[str] = set()
 
     def _dead(persisted: set[str], label: str) -> list[str]:
@@ -989,14 +1014,17 @@ async def prune_deleted_file_rows(
         persisted = {p for p in persisted if not _is_synthetic_node(p)}
         dead = [p for p in persisted if p not in hint and not liveness.is_live(p)]
         if (
-            len(dead) > _PRUNE_FLOOR_MIN_ROWS
+            not accept_mass_deletion
+            and len(dead) > _PRUNE_FLOOR_MIN_ROWS
             and persisted
             and len(dead) > _PRUNE_MAX_FRACTION * len(persisted)
         ):
             refusals.append(
-                f"Deleted-file prune refused for {label}: {len(dead)} of "
-                f"{len(persisted)} paths looked deleted, which reads as a broken "
-                "run rather than a commit. Run a full reindex to clear them."
+                PruneRefusal(
+                    table=label,
+                    candidate_paths=len(dead),
+                    persisted_paths=len(persisted),
+                )
             )
             return []
         deleted.update(dead)
@@ -1143,9 +1171,7 @@ async def sweep_retired_pages(session: Any, repo_id: str) -> list[str]:
     stale = (
         (
             await session.execute(
-                select(Page.id).where(
-                    Page.repository_id == repo_id, or_(*match_clauses)
-                )
+                select(Page.id).where(Page.repository_id == repo_id, or_(*match_clauses))
             )
         )
         .scalars()
@@ -1154,9 +1180,7 @@ async def sweep_retired_pages(session: Any, repo_id: str) -> list[str]:
     for i in range(0, len(stale), _PRUNE_CHUNK):
         batch = stale[i : i + _PRUNE_CHUNK]
         await session.execute(delete(PageVersion).where(PageVersion.page_id.in_(batch)))
-        await session.execute(
-            delete(Page).where(Page.repository_id == repo_id, Page.id.in_(batch))
-        )
+        await session.execute(delete(Page).where(Page.repository_id == repo_id, Page.id.in_(batch)))
     if stale:
         logger.info(
             "retired_pages_swept",
@@ -1293,9 +1317,7 @@ async def sweep_absent_cycle_pages(session: Any, repo_id: str, graph_builder: An
     existing = (
         (
             await session.execute(
-                select(Page.id).where(
-                    Page.repository_id == repo_id, Page.page_type == "scc_page"
-                )
+                select(Page.id).where(Page.repository_id == repo_id, Page.page_type == "scc_page")
             )
         )
         .scalars()
@@ -1305,9 +1327,7 @@ async def sweep_absent_cycle_pages(session: Any, repo_id: str, graph_builder: An
     for i in range(0, len(stale), _PRUNE_CHUNK):
         batch = stale[i : i + _PRUNE_CHUNK]
         await session.execute(delete(PageVersion).where(PageVersion.page_id.in_(batch)))
-        await session.execute(
-            delete(Page).where(Page.repository_id == repo_id, Page.id.in_(batch))
-        )
+        await session.execute(delete(Page).where(Page.repository_id == repo_id, Page.id.in_(batch)))
     if stale:
         logger.info("absent_cycle_pages_swept", repo_id=repo_id, count=len(stale))
     return stale
@@ -1650,9 +1670,7 @@ async def persist_analysis(result: Any, session: Any, repo_id: str) -> None:
         # Snapshot the run for trend tracking (rolling delete inside).
         kpis = hr.kpis or {}
         try:
-            scores_map, deductions_map = snapshot_file_maps(
-                hr.metrics or [], hr.findings or []
-            )
+            scores_map, deductions_map = snapshot_file_maps(hr.metrics or [], hr.findings or [])
             await save_health_snapshot(
                 session,
                 repo_id,

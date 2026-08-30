@@ -13,7 +13,7 @@ import sqlite3
 import subprocess
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -40,6 +40,12 @@ from repowise.core.update_lock import (
 from ..docs_mode import docs_mode_state_fields
 from ..ingestion.change_detector import has_working_tree_changes
 from ..pipeline.phase_timing import PhaseTimingRecorder
+from ..pipeline.prune_state import (
+    DeletedFilePruneOutcome,
+    apply_prune_outcome,
+    prune_repair_base,
+    state_prune_refusals,
+)
 from .config import WorkspaceConfig
 
 _log = logging.getLogger("repowise.workspace.update")
@@ -101,6 +107,7 @@ class RepoUpdateResult:
     # tree state has no ``last_sync_commit`` to diff against. None on the
     # commit-anchored path, which leaves the stored list alone.
     working_tree_paths: list[str] | None = None
+    prune_outcome: DeletedFilePruneOutcome = field(default_factory=DeletedFilePruneOutcome)
 
 
 # ---------------------------------------------------------------------------
@@ -345,6 +352,7 @@ async def _incremental_repo_update(
     base_ref: str,
     exclude_patterns: list[str] | None = None,
     include_working_tree: bool = False,
+    accept_mass_deletion: bool = False,
 ) -> RepoUpdateResult | None:
     """Refresh an already-indexed repo through the incremental update path.
 
@@ -392,9 +400,7 @@ async def _incremental_repo_update(
         # New commits but nothing the index cares about changed (merge/empty
         # commits, or every change excluded). Report success so the caller
         # bumps ``last_sync_commit`` instead of re-diffing forever.
-        return RepoUpdateResult(
-            alias=alias, updated=True, working_tree_paths=working_tree_paths
-        )
+        return RepoUpdateResult(alias=alias, updated=True, working_tree_paths=working_tree_paths)
 
     # Per-repo config, like the single-repo update path. The workspace-level
     # ``exclude_patterns`` (when provided) apply on top.
@@ -489,7 +495,7 @@ async def _incremental_repo_update(
         log=_log.info,
     )
 
-    await persist_incremental_index(
+    prune_outcome = await persist_incremental_index(
         repo_path,
         graph_builder,
         git_meta_map,
@@ -505,6 +511,7 @@ async def _incremental_repo_update(
         parsed_files=parsed_files,
         git_decay_map=git_decay_map,
         log=_log.info,
+        accept_mass_deletion=accept_mass_deletion,
     )
 
     kg_state: dict[str, Any] | None = None
@@ -524,6 +531,7 @@ async def _incremental_repo_update(
         symbol_count=sum(len(pf.symbols) for pf in parsed_files),
         kg_state=kg_state,
         working_tree_paths=working_tree_paths,
+        prune_outcome=prune_outcome,
     )
 
 
@@ -534,6 +542,7 @@ async def update_single_repo_index(
     exclude_patterns: list[str] | None = None,
     include_working_tree: bool = False,
     progress: Any | None = None,
+    accept_mass_deletion: bool = False,
 ) -> RepoUpdateResult:
     """Refresh the index for a single repo.
 
@@ -550,6 +559,8 @@ async def update_single_repo_index(
     alias = repo_path.name
     state = read_repo_state(repo_path)
     base_ref = state.get("last_sync_commit")
+    if accept_mass_deletion:
+        base_ref = prune_repair_base(state) or base_ref
     merged_excludes = _merged_repo_excludes(repo_path, exclude_patterns)
 
     # Config drift check, mirroring the single-repo update path: a changed
@@ -582,6 +593,7 @@ async def update_single_repo_index(
                 base_ref=str(base_ref),
                 exclude_patterns=exclude_patterns,
                 include_working_tree=include_working_tree,
+                accept_mass_deletion=accept_mass_deletion,
             )
             if incremental_result is not None:
                 return incremental_result
@@ -619,6 +631,9 @@ async def update_single_repo_index(
             file_count=result.file_count,
             symbol_count=result.symbol_count,
             kg_state=kg_state,
+            # A successful authoritative full index already removed rows
+            # absent from its complete result, so any older refusal is healed.
+            prune_outcome=DeletedFilePruneOutcome(attempted=True),
         )
     except Exception as exc:
         return RepoUpdateResult(
@@ -646,6 +661,7 @@ async def update_workspace(
     commit_depth: int = 500,
     exclude_patterns: list[str] | None = None,
     include_working_tree: bool = False,
+    accept_mass_deletion: bool = False,
     on_repo_start: Callable[[str], None] | None = None,
     on_repo_done: Callable[[RepoUpdateResult], None] | None = None,
 ) -> list[RepoUpdateResult]:
@@ -670,6 +686,8 @@ async def update_workspace(
             it. Off for every commit-anchored caller (hooks, webhooks, a
             manual sync); ``repowise watch --workspace`` sets it, because a
             repo it is watching normally has no new commits at all.
+        accept_mass_deletion: Cross the deleted-file ratio floor for this run
+            and reopen any commit range a prior refusal recorded.
         on_repo_start: Called with alias when a repo update begins.
         on_repo_done: Called with result when a repo update finishes.
 
@@ -733,6 +751,8 @@ async def update_workspace(
         # become clean so stale symbols/pages can be retired.
         if not is_stale and include_working_tree:
             is_stale = has_working_tree_changes(abs_path) or bool(state.get("working_tree_paths"))
+        if not is_stale and accept_mass_deletion:
+            is_stale = bool(state_prune_refusals(state))
 
         if not is_stale:
             # Nothing to regenerate, but the DB freshness stamp can still be
@@ -806,6 +826,7 @@ async def update_workspace(
                     commit_depth=commit_depth,
                     exclude_patterns=exclude_patterns,
                     include_working_tree=include_working_tree,
+                    accept_mass_deletion=accept_mass_deletion,
                 )
             finally:
                 _release_lock(path)
@@ -821,6 +842,7 @@ async def update_workspace(
                 if state_path.is_file():
                     with suppress(Exception):
                         state = _json.loads(state_path.read_text(encoding="utf-8"))
+                prior_state = dict(state)
 
                 if "last_docs_commit" not in state and "last_sync_commit" in state:
                     state["last_docs_commit"] = state["last_sync_commit"]
@@ -830,6 +852,12 @@ async def update_workspace(
                     state["knowledge_graph"] = result.kg_state
                 if result.working_tree_paths is not None:
                     state["working_tree_paths"] = result.working_tree_paths
+                apply_prune_outcome(
+                    state,
+                    prior_state,
+                    result.prune_outcome,
+                    from_commit=prior_state.get("last_sync_commit"),
+                )
                 # Stamp the config fingerprint so the drift check in
                 # update_single_repo_index stays calibrated (and legacy repos
                 # without one stop re-triggering the full re-index).
@@ -961,9 +989,7 @@ async def run_cross_repo_hooks(
         else WorkspaceIndex({})
     )
     try:
-        await _run_phases(
-            ws_config, workspace_root, changed_repos, timings, workspace_index
-        )
+        await _run_phases(ws_config, workspace_root, changed_repos, timings, workspace_index)
     finally:
         await workspace_index.close()
 
@@ -1029,7 +1055,9 @@ async def _run_phases(
             timings.on_phase_done(phase)
 
     overlay_result, store_result = await asyncio.gather(
-        _timed("cross_repo_analysis", run_cross_repo_analysis(ws_config, workspace_root, changed_repos)),
+        _timed(
+            "cross_repo_analysis", run_cross_repo_analysis(ws_config, workspace_root, changed_repos)
+        ),
         _timed(
             "contract_extraction",
             run_contract_extraction(
