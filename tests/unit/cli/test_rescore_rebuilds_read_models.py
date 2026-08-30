@@ -57,7 +57,15 @@ _SOURCE = "def run(items):\n    return [i for i in items if i]\n"
 
 
 def _parsed_file(repo_path: Path) -> SimpleNamespace:
-    """The re-score scores the caller's parsed files; one real one is enough."""
+    """The re-score scores the caller's parsed files; one real one is enough.
+
+    Every optional ``ParsedFile`` field is spelled out at its dataclass default
+    rather than left off. Upstream's re-score stops at the health read models,
+    but this fork's also persists the reference-site store, and
+    ``build_universe`` / ``extract_sites`` read ``calls``, ``references`` and
+    ``type_refs`` off each parsed file. A stub missing them raises
+    ``AttributeError`` from inside the writer instead of exercising it.
+    """
     return SimpleNamespace(
         file_info=SimpleNamespace(
             path=_SCORED,
@@ -66,6 +74,17 @@ def _parsed_file(repo_path: Path) -> SimpleNamespace:
             is_test=False,
         ),
         symbols=[],
+        imports=[],
+        exports=[],
+        export_aliases={},
+        calls=[],
+        heritage=[],
+        docstring=None,
+        parse_errors=[],
+        content_hash="",
+        type_refs=[],
+        local_refs=frozenset(),
+        references=[],
     )
 
 
@@ -91,9 +110,7 @@ async def _seed_orphan_opportunity(repo_path: Path) -> tuple[str, str]:
     await init_db(engine)
     factory = create_session_factory(engine)
     async with get_session(factory) as session:
-        repo = await upsert_repository(
-            session, name=repo_path.name, local_path=str(repo_path)
-        )
+        repo = await upsert_repository(session, name=repo_path.name, local_path=str(repo_path))
         session.add(
             PerformanceOpportunity(
                 id="orphan-row",
@@ -139,9 +156,7 @@ async def _read_back(repo_path: Path, repo_id: str):
             for row in (
                 (
                     await session.execute(
-                        select(HealthFileMetric).where(
-                            HealthFileMetric.repository_id == repo_id
-                        )
+                        select(HealthFileMetric).where(HealthFileMetric.repository_id == repo_id)
                     )
                 )
                 .scalars()
@@ -156,9 +171,7 @@ class TestRescoreRebuildsTheReadModels:
     async def test_a_cause_with_no_surviving_finding_is_resolved(self, git_repo: Path):
         repo_id, opportunity_id = await _seed_orphan_opportunity(git_repo)
 
-        await _rescore_health_from_db(
-            git_repo, _EmptyGraphBuilder(), [_parsed_file(git_repo)], []
-        )
+        await _rescore_health_from_db(git_repo, _EmptyGraphBuilder(), [_parsed_file(git_repo)], [])
 
         statuses, _, _ = await _read_back(git_repo, repo_id)
         assert statuses[opportunity_id] == "resolved"
@@ -173,9 +186,7 @@ class TestRescoreRebuildsTheReadModels:
             text=True,
         ).stdout.strip()
 
-        await _rescore_health_from_db(
-            git_repo, _EmptyGraphBuilder(), [_parsed_file(git_repo)], []
-        )
+        await _rescore_health_from_db(git_repo, _EmptyGraphBuilder(), [_parsed_file(git_repo)], [])
 
         _, summary_commit, metrics = await _read_back(git_repo, repo_id)
         assert summary_commit == head
