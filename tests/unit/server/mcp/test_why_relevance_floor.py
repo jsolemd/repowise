@@ -61,9 +61,7 @@ async def _seed(
 
 
 @pytest.mark.asyncio
-async def test_a_terse_record_with_the_rare_word_beats_a_long_one_without_it(
-    session, setup_mcp
-):
+async def test_a_terse_record_with_the_rare_word_beats_a_long_one_without_it(session, setup_mcp):
     """The ruff case, reduced to its shape.
 
     "Never run ruff format" is 48 characters and matches two words of the
@@ -91,7 +89,7 @@ async def test_a_terse_record_with_the_rare_word_beats_a_long_one_without_it(
 
 @pytest.mark.asyncio
 async def test_a_plural_in_the_question_matches_a_singular_record(session, setup_mcp):
-    """"why must issue comments avoid em dashes" is answered by a record that
+    """ "why must issue comments avoid em dashes" is answered by a record that
     writes "comment" and "dashes", and ``comments`` is the word carrying most of
     that question's weight."""
     for n in range(6):
@@ -131,9 +129,7 @@ def test_a_word_in_every_record_still_carries_weight():
 
 
 @pytest.mark.asyncio
-async def test_the_answer_is_found_below_the_old_two_hundred_record_cut(
-    session, setup_mcp
-):
+async def test_the_answer_is_found_below_the_old_two_hundred_record_cut(session, setup_mcp):
     """Search ranked over 200 records against a store of 614.
 
     ``list_decisions`` sorts confirmed-then-confident, so the records below the
@@ -258,10 +254,17 @@ async def test_a_good_answer_is_not_hedged_with_a_redirect(session, setup_mcp):
 )
 @pytest.mark.asyncio
 async def test_the_redirect_names_a_tool_that_fits_the_question(
-    session, setup_mcp, query, expected
+    session, setup_mcp, monkeypatch: pytest.MonkeyPatch, query, expected
 ):
     """Routed on the question's shape, because its subject is what the store
     was just found to know nothing about."""
+    from repowise.core.generative_policy import NO_GENERATIVE_ENV
+
+    # The project test command pins the hard policy on. This case specifically
+    # guards the enabled-policy behavior while its sibling below covers the
+    # served non-generative roster.
+    monkeypatch.delenv(NO_GENERATIVE_ENV, raising=False)
+
     # Carries a word from every one of the queries below, so reaching the
     # redirect depends on the floor rather than on matching nothing at all.
     for n in range(6):
@@ -278,6 +281,22 @@ async def test_the_redirect_names_a_tool_that_fits_the_question(
     result = await get_why_search(query)
 
     assert expected in result["try_instead"], result
+
+
+@pytest.mark.asyncio
+async def test_redirect_only_names_tools_the_no_generative_server_serves(
+    setup_mcp, monkeypatch: pytest.MonkeyPatch
+):
+    """A refusal must not redirect to a tool the hard policy removes."""
+    from repowise.core.generative_policy import NO_GENERATIVE_ENV
+
+    monkeypatch.setenv(NO_GENERATIVE_ENV, "1")
+
+    result = await get_why_search("why is entry-point candidacy decided at ingestion")
+
+    assert result["decisions"] == []
+    assert result["try_instead"] == ["search_codebase"]
+    assert "get_answer" not in result["try_instead"]
 
 
 @pytest.mark.asyncio

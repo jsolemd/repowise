@@ -74,6 +74,7 @@ def _result(
         decision_report=None,
         git_metadata_list=[],
         knowledge_graph_result=None,
+        parsed_files=[],
         authoritative_page_types=authoritative_page_types or set(),
         preserved_page_ids=preserved_page_ids or set(),
     )

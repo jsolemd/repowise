@@ -25,9 +25,14 @@ from sqlalchemy import delete, update
 
 from repowise.core.persistence.database import get_session
 from repowise.core.refsites.pipeline import extract_repository
+from repowise.core.refsites.records import ExtractionResult, ReferenceSiteRecord
 from repowise.core.refsites.schema import ReferenceSite
 from repowise.core.refsites.store import SqlReferenceSiteStore
-from repowise.core.refsites.taxonomy import ReferenceKind
+from repowise.core.refsites.taxonomy import (
+    TIER_AST,
+    ReferenceKind,
+    ReferenceOrigin,
+)
 from repowise.core.source_search.worktree import WorkingTreeDivergence
 from repowise.server import source_search_wiring as w
 
@@ -181,6 +186,7 @@ async def test_a_window_row_is_named_from_the_reference_sites(
         "mmr_diversify",
         "mmr_diversify::_sim",
     ]
+    assert response["results"][0]["containment"] == "definition_start_in_span"
 
 
 async def test_an_enclosing_row_is_named_when_no_rival_survived(
@@ -204,6 +210,7 @@ async def test_an_enclosing_row_is_named_when_no_rival_survived(
 
     # Its own name is not something it "contains", and the helper is.
     assert response["results"][0]["contains_symbols"] == ["mmr_diversify::_sim"]
+    assert response["results"][0]["containment"] == "definition_start_in_span"
 
 
 async def test_a_name_the_coordinator_already_found_is_left_alone(
@@ -220,6 +227,55 @@ async def test_a_name_the_coordinator_already_found_is_left_alone(
     response = await coordinator.search("how are near duplicates dropped")
 
     assert response["results"][0]["contains_symbols"] == ["mmr_diversify::_sim"]
+    assert response["results"][0]["containment"] == "full_span_enclosure"
+
+
+async def test_contained_definition_fetch_is_bounded_and_discloses_truncation(
+    monkeypatch, extracted, repo_id, session_factory, nested_repo
+):
+    """A dense file cannot make one search row materialize every definition."""
+    count = w._CONTAINED_SITE_FETCH_LIMIT + 17
+    sites = tuple(
+        ReferenceSiteRecord(
+            file_path=DIVERSIFY_PATH,
+            language="python",
+            name=f"nested_{index}",
+            kind=ReferenceKind.DEFINITION,
+            start_line=index + 1,
+            end_line=index + 1,
+            start_col=4,
+            end_col=12,
+            range_exact=True,
+            origin=ReferenceOrigin.DEFINITION,
+            tier=TIER_AST,
+            target_symbol_id=f"{DIVERSIFY_PATH}::nested_{index}",
+        )
+        for index in range(count)
+    )
+    await extracted.replace_repository(repo_id, ExtractionResult(sites=sites, coverage=()))
+    await extracted.session.commit()
+
+    observed_limits: list[int | None] = []
+    original = SqlReferenceSiteStore.definitions_in_range
+
+    async def recording_fetch(self, *args, limit=None, **kwargs):
+        observed_limits.append(limit)
+        return await original(self, *args, limit=limit, **kwargs)
+
+    monkeypatch.setattr(SqlReferenceSiteStore, "definitions_in_range", recording_fetch)
+    _patch_status(monkeypatch, CLEAN)
+    snippet = "\n".join(f"def nested_{index}(): pass" for index in range(count))
+    coordinator = _coordinator(
+        _window_response(snippet=snippet, end_line=count), session_factory, nested_repo
+    )
+
+    response = await coordinator.search("how are dense nested definitions named")
+
+    row = response["results"][0]
+    assert observed_limits == [w._CONTAINED_SITE_FETCH_LIMIT]
+    assert row["sites_truncated"] is True
+    assert row["sites_total"] == count
+    assert row["containment"] == "definition_start_in_span"
 
 
 # -- the three withdrawals ---------------------------------------------------

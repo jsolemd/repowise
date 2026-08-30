@@ -12,6 +12,8 @@ import os
 import subprocess
 import sys
 import textwrap
+import time
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -608,6 +610,41 @@ async def test_time_range_filters(journal_repo):
     assert (await _call(action="list", recorded_before="2020-01-01"))["total"] == 0
     inverted = await _call(action="list", recorded_after="2026-01-01", recorded_before="2020-01-01")
     assert "no decision can match" in inverted["error"]
+
+
+@pytest.mark.parametrize("timezone", ["America/Los_Angeles", "UTC"])
+@pytest.mark.asyncio
+async def test_recorded_at_round_trips_as_utc_and_bounds_match_storage(
+    journal_repo, monkeypatch: pytest.MonkeyPatch, timezone: str
+):
+    """SQLite's naive round-trip must not reinterpret UTC as host-local time."""
+    previous_timezone = os.environ.get("TZ")
+    monkeypatch.setenv("TZ", timezone)
+    time.tzset()
+    try:
+        recorded = await _record()
+        root, _, _ = journal_repo
+        (journal_row,) = _read_journal(root)
+        stamp = journal_row["recorded_at"]
+
+        got = await _call(action="get", decision_id=recorded["decision"]["id"])
+        assert got["decision"]["recorded_at"] == stamp
+
+        after = await _call(action="list", recorded_after=stamp)
+        assert [row["id"] for row in after["decisions"]] == [recorded["decision"]["id"]]
+
+        one_second_earlier = (
+            (datetime.fromisoformat(stamp.replace("Z", "+00:00")) - timedelta(seconds=1))
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
+        assert (await _call(action="list", recorded_before=one_second_earlier))["total"] == 0
+    finally:
+        if previous_timezone is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = previous_timezone
+        time.tzset()
 
 
 @pytest.mark.asyncio
