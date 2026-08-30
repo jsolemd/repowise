@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from repowise.core.persistence.database import get_session
@@ -24,6 +25,7 @@ from repowise.core.registry import mcp_tool_registry as mcp
 from repowise.server.mcp_server._helpers import (
     _get_repo,
     _is_workspace_mode,
+    _resolve_all_contexts,
     _resolve_repo_context,
     _unsupported_repo_all,
     attach_ignored_arguments,
@@ -49,6 +51,11 @@ _MUTATING = frozenset({"record", "confirm", "supersede"})
 #: one call from filling an agent's context with the entire governance history.
 _MAX_LIMIT = 200
 
+_JOURNAL_NOT_CONFIGURED_NOTE = (
+    "The decision journal is not configured, so these rows are the last "
+    "projected state and no new decision can be recorded."
+)
+
 
 def _error(message: str, *, guidance: str | None = None, **extra: Any) -> dict[str, Any]:
     """Shape a failure as a readable response rather than a protocol error.
@@ -62,6 +69,28 @@ def _error(message: str, *, guidance: str | None = None, **extra: Any) -> dict[s
         payload["guidance"] = guidance
     payload.update(extra)
     payload["_meta"] = _build_meta()
+    return payload
+
+
+def _journal_read_state(repo_root: Path) -> dict[str, Any]:
+    """Payload fields that distinguish journal mode from this repo's file."""
+    location = ops.journal_location()
+    status = ops.journal_status(repo_root)
+    exists = bool(status["exists"])
+    payload: dict[str, Any] = {
+        "journal": location,
+        "journal_available": location is not None,
+        "journal_exists": exists,
+    }
+    if location is None:
+        payload["note"] = _JOURNAL_NOT_CONFIGURED_NOTE
+    elif not exists:
+        relative = status["relative"] if isinstance(status["relative"], str) else location
+        payload["note"] = (
+            f"There is no journal file at `{relative}` under this repo yet; this repo has "
+            "no recorded decisions (not 'zero decisions on record'); `record` will create "
+            "the file."
+        )
     return payload
 
 
@@ -111,7 +140,7 @@ async def manage_decision(
         recorded_after / recorded_before: ISO-8601 bounds (list).
         limit: page size, capped at 200 (list).
         offset: rows to skip (list).
-        repo: workspace repo alias; ``all`` is not supported.
+        repo: workspace alias, default = primary; "all" lists across repos, writes name one.
     """
     started = time.perf_counter()
 
@@ -125,7 +154,7 @@ async def manage_decision(
             guidance="Pass one of: " + "; ".join(f"{k} — {v}" for k, v in _ACTIONS.items()),
         )
 
-    if repo == "all":
+    if repo == "all" and verb != "list":
         return _error(_unsupported_repo_all("manage_decision")["error"])
 
     ignored: list[dict[str, Any]] = []
@@ -164,28 +193,21 @@ async def manage_decision(
         except ops.JournalUnavailableError as exc:
             return _error(str(exc), guidance=exc.guidance, journal_available=False)
 
+    ctx: Any = None
+    contexts: list[Any] = []
     try:
-        ctx = await _resolve_repo_context(repo)
-    except LookupError as exc:
+        if repo == "all":
+            contexts = await _resolve_all_contexts()
+        else:
+            ctx = await _resolve_repo_context(repo)
+    except (LookupError, ValueError) as exc:
         return _error(str(exc))
 
     repository: Any = None
     try:
-        async with get_session(ctx.session_factory) as session:
-            repository = await _get_repo(session, None if _is_workspace_mode() else repo)
-            payload = await _dispatch(
-                verb,
-                session=session,
-                repository_id=repository.id,
-                ctx=ctx,
-                decision_id=decision_id,
-                title=title,
-                decision=decision,
-                why=why,
-                anchors=anchors,
-                supersedes=supersedes,
-                superseded_by=superseded_by,
-                actor=actor,
+        if repo == "all":
+            payload = await _list_all(
+                contexts,
                 status=resolved_status,
                 query=query,
                 after=after,
@@ -193,6 +215,29 @@ async def manage_decision(
                 limit=max(1, min(limit, _MAX_LIMIT)),
                 offset=max(0, offset),
             )
+        else:
+            async with get_session(ctx.session_factory) as session:
+                repository = await _get_repo(session, None if _is_workspace_mode() else repo)
+                payload = await _dispatch(
+                    verb,
+                    session=session,
+                    repository_id=repository.id,
+                    ctx=ctx,
+                    decision_id=decision_id,
+                    title=title,
+                    decision=decision,
+                    why=why,
+                    anchors=anchors,
+                    supersedes=supersedes,
+                    superseded_by=superseded_by,
+                    actor=actor,
+                    status=resolved_status,
+                    query=query,
+                    after=after,
+                    before=before,
+                    limit=max(1, min(limit, _MAX_LIMIT)),
+                    offset=max(0, offset),
+                )
     except ops.JournalUnavailableError as exc:
         return _error(str(exc), guidance=exc.guidance, journal_available=False)
     except ops.DecisionOpsError as exc:
@@ -217,6 +262,67 @@ async def manage_decision(
         timing_ms=(time.perf_counter() - started) * 1000,
         repository=repository,
     )
+    return payload
+
+
+async def _list_all(
+    contexts: list[Any],
+    *,
+    status: str | None,
+    query: str | None,
+    after: datetime | None,
+    before: datetime | None,
+    limit: int,
+    offset: int,
+) -> dict[str, Any]:
+    """List one independently paged decision view per repository."""
+    decisions: list[dict[str, Any]] = []
+    per_repo: dict[str, dict[str, Any]] = {}
+    matched_total = 0
+
+    for ctx in contexts:
+        async with get_session(ctx.session_factory) as session:
+            repository = await _get_repo(session, None)
+            rows, total = await ops.list_decisions(
+                session,
+                repository.id,
+                repo_root=ctx.path,
+                status=status,
+                query=query,
+                recorded_after=after,
+                recorded_before=before,
+                limit=limit,
+                offset=offset,
+                vector_store=getattr(ctx, "decision_store", None),
+            )
+
+        rendered = []
+        for row in rows:
+            item = ops.serialize(row, anchors=False)
+            item["repo"] = ctx.alias
+            rendered.append(item)
+        decisions.extend(rendered)
+        matched_total += total
+        per_repo[ctx.alias] = {
+            "total": total,
+            "returned": len(rendered),
+            "journal_exists": bool(ops.journal_status(ctx.path)["exists"]),
+        }
+
+    location = ops.journal_location()
+    payload: dict[str, Any] = {
+        "decisions": decisions,
+        "total": matched_total,
+        "returned": len(decisions),
+        "offset": offset,
+        "repo": "all",
+        "per_repo": per_repo,
+        "journal": location,
+        "journal_available": location is not None,
+        "paging": "limit and offset apply within each repo",
+    }
+    if location is None:
+        payload["note"] = _JOURNAL_NOT_CONFIGURED_NOTE
     return payload
 
 
@@ -258,22 +364,14 @@ async def _dispatch(
             offset=offset,
             vector_store=store,
         )
-        location = ops.journal_location()
         payload: dict[str, Any] = {
             "decisions": [ops.serialize(row, anchors=False) for row in rows],
             "total": total,
             "offset": offset,
             "returned": len(rows),
-            "journal": location,
-            "journal_available": location is not None,
+            "repo": ctx.alias,
         }
-        if location is None:
-            # Reads survive a disabled journal by serving the last projection,
-            # and have to say which of the two "no rows" they are reporting.
-            payload["note"] = (
-                "The decision journal is not configured, so these rows are the last "
-                "projected state and no new decision can be recorded."
-            )
+        payload.update(_journal_read_state(root))
         return payload
 
     if verb == "get":
@@ -286,18 +384,19 @@ async def _dispatch(
             repo_root=root,
             vector_store=store,
         )
-        location = ops.journal_location()
-        return {
+        payload = {
             "decision": ops.serialize(record),
             # Oldest first, so the chain reads as the history it is. A record
             # with no supersession is a one-entry chain rather than an absent
             # field, so a caller need not special-case it.
             "chain": [ops.serialize(link, anchors=False) for link in chain],
-            "journal": location,
-            "journal_available": location is not None,
+            "repo": ctx.alias,
         }
+        payload.update(_journal_read_state(root))
+        return payload
 
     if verb == "record":
+        existed_before = bool(ops.journal_status(root)["exists"])
         record = await ops.record_decision(
             session,
             repository_id,
@@ -313,6 +412,7 @@ async def _dispatch(
         return {
             "decision": ops.serialize(record),
             "recorded": True,
+            "journal_created": not existed_before,
             "next": (
                 "Landed as 'proposed'. A person confirms it — either "
                 f"`manage_decision(action='confirm', decision_id='{record.id}')` when "

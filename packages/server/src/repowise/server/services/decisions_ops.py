@@ -46,6 +46,7 @@ from repowise.core.analysis.decisions.journal import (
     DecisionJournalMutationDisabledError,
     DecisionJournalValidationError,
     decisions_journal_path,
+    resolve_decisions_journal_path,
 )
 from repowise.core.analysis.decisions.journal_projection import (
     DECISION_JOURNAL_SOURCE,
@@ -67,6 +68,7 @@ __all__ = [
     "get_decision",
     "journal_location",
     "journal_relative_path",
+    "journal_status",
     "list_decisions",
     "parse_anchor",
     "record_decision",
@@ -151,6 +153,26 @@ def journal_location() -> str | None:
     except DecisionJournalConfigurationError:
         return None
     return str(configured) if configured is not None else None
+
+
+def journal_status(repo_root: str | Path) -> dict[str, str | bool | None]:
+    """Report the configured journal path and whether this repository has it.
+
+    Like :func:`journal_location`, this is a read-side disclosure and never
+    raises for an unusable configuration. ``exists`` is deliberately separate
+    from journal mode: one environment setting applies across a workspace, but
+    each repository owns a different file beneath its own root.
+    """
+    try:
+        relative = decisions_journal_path()
+        resolved = resolve_decisions_journal_path(repo_root)
+    except DecisionJournalConfigurationError:
+        return {"relative": None, "path": None, "exists": False}
+    return {
+        "relative": str(relative) if relative is not None else None,
+        "path": str(resolved) if resolved is not None else None,
+        "exists": resolved.is_file() if resolved is not None else False,
+    }
 
 
 def _translate(exc: Exception) -> DecisionOpsError:

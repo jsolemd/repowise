@@ -21,8 +21,21 @@ from repowise.core.analysis.decisions.journal import DECISIONS_JOURNAL_ENV
 from repowise.core.persistence.database import init_db
 from repowise.core.persistence.vector_store import InMemoryVectorStore
 from repowise.core.providers.embedding.base import MockEmbedder
+from tests.unit.server.test_mcp_workspace import _make_repo_context, _MockRegistry
 
 JOURNAL_RELATIVE = ".repowise/decisions.jsonl"
+
+_MCP_STATE = (
+    "_registry",
+    "_workspace_root",
+    "_session_factory",
+    "_fts",
+    "_vector_store",
+    "_decision_store",
+    "_repo_path",
+    "_vector_store_ready",
+    "_cross_repo_enricher",
+)
 
 
 def _read_journal(root: Path) -> list[dict]:
@@ -78,6 +91,52 @@ async def journal_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     await engine.dispose()
 
 
+def _install(contexts: dict, default: str, root: Path) -> _MockRegistry:
+    import repowise.server.mcp_server as mcp_mod
+
+    registry = _MockRegistry(contexts=contexts, default_alias=default, workspace_root=root)
+    primary = contexts[default]
+    mcp_mod._registry = registry
+    mcp_mod._workspace_root = str(root)
+    mcp_mod._session_factory = primary.session_factory
+    mcp_mod._fts = primary.fts
+    mcp_mod._vector_store = primary.vector_store
+    mcp_mod._decision_store = primary.decision_store
+    mcp_mod._repo_path = str(primary.path)
+    mcp_mod._vector_store_ready = primary.vector_store_ready
+    return registry
+
+
+async def _uninstall(registry: _MockRegistry) -> None:
+    import repowise.server.mcp_server as mcp_mod
+
+    await registry.close()
+    for attr in _MCP_STATE:
+        setattr(mcp_mod, attr, None)
+
+
+@pytest.fixture
+async def decision_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Two repo contexts whose journals live under different roots."""
+    root = tmp_path / "workspace"
+    repo_roots = {alias: root / alias for alias in ("a", "b")}
+    for repo_root in repo_roots.values():
+        anchor = repo_root / "src" / "service.py"
+        anchor.parent.mkdir(parents=True)
+        anchor.write_text("VALUE = 1\n", encoding="utf-8")
+
+    contexts = {
+        alias: await _make_repo_context(alias, str(repo_root), pages=[], extra_models=[])
+        for alias, repo_root in repo_roots.items()
+    }
+    registry = _install(contexts, "a", root)
+    monkeypatch.setenv(DECISIONS_JOURNAL_ENV, JOURNAL_RELATIVE)
+
+    yield root, repo_roots["a"], repo_roots["b"]
+
+    await _uninstall(registry)
+
+
 async def _call(**kwargs):
     from repowise.server.mcp_server.tool_decisions import manage_decision
 
@@ -107,6 +166,7 @@ async def test_record_lands_proposed(journal_repo):
 
     assert "error" not in result, result
     assert result["recorded"] is True
+    assert result["journal_created"] is True
     assert result["decision"]["status"] == "proposed"
     assert result["decision"]["confirmed"] is False
     assert result["decision"]["confirmed_at"] is None
@@ -126,6 +186,8 @@ async def test_list_shows_the_proposal(journal_repo):
 
     assert listed["total"] == 1
     assert listed["journal_available"] is True
+    assert listed["journal_exists"] is True
+    assert listed["repo"] == "default"
     (row,) = listed["decisions"]
     assert row["id"] == recorded["decision"]["id"]
     assert row["status"] == "proposed"
@@ -186,6 +248,8 @@ async def test_supersede_keeps_both_records_readable(journal_repo):
 
     got = await _call(action="get", decision_id=first)
     assert got["decision"]["id"] == first
+    assert got["journal_exists"] is True
+    assert got["repo"] == "default"
     assert [link["id"] for link in got["chain"]] == [first, second]
 
     # Asking from either end returns the same history.
@@ -230,6 +294,15 @@ async def test_a_decision_cannot_supersede_itself(journal_repo):
     assert "error" in result
     root, _, _ = journal_repo
     assert _read_journal(root)[0]["status"] == "active"
+
+
+@pytest.mark.asyncio
+async def test_later_record_does_not_claim_journal_creation(journal_repo):
+    await _record()
+
+    result = await _record(title="Second rule")
+
+    assert result["journal_created"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -285,6 +358,9 @@ async def test_reads_still_serve_when_the_journal_is_off(journal_repo, monkeypat
 
     got = await _call(action="get", decision_id=decision_id)
     assert got["decision"]["id"] == decision_id
+    assert got["journal_exists"] is False
+    assert got["repo"] == "default"
+    assert "not configured" in got["note"]
 
 
 @pytest.mark.asyncio
@@ -296,6 +372,18 @@ async def test_misconfigured_journal_path_disables_writes(journal_repo, monkeypa
 
     assert result["journal_available"] is False
     assert "error" in result
+
+
+def test_journal_status_shields_a_misconfigured_path(tmp_path, monkeypatch):
+    from repowise.server.services import decisions_ops as ops
+
+    monkeypatch.setenv(DECISIONS_JOURNAL_ENV, "../elsewhere/decisions.jsonl")
+
+    assert ops.journal_status(tmp_path) == {
+        "relative": None,
+        "path": None,
+        "exists": False,
+    }
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
@@ -611,3 +699,104 @@ async def test_a_proposal_never_reaches_answer_context_until_confirmed(journal_r
     injected = await fetch_relevant_decisions(ctx, repo_id, ["src/service.py"])
     assert [d["title"] for d in injected] == ["Route reads through the projection"]
     assert injected[0]["status"] == "active"
+
+
+# ---------------------------------------------------------------------------
+# Workspace routing: each repo owns its journal, and only list fans out
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_workspace_list_discloses_a_missing_repo_journal(decision_workspace):
+    _root, _a_root, _b_root = decision_workspace
+
+    result = await _call(action="list", repo="b")
+
+    assert result["repo"] == "b"
+    assert result["journal_available"] is True
+    assert result["journal_exists"] is False
+    assert result["total"] == 0
+    assert JOURNAL_RELATIVE in result["note"]
+    assert "no recorded decisions" in result["note"]
+    assert "record" in result["note"] and "create" in result["note"]
+
+
+@pytest.mark.asyncio
+async def test_workspace_record_creates_only_the_target_repo_journal(decision_workspace):
+    _root, a_root, b_root = decision_workspace
+    await _record(repo="a")
+    a_journal = a_root / JOURNAL_RELATIVE
+    b_journal = b_root / JOURNAL_RELATIVE
+    cwd_journal = Path.cwd() / JOURNAL_RELATIVE
+    a_before = a_journal.read_bytes()
+    cwd_before = cwd_journal.read_bytes() if cwd_journal.exists() else None
+
+    result = await _record(repo="b")
+
+    assert result["journal_created"] is True
+    assert result["decision"]["status"] == "proposed"
+    assert result["decision"]["confirmed_at"] is None
+    assert b_journal.is_file()
+    (written,) = _read_journal(b_root)
+    assert written["confirmed_at"] is None
+    assert a_journal.read_bytes() == a_before
+    assert (cwd_journal.read_bytes() if cwd_journal.exists() else None) == cwd_before
+
+    got = await _call(action="get", repo="b", decision_id=result["decision"]["id"])
+    assert got["repo"] == "b"
+    assert got["journal_exists"] is True
+
+
+@pytest.mark.asyncio
+async def test_workspace_list_all_pages_each_repo_and_tags_rows(decision_workspace):
+    _root, _a_root, _b_root = decision_workspace
+    await _record(repo="a")
+    a_list = await _call(action="list", repo="a")
+    b_list = await _call(action="list", repo="b")
+
+    result = await _call(action="list", repo="all")
+
+    assert result["repo"] == "all"
+    assert result["total"] == a_list["total"] + b_list["total"]
+    assert result["returned"] == len(result["decisions"])
+    assert list(result["per_repo"]) == ["a", "b"]
+    assert result["per_repo"]["a"]["journal_exists"] is True
+    assert result["per_repo"]["b"]["journal_exists"] is False
+    assert all(row["repo"] in {"a", "b"} for row in result["decisions"])
+    assert result["paging"] == "limit and offset apply within each repo"
+
+
+@pytest.mark.asyncio
+async def test_workspace_list_all_applies_the_limit_within_each_repo(decision_workspace):
+    await _record(repo="a")
+    await _record(repo="b")
+
+    result = await _call(action="list", repo="all", limit=1)
+
+    assert result["total"] == 2
+    assert result["returned"] == 2
+    assert result["per_repo"]["a"]["returned"] == 1
+    assert result["per_repo"]["b"]["returned"] == 1
+
+
+@pytest.mark.asyncio
+async def test_workspace_get_and_writes_still_refuse_repo_all(decision_workspace):
+    root, _a_root, _b_root = decision_workspace
+
+    recorded = await _record(repo="all")
+    got = await _call(action="get", repo="all", decision_id="dec-00000001")
+
+    for result in (recorded, got):
+        assert "error" in result
+        assert "repo='all'" in result["error"]
+        assert "a" in result["error"] and "b" in result["error"]
+        assert "recorded" not in result
+    assert list(root.rglob("decisions.jsonl")) == []
+
+
+@pytest.mark.asyncio
+async def test_workspace_unknown_alias_is_a_readable_error(decision_workspace):
+    result = await _call(action="list", repo="nope")
+
+    assert "Unknown repo 'nope'" in result["error"]
+    assert "a" in result["error"] and "b" in result["error"]
