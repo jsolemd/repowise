@@ -643,16 +643,19 @@ class QueryIntent:
 
 
 #: A collision-disambiguated symbol id ends in ``~`` plus eight hex digits,
-#: optionally ``-N`` for a same-signature group (see the parser's
-#: ``_finalize_symbol_parentage``). Anchored at the end because that is where
-#: the parser appends it, and matched narrowly rather than splitting on the
-#: first ``~``: a C++ destructor is legitimately named ``~Foo``, and a naive
-#: split would erase it.
+#: optionally ``-N`` for a same-signature group. The parser stopped minting
+#: these in F42 (an overload set is one id now), so nothing appends one to a
+#: freshly indexed symbol. This stays because a store built before F42 is full
+#: of them, and stripping is what keeps those rows naming a readable symbol
+#: instead of a hash until the store is rebuilt. Anchored at the end because
+#: that is where the parser used to append it, and matched narrowly rather
+#: than splitting on the first ``~``: a C++ destructor is legitimately named
+#: ``~Foo``, and a naive split would erase it.
 #:
 #: The lookbehind is what separates a discriminator from a destructor whose
 #: class is *itself* named in eight hex characters. ``Foo::deadbeef::~deadbeef``
 #: is a real symbol whose last segment begins at a ``::`` boundary; a
-#: discriminator never does, because the parser appends it to a complete id.
+#: discriminator never does, because the parser appended it to a complete id.
 #: Without the lookbehind that name is not dropped but *mangled* — the tail is
 #: eaten and ``deadbeef::`` is served as a symbol path, which is the one
 #: outcome this path is not allowed to produce.

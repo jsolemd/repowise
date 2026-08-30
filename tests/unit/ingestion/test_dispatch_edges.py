@@ -365,8 +365,23 @@ def test_a_csharp_bare_call_reaches_an_inherited_method(tmp_path: Path) -> None:
     )
 
 
-def test_a_csharp_overload_set_resolves_to_the_matching_fetchable_id(tmp_path: Path) -> None:
-    """An inherited call resolves to the fetchable overload matching its arity."""
+def test_a_csharp_overload_set_resolves_to_the_one_symbol_it_is(tmp_path: Path) -> None:
+    """An inherited call into an overload set reaches that symbol.
+
+    Until F42 this asserted the edge landed on the ``~<hash>`` id whose
+    signature matched the call's arity, and read as arity dispatch. It never
+    was: ``_build_indices`` keys ``_file_methods`` on
+    ``(class_name, method_name)`` with a single overwritten value
+    (``call_resolver.py:869-871``), and ``_declares`` reads that one value
+    back, so the edge went to whichever overload the class declared LAST.
+    Three-argument ``Given`` won for being written third; reorder the class
+    and the old assertion picks a different "match" for the same call.
+
+    With the fork's per-overload suffix dropped, the three declarations are
+    one id and the graph holds one node for them, so the edge names the
+    overload set. That is the answer the resolver can actually defend without
+    a language-aware overload resolver, which RepoWise does not have.
+    """
     graph = _build(
         tmp_path,
         {
@@ -383,15 +398,14 @@ def test_a_csharp_overload_set_resolves_to_the_matching_fetchable_id(tmp_path: P
         },
         "csharp",
     )
-    overloads = {
-        node_id: data
-        for node_id, data in graph.nodes(data=True)
-        if node_id.startswith("Steps.cs::Steps::Given~")
-    }
-    assert len(overloads) == 3
-    two_arg_id = next(
+    given = [
         node_id
-        for node_id, data in overloads.items()
-        if data["signature"] == "Given(int a, int b) -> int"
+        for node_id, data in graph.nodes(data=True)
+        if data.get("node_type") == "symbol" and data.get("name") == "Given"
+    ]
+    assert given == ["Steps.cs::Steps::Given"], (
+        f"three declarations of Given are one symbol, not three ids; got {given}"
     )
-    assert ("Test.cs::Test::Run", two_arg_id) in _calls_by_origin(graph, "enclosing_inherited")
+    assert ("Test.cs::Test::Run", "Steps.cs::Steps::Given") in _calls_by_origin(
+        graph, "enclosing_inherited"
+    )
