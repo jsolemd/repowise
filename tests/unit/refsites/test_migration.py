@@ -1,7 +1,7 @@
-"""Migration 0058 adds the reference-site store, and takes it away again.
+"""Migration 0063 adds the reference-site store, and takes it away again.
 
 Locks three things the runtime path cannot prove on its own: the revision
-chains onto 0057, the tables and indexes it declares match the ORM models
+chains onto 0062, the tables and indexes it declares match the ORM models
 (so a managed upgrade and ``ensure_schema`` cannot diverge), and the downgrade
 leaves the database exactly as it found it.
 """
@@ -71,7 +71,7 @@ def _names(db_path: Path, kind: str) -> set[str]:
 @pytest.fixture
 def migrated(tmp_path: Path) -> Path:
     db_path = tmp_path / "wiki.db"
-    _run_migration(db_path, "0058")
+    _run_migration(db_path, "0063")
     return db_path
 
 
@@ -178,10 +178,10 @@ def test_position_uniqueness_is_enforced_by_the_database(migrated: Path):
 
 def test_downgrade_removes_everything_it_added(tmp_path: Path):
     db_path = tmp_path / "wiki.db"
-    _run_migration(db_path, "0058")
+    _run_migration(db_path, "0063")
     before_tables = _names(db_path, "table")
 
-    _run_migration(db_path, "0057", downgrade=True)
+    _run_migration(db_path, "0062", downgrade=True)
 
     remaining = _names(db_path, "table")
     assert not set(_TABLES) & remaining

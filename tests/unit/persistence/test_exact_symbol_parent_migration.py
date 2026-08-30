@@ -1,4 +1,4 @@
-"""Migration 0057 separates parent display text from exact symbol identity."""
+"""Migration 0062 separates parent display text from exact symbol identity."""
 
 from __future__ import annotations
 
@@ -91,10 +91,10 @@ def test_migration_0057_upgrade_and_downgrade_preserve_parent_semantics(
     tmp_path: Path,
 ) -> None:
     db_path = tmp_path / "migration.db"
-    _run_migration(db_path, "0056")
+    _run_migration(db_path, "0061")
     _seed_legacy_rows(db_path)
 
-    _run_migration(db_path, "0057")
+    _run_migration(db_path, "0062")
     with sqlite3.connect(db_path) as conn:
         assert "parent_name" in _columns(conn, "graph_nodes")
         assert "parent_symbol_id" in _columns(conn, "wiki_symbols")
@@ -117,7 +117,7 @@ def test_migration_0057_upgrade_and_downgrade_preserve_parent_semantics(
         indexes = {str(row[1]) for row in conn.execute("PRAGMA index_list(wiki_symbols)")}
         assert "ix_wiki_symbols_repo_parent_symbol_id" in indexes
 
-    _run_migration(db_path, "0056", downgrade=True)
+    _run_migration(db_path, "0061", downgrade=True)
     with sqlite3.connect(db_path) as conn:
         assert "parent_name" not in _columns(conn, "graph_nodes")
         assert "parent_symbol_id" not in _columns(conn, "wiki_symbols")

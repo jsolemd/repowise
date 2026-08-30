@@ -6,8 +6,8 @@ migration preserves the legacy text in ``parent_name`` and backfills the ID
 only when one same-repository, same-file type is uniquely provable.  The same
 exact-ID column is added to ``wiki_symbols``.
 
-Revision ID: 0057
-Revises: 0056
+Revision ID: 0062
+Revises: 0061
 Create Date: 2026-08-21
 """
 
@@ -18,8 +18,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0057"
-down_revision: str | None = "0056"
+revision: str = "0062"
+down_revision: str | None = "0061"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
