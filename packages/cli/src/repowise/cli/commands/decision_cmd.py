@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
+from typing import Any
 
 import click
 from rich.panel import Panel
@@ -39,15 +41,65 @@ def _journal_mode_enabled() -> bool:
         raise click.ClickException(str(exc)) from exc
 
 
-def _resolve_decision_repo(path: str | None, fmt: str = "table"):
+def repo_option() -> Any:
+    """The ``--repo <alias>`` every decision subcommand takes.
+
+    One decorator rather than seven copies of the same option, so the help
+    text and the destination name cannot drift between subcommands the way a
+    per-command spelling would.
+    """
+    return click.option(
+        "--repo",
+        "repo_alias",
+        default=None,
+        metavar="ALIAS",
+        help="Workspace repo to target, by alias. Alternative to the path argument.",
+    )
+
+
+def _resolve_decision_repo(
+    path: str | None, fmt: str = "table", repo_alias: str | None = None
+) -> Path:
     """Resolve the repo path for decision subcommands.
 
     Honors workspace auto-detection: in workspace mode without an explicit
-    path, targets the primary repo and prints a transparency notice.
+    path or alias, targets the primary repo and prints a transparency notice.
+
+    ``--repo <alias>`` and the positional path are two ways of naming one
+    repo, so passing both is an error rather than a silent precedence rule.
+    Every decision a workspace holds lives in its own repo's journal, and
+    until now the only reachable one from the CLI was the primary — the
+    workspace's other repos had no spelling at all, which is why the alias
+    resolver on ``CommandTarget`` existed with no caller.
     """
+    if repo_alias is not None and path is not None:
+        raise click.UsageError(
+            "Pass --repo <alias> or a path, not both — the alias already names a repo."
+        )
 
     target = resolve_command_target(path=path)
+
+    resolved: Path | None = None
+    if repo_alias is not None:
+        if not target.is_workspace:
+            raise click.ClickException(
+                f"--repo {repo_alias} needs a workspace; no .repowise-workspace.yaml "
+                "was found at or above here, so there are no aliases to resolve."
+            )
+        resolved = target.resolve_repo_alias(repo_alias)
+        if resolved is None:
+            available = target.ws_config.repo_aliases() if target.ws_config else []
+            # Same sentence the MCP tool raises, so an alias typo reads the
+            # same whichever surface the caller reached for.
+            raise click.ClickException(f"Unknown repo '{repo_alias}'. Available: {available}")
+        # Set before the notice so the transparency line names the repo the
+        # command actually ran on, not the workspace as a whole.
+        target.repo_filter = repo_alias
+
     target.notice(notice_console(fmt), command="decision")
+
+    if resolved is not None:
+        return resolved
     if target.is_workspace:
         primary = target.primary_path()
         if primary is None:
@@ -108,6 +160,7 @@ async def _resolve_decision_id(session, decision_id: str) -> str | None:
     "--affects", "affected", multiple=True, help="A file or module this governs. Repeatable."
 )
 @click.option("--tag", "tags", multiple=True, help="A tag. Repeatable.")
+@repo_option()
 @format_option()
 def decision_add(
     path: str | None,
@@ -119,6 +172,7 @@ def decision_add(
     consequences: tuple[str, ...],
     affected: tuple[str, ...],
     tags: tuple[str, ...],
+    repo_alias: str | None,
     fmt: str,
 ) -> None:
     """Add an architectural decision, interactively or from flags.
@@ -130,6 +184,10 @@ def decision_add(
     A person answering eight questions has reviewed the decision; a caller
     inferring one from a diff has not, and the store should be able to tell
     them apart. Promote with `repowise decision confirm <id>`.
+
+    That holds in journal mode too: a proposal enters the JSONL with
+    `confirmed_at` null, and the git diff is the review. Journal mode still
+    requires a rationale and at least one `--affects` anchor either way.
     """
     # Flags and prompts are the two paths, and a half-filled command line is
     # neither: falling through to the prompts would hang a caller that has no
@@ -150,16 +208,10 @@ def decision_add(
                 fmt,
             )
 
-    repo_path = _resolve_decision_repo(path, fmt)
+    repo_path = _resolve_decision_repo(path, fmt, repo_alias)
     ensure_repowise_dir(repo_path)
 
     journal_mode = _journal_mode_enabled()
-    if journal_mode and non_interactive:
-        raise click.ClickException(
-            "Non-interactive decision add creates an unreviewed proposal and is disabled "
-            "in curated journal mode; use the interactive confirmed path"
-        )
-
     status = "proposed" if non_interactive else "active"
     alternatives_list = list(alternatives)
     consequences_list = list(consequences)
@@ -215,7 +267,7 @@ def decision_add(
                 "one affected file anchor"
             )
 
-    async def _persist() -> str:
+    async def _persist() -> tuple[str, str]:
         from repowise.core.persistence import (
             create_engine,
             create_session_factory,
@@ -237,6 +289,12 @@ def decision_add(
                     record_journal_decision,
                 )
 
+                # A flag-driven record is a machine's reading of a diff, so it
+                # enters the journal unconfirmed and the git diff is what a
+                # human reviews. Refusing it instead — which this did — left
+                # an agent with no way to propose at all, while the MCP tool
+                # proposed freely against the same file. `confirm` remains the
+                # only proposed→active transition either way.
                 rec = await record_journal_decision(
                     session,
                     repo.id,
@@ -244,6 +302,7 @@ def decision_add(
                     decision=decision_text,
                     why=rationale or "",
                     anchors=[{"file": file, "symbol": None} for file in affected_files],
+                    confirmed=not non_interactive,
                 )
             else:
                 rec = await upsert_decision(
@@ -262,12 +321,25 @@ def decision_add(
                     source="cli",
                     confidence=1.0,
                 )
-            decision_id = rec.id
+            # The stored status, not the one asked for: in journal mode it is
+            # the projection that decides, from whether ``confirmed_at`` is set.
+            decision_id, stored_status = rec.id, rec.status
 
         await engine.dispose()
-        return decision_id
+        return decision_id, stored_status
 
-    decision_id = run_async(_persist())
+    decision_id, status = run_async(_persist())
+
+    if not journal_mode:
+        # The derived store is rebuilt from scratch by any reindex and is not
+        # tracked by git, so a row written here reaches nobody else. Said out
+        # loud because the command looks identical in both modes and the
+        # difference only shows up as a decision that quietly went missing.
+        notice_console(fmt).print(
+            "[yellow]Machine-local:[/yellow] this row went to .repowise (derived, "
+            "gitignored, rebuilt on reindex). Set REPOWISE_DECISIONS_JOURNAL to "
+            "record decisions in a git-tracked journal instead."
+        )
 
     if fmt == "json":
         # The full id, not the table's 8-char prefix — a caller that parses
@@ -304,6 +376,7 @@ def decision_add(
 )
 @click.option("--proposed", is_flag=True, default=False, help="Show only proposed decisions.")
 @click.option("--stale-only", is_flag=True, default=False, help="Show only stale decisions.")
+@repo_option()
 @format_option()
 def decision_list(
     path: str | None,
@@ -311,10 +384,11 @@ def decision_list(
     source: str,
     proposed: bool,
     stale_only: bool,
+    repo_alias: str | None,
     fmt: str,
 ) -> None:
     """List architectural decision records."""
-    repo_path = _resolve_decision_repo(path, fmt)
+    repo_path = _resolve_decision_repo(path, fmt, repo_alias)
 
     async def _query() -> list:
         from repowise.core.persistence import (
@@ -427,10 +501,11 @@ def decision_list(
 @decision_group.command("show")
 @click.argument("decision_id")
 @click.argument("path", required=False, default=None)
+@repo_option()
 @format_option()
-def decision_show(decision_id: str, path: str | None, fmt: str) -> None:
+def decision_show(decision_id: str, path: str | None, repo_alias: str | None, fmt: str) -> None:
     """Show full details of a decision record."""
-    repo_path = _resolve_decision_repo(path, fmt)
+    repo_path = _resolve_decision_repo(path, fmt, repo_alias)
     journal_mode = _journal_mode_enabled()
 
     async def _query():
@@ -566,9 +641,10 @@ def decision_show(decision_id: str, path: str | None, fmt: str) -> None:
 @decision_group.command("confirm")
 @click.argument("decision_id")
 @click.argument("path", required=False, default=None)
-def decision_confirm(decision_id: str, path: str | None) -> None:
+@repo_option()
+def decision_confirm(decision_id: str, path: str | None, repo_alias: str | None) -> None:
     """Confirm a proposed decision (set status to active)."""
-    repo_path = _resolve_decision_repo(path)
+    repo_path = _resolve_decision_repo(path, repo_alias=repo_alias)
     journal_mode = _journal_mode_enabled()
 
     async def _update():
@@ -624,9 +700,10 @@ def decision_confirm(decision_id: str, path: str | None) -> None:
 @decision_group.command("dismiss")
 @click.argument("decision_id")
 @click.argument("path", required=False, default=None)
-def decision_dismiss(decision_id: str, path: str | None) -> None:
+@repo_option()
+def decision_dismiss(decision_id: str, path: str | None, repo_alias: str | None) -> None:
     """Dismiss a proposed decision (kept as a tombstone; never re-proposed)."""
-    repo_path = _resolve_decision_repo(path)
+    repo_path = _resolve_decision_repo(path, repo_alias=repo_alias)
 
     if _journal_mode_enabled():
         raise click.ClickException(
@@ -678,9 +755,12 @@ def decision_dismiss(decision_id: str, path: str | None) -> None:
 @click.argument("decision_id")
 @click.argument("path", required=False, default=None)
 @click.option("--superseded-by", default=None, help="ID of the decision that replaces this one.")
-def decision_deprecate(decision_id: str, path: str | None, superseded_by: str | None) -> None:
+@repo_option()
+def decision_deprecate(
+    decision_id: str, path: str | None, superseded_by: str | None, repo_alias: str | None
+) -> None:
     """Deprecate an active decision."""
-    repo_path = _resolve_decision_repo(path)
+    repo_path = _resolve_decision_repo(path, repo_alias=repo_alias)
 
     if _journal_mode_enabled():
         raise click.ClickException(
@@ -729,10 +809,11 @@ def decision_deprecate(decision_id: str, path: str | None, superseded_by: str | 
 
 @decision_group.command("health")
 @click.argument("path", required=False, default=None)
+@repo_option()
 @format_option()
-def decision_health(path: str | None, fmt: str) -> None:
+def decision_health(path: str | None, repo_alias: str | None, fmt: str) -> None:
     """Show decision health: stale decisions, proposed, ungoverned hotspots."""
-    repo_path = _resolve_decision_repo(path, fmt)
+    repo_path = _resolve_decision_repo(path, fmt, repo_alias)
 
     async def _query():
         from repowise.core.persistence import (
