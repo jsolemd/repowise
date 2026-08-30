@@ -16,14 +16,32 @@ def test_mcp_help_lists_streamable_http_transport() -> None:
     assert result.exit_code == 0
     assert "streamable-http" in result.output
     assert "HTTP/SSE" in result.output
+    assert "sse (DEPRECATED legacy HTTP+SSE" in result.output
+
+
+def test_mcp_cli_warns_once_when_legacy_sse_is_selected(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    (tmp_path / ".repowise").mkdir()
+    captured: dict[str, object] = {}
+    monkeypatch.setattr("repowise.server.mcp_server.run_mcp", lambda **kw: captured.update(kw))
+
+    result = CliRunner().invoke(
+        cli,
+        ["mcp", str(tmp_path), "--transport", "sse"],
+    )
+
+    assert result.exit_code == 0
+    assert result.output.count("DEPRECATION WARNING") == 1
+    assert "migrate to --transport streamable-http" in result.output
+    assert captured["transport"] == "sse"
 
 
 def test_mcp_cli_passes_tools_override(monkeypatch, tmp_path: Path) -> None:
     (tmp_path / ".repowise").mkdir()
     captured: dict[str, object] = {}
-    monkeypatch.setattr(
-        "repowise.server.mcp_server.run_mcp", lambda **kw: captured.update(kw)
-    )
+    monkeypatch.setattr("repowise.server.mcp_server.run_mcp", lambda **kw: captured.update(kw))
 
     result = CliRunner().invoke(
         cli, ["mcp", str(tmp_path), "--tools", "+get_execution_flows,-get_dead_code"]
@@ -37,9 +55,7 @@ def test_mcp_cli_passes_tools_override(monkeypatch, tmp_path: Path) -> None:
 def test_mcp_cli_all_flag_overrides_tools(monkeypatch, tmp_path: Path) -> None:
     (tmp_path / ".repowise").mkdir()
     captured: dict[str, object] = {}
-    monkeypatch.setattr(
-        "repowise.server.mcp_server.run_mcp", lambda **kw: captured.update(kw)
-    )
+    monkeypatch.setattr("repowise.server.mcp_server.run_mcp", lambda **kw: captured.update(kw))
 
     result = CliRunner().invoke(cli, ["mcp", str(tmp_path), "--all", "--tools", "get_answer"])
 
@@ -202,7 +218,16 @@ def test_mcp_cli_passes_host_to_run_mcp(monkeypatch, tmp_path: Path) -> None:
 
     result = CliRunner().invoke(
         cli,
-        ["mcp", str(tmp_path), "--transport", "streamable-http", "--host", "0.0.0.0", "--port", "7342"],
+        [
+            "mcp",
+            str(tmp_path),
+            "--transport",
+            "streamable-http",
+            "--host",
+            "0.0.0.0",
+            "--port",
+            "7342",
+        ],
     )
 
     assert result.exit_code == 0

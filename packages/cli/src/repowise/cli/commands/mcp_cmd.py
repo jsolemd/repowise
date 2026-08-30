@@ -91,7 +91,8 @@ def _print_network_startup(
     default="stdio",
     help=(
         "Transport protocol: stdio (Claude Code/Codex/Cursor), "
-        "streamable-http (HTTP clients), or sse (legacy web clients)."
+        "streamable-http (HTTP clients), or sse (DEPRECATED legacy HTTP+SSE; "
+        "migrate to streamable-http)."
     ),
 )
 @click.option(
@@ -173,6 +174,12 @@ def mcp_command(
         )
 
     resolved_host = host or os.environ.get("REPOWISE_HOST", "127.0.0.1")
+
+    if transport == "sse":
+        console.print(
+            "[bold yellow]DEPRECATION WARNING:[/bold yellow] --transport sse uses "
+            "legacy HTTP+SSE; migrate to --transport streamable-http."
+        )
 
     if transport in {"sse", "streamable-http"}:
         _print_network_startup(transport, repo_path, resolved_host, port, workspace)
