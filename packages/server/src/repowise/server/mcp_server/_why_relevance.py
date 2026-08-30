@@ -166,6 +166,28 @@ def clears_floor(score: float) -> bool:
 
 _RISK_MARKERS = ("break", "impact of changing", "safe to change", "blast radius")
 _CONTEXT_MARKERS = ("file", "module", "package", "class", "function", "directory")
+_NON_GENERATIVE_FALLBACKS = ("search_codebase", "get_context", "get_risk")
+
+
+def _served_redirects(preferred: list[str]) -> list[str]:
+    """Keep redirect candidates on the running server's advertised surface."""
+    from repowise.server.mcp_server._helpers import _is_workspace_mode
+    from repowise.server.mcp_server._tool_selection import (
+        GENERATIVE_TOOL_NAMES,
+        no_generative_tools_enabled,
+        selected_tool_names,
+    )
+
+    served = selected_tool_names(is_workspace=_is_workspace_mode())
+    # Selection is normally frozen at server boot. Keep the hard policy
+    # authoritative for embedding processes and tests that change it later too.
+    if no_generative_tools_enabled():
+        served -= GENERATIVE_TOOL_NAMES
+
+    routed = [name for name in preferred if name in served]
+    if routed:
+        return routed
+    return [name for name in _NON_GENERATIVE_FALLBACKS if name in served][:1]
 
 
 def redirect_for(query: str) -> dict[str, Any]:
@@ -190,7 +212,7 @@ def redirect_for(query: str) -> dict[str, Any]:
         tools = ["get_answer"]
 
     return {
-        "try_instead": tools,
+        "try_instead": _served_redirects(tools),
         "reason": (
             "No decision record covers this question. The store holds none "
             "carrying its terms, and the closest ones would be noise."

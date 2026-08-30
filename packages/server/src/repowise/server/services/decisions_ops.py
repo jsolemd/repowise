@@ -262,8 +262,21 @@ def _require(value: str | None, *, argument: str, action: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _naive_utc(value: datetime) -> datetime:
+    """Match the UTC-naive representation SQLite returns for this column."""
+    if value.tzinfo is None:
+        return value
+    return value.astimezone(UTC).replace(tzinfo=None)
+
+
 def _iso(value: datetime | None) -> str | None:
-    return value.astimezone(UTC).isoformat().replace("+00:00", "Z") if value else None
+    if value is None:
+        return None
+    # SQLite drops timezone metadata from ``DateTime(timezone=True)`` values.
+    # The projection writes UTC, so a naive read is UTC too — never host-local.
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=UTC)
+    return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
 
 def serialize(record: DecisionRecord, *, anchors: bool = True) -> dict[str, Any]:
@@ -367,9 +380,9 @@ async def list_decisions(
     if status is not None:
         conditions.append(DecisionRecord.status == status)
     if recorded_after is not None:
-        conditions.append(DecisionRecord.created_at >= recorded_after)
+        conditions.append(DecisionRecord.created_at >= _naive_utc(recorded_after))
     if recorded_before is not None:
-        conditions.append(DecisionRecord.created_at <= recorded_before)
+        conditions.append(DecisionRecord.created_at <= _naive_utc(recorded_before))
     if query:
         needle = f"%{escape_like(query.strip())}%"
         conditions.append(

@@ -47,6 +47,11 @@ _rest_lock = asyncio.Lock()
 #: search that blocks on startup is the failure mode this guards against.
 _READY_TIMEOUT = 10.0
 
+#: Maximum DEFINITION rows materialized for one served search row. The response
+#: itself is capped, but a single dense file can contain far more declarations
+#: than the eight symbol names the payload can carry.
+_CONTAINED_SITE_FETCH_LIMIT = 200
+
 
 def _served_paths(response: dict[str, Any]) -> set[str]:
     """Every repository path this particular response is standing behind."""
@@ -202,13 +207,20 @@ class _StatusCoordinator:
         limit. Snippets are capped, so a definition deep inside a long window
         goes unnamed rather than unverified.
         """
+        result_rows = [row for row in (response.get("results") or []) if isinstance(row, dict)]
+        # Core's coordinator only emits names whose complete span is enclosed.
+        # The refsite fallback below intentionally answers the different
+        # declaration question: whether the definition starts inside the row.
+        for row in result_rows:
+            if row.get("contains_symbols"):
+                row.setdefault("containment", "full_span_enclosure")
+
         if self._session_factory is None or divergence is None or not divergence.checked:
             return
         rows = [
             row
-            for row in (response.get("results") or [])
-            if isinstance(row, dict)
-            and not row.get("contains_symbols")
+            for row in result_rows
+            if not row.get("contains_symbols")
             and row.get("file")
             and isinstance(row.get("start_line"), int)
             and isinstance(row.get("end_line"), int)
@@ -219,8 +231,12 @@ class _StatusCoordinator:
         if not rows:
             return
 
+        from sqlalchemy import func, select
+
         from repowise.core.persistence.database import get_session
+        from repowise.core.refsites.schema import ReferenceSite
         from repowise.core.refsites.store import SqlReferenceSiteStore
+        from repowise.core.refsites.taxonomy import ReferenceKind
         from repowise.core.source_search.coordinator import (
             MAX_CONTAINED_SYMBOLS,
             symbol_path_of,
@@ -239,7 +255,27 @@ class _StatusCoordinator:
                     file_path,
                     int(row["start_line"]),
                     int(row["end_line"]),
+                    limit=_CONTAINED_SITE_FETCH_LIMIT,
                 )
+                if len(sites) == _CONTAINED_SITE_FETCH_LIMIT:
+                    total = int(
+                        (
+                            await session.execute(
+                                select(func.count())
+                                .select_from(ReferenceSite)
+                                .where(
+                                    ReferenceSite.repository_id == repository_id,
+                                    ReferenceSite.file_path == file_path,
+                                    ReferenceSite.kind == str(ReferenceKind.DEFINITION),
+                                    ReferenceSite.start_line >= int(row["start_line"]),
+                                    ReferenceSite.start_line <= int(row["end_line"]),
+                                )
+                            )
+                        ).scalar_one()
+                    )
+                    if total > len(sites):
+                        row["sites_truncated"] = True
+                        row["sites_total"] = total
                 snippet = str(row["snippet"])
                 names: list[str] = []
                 for site in sites:
@@ -263,6 +299,7 @@ class _StatusCoordinator:
                         break
                 if names:
                     row["contains_symbols"] = names
+                    row["containment"] = "definition_start_in_span"
 
     async def close(self) -> None:
         await self._source_vectors.close()

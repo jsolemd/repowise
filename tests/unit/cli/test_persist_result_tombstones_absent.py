@@ -54,6 +54,7 @@ def _result(repo_name: str, generated_pages: list[GeneratedPage]) -> SimpleNames
         decision_report=None,
         git_metadata_list=[],
         knowledge_graph_result=None,
+        parsed_files=[],
         authoritative_page_types=set(),
         preserved_page_ids=set(),
     )
