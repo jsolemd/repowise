@@ -105,8 +105,9 @@ _surface_applied = False
 def tool_middleware(fn: Any) -> Any:
     """Compose the layers wrapped around every registered MCP tool.
 
-    Each layer is signature-preserving, so the tool schemas are unchanged.
-    Ordering, innermost first:
+    Each layer pins the tool's *evaluated* signature (:mod:`._signature`),
+    which is what FastMCP reads to build both of its schemas. Ordering,
+    innermost first:
 
     1. ``shield`` — no exception may escape to FastMCP as a protocol-level
        isError (an early isError teaches the agent to abandon the server for

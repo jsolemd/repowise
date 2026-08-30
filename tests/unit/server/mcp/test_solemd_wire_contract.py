@@ -105,7 +105,7 @@ WRITER_ANNOTATIONS = {
 
 
 @pytest.mark.asyncio
-async def test_served_tools_carry_title_and_annotations_and_wrap_result(
+async def test_served_tools_carry_title_and_annotations_and_a_flat_output_schema(
     monkeypatch: pytest.MonkeyPatch,
 ):
     from repowise.server.mcp_server import ensure_full_surface
@@ -129,16 +129,18 @@ async def test_served_tools_carry_title_and_annotations_and_wrap_result(
     )
     assert len(served_names - EXPECTED_WRITER_TOOLS) == 24
 
-    wrapper_drift = {
+    schema_drift = {
         name: schema
         for name in sorted(served_names)
         if (schema := advertised[name].outputSchema) is None
-        or set(schema.get("properties", {})) != {"result"}
-        or schema.get("required") != ["result"]
+        or schema.get("type") != "object"
+        or "result" in schema.get("properties", {})
+        or schema.get("required")
     }
-    assert not wrapper_drift, (
-        "served tools no longer use the structuredContent {'result': ...} wrapper; "
-        f"unit 4.2 must change these pins with the transport: {wrapper_drift}"
+    assert not schema_drift, (
+        "a served tool's outputSchema is not the flat payload's. Unit 4.2 removed the "
+        "structuredContent {'result': ...} wrapper, nothing may reintroduce it, and no "
+        f"served tool may go without an output schema: {schema_drift}"
     )
 
 

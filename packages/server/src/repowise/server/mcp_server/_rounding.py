@@ -26,13 +26,14 @@ The pass is idempotent, so re-rounding a cached payload is harmless.
 
 from __future__ import annotations
 
-import contextlib
 import functools
 import inspect
 import logging
 import math
 from collections.abc import Callable
 from typing import Any
+
+from repowise.server.mcp_server._signature import preserve
 
 logger = logging.getLogger(__name__)
 
@@ -106,7 +107,4 @@ def quantize(fn: Callable[..., Any]) -> Callable[..., Any]:
             logger.debug("mcp float rounding failed for %s", tool, exc_info=True)
             return result
 
-    # Preserve the original signature so FastMCP builds the correct tool schema.
-    with contextlib.suppress(ValueError, TypeError):  # pragma: no cover - exotic callables
-        _wrapped.__signature__ = inspect.signature(fn)  # type: ignore[attr-defined]
-    return _wrapped
+    return preserve(_wrapped, fn)

@@ -161,15 +161,31 @@ async def test_tool_middleware_rounds_a_tool_response():
 
 @pytest.mark.asyncio
 async def test_middleware_preserves_the_tool_signature():
-    """FastMCP builds each tool's schema from its signature."""
+    """FastMCP builds each tool's schemas from its signature.
+
+    Preserved, and *evaluated*. ``inspect.signature`` hands back a pinned
+    ``__signature__`` verbatim — ``eval_str`` does not reach inside one — so a
+    wrapper that pinned an unevaluated signature gave FastMCP annotation
+    strings, and every tool lost its output schema to the ``{"result": ...}``
+    fallback (see ``mcp_server._signature``). The parameters have to be the
+    tool's; the annotations have to be types.
+    """
     import inspect
+    from typing import Any
 
     from repowise.server.mcp_server import tool_middleware
 
     async def get_thing(targets: list[str], limit: int = 5) -> dict:
         return {}
 
-    assert inspect.signature(tool_middleware(get_thing)) == inspect.signature(get_thing)
+    signature = inspect.signature(tool_middleware(get_thing))
+
+    assert list(signature.parameters) == ["targets", "limit"]
+    assert signature.parameters["limit"].default == 5
+    assert signature.parameters["targets"].annotation == list[str]
+    # Bare ``dict`` is widened: FastMCP builds no schema at all from a class
+    # with no type hints, and the two spellings describe the same value.
+    assert signature.return_annotation == dict[str, Any]
 
 
 #: A full-precision percentile, as ``PERCENT_RANK()`` actually returns it.
