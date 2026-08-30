@@ -74,7 +74,7 @@ export const SigmaCanvas = forwardRef<SigmaCanvasHandle, SigmaCanvasProps>(
       setContainer(node);
     }, []);
 
-    const { sigma, focusNode, fitView, zoomIn, zoomOut } = useSigmaRenderer({
+    const { sigma, initError, focusNode, fitView, zoomIn, zoomOut } = useSigmaRenderer({
       container,
       graph: props.graph,
       selectedNodeId: props.selectedNodeId,
@@ -224,6 +224,26 @@ export const SigmaCanvas = forwardRef<SigmaCanvasHandle, SigmaCanvasProps>(
             cursor: "grab",
           }}
         />
+        {initError && (
+          <div
+            role="alert"
+            className="absolute inset-0 z-[2] flex items-center justify-center px-6"
+          >
+            <div className="max-w-sm rounded-lg border border-[var(--color-border-default)] bg-[var(--color-bg-surface)] px-5 py-4 text-center">
+              <p className="text-sm font-medium text-[var(--color-text-primary)]">
+                The graph cannot be drawn here
+              </p>
+              <p className="mt-1.5 text-xs leading-relaxed text-[var(--color-text-secondary)] [text-wrap:pretty]">
+                This view renders with WebGL, and the browser did not provide it.
+                Nothing is missing from the index — the canvas is empty because it
+                was never started.
+              </p>
+              <p className="mt-2 font-mono text-[11px] leading-relaxed text-[var(--color-text-tertiary)] break-words">
+                {initError.message}
+              </p>
+            </div>
+          </div>
+        )}
         <SigmaControls
           onZoomIn={zoomIn}
           onZoomOut={zoomOut}

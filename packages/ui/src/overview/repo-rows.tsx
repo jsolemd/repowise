@@ -102,9 +102,11 @@ function figuresFor(repo: RepoRow): string[] {
  *
  * Health leads the right-hand column because it is the figure that decides
  * which repo you open. It is painted on `bandForScore`, the canonical three
- * bands, rather than the five-step `healthBand` reading: that one belongs to a
- * lede, where nothing adjacent contradicts it, and a column of rows is the
- * case where two ladders visibly disagree.
+ * bands. `healthBand` in `overview/health-lede` reads the same function now —
+ * it used to carry a five-step ladder of its own, and the note here used to
+ * argue that the ladder was safe in a lede "where nothing adjacent contradicts
+ * it". It was not: this column and the lede on the page it opens describe one
+ * repository at one score, and they disagreed about what to call it.
  */
 export function RepoRows({ repos, LinkComponent, actionsFor }: RepoRowsProps) {
   const A = LinkComponent ?? "a";

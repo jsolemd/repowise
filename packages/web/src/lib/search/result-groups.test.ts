@@ -138,10 +138,26 @@ describe("groupSearchResults — sections", () => {
     expect(groups[0]?.entries[0]).toMatchObject({
       label: "reconcile_project_files",
       href: "/repos/r1/files/codeatlas/code_search/neo4j/writer_mutations.py",
-      detail: "codeatlas/code_search/neo4j/",
+      detail: "codeatlas/code_search/neo4j/writer_mutations.py",
       startLine: 164,
       endLine: 218,
     });
+  });
+
+  it("names the file on a code row whose label is a symbol", () => {
+    // This assertion used to read `codeatlas/code_search/neo4j/` — the
+    // directory — and it pinned a real defect. The label of a code row is the
+    // symbol name whenever the index has one, so between the two lines the
+    // palette rendered, `writer_mutations.py` appeared nowhere: it was in the
+    // href, and the reader was scanning the screen.
+    const { groups } = groupSearchResults({
+      envelope: normalizeSearchResponse(envelopeBody()),
+      linkPrefix: PREFIX,
+    });
+
+    const entry = groups[0]?.entries[0];
+    expect(entry?.label).not.toContain("writer_mutations.py");
+    expect(entry?.detail).toContain("writer_mutations.py");
   });
 
   it("puts a wiki hit under Documentation and opens it in the docs reader", () => {

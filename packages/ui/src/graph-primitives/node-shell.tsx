@@ -3,7 +3,7 @@
 import * as React from "react";
 import { BookOpen } from "lucide-react";
 import { Handle, Position } from "@xyflow/react";
-import { getTone } from "./tone-styles";
+import { getTone, toneLightVars } from "./tone-styles";
 
 export interface NodeShellProps {
   tone: string;
@@ -67,19 +67,37 @@ export function NodeShell(props: NodeShellProps) {
   } = props;
 
   const s = getTone(tone);
+  const light = toneLightVars(s);
   const opacity = diffState === "faded" ? 0.25 : 1;
+
+  // Both readings of the tone travel as custom properties and the theme picks
+  // between them in CSS (`[data-c4-tone]` in globals.css). Not `useTheme()`:
+  // this renders on the server, and reading the theme in JS would either flash
+  // the wrong palette on hydration or force a mounted-guard on every node in
+  // the diagram. Custom properties also sidestep the specificity problem —
+  // these are inline styles, so a stylesheet could not override them, but it
+  // can perfectly well decide what `var(--tone-bg)` resolves to.
+  const toneVars = {
+    "--tone-bg-dark": s.bg,
+    "--tone-bg-light": light.bg,
+    "--tone-band-dark": s.band,
+    "--tone-band-light": light.band,
+    "--tone-ink-dark": s.text,
+    "--tone-ink-light": light.ink,
+  } as React.CSSProperties;
 
   return (
     <div
       data-c4-tone={tone}
       style={{
+        ...toneVars,
         width,
         height,
-        background: s.bg,
+        background: "var(--tone-bg)",
         border: `1.5px ${getBorderStyle(props)} ${getBorderColor(props, s.border)}`,
         borderLeft: `3px solid ${selected ? "var(--color-viz-selection)" : s.band}`,
         borderRadius: 8,
-        color: s.text,
+        color: "var(--tone-ink)",
         overflow: "hidden",
         boxShadow: getBoxShadow(props),
         fontFamily: "var(--font-sans, system-ui, sans-serif)",
@@ -92,7 +110,7 @@ export function NodeShell(props: NodeShellProps) {
       <Handle type="target" position={Position.Top} style={{ opacity: 0 }} />
       <div
         style={{
-          background: s.band,
+          background: "var(--tone-band)",
           padding: "3px 8px",
           fontSize: 9,
           fontWeight: 600,

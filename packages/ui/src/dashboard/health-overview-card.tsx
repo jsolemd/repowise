@@ -10,6 +10,7 @@ import {
   Target,
 } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "../ui/card";
+import { healthBand as band } from "../overview/health-lede";
 import { fileEntityPath } from "../shared/entity/routes";
 import { truncatePath } from "../lib/format";
 import { Sparkline } from "../health/sparkline";
@@ -73,14 +74,9 @@ interface HealthOverviewCardProps {
 }
 
 /* 1–10 health bands — the moat metric, distinct from the 0–100 composite
-   shown in the header badge. */
-function band(v: number): { color: string; label: string } {
-  if (v >= 8) return { color: "var(--color-success)", label: "Excellent" };
-  if (v >= 6.5) return { color: "var(--color-success)", label: "Good" };
-  if (v >= 5) return { color: "var(--color-caution)", label: "Fair" };
-  if (v >= 3.5) return { color: "var(--color-warning)", label: "Needs work" };
-  return { color: "var(--color-error)", label: "Critical" };
-}
+   shown in the header badge. Imported, not redeclared: this file used to carry
+   a byte-identical copy of the five-step ladder, so a threshold moved in one
+   place moved the card and the lede apart. */
 
 const SEVERITY_ORDER = ["critical", "high", "medium", "low"] as const;
 const SEVERITY_COLOR: Record<string, string> = {

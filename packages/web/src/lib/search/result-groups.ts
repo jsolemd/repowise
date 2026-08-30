@@ -22,7 +22,16 @@ export interface SearchResultEntry {
   key: string;
   /** A symbol's name, a file's basename, or a page's title. */
   label: string;
-  /** Repo-relative directory, or the page's kind — whichever locates the row. */
+  /**
+   * The repo-relative path the row opens, or the page's kind.
+   *
+   * The file path in full, never its directory. A code hit's label is the
+   * symbol name when the index has one, so a row detailed with `dirname` named
+   * no file at all: `bandForScore` over `packages/types/src/`, with the one
+   * token a reader is scanning for — `health.ts` — in the href and nowhere on
+   * screen. The rendered line is the answer; `truncatePath` shortens it for
+   * width, which is a different job from dropping the basename.
+   */
   detail: string;
   href: string;
   /** 1-based inclusive bounds, when the hit is a span of a file. */
@@ -102,11 +111,6 @@ function basename(path: string): string {
   return path.split("/").pop() ?? path;
 }
 
-function dirname(path: string): string {
-  const name = basename(path);
-  return path.slice(0, path.length - name.length);
-}
-
 /**
  * Where a hit opens.
  *
@@ -137,13 +141,12 @@ function entryOf(hit: SearchHit, linkPrefix: string): SearchResultEntry | undefi
   // title and drops the identity the reader would need to open it.
   if (!href) return undefined;
 
-  const isCode = groupOf(hit) === "code";
   const label = hit.name || (hit.file ? basename(hit.file) : "") || hit.kind;
 
   return {
     key: href,
     label,
-    detail: isCode ? dirname(hit.file) : hit.file || hit.kind,
+    detail: hit.file || hit.kind,
     href,
     ...(hit.start_line !== undefined ? { startLine: hit.start_line } : {}),
     ...(hit.end_line !== undefined ? { endLine: hit.end_line } : {}),

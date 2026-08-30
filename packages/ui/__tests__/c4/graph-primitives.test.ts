@@ -1,5 +1,10 @@
 import { describe, it, expect } from "vitest";
-import { TONE_STYLES, getTone, ARCH_NODE_SIZES } from "../../src/graph-primitives/tone-styles";
+import {
+  TONE_STYLES,
+  getTone,
+  toneLightVars,
+  ARCH_NODE_SIZES,
+} from "../../src/graph-primitives/tone-styles";
 import { computeEdgeStrokeWidth } from "../../src/graph-primitives/edge-renderer";
 import type { ArchNodeType } from "../../src/c4/types";
 
@@ -29,6 +34,44 @@ describe("tone-styles", () => {
   it("getTone returns correct tone for known types", () => {
     expect(getTone("file")).toEqual(TONE_STYLES.file);
     expect(getTone("system")).toEqual(TONE_STYLES.system);
+  });
+});
+
+describe("toneLightVars", () => {
+  // TONE_STYLES is a dark-only table (near-black fills, white text) that the
+  // SVG exporter needs as literal hex. Every one of its on-screen consumers
+  // also renders under the light theme, which is the default one.
+  it("washes the fill toward the page surface instead of keeping a dark slab", () => {
+    for (const [name, style] of Object.entries(TONE_STYLES)) {
+      const light = toneLightVars(style);
+      if (name === "portal") continue;
+      expect(light.bg).toContain("color-mix");
+      expect(light.bg).toContain(style.band);
+      expect(light.bg).toContain("var(--color-bg-surface)");
+    }
+  });
+
+  it("keeps the hue itself untouched so a legend swatch still matches", () => {
+    // Only `bg`, the kind band's ground and the ink change between themes.
+    // `border` and the hue in `band` are the tone's identity and are read
+    // straight off TONE_STYLES by the legend, the tooltip and the exporter.
+    const before = JSON.stringify(TONE_STYLES);
+    for (const style of Object.values(TONE_STYLES)) toneLightVars(style);
+    expect(JSON.stringify(TONE_STYLES)).toBe(before);
+  });
+
+  it("takes its ink from the page, never from the dark table", () => {
+    for (const style of Object.values(TONE_STYLES)) {
+      expect(toneLightVars(style).ink).toBe("var(--color-text-primary)");
+      expect(toneLightVars(style).ink).not.toBe(style.text);
+    }
+  });
+
+  it("leaves a deliberately fill-less tone without a fill", () => {
+    // `portal` is a pass-through marker, not a card. Washing it would give it
+    // a body it does not have in either theme.
+    expect(TONE_STYLES.portal.bg).toBe("transparent");
+    expect(toneLightVars(TONE_STYLES.portal).bg).toBe("transparent");
   });
 });
 

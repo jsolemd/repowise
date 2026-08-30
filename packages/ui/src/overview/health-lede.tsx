@@ -1,5 +1,7 @@
 import * as React from "react";
+import { bandForScore, HEALTH_BAND_LABEL } from "@repowise-dev/types/health";
 import { LedeLink, PageLede } from "../shared/page-lede";
+import { healthBandInk } from "../health/tokens";
 
 export interface HealthLedeProps {
   /** Defect-risk headline, 1–10. Null until the first health run. */
@@ -16,14 +18,25 @@ export interface HealthLedeProps {
   LinkComponent?: React.ElementType;
 }
 
-/** 1–10 bands. Shared with HealthOverviewCard's thresholds on purpose: two
- *  surfaces disagreeing about what "Good" means is worse than duplication. */
+/**
+ * A 1–10 defect score as the band it falls in, for a lede chip or an inline
+ * figure.
+ *
+ * This is a thin reading of `bandForScore` and nothing else. It used to carry
+ * its own five-step ladder — Excellent/Good/Fair/Needs work/Critical, breaking
+ * at 8 / 6.5 / 5 / 3.5 — and that ladder disagreed with the canonical three
+ * bands about the same number: 6.8 is Warning by `bandForScore` and amber by
+ * `healthInk`, and it read "Good" in green here. The workspace list said one
+ * thing and the repository the row opened said the other, about one score.
+ *
+ * A presentation ramp may be finer than the bands (see `scoreBand` in
+ * `health/tokens`, which keeps a fourth step for pill colour only). It may not
+ * label a score with a word the bands do not use, because the label is the
+ * claim.
+ */
 export function healthBand(v: number): { color: string; label: string } {
-  if (v >= 8) return { color: "var(--color-success)", label: "Excellent" };
-  if (v >= 6.5) return { color: "var(--color-success)", label: "Good" };
-  if (v >= 5) return { color: "var(--color-caution)", label: "Fair" };
-  if (v >= 3.5) return { color: "var(--color-warning)", label: "Needs work" };
-  return { color: "var(--color-error)", label: "Critical" };
+  const band = bandForScore(v);
+  return { color: healthBandInk(band), label: HEALTH_BAND_LABEL[band] };
 }
 
 /**
@@ -100,7 +113,7 @@ export function HealthLede({
         <strong className="font-semibold text-[var(--color-text-primary)]">
           {score.toFixed(1)} out of 10
         </strong>{" "}
-        on defect risk, which we rate {band.label.toLowerCase()}.
+        on defect risk, which puts it in the {band.label} band.
         {pillarSentence && ` ${pillarSentence}`}
         {hotspotCount > 0 && hot && (
           <>

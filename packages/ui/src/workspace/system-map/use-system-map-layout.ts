@@ -15,6 +15,7 @@ import {
   applyView,
   computeSystemMapPositions,
   layoutSignature,
+  SYSTEM_MAP_NODE_SIZE,
   type SystemMapView,
 } from "./layout";
 import {
@@ -123,6 +124,15 @@ export function useSystemMapLayout({
         id: node.id,
         type: "systemService",
         position: { x: pos?.x ?? 0, y: pos?.y ?? 0 },
+        // The same size ELK laid the graph out with, declared on the node
+        // rather than left to measurement. React Flow measures the rendered
+        // card either way, but it keeps the measurement in its own store and
+        // the minimap reads the node object the host passed in: with no
+        // dimensions on it, `nodeHasDimensions` is false and MiniMap skips
+        // the node entirely. That is why the minimap drew its mask over an
+        // empty field — it had a viewport and no silhouettes to put under it.
+        width: SYSTEM_MAP_NODE_SIZE.width,
+        height: SYSTEM_MAP_NODE_SIZE.height,
         data: {
           node,
           health: healthByRepo?.get(node.repo) ?? null,

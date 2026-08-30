@@ -25,8 +25,8 @@ import type {
 } from "@repowise-dev/types/health";
 import { PageLede } from "../shared/page-lede";
 import { StatRibbon, type RibbonStat } from "../stats/stat-ribbon";
-// Bands come from the one shared function on purpose. Two surfaces disagreeing
-// about where "Good" starts is worse than the duplication that would avoid it.
+// Bands come from the one shared function, which reads `bandForScore`. Two
+// surfaces disagreeing about what a 6.8 is called is worse than duplication.
 import { healthBand } from "../overview/health-lede";
 import { formatNumber } from "../lib/format";
 import { scoreTextColor } from "./tokens";
@@ -119,8 +119,8 @@ export function CodeHealthLede({
             {summary.average_health.toFixed(1)} out of 10
           </strong>{" "}
           on defect risk, weighted by lines of code and built from complexity,
-          duplication, coverage, churn and ownership. We rate that{" "}
-          {band.label.toLowerCase()}.
+          duplication, coverage, churn and ownership. That puts it in the{" "}
+          {band.label} band.
           {pillars.length > 0 && (
             <>
               {" "}

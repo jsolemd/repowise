@@ -39,6 +39,11 @@ export function CommandPalette({ repos, workspace }: CommandPaletteProps) {
   const generativeDisabled = useGenerativeDisabled();
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
+  // Callback refs held in state, not `useRef`: the dialog's content mounts in a
+  // later commit than the one that flips `open`, so an effect keyed on `open`
+  // alone reads two nulls and returns before it can observe anything.
+  const [inputEl, setInputEl] = useState<HTMLInputElement | null>(null);
+  const [listEl, setListEl] = useState<HTMLDivElement | null>(null);
   const router = useRouter();
   const pathname = usePathname();
 
@@ -141,6 +146,37 @@ export function CommandPalette({ repos, workspace }: CommandPaletteProps) {
     };
   }, []);
 
+  // cmdk renders `role="combobox"` on the input and marks the active row with
+  // `aria-selected="true"`, but it only fills its own `aria-activedescendant`
+  // from a store field it writes inside one `setState("value")` branch — a
+  // branch this palette never takes, so the attribute stayed absent while a
+  // row was visibly highlighted. A combobox that cannot name its active option
+  // leaves a screen-reader user arrowing through a list that never announces
+  // anything, which is the whole point of the pattern.
+  //
+  // Mirrored imperatively rather than passed as a prop: cmdk spreads caller
+  // props first and then sets `aria-activedescendant` itself, so its own
+  // `undefined` wins over anything passed in.
+  useEffect(() => {
+    if (!open || !inputEl || !listEl) return;
+
+    const sync = () => {
+      const active = listEl.querySelector('[cmdk-item][aria-selected="true"]');
+      if (active?.id) inputEl.setAttribute("aria-activedescendant", active.id);
+      else inputEl.removeAttribute("aria-activedescendant");
+    };
+
+    sync();
+    const observer = new MutationObserver(sync);
+    observer.observe(listEl, {
+      subtree: true,
+      childList: true,
+      attributes: true,
+      attributeFilter: ["aria-selected"],
+    });
+    return () => observer.disconnect();
+  }, [open, inputEl, listEl]);
+
   const navigate = useCallback(
     (href: string) => {
       router.push(href);
@@ -168,6 +204,7 @@ export function CommandPalette({ repos, workspace }: CommandPaletteProps) {
         <div className="flex items-center gap-3 px-4 py-3 border-b border-[var(--color-border-default)]">
           <Search className="h-4 w-4 text-[var(--color-text-tertiary)] shrink-0" />
           <Command.Input
+            ref={setInputEl}
             value={query}
             onValueChange={setQuery}
             placeholder="Jump to a file, search pages, navigate repos…"
@@ -178,14 +215,31 @@ export function CommandPalette({ repos, workspace }: CommandPaletteProps) {
           </kbd>
         </div>
 
-        <Command.List className="max-h-[60dvh] overflow-y-auto py-2">
-          <Command.Empty className="px-4 py-8 text-center text-sm text-[var(--color-text-tertiary)]">
-            {isLoading ? "Searching…" : "No results found."}
-          </Command.Empty>
+        <Command.List ref={setListEl} className="max-h-[60dvh] overflow-y-auto py-2">
+          {/* The generic empty state, and only where nothing better is owed.
+              `no_match` and a failed search each render their own copy below,
+              and cmdk fires `Command.Empty` whenever no item matched — which
+              is most of the time in those two states, because the rows that
+              would have matched are exactly the ones that are missing. Left
+              ungated, "No results found." printed above a red banner saying
+              nothing had been searched: the generic line answers the question
+              the banner exists to refuse. */}
+          {!unavailable && !noMatch && (
+            <Command.Empty className="px-4 py-8 text-center text-sm text-[var(--color-text-tertiary)]">
+              {isLoading ? "Searching…" : "No results found."}
+            </Command.Empty>
+          )}
 
-          {/* A `no_match` verdict, said plainly. Not `Command.Empty`: the Ask
-              row always matches, so cmdk never considers the list empty and
-              would never render it. */}
+          {/* A `no_match` verdict, said plainly. Not `Command.Empty`, but not
+              for the reason this note used to give — "the Ask row always
+              matches, so cmdk never considers the list empty". It does not
+              always match: the row is only rendered with a repo in scope and
+              generative surfaces permitted, and it carries no `PRE_RANKED`
+              keyword, so `defaultFilter` can and does score it zero. Measured
+              on a failed search: zero cmdk items. Believing otherwise is what
+              left the generic empty state ungated above. `Command.Empty` is
+              still the wrong home for this copy, because it is a finding about
+              the repository rather than a statement that the list is short. */}
           {noMatch && grouped.emptyMessage && (
             <p className="px-5 py-6 text-center text-sm leading-relaxed text-[var(--color-text-tertiary)] [text-wrap:pretty]">
               {grouped.emptyMessage}
