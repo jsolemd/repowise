@@ -15,6 +15,7 @@ import json
 import subprocess
 from pathlib import Path
 
+import pytest
 import yaml
 from click.testing import CliRunner
 
@@ -90,18 +91,23 @@ class _StubPrompt:
     it sets the key in the environment and writes it to ``.repowise/.env``,
     exactly as ``interactive_provider_config_select`` does for a real provider,
     then returns a selection for the (unselectable-in-table) ``mock`` provider.
+
+    The env half goes through the test's ``monkeypatch`` rather than a bare
+    ``os.environ`` assignment. The real prompt exports the key for the rest of
+    the process on purpose; a test that does the same leaves a configured-key
+    signal standing in every test that runs after it, in a file whose whole
+    subject is what happens when no provider is configured.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
         self.calls = 0
+        self._monkeypatch = monkeypatch
 
     def __call__(self, console, model, reasoning=None, *, repo_path=None):
         self.calls += 1
-        import os
-
         from repowise.cli.ui.env_persistence import _save_key_to_dotenv
 
-        os.environ["MOCK_API_KEY"] = "sk-mock-test-key"
+        self._monkeypatch.setenv("MOCK_API_KEY", "sk-mock-test-key")
         if repo_path is not None:
             _save_key_to_dotenv(repo_path, "MOCK_API_KEY", "sk-mock-test-key")
         return ProviderSelection("mock", "mock-model-1", "auto")
@@ -128,7 +134,7 @@ def _force_interactive(monkeypatch) -> None:
 def test_update_prompts_and_persists_when_docs_needs_a_provider(tmp_path, monkeypatch) -> None:
     repo, new_head = _prep_docs_repo_without_provider(tmp_path)
 
-    stub = _StubPrompt()
+    stub = _StubPrompt(monkeypatch)
     monkeypatch.setattr("repowise.cli.ui.interactive_provider_config_select", stub, raising=False)
     _force_interactive(monkeypatch)
 
@@ -170,7 +176,7 @@ def test_update_prompts_and_persists_when_docs_needs_a_provider(tmp_path, monkey
 def test_update_non_interactive_stays_a_clean_failure(tmp_path, monkeypatch) -> None:
     repo, _ = _prep_docs_repo_without_provider(tmp_path)
 
-    stub = _StubPrompt()
+    stub = _StubPrompt(monkeypatch)
     monkeypatch.setattr("repowise.cli.ui.interactive_provider_config_select", stub, raising=False)
     # No _force_interactive: under CliRunner stdin is not a tty and the console
     # is not a terminal, so the prompt gate is closed (the hook / CI case).

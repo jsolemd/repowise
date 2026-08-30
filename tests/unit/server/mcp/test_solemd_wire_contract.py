@@ -58,6 +58,42 @@ EXPECTED_SERVED_TOOLS = frozenset(
 )
 
 
+@pytest.fixture(autouse=True)
+def _restore_full_surface():
+    """Undo the bind-time generative purge this module performs.
+
+    ``_served_tool_names`` sets ``REPOWISE_TOOLS_NO_GENERATIVE`` and calls
+    ``ensure_full_surface``, and the ``snapshot_full_surface`` step inside it
+    deletes the generative tools from the *process-wide* FastMCP singleton —
+    and, if this is the first caller in the process, from the ``_full_surface``
+    snapshot that every later ``apply_tool_selection`` rebuilds from.
+    ``monkeypatch`` puts the env var back at teardown; nothing puts the tools
+    back, and ``snapshot_full_surface`` keeps its first non-empty snapshot for
+    the life of the process, so the removal outlives this module.
+
+    A later test that compares what the server serves against the surface
+    guide then sees ``get_answer`` on one side only —
+    ``test_tool_selection.py::test_apply_trims_and_restores_live_server``
+    passes alone and fails once this module has run.
+    ``test_no_generative_surface.py`` sidesteps the same trap with the same
+    save/restore in its ``rebind`` fixture.
+
+    Binding here, before the env var is set, also fixes ``_full_surface`` from
+    an unpurged surface, so the "first snapshot wins" rule captures every tool
+    rather than whichever subset the first caller's environment allowed.
+    """
+    from repowise.server.mcp_server import _tool_selection, ensure_full_surface
+
+    mcp = ensure_full_surface()
+    saved_snapshot = _tool_selection._full_surface
+    saved_tools = dict(mcp._tool_manager._tools)
+    try:
+        yield
+    finally:
+        _tool_selection._full_surface = saved_snapshot
+        mcp._tool_manager._tools = dict(saved_tools)
+
+
 def _served_tool_names(monkeypatch: pytest.MonkeyPatch) -> set[str]:
     monkeypatch.setenv("REPOWISE_TOOLS_NO_GENERATIVE", "1")
 
