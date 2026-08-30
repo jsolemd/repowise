@@ -33,6 +33,7 @@ from repowise.core.refsites.taxonomy import (
     ReferenceKind,
     ReferenceOrigin,
 )
+from repowise.core.source_search.vector_store import STORED_SNIPPET_CHARS
 from repowise.core.source_search.worktree import WorkingTreeDivergence
 from repowise.server import source_search_wiring as w
 
@@ -265,6 +266,10 @@ async def test_contained_definition_fetch_is_bounded_and_discloses_truncation(
     monkeypatch.setattr(SqlReferenceSiteStore, "definitions_in_range", recording_fetch)
     _patch_status(monkeypatch, CLEAN)
     snippet = "\n".join(f"def nested_{index}(): pass" for index in range(count))
+    # Corroboration reads the working tree, so the file has to hold the
+    # definitions these synthesized sites claim, at the lines they claim them
+    # — which is exactly what ``start_line=index + 1`` above asserts.
+    (nested_repo / DIVERSIFY_PATH).write_text(snippet + "\n")
     coordinator = _coordinator(
         _window_response(snippet=snippet, end_line=count), session_factory, nested_repo
     )
@@ -416,40 +421,47 @@ async def test_an_empty_site_name_does_not_corroborate_against_everything(
     assert response["results"][0]["contains_symbols"] == ["mmr_diversify"]
 
 
-async def test_a_name_the_served_snippet_does_not_show_is_not_asserted(
+async def test_a_name_the_live_file_does_not_show_is_not_asserted(
     monkeypatch, extracted, session_factory, nested_repo
 ):
-    """A recorded definition the current chunk text cannot show goes unnamed.
+    """A recorded definition the file itself cannot show goes unnamed.
 
     This is what makes the generation skew between the two indexes a coverage
-    limit rather than a correctness risk: the snippet comes from the chunk
-    generation being served, so a name that survives is one the reader can see.
+    limit rather than a correctness risk. The snippet here still carries the
+    helper, and it is still refused — which is the whole swap stated as a
+    test: the working tree is the corroborating text now, and a stored snippet
+    that disagrees with it does not get to speak for the row.
     """
-    _patch_status(monkeypatch, CLEAN)
-    coordinator = _coordinator(
-        _window_response(snippet="def mmr_diversify(items, k):\n    ..."),
-        session_factory,
-        nested_repo,
+    (nested_repo / DIVERSIFY_PATH).write_text(
+        "def mmr_diversify(items, k):\n    return items[:k]\n"
     )
+    _patch_status(monkeypatch, CLEAN)
+    coordinator = _coordinator(_window_response(), session_factory, nested_repo)
 
     response = await coordinator.search("how are near duplicates dropped")
 
+    assert "_sim" in response["results"][0]["snippet"]
     assert response["results"][0]["contains_symbols"] == ["mmr_diversify"]
 
 
 async def test_a_substring_of_a_longer_identifier_does_not_corroborate(
     monkeypatch, extracted, session_factory, nested_repo
 ):
-    """``_sim`` inside ``_similarity`` is a different name, not this one."""
-    _patch_status(monkeypatch, CLEAN)
-    coordinator = _coordinator(
-        _window_response(snippet="def mmr_diversify(items, k):\n    _similarity(a, b)"),
-        session_factory,
-        nested_repo,
+    """``_sim`` inside ``_similarity`` is a different name, not this one.
+
+    Read from the live file, so the boundary rule is being exercised against
+    the text the check actually consults: a naive substring search over these
+    bytes finds ``_sim`` three times and would name a symbol that is not here.
+    """
+    (nested_repo / DIVERSIFY_PATH).write_text(
+        "def mmr_diversify(items, k):\n    return [_similarity(a, b) for a, b in items][:k]\n"
     )
+    _patch_status(monkeypatch, CLEAN)
+    coordinator = _coordinator(_window_response(), session_factory, nested_repo)
 
     response = await coordinator.search("how are near duplicates dropped")
 
+    assert "_sim" in (nested_repo / DIVERSIFY_PATH).read_text()
     assert response["results"][0]["contains_symbols"] == ["mmr_diversify"]
 
 
@@ -528,3 +540,208 @@ async def test_get_session_is_not_opened_when_no_row_needs_naming(
     await coordinator.search("q")
 
     assert opened == 0
+
+
+# ---------------------------------------------------------------------------
+# Past the snippet cap: what the stored text cannot show and the file can
+# ---------------------------------------------------------------------------
+
+DEEP_PATH = "threads.py"
+
+_DEEP_PADDING = "\n".join(f"    step_{n} = compute({n}, {'settings' * 6})" for n in range(48))
+
+#: An outer function whose body runs past ``STORED_SNIPPET_CHARS`` before it
+#: nests — the shape measured in SoleMD.Web, where ``weaveTo`` is declared
+#: 3,265 characters into ``buildThreads`` and the stored snippet stops at 2,000.
+DEEP_PY = f"""\
+def build_threads(items):
+    \"\"\"An outer function whose body runs long before it nests.\"\"\"
+
+{_DEEP_PADDING}
+
+    def weave_to(target):
+        return target
+
+    return [weave_to(item) for item in items]
+"""
+
+
+@pytest.fixture
+def deep_repo(tmp_path: Path) -> Path:
+    (tmp_path / DEEP_PATH).write_text(DEEP_PY)
+    (tmp_path / ".git").mkdir()
+    return tmp_path
+
+
+@pytest.fixture
+async def deep_extracted(async_session, repo_id, deep_repo):
+    store = SqlReferenceSiteStore(async_session)
+    await store.replace_repository(repo_id, extract_repository(deep_repo))
+    await async_session.commit()
+    return store
+
+
+def _deep_response(**overrides) -> dict:
+    """A window row carrying exactly what the store would have kept of it."""
+    row = {
+        "file": DEEP_PATH,
+        "target_path": DEEP_PATH,
+        "name": DEEP_PATH,
+        "kind": "file_window",
+        "source": "file_window",
+        "snippet": DEEP_PY[:STORED_SNIPPET_CHARS],
+        "relevance_score": 0.5,
+        "evidence": {},
+        "start_line": 1,
+        "end_line": 160,
+    }
+    row.update(overrides)
+    return {"results": [row], "mode": "hybrid", "confidence": "confident", "_meta": {}}
+
+
+async def test_a_definition_past_the_snippet_cap_is_named_from_the_live_file(
+    monkeypatch, deep_extracted, session_factory, deep_repo
+):
+    """The residue the stored snippet could never reach.
+
+    The helper is declared past the cut, so the row served it without ever
+    showing it, and corroborating against the snippet withheld a name that the
+    file proves on the very lines the row cites. The cut is a fact about the
+    storage format; the check now asks the file instead.
+    """
+    assert DEEP_PY.index("def weave_to") > STORED_SNIPPET_CHARS
+    _patch_status(monkeypatch, CLEAN)
+    body = _deep_response()
+    # The premise, asserted rather than assumed: the old text source is blind here.
+    assert "weave_to" not in body["results"][0]["snippet"]
+    coordinator = _coordinator(body, session_factory, deep_repo)
+
+    response = await coordinator.search("how are threads woven together")
+
+    assert response["results"][0]["contains_symbols"] == [
+        "build_threads",
+        "build_threads::weave_to",
+    ]
+    assert response["results"][0]["containment"] == "definition_start_in_span"
+
+
+# ---------------------------------------------------------------------------
+# Never worse: when the file cannot answer, the snippet still can
+# ---------------------------------------------------------------------------
+
+
+async def test_a_missing_file_falls_back_to_the_stored_snippet(
+    monkeypatch, extracted, session_factory, nested_repo
+):
+    """No file behind the path: the row is named exactly as it was before."""
+    (nested_repo / DIVERSIFY_PATH).unlink()
+    _patch_status(monkeypatch, CLEAN)
+    coordinator = _coordinator(_window_response(), session_factory, nested_repo)
+
+    response = await coordinator.search("how are near duplicates dropped")
+
+    assert response["results"][0]["contains_symbols"] == [
+        "mmr_diversify",
+        "mmr_diversify::_sim",
+    ]
+
+
+async def test_a_start_line_past_the_live_file_falls_back_to_the_snippet(
+    monkeypatch, extracted, async_session, repo_id, session_factory, nested_repo
+):
+    """Drift: the row cites a region the working tree no longer reaches.
+
+    The sites are recorded high in a file that is now twelve lines long, so
+    the live read has nothing to return and refuses rather than reporting an
+    empty span as an absence of names. The snippet answers instead, which is
+    the pre-change behaviour arriving unchanged.
+    """
+    await async_session.execute(
+        update(ReferenceSite)
+        .where(
+            ReferenceSite.repository_id == repo_id,
+            ReferenceSite.file_path == DIVERSIFY_PATH,
+        )
+        .values(start_line=ReferenceSite.start_line + 500)
+    )
+    await async_session.commit()
+    assert len((nested_repo / DIVERSIFY_PATH).read_text().splitlines()) < 500
+    _patch_status(monkeypatch, CLEAN)
+    coordinator = _coordinator(
+        _window_response(start_line=500, end_line=660), session_factory, nested_repo
+    )
+
+    response = await coordinator.search("how are near duplicates dropped")
+
+    assert response["results"][0]["contains_symbols"] == [
+        "mmr_diversify",
+        "mmr_diversify::_sim",
+    ]
+
+
+# ---------------------------------------------------------------------------
+# The live read itself
+# ---------------------------------------------------------------------------
+
+
+def test_live_slice_returns_the_cited_lines(tmp_path: Path):
+    (tmp_path / "a.py").write_text("one\ntwo\nthree\nfour\n")
+
+    assert w._live_slice(tmp_path, "a.py", 2, 3) == "two\nthree\n"
+
+
+def test_live_slice_stops_at_the_end_of_a_short_file(tmp_path: Path):
+    """A window row cites a nominal end; a short file simply ends sooner.
+
+    This is the ordinary case, not drift, which is why only the *start* is
+    checked against the file's length.
+    """
+    (tmp_path / "a.py").write_text("one\ntwo\n")
+
+    assert w._live_slice(tmp_path, "a.py", 1, 160) == "one\ntwo\n"
+
+
+def test_live_slice_refuses_a_start_past_the_end_of_the_file(tmp_path: Path):
+    (tmp_path / "a.py").write_text("one\ntwo\n")
+
+    assert w._live_slice(tmp_path, "a.py", 500, 660) is None
+
+
+def test_live_slice_refuses_what_has_no_file_behind_it(tmp_path: Path):
+    (tmp_path / "sub").mkdir()
+
+    assert w._live_slice(tmp_path, "sub", 1, 10) is None
+    assert w._live_slice(tmp_path, "absent.py", 1, 10) is None
+
+
+def test_live_slice_refuses_an_empty_file(tmp_path: Path):
+    """Nothing collected is not a corroborating text of nothing."""
+    (tmp_path / "empty.py").write_text("")
+
+    assert w._live_slice(tmp_path, "empty.py", 1, 160) is None
+
+
+def test_live_slice_refuses_a_path_that_leaves_the_repository(tmp_path: Path):
+    (tmp_path / "outside.py").write_text("secret\n")
+    root = tmp_path / "repo"
+    root.mkdir()
+
+    assert w._live_slice(root, "../outside.py", 1, 10) is None
+    assert w._live_slice(root, str(tmp_path / "outside.py"), 1, 10) is None
+
+
+def test_live_slice_refuses_a_range_that_is_not_one(tmp_path: Path):
+    (tmp_path / "a.py").write_text("one\ntwo\n")
+
+    assert w._live_slice(tmp_path, "a.py", 5, 2) is None
+    assert w._live_slice(tmp_path, "a.py", 0, 2) is None
+
+
+def test_live_slice_caps_a_single_enormous_line(tmp_path: Path):
+    """A minified bundle is one line, so the line range bounds nothing there."""
+    (tmp_path / "bundle.js").write_text("x" * (w._LIVE_SLICE_MAX_CHARS * 3))
+
+    sliced = w._live_slice(tmp_path, "bundle.js", 1, 160)
+
+    assert sliced is not None
+    assert len(sliced) == w._LIVE_SLICE_MAX_CHARS

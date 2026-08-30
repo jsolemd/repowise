@@ -82,6 +82,71 @@ def _identifier_token(name: str) -> Any:
     return re.compile(rf"(?<![0-9A-Za-z_]){escaped}(?![0-9A-Za-z_])")
 
 
+#: Hard ceiling on the text one row's corroboration read may collect. The
+#: cited line range bounds the read in every ordinary case; this bounds the
+#: pathological one, where a "line" is a minified bundle megabytes wide. Far
+#: above any real source window, and small enough that a full page of rows
+#: reading one each stays beneath the cost of the query that produced them.
+_LIVE_SLICE_MAX_CHARS = 256_000
+
+
+def _live_slice(repo: Path, file_path: str, start_line: int, end_line: int) -> str | None:
+    """The cited lines of *file_path* as the working tree currently holds them.
+
+    ``None`` means "this file cannot answer", and every caller treats that as
+    a signal to fall back rather than as a finding — the enrichment above is
+    built on never reading silence as evidence, and an unreadable file is
+    silence. Four ways to get it: a path that is not repository-relative or
+    escapes the root, a path with no regular file behind it, a range that is
+    not a range, and a *start* line the file no longer reaches.
+
+    Only the start line is checked against the file's length. A window row
+    routinely cites a nominal end far past the last line of a short file, so
+    an end beyond EOF is the ordinary case and the slice simply stops there;
+    it is a start beyond EOF that says the row is describing a region which no
+    longer exists, and that is the drift worth refusing on.
+
+    Reading up to *end_line* is strictly less work than indexing this file
+    already did, which is the real bound; the char ceiling only covers the
+    file whose line structure makes "up to end_line" meaningless.
+    """
+    try:
+        if start_line < 1 or end_line < start_line:
+            return None
+        relative = Path(file_path)
+        if relative.is_absolute():
+            return None
+        root = repo.resolve()
+        target = (root / relative).resolve()
+        if root not in target.parents:
+            return None
+        if not target.is_file():
+            return None
+        collected: list[str] = []
+        size = 0
+        with target.open("r", encoding="utf-8", errors="replace") as handle:
+            for number, line in enumerate(handle, start=1):
+                if number < start_line:
+                    continue
+                if number > end_line:
+                    break
+                remaining = _LIVE_SLICE_MAX_CHARS - size
+                if len(line) >= remaining:
+                    # Cut inside the line, not after it: one minified line can
+                    # be the whole budget several times over, and appending it
+                    # first to discover that defeats the ceiling.
+                    collected.append(line[:remaining])
+                    break
+                collected.append(line)
+                size += len(line)
+        if not collected:
+            return None
+        return "".join(collected)
+    except Exception:
+        log.debug("source-search: live slice unavailable for %s", file_path, exc_info=True)
+        return None
+
+
 class _StatusCoordinator:
     """Add live queue health without changing the ranking coordinator."""
 
@@ -199,13 +264,25 @@ class _StatusCoordinator:
         having run is not a finding of cleanliness, and enriching on it would
         be reading silence as evidence in the other direction.
 
-        **Corroboration.** The name has to appear in the snippet this very
-        response is serving. That snippet comes from the current chunk
-        generation, so a name that survives the check is one the reader can see
-        in the row in front of them — which turns the residual
-        generation-skew question from a correctness risk into a coverage
-        limit. Snippets are capped, so a definition deep inside a long window
-        goes unnamed rather than unverified.
+        **Corroboration.** The name has to appear as a standalone identifier
+        in the file's own text at the lines this row cites, read back from the
+        working tree rather than from the stored snippet. Snippets are cut at
+        ``STORED_SNIPPET_CHARS``, and that cut is a property of the storage
+        format, not a statement about the code: a helper declared past it is
+        no less real than one declared before it, so withholding it named the
+        cap rather than the file. Reading the cited lines back off disk asks
+        the question the row is actually making a claim about. The freshness
+        gate above is what lets the two sources be exchanged at all — a file
+        it has not flagged is one the working tree still matches — so this
+        widens what can be proved without weakening the proof.
+
+        What a reader gives up is being able to find every named symbol inside
+        the snippet in front of them; a name can now sit past the cut. What the
+        row asserts is unchanged, and it was never "this is visible above": it
+        is that the definition starts inside the lines cited. When the file
+        cannot be read, has nothing file-backed behind it, or no longer
+        reaches those lines, the stored snippet corroborates exactly as it did
+        before, so no row is named on weaker evidence than it would have been.
         """
         result_rows = [row for row in (response.get("results") or []) if isinstance(row, dict)]
         # Core's coordinator only emits names whose complete span is enclosed.
@@ -276,7 +353,14 @@ class _StatusCoordinator:
                     if total > len(sites):
                         row["sites_truncated"] = True
                         row["sites_total"] = total
-                snippet = str(row["snippet"])
+                # The row's own lines, read from the working tree, with the
+                # stored snippet as the fallback when they cannot be read.
+                corroborating = _live_slice(
+                    self._repo,
+                    file_path,
+                    int(row["start_line"]),
+                    int(row["end_line"]),
+                ) or str(row["snippet"])
                 names: list[str] = []
                 for site in sites:
                     chain = symbol_path_of(site.target_symbol_id or "", file_path)
@@ -291,7 +375,7 @@ class _StatusCoordinator:
                     # it compiles to is zero-width and matches at the first
                     # position it is tried. The column is not empty-constrained,
                     # so the check has to be made rather than assumed.
-                    if not site.name or not _identifier_token(site.name).search(snippet):
+                    if not site.name or not _identifier_token(site.name).search(corroborating):
                         continue
                     if chain not in names:
                         names.append(chain)
