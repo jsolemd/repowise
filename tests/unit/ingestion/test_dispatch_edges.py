@@ -48,9 +48,7 @@ def _build(tmp_path: Path, sources: dict[str, str], language: str):
 
 
 def _dispatch_pairs(graph) -> set[tuple[str, str]]:
-    return {
-        (u, v) for u, v, d in graph.edges(data=True) if d.get("edge_type") == "dispatches_to"
-    }
+    return {(u, v) for u, v, d in graph.edges(data=True) if d.get("edge_type") == "dispatches_to"}
 
 
 def _calls_by_origin(graph, origin: str) -> set[tuple[str, str]]:
@@ -85,9 +83,7 @@ def test_a_subtype_method_answers_for_the_base_it_overrides(tmp_path: Path) -> N
 
 def test_a_base_method_no_subtype_declares_gains_nothing(tmp_path: Path) -> None:
     graph = _build(tmp_path, _PY_HIERARCHY, "python")
-    assert not [
-        pair for pair in _dispatch_pairs(graph) if pair[0].endswith("Handler::finish")
-    ]
+    assert not [pair for pair in _dispatch_pairs(graph) if pair[0].endswith("Handler::finish")]
 
 
 def test_two_classes_sharing_a_method_name_but_no_heritage_are_not_linked(
@@ -163,8 +159,7 @@ def test_a_private_implementation_overrides_nothing(tmp_path: Path) -> None:
         tmp_path,
         {
             "Base.cs": (
-                "namespace App;\n\npublic class Base\n{\n"
-                "    public virtual void Run() { }\n}\n"
+                "namespace App;\n\npublic class Base\n{\n    public virtual void Run() { }\n}\n"
             ),
             "Child.cs": (
                 "namespace App;\n\npublic class Child : Base\n{\n"
@@ -297,9 +292,7 @@ def test_a_bare_call_reaches_an_inherited_method_in_an_implicit_receiver_languag
             "base/Base.kt": (
                 "package app.base\n\nopen class Base {\n    fun helper(): Int = 1\n}\n"
             ),
-            "mid/Mid.kt": (
-                "package app.mid\n\nimport app.base.Base\n\nopen class Mid : Base()\n"
-            ),
+            "mid/Mid.kt": ("package app.mid\n\nimport app.base.Base\n\nopen class Mid : Base()\n"),
             "web/Child.kt": (
                 "package app.web\n\n"
                 "import app.mid.Mid\n\n"
@@ -345,8 +338,7 @@ def test_a_csharp_bare_call_reaches_an_inherited_method(tmp_path: Path) -> None:
         tmp_path,
         {
             "Base.cs": (
-                "namespace App.Base;\n\npublic class Base\n{\n"
-                "    protected int Helper() => 1;\n}\n"
+                "namespace App.Base;\n\npublic class Base\n{\n    protected int Helper() => 1;\n}\n"
             ),
             "Mid.cs": "namespace App.Mid;\n\npublic class Mid : Base\n{\n}\n",
             "Child.cs": (
@@ -354,8 +346,7 @@ def test_a_csharp_bare_call_reaches_an_inherited_method(tmp_path: Path) -> None:
                 "    public int Run() => Helper();\n}\n"
             ),
             "Decoy.cs": (
-                "namespace App.Other;\n\npublic class Decoy\n{\n"
-                "    public int Helper() => 9;\n}\n"
+                "namespace App.Other;\n\npublic class Decoy\n{\n    public int Helper() => 9;\n}\n"
             ),
         },
         "csharp",
