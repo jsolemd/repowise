@@ -14,9 +14,10 @@ Two non-negotiables:
   savings path is wrapped in a ``try`` that degrades to returning the untouched
   result on any failure.
 * **Signature-preserving.** FastMCP introspects each tool's signature to build
-  its input schema, so the wrapper copies ``functools.wraps`` metadata *and*
-  the original ``__signature__`` — a bare ``*args, **kwargs`` wrapper would
-  erase the tool's parameters from the MCP schema.
+  its schemas, so the wrapper copies ``functools.wraps`` metadata *and* pins an
+  evaluated ``__signature__`` (:mod:`.._signature`) — a bare ``*args,
+  **kwargs`` wrapper would erase the tool's parameters from the MCP schema, and
+  an unevaluated one costs it the output schema.
 
 The counterfactual comes from one of two places, in order of trust:
   1. a value the tool *declared* via :func:`declare_replaced` (it held the exact
@@ -26,7 +27,6 @@ The counterfactual comes from one of two places, in order of trust:
 
 from __future__ import annotations
 
-import contextlib
 import functools
 import inspect
 import json
@@ -35,6 +35,7 @@ from collections.abc import Callable
 from typing import Any
 
 from repowise.core.distill.budget import estimate_tokens
+from repowise.server.mcp_server._signature import preserve
 
 from . import counterfactual
 from .recorder import record_mcp_dead_end, record_mcp_saving
@@ -103,6 +104,7 @@ def _emit_telemetry(tool: str, result: Any, duration_ms: int) -> None:
     from repowise.core.platform import telemetry
 
     telemetry.record_event("mcp_tool_call", _telemetry_properties(tool, result, duration_ms))
+
 
 #: ``_meta`` key a tool sets to declare its own counterfactual (see
 #: :func:`declare_replaced`). The wrapper reads and then leaves it in place as a
@@ -204,7 +206,4 @@ def instrument(fn: Callable[..., Any]) -> Callable[..., Any]:
             logger.debug("mcp telemetry emit failed for %s", tool, exc_info=True)
         return result
 
-    # Preserve the original signature so FastMCP builds the correct tool schema.
-    with contextlib.suppress(ValueError, TypeError):  # pragma: no cover - exotic callables
-        _wrapped.__signature__ = inspect.signature(fn)  # type: ignore[attr-defined]
-    return _wrapped
+    return preserve(_wrapped, fn)

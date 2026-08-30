@@ -7,6 +7,7 @@ must land together so an upstream absorption cannot silently move consumers.
 
 from __future__ import annotations
 
+import json
 from importlib.metadata import version
 
 import pytest
@@ -105,7 +106,7 @@ WRITER_ANNOTATIONS = {
 
 
 @pytest.mark.asyncio
-async def test_served_tools_carry_title_and_annotations_and_wrap_result(
+async def test_served_tools_carry_title_and_annotations_and_a_flat_output_schema(
     monkeypatch: pytest.MonkeyPatch,
 ):
     from repowise.server.mcp_server import ensure_full_surface
@@ -129,16 +130,18 @@ async def test_served_tools_carry_title_and_annotations_and_wrap_result(
     )
     assert len(served_names - EXPECTED_WRITER_TOOLS) == 24
 
-    wrapper_drift = {
+    schema_drift = {
         name: schema
         for name in sorted(served_names)
         if (schema := advertised[name].outputSchema) is None
-        or set(schema.get("properties", {})) != {"result"}
-        or schema.get("required") != ["result"]
+        or schema.get("type") != "object"
+        or "result" in schema.get("properties", {})
+        or schema.get("required")
     }
-    assert not wrapper_drift, (
-        "served tools no longer use the structuredContent {'result': ...} wrapper; "
-        f"unit 4.2 must change these pins with the transport: {wrapper_drift}"
+    assert not schema_drift, (
+        "a served tool's outputSchema is not the flat payload's. Unit 4.2 removed the "
+        "structuredContent {'result': ...} wrapper, nothing may reintroduce it, and no "
+        f"served tool may go without an output schema: {schema_drift}"
     )
 
 
@@ -269,3 +272,143 @@ def test_source_manifest_round_trips_working_tree_ingest():
     assert SourceIndexManifest.from_dict(encoded).working_tree_ingest == {
         "src/example.py": "content-hash"
     }
+
+
+# ---------------------------------------------------------------------------
+# Unit 4.2: the wire shape itself, read off raw JSON-RPC frames.
+# ---------------------------------------------------------------------------
+
+
+async def _wire_session(tool: str, arguments: dict) -> tuple[dict, dict]:
+    """One transport session: the ``tools/list`` and ``tools/call`` frames.
+
+    No SDK client — a client library re-shapes exactly the fields under test,
+    so the JSON-RPC frames are read as they go out. Two constraints shape this:
+    ``ASGITransport`` does not run the app's lifespan and the streamable-HTTP
+    session manager starts there, so the lifespan is entered by hand; and that
+    manager refuses a second ``run()``, so both calls share one session.
+    """
+    import httpx
+
+    from repowise.server.mcp_server import ensure_full_surface
+
+    app = ensure_full_surface().streamable_http_app()
+    headers = {
+        "Accept": "application/json, text/event-stream",
+        "Content-Type": "application/json",
+    }
+
+    def _frame(response: httpx.Response) -> dict:
+        assert response.status_code == 200, response.text
+        for line in response.text.splitlines():
+            if line.startswith("data:"):
+                return json.loads(line[len("data:") :].strip())
+        raise AssertionError(f"no JSON-RPC frame in transport reply: {response.text[:400]}")
+
+    async with app.router.lifespan_context(app):
+        transport = httpx.ASGITransport(app=app)
+        # The Host header is validated, so the base URL has to look like the bind.
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://127.0.0.1:7350"
+        ) as client:
+            opened = await client.post(
+                "/mcp",
+                headers=headers,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {},
+                        "clientInfo": {"name": "solemd-wire-contract", "version": "0"},
+                    },
+                },
+            )
+            assert opened.status_code == 200, opened.text
+            if session := opened.headers.get("mcp-session-id"):
+                headers = {**headers, "mcp-session-id": session}
+            await client.post(
+                "/mcp",
+                headers=headers,
+                json={"jsonrpc": "2.0", "method": "notifications/initialized"},
+            )
+            listed = _frame(
+                await client.post(
+                    "/mcp",
+                    headers=headers,
+                    json={"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+                )
+            )
+            called = _frame(
+                await client.post(
+                    "/mcp",
+                    headers=headers,
+                    json={
+                        "jsonrpc": "2.0",
+                        "id": 3,
+                        "method": "tools/call",
+                        "params": {"name": tool, "arguments": arguments},
+                    },
+                )
+            )
+    return listed["result"], called["result"]
+
+
+@pytest.mark.asyncio
+async def test_the_served_wire_shape_over_a_real_transport(monkeypatch: pytest.MonkeyPatch):
+    """What a client actually receives, read off raw JSON-RPC frames.
+
+    ``get_index_status`` with nothing wired is the cheapest served tool that
+    still answers: the failure shield shapes "no index yet" into a payload
+    carrying the same trust envelope as any other response. Shape is what is
+    pinned here, never content.
+
+    ``test_served_tools_carry_title_and_annotations_and_a_flat_output_schema``
+    reads the schemas off the server object; this reads them off the wire,
+    because the schema a client validates against is the serialised one.
+    """
+    from repowise.server.mcp_server._meta import MCP_CONTRACT_VERSION
+
+    served = _served_tool_names(monkeypatch)
+    listed, result = await _wire_session("get_index_status", {})
+
+    schemas = {tool["name"]: tool.get("outputSchema") for tool in listed["tools"]}
+    wrapped = {
+        name: schema
+        for name, schema in schemas.items()
+        if name in served and (schema is None or "result" in schema.get("properties", {}))
+    }
+    assert not wrapped, f"served tools still advertise the result wrapper on the wire: {wrapped}"
+
+    structured = result["structuredContent"]
+    assert "result" not in structured, (
+        f"structuredContent is still wrapped in {{'result': ...}}: {sorted(structured)}"
+    )
+    assert "_meta" not in structured, (
+        "the trust envelope is still a payload key; it belongs on the protocol result"
+    )
+    assert result["_meta"]["contract_version"] == MCP_CONTRACT_VERSION, (
+        f"no trust envelope on the JSON-RPC result: {sorted(result)}"
+    )
+    # One copy of the envelope on the wire, so no client can read a second.
+    assert json.loads(result["content"][0]["text"]) == structured
+
+
+@pytest.mark.asyncio
+async def test_the_tool_function_itself_still_carries_meta_in_its_payload(setup_mcp):
+    """The promotion is wire-only, and this is the half that must not move.
+
+    ``repowise search`` awaits ``search_codebase`` in process
+    (``cli/tool_bridge.py``) and reads ``payload["_meta"]`` to say when an
+    answer came back lexical-only. That path calls the registered *function*,
+    which the MCP middleware never touches, so the envelope has to stay where
+    it is on the dict a tool returns.
+    """
+    from repowise.server.mcp_server._meta import MCP_CONTRACT_VERSION
+    from repowise.server.mcp_server.tool_index_status import get_index_status
+
+    payload = await get_index_status()
+
+    assert isinstance(payload, dict)
+    assert payload["_meta"]["contract_version"] == MCP_CONTRACT_VERSION

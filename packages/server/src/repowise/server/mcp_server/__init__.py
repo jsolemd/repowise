@@ -105,8 +105,9 @@ _surface_applied = False
 def tool_middleware(fn: Any) -> Any:
     """Compose the layers wrapped around every registered MCP tool.
 
-    Each layer is signature-preserving, so the tool schemas are unchanged.
-    Ordering, innermost first:
+    Each layer pins the tool's *evaluated* signature (:mod:`._signature`),
+    which is what FastMCP reads to build both of its schemas. Ordering,
+    innermost first:
 
     1. ``shield`` — no exception may escape to FastMCP as a protocol-level
        isError (an early isError teaches the agent to abandon the server for
@@ -118,6 +119,10 @@ def tool_middleware(fn: Any) -> Any:
     4. ``budget`` — caps the delivered shape before savings are measured.
     5. ``instrument`` — records the bounded result and adds savings metadata.
     6. ``budget`` — accounts for those final middleware fields and rechecks.
+
+    Every layer here is about the *payload* — what the answer contains, how
+    precise its numbers are, how large it may get, what it cost. The transport
+    shape is a separate concern and a separate wrapper: see :func:`served_tool`.
 
     Named rather than inlined at the ``apply`` call so tests can wrap a tool in
     the real composition; ``tests/unit/server/mcp/test_number_precision.py``
@@ -174,6 +179,26 @@ def tool_middleware(fn: Any) -> Any:
     return budget(instrument(budget(quantize(trust(shield(fn))))))
 
 
+def served_tool(fn: Any) -> Any:
+    """The callable FastMCP registers: the payload pipeline, then the wire shape.
+
+    Two levels, deliberately not one. :func:`tool_middleware` shapes the
+    payload; ``_wire.wire`` shapes the *transport* around it — where the trust
+    envelope rides, and what ``structuredContent`` holds. Only the served
+    surface needs the second, so only this composition has it: the CLI awaits
+    tool functions in process through ``cli/tool_bridge.py``, and the suites
+    that assert on payloads compose ``tool_middleware`` directly. Both keep
+    reading one dict with ``_meta`` in it.
+
+    Outermost also means the savings ledger and the response budget still
+    measure the dict payload as delivered; neither can measure a
+    ``CallToolResult``.
+    """
+    from repowise.server.mcp_server._wire import wire
+
+    return wire(tool_middleware(fn))
+
+
 def ensure_full_surface() -> Any:
     """Import every tool module and attach the registry to the FastMCP server.
 
@@ -201,7 +226,7 @@ def ensure_full_surface() -> Any:
     from repowise.server.mcp_server._tool_metadata import resolve_tool_metadata
     from repowise.server.mcp_server._tool_selection import snapshot_full_surface
 
-    mcp_tool_registry.apply(_mcp, middleware=tool_middleware, metadata=resolve_tool_metadata)
+    mcp_tool_registry.apply(_mcp, middleware=served_tool, metadata=resolve_tool_metadata)
 
     # Snapshot the full registered surface so per-server tool selection
     # (single-repo vs workspace, config/CLI overrides) can rebuild from it.

@@ -149,6 +149,15 @@ Resolve refs with `repowise expand <ref>` from a shell, or
 `get_symbol("repowise#<ref>")` from any MCP client. See
 [DISTILL.md](DISTILL.md) for the full reversibility model.
 
+**Where the envelope rides.** Over MCP it is protocol metadata, not payload: it
+comes back as `_meta` on the JSON-RPC `result`, beside `content` and
+`structuredContent`. `structuredContent` is the tool's payload flat — no
+`{"result": ...}` wrapper around it, and no `_meta` key inside it — and the text
+content block mirrors that same flat payload, so a response carries exactly one
+copy of the envelope. A tool function awaited in process, which is what the
+`repowise` CLI does, still gets a single dict with `_meta` inside it; the
+promotion happens in the served MCP wrapper and nowhere else.
+
 **The `_meta` envelope** (all fields optional, present only when meaningful):
 
 | Field | When present |

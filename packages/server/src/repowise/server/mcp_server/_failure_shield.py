@@ -16,7 +16,6 @@ still sees (and dead-end-debits) the shaped error response.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import functools
 import inspect
 import logging
@@ -24,6 +23,7 @@ from collections.abc import Callable
 from typing import Any
 
 from repowise.server.mcp_server import _state
+from repowise.server.mcp_server._signature import preserve
 
 logger = logging.getLogger(__name__)
 
@@ -212,6 +212,4 @@ def shield(fn: Callable[..., Any]) -> Callable[..., Any]:
             logger.warning("mcp tool %s shielded exception: %s", tool, exc, exc_info=True)
             return _shape_exception(tool, exc)
 
-    with contextlib.suppress(ValueError, TypeError):  # pragma: no cover - exotic callables
-        _wrapped.__signature__ = inspect.signature(fn)  # type: ignore[attr-defined]
-    return _wrapped
+    return preserve(_wrapped, fn)

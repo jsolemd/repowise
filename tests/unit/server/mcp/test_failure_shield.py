@@ -160,12 +160,28 @@ async def test_successful_result_passes_through_untouched():
 
 
 def test_shield_preserves_signature_for_fastmcp_schema():
+    """Preserved, and evaluated — annotations, not annotation strings.
+
+    FastMCP reads a pinned ``__signature__`` verbatim (``eval_str`` does not
+    reach inside one), so a shield that pinned an unevaluated signature under
+    ``from __future__ import annotations`` handed it strings, and every tool
+    lost its output schema to the ``{"result": ...}`` fallback. See
+    ``mcp_server._signature``, which also widens a bare ``dict`` return to
+    ``dict[str, Any]`` — FastMCP builds no schema at all from the bare class.
+    """
+    from typing import Any
+
     async def tool_fn(symbol_id: str, context_lines: int = 0) -> dict:
         return {}
 
     wrapped = shield(tool_fn)
+    signature = inspect.signature(wrapped)
+
     assert wrapped.__name__ == "tool_fn"
-    assert str(inspect.signature(wrapped)) == str(inspect.signature(tool_fn))
+    assert list(signature.parameters) == ["symbol_id", "context_lines"]
+    assert signature.parameters["symbol_id"].annotation is str
+    assert signature.parameters["context_lines"].default == 0
+    assert signature.return_annotation == dict[str, Any]
 
 
 def test_sync_callables_pass_through():

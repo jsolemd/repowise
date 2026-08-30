@@ -163,6 +163,29 @@ def test_served_ranges_parser_shapes():
     assert served_reads._served_ranges([{"type": "text", "text": "{broken"}]) == []
 
 
+def test_served_ranges_parses_the_flat_record_the_transport_now_sends():
+    """No ``result`` wrapper, no ``_meta``: still parsed.
+
+    Unit 4.2 stopped wrapping MCP payloads in ``{"result": ...}`` and moved the
+    trust envelope onto the protocol result, so what a hook is handed is the
+    payload itself. The parser accepted both shapes before that and has to keep
+    accepting both — the served-read measurement does not fail when it stops
+    recognising a response, it silently stops measuring.
+    """
+    flat = {
+        "file": "a.py",
+        "start_line": 10,
+        "end_line": 40,
+        "source": "src",
+        "candidates": [{"file": "b.py", "start_line": 1, "end_line": 5, "source": "s"}],
+    }
+    expected = [("a.py", 10, 40), ("b.py", 1, 5)]
+
+    assert served_reads._served_ranges(flat) == expected
+    # The text content block now mirrors that same flat payload.
+    assert served_reads._served_ranges([{"type": "text", "text": json.dumps(flat)}]) == expected
+
+
 # ---------------------------------------------------------------------------
 # Shared ledger: search-surface logging + migration
 # ---------------------------------------------------------------------------
