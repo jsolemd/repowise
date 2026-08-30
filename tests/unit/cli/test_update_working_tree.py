@@ -151,6 +151,99 @@ def test_workspace_working_tree_staleness(
         assert "All repos are up to date" in output
 
 
+def test_workspace_recipe_drift_is_stale_and_names_moved_fingerprint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from repowise.cli import source_search_runtime
+
+    target, _repo = _workspace_target(tmp_path)
+
+    async def fake_recipe_changes(_path: Path) -> tuple[str, ...]:
+        return ("parser fingerprint old-parser → new-parser",)
+
+    monkeypatch.setattr(
+        source_search_runtime,
+        "configured_source_recipe_changes",
+        fake_recipe_changes,
+    )
+
+    workspace_cmd._workspace_update(target, dry_run=True, index_only=True)
+
+    output = capsys.readouterr().out
+    assert "parser fingerprint old-parser → new-parser" in output
+    assert "1 repo(s) would be updated" in output
+
+
+def test_workspace_recipe_drift_forces_only_the_mismatched_current_repo(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import repowise.core.workspace as core_workspace
+    from repowise.cli import source_search_runtime
+    from repowise.core.workspace import RepoUpdateResult
+
+    target, stale = _workspace_target(tmp_path)
+    current = target.ws_root / "current"
+    current.mkdir()
+    _git(current, "init")
+    _git(current, "config", "user.email", "test@test.com")
+    _git(current, "config", "user.name", "Test")
+    (current / "app.py").write_text("VALUE = 2\n", encoding="utf-8")
+    _git(current, "add", "app.py")
+    _git(current, "commit", "-m", "initial")
+    current_head = _git(current, "rev-parse", "HEAD")
+    (current / ".repowise").mkdir()
+    (current / ".repowise" / "state.json").write_text(
+        json.dumps({"last_sync_commit": current_head, "docs_mode": "none"}),
+        encoding="utf-8",
+    )
+    target.ws_config.repos.append(
+        RepoEntry(path="current", alias="current", last_commit_at_index=current_head)
+    )
+    captured: dict[str, object] = {}
+
+    async def fake_recipe_changes(path: Path) -> tuple[str, ...]:
+        return (
+            ("parser fingerprint parser-v1 → parser-v2",)
+            if path.resolve() == stale.resolve()
+            else ()
+        )
+
+    async def fake_update_workspace(*_args, **kwargs):
+        captured.update(kwargs)
+        return [
+            RepoUpdateResult(alias="repo", updated=True),
+            RepoUpdateResult(alias="current", updated=False, skipped_reason="up_to_date"),
+        ]
+
+    async def fake_reconcile(_paths: list[Path]) -> dict[Path, object]:
+        return {}
+
+    monkeypatch.setattr(
+        source_search_runtime,
+        "configured_source_recipe_changes",
+        fake_recipe_changes,
+    )
+    monkeypatch.setattr(
+        source_search_runtime,
+        "reconcile_configured_source_indexes",
+        fake_reconcile,
+    )
+    monkeypatch.setattr(core_workspace, "update_workspace", fake_update_workspace)
+    monkeypatch.setattr(
+        workspace_cmd,
+        "_refresh_workspace_editor_project_files",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(workspace_cmd, "_print_breaking_changes", lambda *_args: None)
+
+    workspace_cmd._workspace_update(target, index_only=True)
+
+    assert captured["force_aliases"] == {"repo"}
+
+
 def test_workspace_dispatch_forwards_include_working_tree(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

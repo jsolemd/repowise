@@ -122,6 +122,37 @@ async def test_transient_parse_failure_prunes_nothing(async_session, repo_with_k
         assert await _paths(async_session, model, column, repo.id) == {KEPT, STALE}, model.__name__
 
 
+async def test_newly_excluded_file_is_pruned_from_every_table(async_session, repo_with_kept_file):
+    """An explicit exclusion overrides the disk/git liveness witnesses."""
+    stale_path = repo_with_kept_file / STALE
+    stale_path.parent.mkdir(parents=True, exist_ok=True)
+    stale_path.write_text("export const debug = true;\n", encoding="utf-8")
+    _git(repo_with_kept_file, "add", STALE)
+    _git(repo_with_kept_file, "commit", "-q", "-m", "add debug helper")
+    config = repo_with_kept_file / ".repowise" / "config.yaml"
+    config.parent.mkdir(parents=True)
+    config.write_text("exclude_patterns:\n  - tools/**\n", encoding="utf-8")
+
+    repo = await insert_repo(async_session)
+    await _seed(async_session, repo.id)
+
+    pruned, refusals = await prune_deleted_file_rows(
+        async_session,
+        repo.id,
+        repo_with_kept_file,
+        live_hint={KEPT},
+    )
+    await async_session.commit()
+
+    assert (pruned, refusals) == (1, [])
+    assert await _paths(async_session, GraphNode, GraphNode.node_id, repo.id) == {
+        KEPT,
+        f"{KEPT}::main",
+    }
+    for model, column in FILE_SCOPED:
+        assert await _paths(async_session, model, column, repo.id) == {KEPT}, model.__name__
+
+
 async def test_git_tracked_file_missing_from_disk_survives(async_session, repo_with_kept_file):
     """The second witness: a stat that fails must not count as a deletion.
 
@@ -230,6 +261,47 @@ async def test_accept_mass_deletion_lifts_the_floor_for_one_run(async_session, r
 
     assert (pruned, refusals) == (40, [])
     assert await _paths(async_session, GitMetadata, GitMetadata.file_path, repo.id) == set()
+
+
+@pytest.mark.parametrize("accept", [False, True])
+async def test_mass_exclusion_uses_deleted_file_floor(
+    async_session,
+    repo_with_kept_file,
+    accept,
+):
+    """A two-thirds exclusion is refused until the one-run override is supplied."""
+    repo = await insert_repo(async_session)
+    excluded = {f"generated/module_{i}.js" for i in range(30)}
+    kept = {f"src/module_{i}.js" for i in range(10)}
+    for path in excluded | kept:
+        target = repo_with_kept_file / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("export {};\n", encoding="utf-8")
+        async_session.add(GitMetadata(repository_id=repo.id, file_path=path))
+    config = repo_with_kept_file / ".repowise" / "config.yaml"
+    config.parent.mkdir(parents=True)
+    config.write_text("exclude_patterns:\n  - generated/**\n", encoding="utf-8")
+    await async_session.flush()
+
+    pruned, refusals = await prune_deleted_file_rows(
+        async_session,
+        repo.id,
+        repo_with_kept_file,
+        live_hint=kept,
+        accept_mass_deletion=accept,
+    )
+    await async_session.commit()
+
+    remaining = await _paths(async_session, GitMetadata, GitMetadata.file_path, repo.id)
+    if accept:
+        assert (pruned, refusals) == (30, [])
+        assert remaining == kept
+    else:
+        assert pruned == 0
+        assert [(r.table, r.candidate_paths, r.persisted_paths) for r in refusals] == [
+            ("git_metadata", 30, 40)
+        ]
+        assert remaining == excluded | kept
 
 
 async def test_small_repo_can_still_lose_most_of_its_files(async_session, repo_with_kept_file):

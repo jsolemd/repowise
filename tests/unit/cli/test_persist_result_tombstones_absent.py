@@ -42,13 +42,18 @@ def _generated_page(page_type: str, target: str) -> GeneratedPage:
     )
 
 
-def _result(repo_name: str, generated_pages: list[GeneratedPage]) -> SimpleNamespace:
+def _result(
+    repo_name: str,
+    generated_pages: list[GeneratedPage],
+    *,
+    vector_store=None,
+) -> SimpleNamespace:
     return SimpleNamespace(
         repo_name=repo_name,
         index_persisted_incrementally=True,
         generated_pages=generated_pages,
         tech_stack=None,
-        vector_store=None,
+        vector_store=vector_store,
         dead_code_report=None,
         health_report=None,
         decision_report=None,
@@ -135,3 +140,51 @@ async def test_the_tombstoned_page_leaves_the_full_text_index(tmp_path):
 
     assert "file_page:gone.py" not in hits
     assert "file_page:kept.py" in hits
+
+
+async def test_reinit_tombstones_and_deindexes_a_newly_excluded_file(tmp_path):
+    """A full init converges page, FTS, and vector stores without deleting the file."""
+    repo_path = tmp_path / "repo"
+    repo_path.mkdir()
+    for path in ("src/kept.py", "generated/drop.py"):
+        target = repo_path / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("x = 1\n", encoding="utf-8")
+    await _seed_file_pages(repo_path, "src/kept.py", "generated/drop.py")
+    config = repo_path / ".repowise" / "config.yaml"
+    config.write_text("exclude_patterns:\n  - generated/**\n", encoding="utf-8")
+
+    engine, _sf, _ = await open_repo_db(repo_path, repo_name="r")
+    fts = FullTextSearch(engine)
+    await fts.ensure_index()
+    for path in ("src/kept.py", "generated/drop.py"):
+        await fts.index(f"file_page:{path}", path, f"{path} handles xylophone tuning.")
+    await engine.dispose()
+
+    class _VectorStore:
+        def __init__(self) -> None:
+            self.deleted: list[str] = []
+
+        async def delete_many(self, page_ids: list[str]) -> None:
+            self.deleted.extend(page_ids)
+
+    vectors = _VectorStore()
+    await persist_result(
+        _result(
+            "r",
+            [_generated_page("module_page", "community-75")],
+            vector_store=vectors,
+        ),
+        repo_path,
+    )
+
+    excluded_id = "file_page:generated/drop.py"
+    assert await _status(repo_path, excluded_id) == "tombstone"
+    assert vectors.deleted == [excluded_id]
+    engine, _sf, _ = await open_repo_db(repo_path, repo_name="r")
+    fts = FullTextSearch(engine)
+    await fts.ensure_index()
+    hits = {r.page_id for r in await fts.search("xylophone", limit=10)}
+    await engine.dispose()
+    assert excluded_id not in hits
+    assert "file_page:src/kept.py" in hits

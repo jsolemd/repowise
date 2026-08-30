@@ -422,6 +422,18 @@ def _persist_index_only_update(
             accept_mass_deletion=accept_mass_deletion,
         )
     )
+    if isinstance(prune_outcome, DeletedFilePruneOutcome) and prune_outcome.tombstoned_page_ids:
+        try:
+            from repowise.cli.helpers import load_config
+
+            from .incremental import _build_update_vector_store
+
+            page_store = _build_update_vector_store(repo_path, load_config(Path(repo_path)))
+            if page_store is not None:
+                run_async(page_store.delete_many(list(prune_outcome.tombstoned_page_ids)))
+        except Exception as exc:
+            degraded.append(f"Tombstone vector removal: {exc}")
+            console.print(f"[yellow]Tombstone vector removal deferred: {exc}[/yellow]")
     try:
         from repowise.cli.source_search_runtime import reconcile_configured_source_index
 
@@ -466,7 +478,6 @@ def _persist_index_only_update(
         "renderer_fingerprint": _current_renderer_fingerprint(repo_path),
     }
     from repowise.core.pipeline.prune_state import (
-        DeletedFilePruneOutcome,
         apply_prune_outcome,
     )
 
@@ -570,9 +581,11 @@ class PageCheckpointer:
             upsert_repository,
         )
 
+        queue = self._queue
+        assert queue is not None
         repo_id: str | None = None
         while True:
-            page = await self._queue.get()
+            page = await queue.get()
             if page is None:
                 return
             if self.failure is not None:
@@ -708,6 +721,14 @@ async def _persist_full_update_async(
         async with get_session(sf) as session:
             repo = await upsert_repository(session, name=repo_name, local_path=str(repo_path))
             repo_id = repo.id
+            from repowise.core.pipeline.persist import plan_excluded_file_prune
+
+            exclusion_plan = await plan_excluded_file_prune(
+                session,
+                repo_id,
+                repo_path,
+                accept_mass_deletion=accept_mass_deletion,
+            )
 
             # Pages first and without a net: everything else is derived
             # metadata, but a docs-mode update that can't write pages failed.
@@ -756,6 +777,14 @@ async def _persist_full_update_async(
                 tombstoned_page_ids = await mark_tombstone_pages(
                     session, repo_id, tombstone_candidates(file_diffs)
                 )
+                if exclusion_plan.actionable_paths:
+                    tombstoned_page_ids += await mark_tombstone_pages(
+                        session,
+                        repo_id,
+                        [(path, []) for path in exclusion_plan.actionable_paths],
+                    )
+                if tombstoned_page_ids and decision_vector_store is not None:
+                    await decision_vector_store.delete_many(tombstoned_page_ids)
             except Exception as exc:
                 _skip("Tombstone marking", exc)
 
@@ -970,6 +999,19 @@ async def _persist_full_update_async(
                 _skip("Symbol persist", exc)
                 source_symbol_error = str(exc)
 
+            if parsed_files and not exclusion_plan.refusals:
+                try:
+                    from repowise.core.pipeline.persist import persist_reference_sites
+
+                    await persist_reference_sites(
+                        session,
+                        repo_id,
+                        parsed_files,
+                        repo_path=repo_path,
+                    )
+                except Exception as exc:
+                    _skip("Reference sites persist", exc)
+
             # Refresh graph_edges for the changed files (delete-then-insert of
             # each file's outgoing edges). Without this, adjacency fossilizes at
             # the last full index and Phase E flow-path answers decay on every
@@ -1040,6 +1082,7 @@ async def _persist_full_update_async(
                     repo_path,
                     live_hint=live_hint,
                     accept_mass_deletion=accept_mass_deletion,
+                    exclusion_plan=exclusion_plan,
                 )
                 prune_outcome = DeletedFilePruneOutcome(
                     attempted=True,
@@ -1047,7 +1090,9 @@ async def _persist_full_update_async(
                     refusals=tuple(refusals),
                 )
                 if pruned:
-                    console.print(f"Pruned rows for [cyan]{pruned}[/cyan] deleted file(s)")
+                    console.print(
+                        f"Pruned rows for [cyan]{pruned}[/cyan] deleted or excluded file(s)"
+                    )
                 for refusal in refusals:
                     console.print(f"[yellow]{refusal.message}[/yellow]")
                     degraded.append(refusal.message)
@@ -1078,17 +1123,29 @@ async def _persist_full_update_async(
             from repowise.core.source_search import source_search_enabled
 
             if source_search_enabled():
-                from repowise.core.source_search.outbox import enqueue_incremental_update
+                if exclusion_plan.actionable_paths:
+                    from repowise.core.source_search.outbox import enqueue_full_update
 
-                await enqueue_incremental_update(
-                    session,
-                    repo_id,
-                    repo_path,
-                    file_diffs=file_diffs,
-                    parsed_files=parsed_files,
-                    upstream_ready=source_symbol_error is None,
-                    upstream_error=source_symbol_error,
-                )
+                    await enqueue_full_update(
+                        session,
+                        repo_id,
+                        repo_path,
+                        parsed_files=parsed_files,
+                        upstream_ready=source_symbol_error is None,
+                        upstream_error=source_symbol_error,
+                    )
+                else:
+                    from repowise.core.source_search.outbox import enqueue_incremental_update
+
+                    await enqueue_incremental_update(
+                        session,
+                        repo_id,
+                        repo_path,
+                        file_diffs=file_diffs,
+                        parsed_files=parsed_files,
+                        upstream_ready=source_symbol_error is None,
+                        upstream_error=source_symbol_error,
+                    )
 
         try:
             from repowise.cli.source_search_runtime import reconcile_configured_source_index
@@ -1175,7 +1232,10 @@ async def _rescore_health_from_db(
     graph_builder: Any,
     parsed_files: list,
     exclude_patterns: list[str],
-) -> None:
+    *,
+    accept_mass_deletion: bool = False,
+    vector_store: Any | None = None,
+) -> DeletedFilePruneOutcome:
     """Full-replace health re-score reading git metadata from the DB.
 
     Shared by the config-changed rebuild path and the periodic decay re-score
@@ -1189,19 +1249,16 @@ async def _rescore_health_from_db(
     The caller supplies an already-built *graph_builder* / *parsed_files* so the
     graph is rebuilt at most once per update.
     """
-    import pathspec
 
-    exclude_spec = (
-        pathspec.PathSpec.from_lines("gitwildmatch", exclude_patterns) if exclude_patterns else None
-    )
-
-    async def _rescore() -> None:
-        from sqlalchemy import delete, select
+    async def _rescore() -> DeletedFilePruneOutcome:
+        from sqlalchemy import select
 
         from repowise.cli.helpers import get_db_url_for_repo
         from repowise.core.analysis.health import HealthAnalyzer
         from repowise.core.analysis.health.config import HealthConfig
+        from repowise.core.exclusion import build_exclude_spec, is_excluded
         from repowise.core.persistence import (
+            FullTextSearch,
             create_engine,
             create_session_factory,
             get_session,
@@ -1214,84 +1271,165 @@ async def _rescore_health_from_db(
             save_health_metrics,
         )
         from repowise.core.persistence.models import GitMetadata
-        from repowise.core.pipeline.persist import persist_graph_nodes
+        from repowise.core.pipeline.persist import (
+            mark_tombstone_pages,
+            persist_graph_nodes,
+            persist_reference_sites,
+            plan_excluded_file_prune,
+            prune_deleted_file_rows,
+        )
 
         url = get_db_url_for_repo(repo_path)
         engine = create_engine(url)
-        await init_db(engine)
-        sf = create_session_factory(engine)
+        tombstoned_page_ids: list[str] = []
+        source_full_requested = False
+        outcome = DeletedFilePruneOutcome()
+        try:
+            await init_db(engine)
+            sf = create_session_factory(engine)
 
-        async with get_session(sf) as session:
-            repo = await upsert_repository(session, name=repo_path.name, local_path=str(repo_path))
-            repo_id = repo.id
-
-            gm_result = await session.execute(
-                select(GitMetadata).where(GitMetadata.repository_id == repo_id)
-            )
-            git_rows = list(gm_result.scalars().all())
-            excluded_git_paths = [
-                gm.file_path
-                for gm in git_rows
-                if exclude_spec is not None and exclude_spec.match_file(gm.file_path)
-            ]
-            if excluded_git_paths:
-                await session.execute(
-                    delete(GitMetadata).where(
-                        GitMetadata.repository_id == repo_id,
-                        GitMetadata.file_path.in_(excluded_git_paths),
-                    )
+            async with get_session(sf) as session:
+                repo = await upsert_repository(
+                    session, name=repo_path.name, local_path=str(repo_path)
                 )
-                await session.flush()
-
-            git_meta_map = {
-                gm.file_path: _git_metadata_to_dict(gm)
-                for gm in git_rows
-                if exclude_spec is None or not exclude_spec.match_file(gm.file_path)
-            }
-
-            # Preserve coverage across a re-score. The previous behaviour
-            # rebuilt the analyzer with no coverage_map, nulling every file's
-            # line/branch coverage even though the coverage_files rows still
-            # existed. Reload them (and optionally re-discover a fresh report)
-            # so coverage survives `repowise update`.
-            coverage_map, coverage_files, coverage_format = await _coverage_for_rescore(
-                session, repo_id, repo_path, parsed_files
-            )
-
-            analyzer = HealthAnalyzer(
-                graph_builder.graph(),
-                git_meta_map=git_meta_map,
-                parsed_files=parsed_files,
-                coverage_map=coverage_map,
-                duplication_cache_dir=Path(repo_path) / ".repowise",
-                repo_root=repo_path,
-            )
-            hcfg = HealthConfig.load(repo_path)
-            analyzer_config = (
-                hcfg.to_analyzer_config([pf.file_info.path for pf in parsed_files])
-                if (hcfg.disabled_biomarkers or hcfg.rules)
-                else None
-            )
-            report = analyzer.analyze(analyzer_config)
-
-            console.print(
-                f"Health re-score: [cyan]{len(parsed_files)} files[/cyan], "
-                f"[yellow]{len(report.findings)} findings[/yellow]"
-            )
-
-            await save_health_metrics(session, repo_id, report.metrics or [])
-            await save_health_findings(session, repo_id, list(report.findings or []))
-            if coverage_files:
-                await save_coverage_files(
+                repo_id = repo.id
+                exclusion_plan = await plan_excluded_file_prune(
                     session,
                     repo_id,
-                    coverage_files,
-                    source_format=coverage_format or "lcov",
-                    ingested_commit_sha=getattr(repo, "head_commit", None),
+                    repo_path,
+                    accept_mass_deletion=accept_mass_deletion,
                 )
-            await persist_graph_nodes(session, repo_id, graph_builder)
 
-    await _rescore()
+                live_hint = {pf.file_info.path for pf in parsed_files or []}
+                live_hint |= {
+                    node
+                    for node, data in graph_builder.graph().nodes(data=True)
+                    if data.get("node_type", "file") == "file"
+                }
+                pruned, refusals = await prune_deleted_file_rows(
+                    session,
+                    repo_id,
+                    repo_path,
+                    live_hint=live_hint,
+                    accept_mass_deletion=accept_mass_deletion,
+                    exclusion_plan=exclusion_plan,
+                )
+                outcome = DeletedFilePruneOutcome(
+                    attempted=True,
+                    pruned_paths=pruned,
+                    refusals=tuple(refusals),
+                )
+                if pruned:
+                    console.print(
+                        f"Pruned rows for [cyan]{pruned}[/cyan] deleted or excluded file(s)"
+                    )
+                for refusal in refusals:
+                    console.print(f"[yellow]{refusal.message}[/yellow]")
+
+                # A refusal is a transaction-wide verdict for an exclusion
+                # change. Full-replacing health/refsites underneath it would
+                # enact the same sweep through a different table.
+                if exclusion_plan.refusals:
+                    return outcome
+
+                exclude_spec = build_exclude_spec(repo_path)
+                gm_result = await session.execute(
+                    select(GitMetadata).where(GitMetadata.repository_id == repo_id)
+                )
+                git_rows = list(gm_result.scalars().all())
+                git_meta_map = {
+                    gm.file_path: _git_metadata_to_dict(gm)
+                    for gm in git_rows
+                    if not is_excluded(gm.file_path, exclude_spec)
+                }
+
+                # Preserve coverage across a re-score. The previous behaviour
+                # rebuilt the analyzer with no coverage_map, nulling every file's
+                # line/branch coverage even though the coverage_files rows still
+                # existed. Reload them (and optionally re-discover a fresh report)
+                # so coverage survives `repowise update`.
+                coverage_map, coverage_files, coverage_format = await _coverage_for_rescore(
+                    session, repo_id, repo_path, parsed_files
+                )
+
+                analyzer = HealthAnalyzer(
+                    graph_builder.graph(),
+                    git_meta_map=git_meta_map,
+                    parsed_files=parsed_files,
+                    coverage_map=coverage_map,
+                    duplication_cache_dir=Path(repo_path) / ".repowise",
+                    repo_root=repo_path,
+                )
+                hcfg = HealthConfig.load(repo_path)
+                analyzer_config = (
+                    hcfg.to_analyzer_config([pf.file_info.path for pf in parsed_files])
+                    if (hcfg.disabled_biomarkers or hcfg.rules)
+                    else None
+                )
+                report = analyzer.analyze(analyzer_config)
+
+                console.print(
+                    f"Health re-score: [cyan]{len(parsed_files)} files[/cyan], "
+                    f"[yellow]{len(report.findings)} findings[/yellow]"
+                )
+
+                await save_health_metrics(session, repo_id, report.metrics or [])
+                await save_health_findings(session, repo_id, list(report.findings or []))
+                if coverage_files:
+                    await save_coverage_files(
+                        session,
+                        repo_id,
+                        coverage_files,
+                        source_format=coverage_format or "lcov",
+                        ingested_commit_sha=getattr(repo, "head_commit", None),
+                    )
+                await persist_graph_nodes(session, repo_id, graph_builder)
+
+                if parsed_files:
+                    await persist_reference_sites(
+                        session,
+                        repo_id,
+                        parsed_files,
+                        repo_path=repo_path,
+                    )
+                if exclusion_plan.actionable_paths:
+                    tombstoned_page_ids = await mark_tombstone_pages(
+                        session,
+                        repo_id,
+                        [(path, []) for path in exclusion_plan.actionable_paths],
+                    )
+                    from repowise.core.source_search import source_search_enabled
+
+                    if source_search_enabled():
+                        from repowise.core.source_search.outbox import enqueue_full_update
+
+                        await enqueue_full_update(
+                            session,
+                            repo_id,
+                            repo_path,
+                            parsed_files=parsed_files,
+                        )
+                        source_full_requested = True
+
+            if tombstoned_page_ids:
+                if vector_store is not None:
+                    await vector_store.delete_many(tombstoned_page_ids)
+                fts = FullTextSearch(engine)
+                await fts.ensure_index()
+                await fts.delete_many(tombstoned_page_ids)
+
+            if source_full_requested:
+                from repowise.cli.source_search_runtime import (
+                    reconcile_configured_source_index,
+                )
+
+                await reconcile_configured_source_index(repo_path)
+            return outcome
+        finally:
+            await engine.dispose()
+
+    _ = exclude_patterns  # retained for the shared call signature/documentation
+    return await _rescore()
 
 
 def _run_full_health_rescore(
@@ -1300,6 +1438,8 @@ def _run_full_health_rescore(
     state: dict,
     head: str | None,
     curr_fingerprint: str,
+    *,
+    accept_mass_deletion: bool = False,
 ) -> None:
     """Rebuild graph and re-run full health analysis when config changed.
 
@@ -1328,8 +1468,22 @@ def _run_full_health_rescore(
     with contextlib.suppress(Exception):
         run_async(graph_builder.compute_metrics_parallel())
 
+    from repowise.cli.helpers import load_config
+
+    from .incremental import _build_update_vector_store
+
+    vector_store = _build_update_vector_store(repo_path, load_config(Path(repo_path)))
     try:
-        run_async(_rescore_health_from_db(repo_path, graph_builder, parsed_files, exclude_patterns))
+        prune_outcome = run_async(
+            _rescore_health_from_db(
+                repo_path,
+                graph_builder,
+                parsed_files,
+                exclude_patterns,
+                accept_mass_deletion=accept_mass_deletion,
+                vector_store=vector_store,
+            )
+        )
     except Exception as exc:
         # Return without advancing the fingerprint so the next update retries.
         console.print(f"[yellow]Health re-score failed: {exc}[/yellow]")
@@ -1345,6 +1499,14 @@ def _run_full_health_rescore(
         # These rows were just rewritten by this analyzer.
         "health_analyzer_version": HEALTH_ANALYZER_VERSION,
     }
+    from repowise.core.pipeline.prune_state import apply_prune_outcome
+
+    apply_prune_outcome(
+        new_state,
+        state,
+        prune_outcome,
+        from_commit=state.get("last_sync_commit"),
+    )
     rescored_at = head_commit_ts(repo_path)
     if rescored_at is not None:
         new_state["last_full_rescore_at"] = rescored_at
