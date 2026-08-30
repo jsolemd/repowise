@@ -1498,6 +1498,10 @@ repository, or naming an unwritable path, every mutating verb returns
 table — a decision written only to a local derived store never reaches git, so no teammate
 ever sees it. `list` and `get` keep serving the last projected state and say so.
 
+`list` and `get` report `repo` and `journal_exists` — `journal_exists: false` under journal
+mode means this repo has no journal file yet, not zero decisions; `record` creates it and
+says so with `journal_created: true`.
+
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `action` | string | Yes | `record`, `list`, `get`, `confirm`, or `supersede` |
@@ -1513,7 +1517,7 @@ ever sees it. `list` and `get` keep serving the last projected state and say so.
 | `query` | string | No | Case-insensitive match over title, decision, and why (list) |
 | `recorded_after` / `recorded_before` | string | No | ISO-8601 instant or bare date (list) |
 | `limit` / `offset` | int | No | Page size (capped at 200) and offset (list) |
-| `repo` | string | No | *(workspace only)* Target repo alias; `"all"` is not supported |
+| `repo` | string | No | *(workspace only)* Target repo alias; `"all"` lists across repos (writes and get name one) |
 
 Rows come back in a total order: confirmed rules first, then proposals, then history; newest
 within each, with the id as a final tiebreak (the journal stamps whole seconds, so
