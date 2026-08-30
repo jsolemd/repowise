@@ -48,7 +48,17 @@ STORE_FORMAT_VERSION: int = 2
 #: a Rust macro invocation stopped being extracted as a call. A cache written
 #: before that carries neither field, so the scoped-call, chained-call and
 #: macro fixes would resolve against stale rows instead of firing.
-PARSER_SCHEMA_VERSION: int = 2
+#:
+#: v3: F42 — a contained overload set is one symbol id again (upstream's
+#: identity), where the fork had rewritten each colliding sibling to
+#: ``<lexical id>~<hash of kind + signature>``. Same fields, different values,
+#: which is precisely the case :mod:`repowise.core.ingestion.parse_cache`
+#: reserves this constant for: nothing else in the fingerprint moved (not the
+#: ``.scm`` sources, not a ``models`` dataclass field set), so without this
+#: bump a cache sealed by a pre-F42 build stays acceptable and hands back
+#: ``ParsedFile``s whose symbols still carry ``~<hash>`` ids. Measured: same
+#: bytes, same fingerprint, two identity schemes in one index.
+PARSER_SCHEMA_VERSION: int = 3
 
 #: state.json key holding the store format version that wrote the store.
 STORE_FORMAT_VERSION_KEY = "store_format_version"
