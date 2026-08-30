@@ -14,7 +14,7 @@ the bytes; this module decides what text goes in the index.
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from functools import cache
 from pathlib import PurePosixPath
@@ -28,6 +28,7 @@ __all__ = [
     "TRUNCATION_MARKER",
     "WINDOW_LINES",
     "WINDOW_STRIDE",
+    "SmartCap",
     "SourceChunk",
     "SymbolRecord",
     "apply_smart_cap",
@@ -38,6 +39,7 @@ __all__ = [
     "looks_binary",
     "parser_eligible",
     "recipe_parameters",
+    "smart_cap",
     "window_eligible",
 ]
 
@@ -186,18 +188,103 @@ def chunk_content_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def apply_smart_cap(text: str, cap: int = SMART_CAP_CHARS) -> str:
-    """Hold *text* to *cap* characters by dropping its middle, not its tail.
+@dataclass(frozen=True, slots=True)
+class SmartCap:
+    """The outcome of one :func:`smart_cap` call.
 
-    Under the cap the text is returned unchanged, so the common case is
-    identity. Over it, the head and tail shares are taken of the *cap* rather
-    than of the input, which is what makes the output length a constant.
+    ``cap_basis`` is the unit the cap was measured in, and it is the field
+    worth reporting: characters are a *proxy* for what an embedding endpoint
+    actually rejects, and the proxy is wrong by a factor of four either way
+    depending on the text. A caller that logs "truncated" without the basis
+    cannot tell a real overrun from a mis-sized guess.
     """
-    if len(text) <= cap:
-        return text
-    head = int(cap * _CAP_HEAD_SHARE)
-    tail = int(cap * _CAP_TAIL_SHARE)
-    return text[:head] + TRUNCATION_MARKER + text[-tail:]
+
+    text: str
+    truncated: bool
+    cap_basis: str
+    measured: int
+    cap: int
+
+
+def _cut_to_budget(text: str, budget: int, counter: Callable[[str], int], *, tail: bool) -> str:
+    """Longest prefix (or suffix) of *text* whose token count fits *budget*.
+
+    Binary search, so a tokenizer is called ~log2(len(text)) times rather than
+    once per candidate length. BPE token counts are monotone in prefix length
+    only *almost* everywhere — one more character can merge two tokens into
+    one — so the search can settle one or two characters short of the longest
+    fitting cut. It can never settle long: ``best`` only advances on a
+    measurement that fit, which is the direction that matters.
+    """
+    if budget <= 0 or not text:
+        return ""
+    lo, hi, best = 0, len(text), 0
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        piece = text[-mid:] if (tail and mid) else text[:mid]
+        if counter(piece) <= budget:
+            best = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    if best == 0:
+        return ""
+    return text[-best:] if tail else text[:best]
+
+
+def smart_cap(
+    text: str,
+    cap: int = SMART_CAP_CHARS,
+    *,
+    token_counter: Callable[[str], int] | None = None,
+) -> SmartCap:
+    """Hold *text* to *cap* by dropping its middle, and say how it was measured.
+
+    Without *token_counter* the cap is characters and the result is what this
+    module has always produced — the chunk recipe's path, which must stay
+    byte-identical or every stored vector is invalidated. With one, *cap* is
+    read as a token budget and the counter measures it: the head and tail
+    shares are taken of the budget in tokens, so a token-dense input is cut
+    where an endpoint would actually reject it rather than where a
+    four-characters-per-token guess said it might.
+
+    The counter is called once for text that fits, which is the common case;
+    only an over-budget text pays for the search that finds the cut.
+    """
+    if token_counter is None:
+        measured = len(text)
+        basis = "chars"
+        if measured <= cap:
+            return SmartCap(text, False, basis, measured, cap)
+        head = int(cap * _CAP_HEAD_SHARE)
+        tail = int(cap * _CAP_TAIL_SHARE)
+        return SmartCap(text[:head] + TRUNCATION_MARKER + text[-tail:], True, basis, measured, cap)
+
+    measured = token_counter(text)
+    basis = "tokens"
+    if measured <= cap:
+        return SmartCap(text, False, basis, measured, cap)
+    # The shares leave 4% of the budget unspent, which is what pays for the
+    # marker itself — the same slack the character path relies on.
+    head_text = _cut_to_budget(text, int(cap * _CAP_HEAD_SHARE), token_counter, tail=False)
+    tail_text = _cut_to_budget(text, int(cap * _CAP_TAIL_SHARE), token_counter, tail=True)
+    return SmartCap(head_text + TRUNCATION_MARKER + tail_text, True, basis, measured, cap)
+
+
+def apply_smart_cap(
+    text: str,
+    cap: int = SMART_CAP_CHARS,
+    *,
+    token_counter: Callable[[str], int] | None = None,
+) -> str:
+    """The capped text from :func:`smart_cap`, for callers that want only it.
+
+    The chunk recipe calls it with no counter and must keep doing so: the
+    recipe fingerprint declares ``smart_cap_chars`` and nothing else, so a
+    token-measured chunk would be indistinguishable from a character-measured
+    one in a stored index.
+    """
+    return smart_cap(text, cap, token_counter=token_counter).text
 
 
 def looks_binary(data: bytes) -> bool:

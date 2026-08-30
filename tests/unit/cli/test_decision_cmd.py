@@ -50,6 +50,16 @@ def _seed_wiki_db(repo_root: Path, decisions: list[dict]) -> None:
     asyncio.run(_build())
 
 
+def _payload(result) -> dict:
+    """The JSON document out of a stream that also carries notices.
+
+    ``--format json`` sends every human-facing aside to stderr and ``CliRunner``
+    mixes the two, so a payload is read from the first brace on — the same
+    slice ``test_doctor_json`` takes.
+    """
+    return json.loads(result.output[result.output.index("{") :])
+
+
 @pytest.fixture
 def indexed_repo(tmp_path: Path) -> Path:
     repo = tmp_path / "repo"
@@ -90,7 +100,7 @@ def test_decision_add_records_without_prompting(indexed_repo: Path) -> None:
     )
 
     assert result.exit_code == 0, result.output
-    payload = json.loads(result.output)
+    payload = _payload(result)
     assert payload["decision"]["title"] == "Escape LIKE patterns"
     assert len(payload["decision"]["id"]) > 8, "the full id, not the table's prefix"
 
@@ -98,7 +108,7 @@ def test_decision_add_records_without_prompting(indexed_repo: Path) -> None:
         cli, ["decision", "show", payload["decision"]["id"], str(indexed_repo), "--format", "json"]
     )
     assert shown.exit_code == 0, shown.output
-    record = json.loads(shown.output)["decision"]
+    record = _payload(shown)["decision"]
     assert record["rationale"] == "an unescaped pattern scans the table"
     assert record["alternatives"] == ["match in Python"]
     assert record["consequences"] == ["one more helper on the query path"]
@@ -126,7 +136,7 @@ def test_a_flag_driven_decision_lands_proposed(indexed_repo: Path) -> None:
     )
 
     assert result.exit_code == 0, result.output
-    assert json.loads(result.output)["decision"]["status"] == "proposed"
+    assert _payload(result)["decision"]["status"] == "proposed"
 
 
 def test_decision_add_prompts_record_active(indexed_repo: Path) -> None:
@@ -140,7 +150,7 @@ def test_decision_add_prompts_record_active(indexed_repo: Path) -> None:
     listed = CliRunner().invoke(
         cli, ["decision", "list", str(indexed_repo), "--format", "json"]
     )
-    records = json.loads(listed.output)["decisions"]
+    records = _payload(listed)["decisions"]
     assert [d["status"] for d in records if d["title"] == "Interactive title"] == ["active"]
 
 
@@ -158,7 +168,7 @@ def test_half_a_command_line_is_an_error_not_a_prompt(indexed_repo: Path) -> Non
     )
 
     assert result.exit_code == 1, result.output
-    assert json.loads(result.output)["error"].startswith("--title and --decision")
+    assert _payload(result)["error"].startswith("--title and --decision")
 
 
 def test_decision_add_help_lists_a_flag_per_field() -> None:
@@ -329,3 +339,111 @@ def test_decision_health_prints_summary(indexed_repo: Path) -> None:
     assert "Decision Health" in result.output
     assert "Active decisions" in result.output
     assert "Proposed (needs review)" in result.output
+
+
+# ---------------------------------------------------------------------------
+# --repo, and what the derived store is (F48)
+# ---------------------------------------------------------------------------
+
+
+def test_the_derived_store_says_it_is_machine_local(indexed_repo: Path) -> None:
+    """Without a journal, a decision reaches nobody but this machine.
+
+    ``.repowise`` is derived, gitignored and rebuilt by any reindex, so a row
+    recorded there is gone on the next full index and was never visible to a
+    teammate. The command looks identical in both modes, and the difference
+    only ever showed up as a decision that had quietly disappeared. The MCP
+    tool refuses to write in this state; the CLI has always written, so it says
+    what it wrote instead of changing under callers that depend on it.
+    """
+    result = CliRunner().invoke(
+        cli,
+        [
+            "decision",
+            "add",
+            "--title",
+            "Machine-local for now",
+            "--decision",
+            "Write to the derived store",
+            str(indexed_repo),
+        ],
+        input="",
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Machine-local" in result.output
+    assert "REPOWISE_DECISIONS_JOURNAL" in result.output
+
+
+def test_a_journal_backed_add_says_nothing_about_being_machine_local(
+    indexed_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("REPOWISE_DECISIONS_JOURNAL", ".codeatlas/decisions.jsonl")
+    (indexed_repo / "src").mkdir(exist_ok=True)
+    (indexed_repo / "src" / "thing.py").write_text("VALUE = 1\n", encoding="utf-8")
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "decision",
+            "add",
+            "--title",
+            "Journal backed",
+            "--decision",
+            "Write to the journal",
+            "--rationale",
+            "git is the review surface",
+            "--affects",
+            "src/thing.py",
+            str(indexed_repo),
+        ],
+        input="",
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Machine-local" not in result.output
+
+
+def test_repo_alias_is_refused_outside_a_workspace(
+    indexed_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One repo has no aliases, so the flag has nothing to resolve against.
+
+    Refused with the reason rather than silently ignored: an alias that does
+    nothing would look like it had targeted something.
+    """
+    monkeypatch.chdir(indexed_repo)
+    result = CliRunner().invoke(
+        cli,
+        ["decision", "list", "--repo", "graph"],
+    )
+
+    assert result.exit_code != 0
+    assert "--repo graph needs a workspace" in result.output
+
+
+def test_repo_alias_and_path_cannot_be_combined(indexed_repo: Path) -> None:
+    result = CliRunner().invoke(
+        cli,
+        ["decision", "list", "--repo", "graph", str(indexed_repo)],
+    )
+
+    assert result.exit_code != 0
+    assert "not both" in result.output
+
+
+@pytest.mark.parametrize(
+    "subcommand",
+    ["add", "list", "show", "confirm", "dismiss", "deprecate", "health"],
+)
+def test_every_decision_subcommand_offers_the_alias(subcommand: str) -> None:
+    """One surface, not five of seven.
+
+    A flag present on some subcommands and absent on the rest is worse than
+    one that is missing everywhere, because the shape of the gap has to be
+    memorised.
+    """
+    result = CliRunner().invoke(cli, ["decision", subcommand, "--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "--repo ALIAS" in result.output

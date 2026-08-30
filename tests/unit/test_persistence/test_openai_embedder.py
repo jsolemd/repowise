@@ -12,7 +12,8 @@ import pytest
 
 pytest.importorskip("openai", reason="openai SDK not installed")
 
-from repowise.core.providers.embedding.openai import OpenAIEmbedder
+from repowise.core.providers.embedding.openai import OpenAIEmbedder, _token_counter_for
+from repowise.core.source_search.chunks import TRUNCATION_MARKER
 
 # ---------------------------------------------------------------------------
 # Construction
@@ -278,3 +279,114 @@ async def test_embed_width_check_is_skipped_for_empty_response():
     # must not fire on the empty list itself.
     emb = OpenAIEmbedder(api_key="k")
     assert await emb.embed([]) == []
+
+
+# ---------------------------------------------------------------------------
+# Per-input cap (F34) — the request the endpoint would refuse
+# ---------------------------------------------------------------------------
+#
+# The batch writers cap on the way in (``iter_embed_chunks``), but three paths
+# reach an embedder without them: the single-item ``embed_and_upsert``, the
+# source-search query leg, and the source indexer. OpenAI does not truncate an
+# oversized input — it rejects the whole request, so one long page took its
+# batch down with it and the loss showed up only as missing vectors.
+
+
+async def _capture_input(emb: OpenAIEmbedder, texts: list[str]) -> list[str]:
+    captured: dict = {}
+
+    def fake_create(**kwargs):
+        captured.update(kwargs)
+        width = emb.dimensions
+        return _make_mock_response([[1.0] + [0.0] * (width - 1) for _ in kwargs["input"]])
+
+    with patch("openai.OpenAI") as mock_client:
+        mock_client.return_value.embeddings.create.side_effect = fake_create
+        await emb.embed(texts)
+    return list(captured["input"])
+
+
+async def test_an_oversized_input_is_shortened_before_the_http_call():
+    from repowise.core.persistence.vector_store._base import EMBED_TEXT_MAX_TOKENS
+
+    emb = OpenAIEmbedder(api_key="k", dimensions=2)
+    # Ordinary prose/source, so the real tokenizer path runs: ~4 characters to
+    # a token puts 200,000 characters an order of magnitude over the budget.
+    text = "the quick brown fox jumps over the lazy dog " * 5000
+    sent = await _capture_input(emb, [text])
+
+    assert len(sent[0]) < len(text)
+    counter = _token_counter_for(emb._model)
+    assert counter is not None, "tiktoken should be resolvable in the test env"
+    assert counter(sent[0]) <= EMBED_TEXT_MAX_TOKENS
+
+
+async def test_a_text_within_the_cap_is_sent_byte_for_byte():
+    emb = OpenAIEmbedder(api_key="k", dimensions=2)
+    sent = await _capture_input(emb, ["hello", "world"])
+    assert sent == ["hello", "world"]
+
+
+async def test_a_token_dense_text_the_character_cap_would_pass_is_cut(monkeypatch):
+    """The bug the character cap cannot see.
+
+    10,000 characters is a third of ``EMBED_TEXT_MAX_CHARS`` and would sail
+    through it. At four tokens to the character it is 40,000 tokens, which the
+    endpoint refuses outright.
+    """
+    monkeypatch.setattr(
+        "repowise.core.providers.embedding.openai._token_counter_for",
+        lambda model: lambda text: len(text) * 4,
+    )
+    emb = OpenAIEmbedder(api_key="k", dimensions=2)
+    text = "zz " * 3_334  # short words, so the quadratic-run guard stays out of it
+
+    sent = await _capture_input(emb, [text])
+    assert len(sent[0]) < len(text)
+    body = sent[0].replace(TRUNCATION_MARKER, "")
+    assert len(body) * 4 <= 8_000
+
+
+async def test_a_long_unbroken_run_falls_back_to_the_character_cap(monkeypatch):
+    """The tokenizer is quadratic in the length of one unbroken word.
+
+    Measured on cl100k: a 30,000-character run costs 200 ms *per input, per
+    request*. Text like that is generated data, and the character cap is what
+    it gets instead — a cap that binds, at a cost that does not.
+    """
+    from repowise.core.persistence.vector_store._base import EMBED_TEXT_MAX_CHARS
+
+    calls: list[int] = []
+
+    def counted(model):
+        def _count(text: str) -> int:
+            calls.append(len(text))
+            return len(text) // 4
+
+        return _count
+
+    monkeypatch.setattr("repowise.core.providers.embedding.openai._token_counter_for", counted)
+    emb = OpenAIEmbedder(api_key="k", dimensions=2)
+
+    sent = await _capture_input(emb, ["x" * 40_000])
+    assert calls == [], "the tokenizer must not see a text it would choke on"
+    assert len(sent[0]) == int(EMBED_TEXT_MAX_CHARS * 0.68) + len(TRUNCATION_MARKER) + int(
+        EMBED_TEXT_MAX_CHARS * 0.28
+    )
+
+
+async def test_the_cut_is_reported_with_the_basis_that_measured_it(capsys):
+    """Debug level, and structlog's own stream — hence capsys, not caplog.
+
+    The basis is the part worth logging: "truncated" alone cannot distinguish
+    a real overrun from a character cap that guessed wrong.
+    """
+    emb = OpenAIEmbedder(api_key="k", dimensions=2)
+    text = "the quick brown fox jumps over the lazy dog " * 5000
+
+    await _capture_input(emb, [text])
+
+    out = capsys.readouterr().out
+    assert "openai_embed_input_truncated" in out
+    assert "cap_basis=tokens" in out
+    assert "truncated=1" in out

@@ -16,6 +16,8 @@ from repowise.core.source_search.chunks import (
     build_symbol_chunk,
     iter_file_windows,
     looks_binary,
+    recipe_parameters,
+    smart_cap,
     window_eligible,
 )
 
@@ -161,6 +163,124 @@ def test_the_cap_applies_to_symbol_chunks():
     )
     assert TRUNCATION_MARKER in chunk.text
     assert len(chunk.text) < SMART_CAP_CHARS + len(TRUNCATION_MARKER)
+
+
+# ---------------------------------------------------------------------------
+# Token-aware cap (F35)
+# ---------------------------------------------------------------------------
+#
+# ``SMART_CAP_CHARS`` measures characters, and characters are a proxy for what
+# an embedding endpoint actually refuses. The proxy is off by a factor of four
+# in both directions — 30,000 characters of CJK is 28,500 tokens, 30,000 of
+# ASCII source is 6,800 — so the cap either wastes most of the budget or fails
+# to bind at all, depending on the text. A caller that can count tokens passes
+# a counter and gets the real limit; one that cannot keeps the old behaviour.
+
+
+def _one_token_per_char(text: str) -> int:
+    """The densest a tokenizer can be: every character its own token."""
+    return len(text)
+
+
+def _four_tokens_per_char(text: str) -> int:
+    """Denser than any real tokenizer, so a short text is over any budget."""
+    return len(text) * 4
+
+
+def test_the_default_path_reports_characters_and_returns_the_old_text():
+    fits = smart_cap("x" * SMART_CAP_CHARS)
+    assert (fits.text, fits.truncated, fits.cap_basis) == ("x" * SMART_CAP_CHARS, False, "chars")
+
+    over = smart_cap("x" * (SMART_CAP_CHARS + 1))
+    assert over.truncated is True
+    assert over.cap_basis == "chars"
+    assert over.measured == SMART_CAP_CHARS + 1
+    assert over.text == apply_smart_cap("x" * (SMART_CAP_CHARS + 1))
+
+
+def test_a_counter_switches_the_basis_to_tokens():
+    result = smart_cap("abcdefghij", cap=100, token_counter=_one_token_per_char)
+    assert (result.truncated, result.cap_basis, result.measured) == (False, "tokens", 10)
+
+
+def test_the_counter_is_called_once_for_a_text_that_fits():
+    """The common case must not pay for a search it does not need."""
+    calls = []
+
+    def counting(text: str) -> int:
+        calls.append(len(text))
+        return len(text)
+
+    smart_cap("short enough", cap=1000, token_counter=counting)
+    assert calls == [len("short enough")]
+
+
+def test_a_text_the_character_cap_would_pass_is_cut_by_tokens():
+    """The case the character cap cannot see.
+
+    2,000 characters is far inside ``SMART_CAP_CHARS`` and untouched by the
+    default path, while a tokenizer that measures four tokens to the character
+    puts it at 8,000 — over the 1,000-token budget asked for here.
+    """
+    text = "y" * 2000
+    assert apply_smart_cap(text) == text
+
+    result = smart_cap(text, cap=1000, token_counter=_four_tokens_per_char)
+    assert result.truncated is True
+    assert result.cap_basis == "tokens"
+    assert result.measured == 8000
+    assert TRUNCATION_MARKER in result.text
+    head, tail = result.text.split(TRUNCATION_MARKER)
+    # Head and tail shares are taken of the *budget in tokens*, then converted
+    # back to characters by the counter: 680 tokens is 170 characters at this
+    # density, 280 tokens is 70.
+    assert _four_tokens_per_char(head) <= int(1000 * 0.68)
+    assert _four_tokens_per_char(tail) <= int(1000 * 0.28)
+    assert head == "y" * 170
+    assert tail == "y" * 70
+
+
+def test_the_token_cut_never_overshoots_its_budget():
+    """A cut that fits is the invariant; the exact length is not.
+
+    BPE counts are only almost monotone in prefix length, so the search may
+    land a character or two short. It must never land long.
+    """
+    text = "".join(chr(ord("a") + i % 26) for i in range(4000))
+    result = smart_cap(text, cap=200, token_counter=_one_token_per_char)
+    head, tail = result.text.split(TRUNCATION_MARKER)
+    assert len(head) <= int(200 * 0.68)
+    assert len(tail) <= int(200 * 0.28)
+    assert result.truncated is True
+
+
+def test_a_budget_that_rounds_to_nothing_yields_an_empty_side():
+    """A cap so small the tail share is zero must not slice the whole string.
+
+    ``text[-0:]`` is the whole text, which would return more than the cap
+    rather than less — the one way this could fail open.
+    """
+    result = smart_cap("abcdef", cap=1, token_counter=_one_token_per_char)
+    assert result.text == TRUNCATION_MARKER
+    assert result.truncated is True
+
+
+def test_the_recipe_fingerprint_inputs_are_untouched_by_the_token_option():
+    """Existing indexes must not re-embed.
+
+    ``recipe_parameters`` is hashed verbatim into the manifest's recipe
+    fingerprint, so this pins the exact pairs. The token option is deliberately
+    absent from them: it belongs to a caller, not to the chunk recipe, and the
+    recipe calls the cap with no counter.
+    """
+    assert recipe_parameters() == (
+        ("recipe_version", "source-chunk/1"),
+        ("smart_cap_chars", "6000"),
+        ("cap_head_share", "0.6800"),
+        ("cap_tail_share", "0.2800"),
+        ("window_lines", "160"),
+        ("window_stride", "120"),
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -19,6 +19,7 @@ from ..search import SearchResult
 __all__ = [
     "EMBED_BATCH_MAX_ITEMS",
     "EMBED_TEXT_MAX_CHARS",
+    "EMBED_TEXT_MAX_TOKENS",
     "STORED_SNIPPET_CHARS",
     "VectorStore",
     "cosine_similarity",
@@ -40,6 +41,16 @@ EMBED_BATCH_MAX_ITEMS = 16
 # Per-input cap (~7.5k tokens): embedding models reject a single input past
 # ~8,192 tokens, and one oversized page must not sink its whole chunk.
 EMBED_TEXT_MAX_CHARS = 30_000
+
+# The same ceiling for a caller that can count tokens instead of guessing at
+# them. Characters are a proxy, and the ratio behind the 30,000 above (four
+# characters to a token) is an average over prose: minified JSON, base64 blobs
+# and CJK source comments run two to three times denser, so a text well inside
+# the character cap can still be the 8,192-token input the endpoint refuses.
+# Below the hard limit rather than at it, because the same margin that makes
+# 30,000 safe has to survive a tokenizer that disagrees with the server's by a
+# few tokens.
+EMBED_TEXT_MAX_TOKENS = 8_000
 
 # How much of a page's content a vector row keeps for its evidence snippet.
 #

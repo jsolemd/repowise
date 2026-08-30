@@ -920,6 +920,11 @@ repowise decision deprecate ID [PATH]   # mark deprecated
 repowise decision health [PATH]         # health dashboard
 ```
 
+Every subcommand takes `--repo <alias>` in workspace mode, naming one of the
+workspace's repos instead of the primary. It is an alternative to the positional
+path, not a modifier of it, so passing both is an error; an unknown alias lists
+the ones that exist. Outside a workspace the flag is refused rather than ignored.
+
 **List options:**
 
 | Flag | Description |
@@ -934,9 +939,17 @@ repowise decision health [PATH]         # health dashboard
 
 When `REPOWISE_DECISIONS_JOURNAL` names a repository-relative JSONL file,
 `decision list`, `show`, and `health` refresh their database projection from
-that file. Interactive `add` and `confirm` write through to it. Proposal-only
-non-interactive adds, `dismiss`, and `deprecate` exit with an explicit error
+that file, and `add` and `confirm` write through to it. Interactive `add` lands
+`confirmed`; a flag-driven `add` lands a proposal with `confirmed_at` null, the
+same state the MCP tool records — `confirm` is the only promotion, and the git
+diff is where a human reviews it. Both forms still require a rationale and at
+least one `--affects` anchor, since a row with neither can be neither reviewed
+nor scored for staleness. `dismiss` and `deprecate` exit with an explicit error
 because the canonical journal format has no equivalent state.
+
+Without that variable set, `add` writes to the derived `.repowise` store
+instead and says so: that store is gitignored and rebuilt by any reindex, so
+the row reaches nobody else and does not survive the next full index.
 
 ---
 

@@ -30,9 +30,96 @@ from __future__ import annotations
 import asyncio
 import math
 import os
+import re
+from collections.abc import Callable
+from functools import lru_cache
 from typing import Any, ClassVar
 
+import structlog
+
 from repowise.core.providers.embedding.base import resolve_embedding_timeout
+from repowise.core.source_search.chunks import smart_cap
+
+log = structlog.get_logger(__name__)
+
+
+@lru_cache(maxsize=1)
+def _input_policy() -> tuple[int, int]:
+    """``(char cap, token cap)`` — the per-input ceiling, from its owner.
+
+    Imported here rather than at module scope because reaching
+    ``repowise.core.persistence`` pulls the ORM and the CRUD layer onto the
+    path, and an embedder has to stay importable without them. Read from that
+    module rather than restated, so there is one number to change.
+    """
+    from repowise.core.persistence.vector_store._base import (
+        EMBED_TEXT_MAX_CHARS,
+        EMBED_TEXT_MAX_TOKENS,
+    )
+
+    return EMBED_TEXT_MAX_CHARS, EMBED_TEXT_MAX_TOKENS
+
+
+#: Longest unbroken word-character run a text may hold and still be handed to
+#: the tokenizer. BPE merges within one such run, and the merge is quadratic in
+#: its length: measured on cl100k, a 4k run costs 3.5 ms, an 8k run 14 ms and a
+#: 30k run 200 ms — per input, per request. Above the threshold the cap falls
+#: back to characters, which is what "where a tokenizer is cheaply available"
+#: has to mean if the phrase is to bind on anything.
+#:
+#: This does not cost the case token counting exists for. Real dense text —
+#: CJK prose, minified JSON, base64 — carries punctuation or digits that break
+#: the run (measured: 30k of punctuated CJK tokenizes in 2.4 ms and reports
+#: 28,500 tokens, which is the 3.5x undercount the character cap makes). What
+#: it excludes is a single 4k-character word, which is generated data.
+_TOKENIZER_MAX_RUN = 4096
+_LONG_RUN_RE = re.compile(rf"\w{{{_TOKENIZER_MAX_RUN + 1},}}")
+
+
+def _tokenizer_is_cheap(text: str) -> bool:
+    """Whether *text* can be tokenized without paying the quadratic case.
+
+    One regex search, ~0.6 ms on a 30,000-character input — two orders of
+    magnitude below what it is there to avoid.
+    """
+    return _LONG_RUN_RE.search(text) is None
+
+
+@lru_cache(maxsize=8)
+def _token_counter_for(model: str) -> Callable[[str], int] | None:
+    """A tiktoken counter for *model*, or ``None`` to fall back to characters.
+
+    Resolved once per model and cached, because the first resolution may fetch
+    an encoding file over the network; after that it is local and fast. Every
+    failure path — tiktoken absent, offline, a model name it has never heard
+    of — returns ``None`` rather than raising, since a cap measured in
+    characters is what the rest of the codebase already uses and is strictly
+    better than no cap at all.
+
+    ``disallowed_special=()`` matters: by default tiktoken *raises* when the
+    text contains ``<|endoftext|>``, and the text here is source code, which
+    may legitimately contain that string.
+    """
+    try:
+        import tiktoken
+    except ImportError:
+        return None
+    encoding: Any
+    try:
+        encoding = tiktoken.encoding_for_model(model)
+    except Exception:
+        # A local OpenAI-compatible endpoint's model name is not in tiktoken's
+        # table. cl100k_base is what every current OpenAI embedding model uses,
+        # so it is the right guess rather than a refusal.
+        try:
+            encoding = tiktoken.get_encoding("cl100k_base")
+        except Exception:
+            return None
+
+    def _count(text: str) -> int:
+        return len(encoding.encode(text, disallowed_special=()))
+
+    return _count
 
 
 class OpenAIEmbedder:
@@ -123,6 +210,55 @@ class OpenAIEmbedder:
     def dimensions(self) -> int:
         return self._dimensions
 
+    def _cap_inputs(self, texts: list[str]) -> list[str]:
+        """Hold every input to the per-input ceiling before it is sent.
+
+        The batch writers cap on the way in (``iter_embed_chunks``), but three
+        paths reach an embedder without passing through them — the single-item
+        ``embed_and_upsert``, the source-search query leg, and the source
+        indexer — and OpenAI does not truncate an oversized input, it refuses
+        the whole request. A refusal there is not one lost page: it is the
+        batch, and on the query leg it is the search. Capping here is the
+        backstop for every caller at once, and it reuses the chunk recipe's
+        head-and-tail cut rather than inventing a second truncation policy.
+        """
+        char_cap, token_cap = _input_policy()
+        counter = _token_counter_for(self._model)
+        capped: list[str] = []
+        truncated: dict[str, int] = {}
+        largest: dict[str, int] = {}
+        for text in texts:
+            # Every token is at least one character, so a text shorter than the
+            # token budget is under both caps and needs neither the tokenizer
+            # nor the scan that decides whether to use it. This is the whole
+            # index path: a source chunk is capped at 6,000 characters upstream.
+            if len(text) <= token_cap:
+                capped.append(text)
+                continue
+            text_counter = counter if _tokenizer_is_cheap(text) else None
+            cap = token_cap if text_counter is not None else char_cap
+            result = smart_cap(text, cap, token_counter=text_counter)
+            if result.truncated:
+                truncated[result.cap_basis] = truncated.get(result.cap_basis, 0) + 1
+                largest[result.cap_basis] = max(largest.get(result.cap_basis, 0), result.measured)
+            capped.append(result.text)
+        for basis, count in truncated.items():
+            # Debug, not error: the batch path already reports its own cut at
+            # error level, and this one fires for the same page a second time.
+            # What is new here is the basis — a text the character cap waved
+            # through can still be over the token limit, and that is the case
+            # this line exists to name.
+            log.debug(
+                "openai_embed_input_truncated",
+                truncated=count,
+                of=len(texts),
+                cap=token_cap if basis == "tokens" else char_cap,
+                cap_basis=basis,
+                largest=largest[basis],
+                model=self._model,
+            )
+        return capped
+
     async def embed(self, texts: list[str]) -> list[list[float]]:
         """Embed a batch of texts using OpenAI.
 
@@ -138,6 +274,7 @@ class OpenAIEmbedder:
         if not texts:
             return []
 
+        texts = self._cap_inputs(texts)
         model = self._model
         timeout = self._timeout
         request_dimensions = self._request_dimensions
