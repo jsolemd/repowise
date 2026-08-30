@@ -44,6 +44,12 @@ def _print_repo_result(result: Any) -> None:
             f"    [green]✓[/green] {result.alias}: "
             f"{result.file_count} files, {result.symbol_count:,} symbols"
         )
+        if result.prune_outcome.pruned_paths:
+            console.print(
+                f"      Pruned rows for {result.prune_outcome.pruned_paths} deleted file(s)"
+            )
+        for refusal in result.prune_outcome.refusals:
+            console.print(f"      [yellow]{refusal.message}[/yellow]")
 
 
 def _workspace_update(
@@ -63,6 +69,7 @@ def _workspace_update(
     no_cost_tracking: bool = False,
     progress: str = "rich",
     include_working_tree: bool = False,
+    accept_mass_deletion: bool = False,
 ) -> None:
     """Update stale repos in a workspace.
 
@@ -117,14 +124,28 @@ def _workspace_update(
         stored = entry.last_commit_at_index
         commit_stale, head, behind = check_repo_staleness(abs_path, stored)
         indexed = (abs_path / ".repowise").is_dir()
-        repo_state = load_state(abs_path) if indexed and include_working_tree else None
+        repo_state = (
+            load_state(abs_path)
+            if indexed and (include_working_tree or accept_mass_deletion)
+            else None
+        )
         has_uncommitted_changes = (
             include_working_tree and indexed and has_working_tree_changes(abs_path)
         )
         has_working_tree_cleanup = bool(
             include_working_tree and indexed and repo_state and repo_state.get("working_tree_paths")
         )
-        is_stale = commit_stale or has_uncommitted_changes or has_working_tree_cleanup
+        from repowise.core.pipeline.prune_state import state_prune_refusals
+
+        has_accepted_prune = bool(
+            accept_mass_deletion and repo_state and state_prune_refusals(repo_state)
+        )
+        is_stale = (
+            commit_stale
+            or has_uncommitted_changes
+            or has_working_tree_cleanup
+            or has_accepted_prune
+        )
         if not indexed:
             status = "[dim]not indexed[/dim]"
         elif is_stale:
@@ -135,6 +156,8 @@ def _workspace_update(
                 reasons.append("uncommitted changes")
             elif has_working_tree_cleanup:
                 reasons.append("working-tree cleanup")
+            if has_accepted_prune:
+                reasons.append("accepted mass-deletion repair")
             status = f"[yellow]{', '.join(reasons)}[/yellow]"
         else:
             status = "[green]up to date[/green]"
@@ -226,13 +249,13 @@ def _workspace_update(
             no_cost_tracking=no_cost_tracking,
             progress=progress,
             include_working_tree=include_working_tree,
+            accept_mass_deletion=accept_mass_deletion,
         )
         return
 
     # Run the updates
     def _on_start(alias: str) -> None:
         console.print(f"  Updating [bold]{alias}[/bold]...")
-
 
     results = run_async(
         update_workspace(
@@ -243,6 +266,7 @@ def _workspace_update(
             on_repo_start=_on_start,
             on_repo_done=_print_repo_result,
             include_working_tree=include_working_tree,
+            accept_mass_deletion=accept_mass_deletion,
         )
     )
 
@@ -369,6 +393,7 @@ def _workspace_docs_update(
     no_cost_tracking: bool,
     progress: str,
     include_working_tree: bool,
+    accept_mass_deletion: bool,
 ) -> None:
     """Update a workspace where at least one stale repo wants docs.
 
@@ -421,6 +446,7 @@ def _workspace_docs_update(
                 on_repo_start=_on_start,
                 on_repo_done=_print_repo_result,
                 include_working_tree=include_working_tree,
+                accept_mass_deletion=accept_mass_deletion,
             )
         )
         changed_aliases.extend(r.alias for r in core_results if r.updated)
@@ -471,6 +497,7 @@ def _workspace_docs_update(
                 progress="rich",
                 skip_cross_repo_hooks=True,
                 include_working_tree=include_working_tree,
+                accept_mass_deletion=accept_mass_deletion,
             )
         except Exception as exc:
             docs_failed += 1

@@ -135,7 +135,7 @@ async def test_every_page_absent_is_refused_rather_than_obeyed(
     assert "tombstone_sweep_refused" in caplog.text
 
 
-async def test_only_file_pages_are_swept(session, tmp_path: Path):
+async def test_only_file_derived_pages_are_swept(session, tmp_path: Path):
     """A module page's target_path is a grouping, not a file that must exist.
 
     Several page types carry a target_path that never named a file — a
@@ -144,11 +144,19 @@ async def test_only_file_pages_are_swept(session, tmp_path: Path):
     """
     repo_id = await _seed(session, tmp_path, "community-7", page_type="module_page")
     await _seed(session, tmp_path, "kept.py", "gone.py")
+    await _seed(session, tmp_path, "gone.py::Widget", page_type="symbol_spotlight")
+    await _seed(session, tmp_path, "gone.py", page_type="api_contract")
+    await _seed(session, tmp_path, "gone.py", page_type="infra_page")
     _write(tmp_path, "kept.py")
 
     marked = await tombstone_absent_file_pages(session, repo_id, tmp_path)
 
-    assert marked == ["file_page:gone.py"]
+    assert set(marked) == {
+        "file_page:gone.py",
+        "symbol_spotlight:gone.py::Widget",
+        "api_contract:gone.py",
+        "infra_page:gone.py",
+    }
     assert await _status(session, "module_page:community-7") == "fresh"
 
 

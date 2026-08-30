@@ -171,6 +171,43 @@ def test_no_relevant_changes_still_reports_updated(tmp_path, forbid_full_pipelin
     assert result.file_count == 0
 
 
+def test_accept_mass_deletion_reopens_the_refused_commit_range(tmp_path, monkeypatch):
+    """The override must reach the old deletion after the sync pointer advanced."""
+    from repowise.core.workspace import update as update_module
+    from repowise.core.workspace.update import RepoUpdateResult
+
+    repo = _make_git_repo(tmp_path)
+    base = get_head_commit(repo)
+    head = _add_commit(repo, "b.py")
+    _mark_indexed(
+        repo,
+        head,
+        prune_refusals={
+            "from_commit": base,
+            "findings": [
+                {
+                    "table": "graph_nodes",
+                    "candidate_paths": 30,
+                    "persisted_paths": 40,
+                }
+            ],
+        },
+    )
+    seen: dict[str, object] = {}
+
+    async def fake_incremental(repo_path, **kwargs):
+        seen.update(repo_path=repo_path, **kwargs)
+        return RepoUpdateResult(alias=repo.name, updated=True)
+
+    monkeypatch.setattr(update_module, "_incremental_repo_update", fake_incremental)
+
+    result = asyncio.run(update_single_repo_index(repo, accept_mass_deletion=True))
+
+    assert result.updated is True
+    assert seen["base_ref"] == base
+    assert seen["accept_mass_deletion"] is True
+
+
 def test_deleted_file_stays_on_incremental_path(tmp_path, forbid_full_pipeline):
     """Deletions are handled incrementally: the persistence pass prunes rows
     against the rebuilt graph and tombstones pages for removed paths, same as

@@ -88,6 +88,18 @@ def test_update_cli_forwards_include_working_tree(
     assert captured["include_working_tree"] is expected
 
 
+def test_update_cli_forwards_one_run_mass_deletion_authority(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(update_cmd, "run_update", lambda **kwargs: captured.update(kwargs))
+
+    result = CliRunner().invoke(cli, ["update", "--accept-mass-deletion"])
+
+    assert result.exit_code == 0, result.output
+    assert captured["accept_mass_deletion"] is True
+
+
 @pytest.mark.parametrize(
     (
         "include_working_tree",
@@ -177,3 +189,57 @@ def test_workspace_dispatch_forwards_include_working_tree(
     )
 
     assert captured["include_working_tree"] is True
+
+
+def test_workspace_acceptance_reopens_and_forwards_a_persisted_refusal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import repowise.core.workspace as core_workspace
+    from repowise.cli import source_search_runtime
+    from repowise.core.workspace import RepoUpdateResult
+
+    target, repo = _workspace_target(tmp_path)
+    state_path = repo / ".repowise" / "state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["prune_refusals"] = {
+        "from_commit": state["last_sync_commit"],
+        "findings": [
+            {
+                "table": "graph_nodes",
+                "candidate_paths": 30,
+                "persisted_paths": 40,
+            }
+        ],
+    }
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    captured: dict[str, object] = {}
+
+    async def fake_update_workspace(*_args: object, **kwargs: object):
+        captured.update(kwargs)
+        return [RepoUpdateResult(alias="repo", updated=False, skipped_reason="up_to_date")]
+
+    async def fake_reconcile(_paths: list[Path]) -> dict[Path, object]:
+        return {}
+
+    monkeypatch.setattr(core_workspace, "update_workspace", fake_update_workspace)
+    monkeypatch.setattr(
+        source_search_runtime,
+        "reconcile_configured_source_indexes",
+        fake_reconcile,
+    )
+    monkeypatch.setattr(
+        workspace_cmd,
+        "_refresh_workspace_editor_project_files",
+        lambda **_kwargs: None,
+    )
+
+    workspace_cmd._workspace_update(
+        target,
+        index_only=True,
+        accept_mass_deletion=True,
+    )
+
+    assert "accepted mass-deletion repair" in capsys.readouterr().out
+    assert captured["accept_mass_deletion"] is True

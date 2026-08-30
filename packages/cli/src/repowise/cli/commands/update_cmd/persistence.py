@@ -11,6 +11,7 @@ from __future__ import annotations
 import contextlib
 import os
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -18,10 +19,19 @@ import structlog
 
 from repowise.cli.helpers import console, head_commit_ts, run_async, save_state
 from repowise.core.analysis.health import HEALTH_ANALYZER_VERSION
+from repowise.core.pipeline.prune_state import DeletedFilePruneOutcome
 
 from .incremental import _build_repo_graph
 
 log = structlog.get_logger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class FullUpdatePersistResult:
+    """Transactional page total plus the deleted-file prune outcome."""
+
+    total_pages: int
+    prune_outcome: DeletedFilePruneOutcome
 
 
 def _repair_module_attribution(repo_path: Path) -> int:
@@ -244,7 +254,13 @@ def heal_commit_offsets(repo_path: Any) -> None:
 _REPAIR_MAX_COMMITS = 500
 
 
-def record_repair_marker(new_state: dict, prior_state: dict, failed_steps: list[str]) -> None:
+def record_repair_marker(
+    new_state: dict,
+    prior_state: dict,
+    failed_steps: list[str],
+    *,
+    from_commit: str | None = None,
+) -> None:
     """Record, or clear, the commit range this update failed to fully persist.
 
     ``last_sync_commit`` advances whether or not the persist steps succeeded, so
@@ -269,8 +285,11 @@ def record_repair_marker(new_state: dict, prior_state: dict, failed_steps: list[
     prior = prior_state.get("pending_repair")
     if not isinstance(prior, dict):  # a hand-edited or truncated state file
         prior = {}
-    from_commit = prior.get("from_commit") or prior_state.get("last_sync_commit")
-    if not from_commit:
+    # The caller may have widened this run for a refused mass deletion.  Its
+    # actual diff base is then older than ``last_sync_commit`` and is the only
+    # pointer that can re-cover a persistence failure from this attempt.
+    repair_base = from_commit or prior.get("from_commit") or prior_state.get("last_sync_commit")
+    if not repair_base:
         # Nothing to diff back to (a first index, or a state file with no
         # pointer). Widening from an unknown base is not something we can do
         # safely, so leave no marker rather than a broken one.
@@ -282,7 +301,7 @@ def record_repair_marker(new_state: dict, prior_state: dict, failed_steps: list[
     prior_steps = prior.get("steps")
     prior_steps = prior_steps if isinstance(prior_steps, list) else []
     new_state["pending_repair"] = {
-        "from_commit": from_commit,
+        "from_commit": repair_base,
         "steps": sorted({*prior_steps, *failed_steps}),
     }
 
@@ -363,6 +382,8 @@ def _persist_index_only_update(
     exclude_patterns: list[str] | None = None,
     head_ts: float | None = None,
     force_full_rescore: bool = False,
+    accept_mass_deletion: bool = False,
+    repair_from_commit: str | None = None,
 ) -> None:
     """Persist the index-only update (graph + symbols + git + dead-code + health + KG),
     save state, and print the completion line. No LLM regeneration.
@@ -383,7 +404,7 @@ def _persist_index_only_update(
     # (which also collects repo-wide and non-DB failures) because only these
     # strand data the advancing sync pointer would otherwise skip forever.
     failed_steps: list[str] = []
-    run_async(
+    prune_outcome = run_async(
         persist_incremental_index(
             repo_path,
             graph_builder,
@@ -398,6 +419,7 @@ def _persist_index_only_update(
             log=console.print,
             degraded=degraded,
             failed_steps=failed_steps,
+            accept_mass_deletion=accept_mass_deletion,
         )
     )
     try:
@@ -443,10 +465,25 @@ def _persist_index_only_update(
         # here is exactly the cost the mode exists to avoid.
         "renderer_fingerprint": _current_renderer_fingerprint(repo_path),
     }
+    from repowise.core.pipeline.prune_state import (
+        DeletedFilePruneOutcome,
+        apply_prune_outcome,
+    )
+
+    # Some tests and downstream wrappers patch the core persister with an
+    # older no-return stub. A missing outcome means "not observed", never
+    # permission to erase a durable refusal.
+    if isinstance(prune_outcome, DeletedFilePruneOutcome):
+        apply_prune_outcome(
+            new_state,
+            state,
+            prune_outcome,
+            from_commit=repair_from_commit or state.get("last_sync_commit"),
+        )
     # Before save_state, and reading ``state`` (the pre-update dict) for the old
     # pointer: this is what keeps a degraded run recoverable now that the
     # pointer below advances to head regardless.
-    record_repair_marker(new_state, state, failed_steps)
+    record_repair_marker(new_state, state, failed_steps, from_commit=repair_from_commit)
     if failed_steps:
         console.print(
             "[yellow]Some data for this commit range was not persisted; "
@@ -579,7 +616,8 @@ def _persist_full_update(
     decay_paths: list[str] | None = None,
     parsed_files: list | None = None,
     git_decay_map: dict | None = None,
-) -> int:
+    accept_mass_deletion: bool = False,
+) -> FullUpdatePersistResult:
     """Persist a full (LLM-regenerating) update in one transaction.
 
     Mirrors :func:`repowise.core.pipeline.incremental.persist_incremental_index`:
@@ -590,10 +628,11 @@ def _persist_full_update(
     step degrades into ``degraded`` with a logged warning. FTS indexing stays
     outside the transaction: it is rebuildable and non-transactional anyway.
 
-    Returns the repository's total page count after the write, so the caller
-    can stamp ``state["total_pages"]`` with the real DB total (regeneration
-    upserts existing pages, so accumulating ``len(generated_pages)`` inflates
-    the count forever).
+    Returns the repository's total page count and deleted-file prune outcome.
+    The caller stamps the real DB total into ``state["total_pages"]``
+    (regeneration upserts existing pages, so accumulating
+    ``len(generated_pages)`` inflates the count forever) and records any prune
+    refusal beside the commit range that can repair it.
     """
     return run_async(
         _persist_full_update_async(
@@ -613,6 +652,7 @@ def _persist_full_update(
             decay_paths=decay_paths,
             parsed_files=parsed_files,
             git_decay_map=git_decay_map,
+            accept_mass_deletion=accept_mass_deletion,
         )
     )
 
@@ -635,7 +675,8 @@ async def _persist_full_update_async(
     decay_paths: list[str] | None = None,
     parsed_files: list | None = None,
     git_decay_map: dict | None = None,
-) -> int:
+    accept_mass_deletion: bool = False,
+) -> FullUpdatePersistResult:
     from repowise.cli.helpers import get_db_url_for_repo
     from repowise.core.persistence import (
         FullTextSearch,
@@ -659,6 +700,7 @@ async def _persist_full_update_async(
     # Same contract, for rows of a page that has been retired outright.
     swept_page_ids: list[str] = []
     source_symbol_error: str | None = None
+    prune_outcome = DeletedFilePruneOutcome()
     try:
         await init_db(engine)
         sf = create_session_factory(engine)
@@ -690,9 +732,7 @@ async def _persist_full_update_async(
                 # Cycle pages are never regenerated on this path (the ladder
                 # stops at file pages), so a cycle that no longer exists can
                 # only be retired by asking the rebuilt graph directly.
-                swept_page_ids += await sweep_absent_cycle_pages(
-                    session, repo_id, graph_builder
-                )
+                swept_page_ids += await sweep_absent_cycle_pages(session, repo_id, graph_builder)
 
                 # Drop the embeddings before the SQL session commits, the same
                 # ordering ``init`` uses: the vector store is a separate engine,
@@ -980,6 +1020,40 @@ async def _persist_full_update_async(
             except Exception as exc:
                 _skip("Generation job record", exc)
 
+            # Last writer in the transaction. The changed-file git pass above
+            # can recreate metadata for a deleted path, so the liveness prune
+            # must have final authority here just as it does on index-only
+            # updates.
+            try:
+                from repowise.core.pipeline.persist import prune_deleted_file_rows
+
+                live_hint = {pf.file_info.path for pf in parsed_files or []}
+                graph = graph_builder.graph()
+                live_hint |= {
+                    node
+                    for node, data in graph.nodes(data=True)
+                    if data.get("node_type", "file") == "file"
+                }
+                pruned, refusals = await prune_deleted_file_rows(
+                    session,
+                    repo_id,
+                    repo_path,
+                    live_hint=live_hint,
+                    accept_mass_deletion=accept_mass_deletion,
+                )
+                prune_outcome = DeletedFilePruneOutcome(
+                    attempted=True,
+                    pruned_paths=pruned,
+                    refusals=tuple(refusals),
+                )
+                if pruned:
+                    console.print(f"Pruned rows for [cyan]{pruned}[/cyan] deleted file(s)")
+                for refusal in refusals:
+                    console.print(f"[yellow]{refusal.message}[/yellow]")
+                    degraded.append(refusal.message)
+            except Exception as exc:
+                _skip("Deleted-file prune", exc)
+
             # Real page total for state.json — see _persist_full_update's
             # docstring. Falls back to the upsert count if the count query
             # itself degrades.
@@ -1053,7 +1127,7 @@ async def _persist_full_update_async(
                 await fts.delete_many(swept_page_ids)
         except Exception as exc:
             _skip("Full-text search indexing", exc)
-        return total_pages
+        return FullUpdatePersistResult(total_pages=total_pages, prune_outcome=prune_outcome)
     finally:
         await engine.dispose()
 

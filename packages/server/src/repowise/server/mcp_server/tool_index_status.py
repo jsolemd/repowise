@@ -16,6 +16,7 @@ from sqlalchemy import func, select
 from repowise.core.ingestion import FileTraverser, is_candidate_source_path
 from repowise.core.persistence.database import get_session
 from repowise.core.persistence.models import GenerationJob
+from repowise.core.pipeline.prune_state import PruneRefusal, state_prune_refusals
 from repowise.core.registry import mcp_tool_registry as mcp
 from repowise.core.source_search.chunks import parser_eligible, window_eligible
 from repowise.core.source_search.coordinator import LEG_SOURCE_DENSE, LEG_SOURCE_LEXICAL
@@ -155,6 +156,7 @@ def _trust_state(
     head_commit: str | None,
     runtime_embedder: Any | None,
     runtime_parser: str | None,
+    prune_refusals: tuple[PruneRefusal, ...] = (),
 ) -> tuple[str, list[str]]:
     reasons: list[str] = []
 
@@ -185,6 +187,7 @@ def _trust_state(
             reasons.append("fts_unverified")
         if status.vector_chunks is None:
             reasons.append("vector_unverified")
+        reasons.extend(refusal.reason for refusal in prune_refusals)
         if not reasons:
             reasons.append("source_publication_unverified")
         return "unknown", list(dict.fromkeys(reasons))
@@ -210,6 +213,7 @@ def _trust_state(
         known_stale.append("updates_blocked")
     if status.stale_files:
         known_stale.append("stale_files")
+    known_stale.extend(refusal.reason for refusal in prune_refusals)
     if status.fts_chunks is not None and status.fts_chunks != status.expected_chunks:
         known_stale.append("fts_count_mismatch")
     if status.vector_chunks is not None and status.vector_chunks != status.expected_chunks:
@@ -253,7 +257,10 @@ def _trust_state(
     return "trustworthy", []
 
 
-def _degradation_findings(status: SourceIndexStatus) -> list[dict[str, str]]:
+def _degradation_findings(
+    status: SourceIndexStatus,
+    prune_refusals: tuple[PruneRefusal, ...] = (),
+) -> list[dict[str, str]]:
     """Structured index-health findings, distinct from retrieval failures.
 
     ``failed_legs`` is reserved for runtime retrieval failures whose ``error``
@@ -295,6 +302,14 @@ def _degradation_findings(status: SourceIndexStatus) -> list[dict[str, str]]:
                 "detail": f"{status.blocked_updates} source-index update rows are blocked",
             }
         )
+    findings.extend(
+        {
+            "component": "deleted-file prune",
+            "code": "prune_refused",
+            "detail": refusal.message,
+        }
+        for refusal in prune_refusals
+    )
     return findings
 
 
@@ -391,11 +406,13 @@ async def _status_payload(ctx: Any, repository: Any, *, started: float) -> tuple
         collector.add("stale_files (omitted tail)", omitted_stale)
     working_tree = _working_tree_payload(status.working_tree, collector)
     runtime_embedder, runtime_parser, identity_error = _runtime_identities(ctx)
+    prune_refusals = state_prune_refusals(repo_state)
     trust, trust_reasons = _trust_state(
         status,
         head_commit=head_commit,
         runtime_embedder=runtime_embedder,
         runtime_parser=runtime_parser,
+        prune_refusals=prune_refusals,
     )
 
     fts_parity = (
@@ -487,14 +504,14 @@ async def _status_payload(ctx: Any, repository: Any, *, started: float) -> tuple
             "identity_error": identity_error,
         },
         "last_update": status.published_at or status.built_at,
-        "degraded": status.degraded,
+        "degraded": status.degraded or bool(prune_refusals),
         "_meta": _build_meta(
             timing_ms=(perf_counter() - started) * 1000.0,
             repository=repository,
         ),
     }
-    if status.degraded:
-        findings = _degradation_findings(status)
+    if status.degraded or prune_refusals:
+        findings = _degradation_findings(status, prune_refusals)
         payload["degraded_reason"] = (
             status.last_error
             or "; ".join(status.integrity_errors)

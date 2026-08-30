@@ -318,6 +318,36 @@ def _embedder_identity_mismatch(embedder: Any, stored: Any) -> str | None:
     return None
 
 
+async def _wiki_tombstone_ids(repo_path: Path, session_factory: Any) -> frozenset[str]:
+    """Current tombstoned wiki page ids for one coordinator's repository.
+
+    This read runs once per federated query, before either wiki retriever sets
+    its fixed candidate window. Updates can tombstone pages without changing
+    the active source generation, so caching the answer with the coordinator
+    would make the filter stale for exactly the interval it exists to close.
+    """
+    from sqlalchemy import select
+
+    from repowise.core.persistence.crud import get_repository_by_path
+    from repowise.core.persistence.database import get_session
+    from repowise.core.persistence.models import Page
+
+    async with get_session(session_factory) as session:
+        repository = await get_repository_by_path(session, str(repo_path))
+        if repository is None:
+            # Construction succeeded from this repository's stores, but its
+            # SQL identity cannot be proved. Raising disables the wiki legs;
+            # an empty set would turn missing evidence into a claim of liveness.
+            raise LookupError(f"repository row not found for {repo_path}")
+        rows = await session.execute(
+            select(Page.id).where(
+                Page.repository_id == repository.id,
+                Page.freshness_status == "tombstone",
+            )
+        )
+        return frozenset(rows.scalars().all())
+
+
 def _build(
     repo_path: Path | str,
     wiki_vectors: Any,
@@ -331,9 +361,9 @@ def _build(
     both — the dense fusion is arithmetic on that assumption.
 
     *session_factory* is the wiki database this repository's reference sites
-    live in, used only by the post-retrieval naming pass. Optional, and its
-    absence costs nothing but that pass: it never reaches the coordinator,
-    which takes no database handle by contract.
+    and page freshness rows live in. When present, the coordinator checks the
+    tombstone set before fixing each wiki leg's fetch window; it still receives
+    a callback rather than a database handle, so storage wiring stays here.
     """
     from repowise.core.providers.embedding import store_has_semantic_vectors
     from repowise.core.source_search.coordinator import SourceSearchCoordinator
@@ -360,8 +390,7 @@ def _build(
         return None
     if int(getattr(embedder, "dimensions", 0) or 0) != manifest.embedder.dims:
         log.warning(
-            "source-search: configured embedder width does not match active generation "
-            "(%s != %s)",
+            "source-search: configured embedder width does not match active generation (%s != %s)",
             getattr(embedder, "dimensions", None),
             manifest.embedder.dims,
         )
@@ -398,8 +427,16 @@ def _build(
         embedder=embedder,
         source_vectors=source_vectors,
         source_fts=source_fts,
-        wiki_vectors=wiki_vectors,
-        wiki_fts=wiki_fts,
+        # A wiki store without its page-status database cannot prove which
+        # rows are still serveable. Keep the independent source lanes, but do
+        # not admit an unverified wiki lane.
+        wiki_vectors=wiki_vectors if session_factory is not None else None,
+        wiki_fts=wiki_fts if session_factory is not None else None,
+        wiki_tombstones=(
+            (lambda: _wiki_tombstone_ids(repo, session_factory))
+            if session_factory is not None
+            else None
+        ),
     )
     return _StatusCoordinator(coordinator, repo, source_vectors, source_fts, session_factory)
 
@@ -467,9 +504,7 @@ async def rest_coordinator(app_state: Any) -> Any:
 
     async with _rest_lock:
         existing = getattr(app_state, _REST_ATTR, None)
-        if existing is not None and generation == getattr(
-            app_state, _REST_GENERATION_ATTR, None
-        ):
+        if existing is not None and generation == getattr(app_state, _REST_GENERATION_ATTR, None):
             return existing
         if existing is not None:
             await existing.close()
@@ -702,8 +737,7 @@ async def context_coordinator(ctx: Any) -> Any:
             await asyncio.wait_for(ready.wait(), timeout=_READY_TIMEOUT)
         except TimeoutError:
             log.debug(
-                "source-search: vector stores for %s still loading, staying on "
-                "the stock path",
+                "source-search: vector stores for %s still loading, staying on the stock path",
                 getattr(ctx, "alias", repo_path),
             )
             return None

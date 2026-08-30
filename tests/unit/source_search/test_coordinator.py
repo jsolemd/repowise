@@ -185,7 +185,11 @@ def _coordinator(
     embedder: Any = None,
     source_term_files: dict[str, set[str]] | None = None,
     source_active_paths: set[str] | None = None,
+    wiki_tombstones: set[str] | None = None,
 ) -> SourceSearchCoordinator:
+    async def load_wiki_tombstones() -> frozenset[str]:
+        return frozenset(wiki_tombstones or ())
+
     return SourceSearchCoordinator(
         repo_path=tmp_path,
         embedder=embedder or _Embedder(),
@@ -195,6 +199,7 @@ def _coordinator(
         ),
         wiki_vectors=_WikiVectors(wiki_dense or []),
         wiki_fts=_WikiFTS(wiki_lexical or []),
+        wiki_tombstones=load_wiki_tombstones if wiki_tombstones is not None else None,
         query_log=QueryLog(tmp_path / "log.jsonl"),
     )
 
@@ -222,6 +227,54 @@ async def test_the_dense_leg_merges_both_corpora_by_raw_cosine(tmp_path):
         "wiki",
         "source",
     ]
+
+
+async def test_federated_wiki_lane_filters_tombstones_before_its_fetch_limit(tmp_path):
+    """A stale vector cannot consume the hundredth live candidate's slot."""
+    tombstone_id = "file_page:src/deleted.py"
+    hits = [_PageHit(tombstone_id, "src/deleted.py", 1.0)]
+    hits.extend(
+        _PageHit(f"file_page:src/live_{i}.py", f"src/live_{i}.py", 0.99 - i / 1000)
+        for i in range(100)
+    )
+    coordinator = _coordinator(
+        tmp_path,
+        wiki_dense=hits,
+        wiki_lexical=hits,
+        wiki_tombstones={tombstone_id},
+    )
+
+    response = await coordinator.search("live implementation", limit=100)
+
+    page_ids = {row["page_id"] for row in response["results"]}
+    assert tombstone_id not in page_ids
+    assert "file_page:src/live_99.py" in page_ids
+    assert len(page_ids) == 100
+
+
+async def test_a_failed_tombstone_lookup_disables_only_the_unverified_wiki_legs(tmp_path):
+    coordinator = _coordinator(
+        tmp_path,
+        source_dense=[_hit("live", "src/live.py", 0.9)],
+        wiki_dense=[_PageHit("file_page:src/unknown.py", "src/unknown.py", 0.99)],
+        wiki_lexical=[_PageHit("file_page:src/unknown.py", "src/unknown.py", 5.0)],
+        wiki_tombstones=set(),
+    )
+
+    async def broken_lookup() -> frozenset[str]:
+        raise OSError("wiki page status unavailable")
+
+    coordinator._wiki_tombstones = broken_lookup
+
+    response = await coordinator.search("live implementation", limit=5)
+
+    assert _files(response) == ["src/live.py"]
+    source_meta = response["_meta"]["source_search"]
+    assert {failure["leg"] for failure in source_meta["failed_legs"]} == {
+        "wiki dense",
+        "wiki lexical",
+    }
+    assert "wiki tombstone lookup failed" in source_meta["degraded_reason"]
 
 
 async def test_the_query_is_embedded_once_for_both_dense_stores(tmp_path):

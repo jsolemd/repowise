@@ -196,9 +196,7 @@ async def test_mass_deletion_is_refused_not_applied(async_session, repo_with_kep
     """A prune that would take most of a table reads as a broken run, and is refused."""
     repo = await insert_repo(async_session)
     for i in range(40):
-        async_session.add(
-            GitMetadata(repository_id=repo.id, file_path=f"src/module_{i}.js")
-        )
+        async_session.add(GitMetadata(repository_id=repo.id, file_path=f"src/module_{i}.js"))
     await async_session.flush()
 
     pruned, refusals = await prune_deleted_file_rows(
@@ -208,8 +206,30 @@ async def test_mass_deletion_is_refused_not_applied(async_session, repo_with_kep
 
     assert pruned == 0
     assert len(refusals) == 1
-    assert "git_metadata" in refusals[0]
+    assert refusals[0].table == "git_metadata"
+    assert refusals[0].candidate_paths == 40
+    assert refusals[0].persisted_paths == 40
     assert len(await _paths(async_session, GitMetadata, GitMetadata.file_path, repo.id)) == 40
+
+
+async def test_accept_mass_deletion_lifts_the_floor_for_one_run(async_session, repo_with_kept_file):
+    """Explicit authority applies the same liveness verdict the floor refused."""
+    repo = await insert_repo(async_session)
+    for i in range(40):
+        async_session.add(GitMetadata(repository_id=repo.id, file_path=f"src/module_{i}.js"))
+    await async_session.flush()
+
+    pruned, refusals = await prune_deleted_file_rows(
+        async_session,
+        repo.id,
+        repo_with_kept_file,
+        live_hint=set(),
+        accept_mass_deletion=True,
+    )
+    await async_session.commit()
+
+    assert (pruned, refusals) == (40, [])
+    assert await _paths(async_session, GitMetadata, GitMetadata.file_path, repo.id) == set()
 
 
 async def test_small_repo_can_still_lose_most_of_its_files(async_session, repo_with_kept_file):
@@ -235,9 +255,7 @@ async def test_prune_is_scoped_to_one_repo(async_session, repo_with_kept_file):
     await _seed(async_session, repo_a.id)
     await _seed(async_session, repo_b.id)
 
-    await prune_deleted_file_rows(
-        async_session, repo_a.id, repo_with_kept_file, live_hint={KEPT}
-    )
+    await prune_deleted_file_rows(async_session, repo_a.id, repo_with_kept_file, live_hint={KEPT})
     await async_session.commit()
 
     assert await _paths(async_session, GitMetadata, GitMetadata.file_path, repo_b.id) == {

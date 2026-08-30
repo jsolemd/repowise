@@ -274,6 +274,15 @@ def _surface_reindex_recommendation(repo_path, verdict, *, emitter: Any, dry_run
     help="Include staged, unstaged, and untracked source files in this update.",
 )
 @click.option(
+    "--accept-mass-deletion",
+    is_flag=True,
+    default=False,
+    help=(
+        "Accept a deletion that crosses the incremental prune safety floor for "
+        "this run only. Use after confirming the checkout really lost those files."
+    ),
+)
+@click.option(
     "--docs/--no-docs",
     "docs_flag",
     default=None,
@@ -361,6 +370,7 @@ def update_command(
     repo_alias: str | None,
     index_only: bool = False,
     include_working_tree: bool = False,
+    accept_mass_deletion: bool = False,
     docs_flag: bool | None = None,
     full: bool = False,
     yes: bool = False,
@@ -391,6 +401,7 @@ def update_command(
         repo_alias=repo_alias,
         index_only=index_only,
         include_working_tree=include_working_tree,
+        accept_mass_deletion=accept_mass_deletion,
         docs_flag=docs_flag,
         full=full,
         yes=yes,
@@ -546,6 +557,7 @@ def run_update(
     progress: str = "rich",
     skip_cross_repo_hooks: bool = False,
     include_working_tree: bool = False,
+    accept_mass_deletion: bool = False,
 ) -> UpdateOutcome:
     """Incrementally update wiki pages for files changed since last sync.
 
@@ -634,6 +646,7 @@ def run_update(
                 docs_flag=docs_flag,
                 index_only=index_only,
                 include_working_tree=include_working_tree,
+                accept_mass_deletion=accept_mass_deletion,
                 since=since,
                 provider_name=provider_name,
                 model=model,
@@ -773,6 +786,20 @@ def run_update(
         if emitter is not None:
             emitter.error(message)
         raise click.ClickException(message)
+
+    # A refused prune advances the ordinary sync pointer so background update
+    # timers remain successful. The durable refusal records the earlier base;
+    # an explicit one-run acceptance reopens that exact range so the override
+    # cannot be swallowed by the "already up to date" gate below. An explicit
+    # --since still names the user's range and wins.
+    if since is None and accept_mass_deletion:
+        from repowise.core.pipeline.prune_state import prune_repair_base
+
+        if prune_base := prune_repair_base(state):
+            base_ref = prune_base
+            console.print(
+                f"[dim]Re-checking the refused mass deletion from {prune_base[:8]}.[/dim]"
+            )
 
     # Re-cover a range a previous update failed to fully persist. The pointer
     # advanced past it anyway (so every other reader stays current), and the
@@ -1378,6 +1405,8 @@ def run_update(
                 exclude_patterns=exclude_patterns,
                 head_ts=head_ts,
                 force_full_rescore=config_changed,
+                accept_mass_deletion=accept_mass_deletion,
+                repair_from_commit=base_ref,
             )
         except Exception as exc:
             if emitter is not None:
@@ -1844,7 +1873,7 @@ def run_update(
     if emitter is not None:
         emitter.stage("persist")
     try:
-        db_total_pages = _persist_full_update(
+        persist_result = _persist_full_update(
             repo_path=repo_path,
             repo_name=repo_name,
             generated_pages=generated_pages,
@@ -1861,7 +1890,9 @@ def run_update(
             decay_paths=affected.decay_only,
             parsed_files=parsed_files,
             git_decay_map=git_decay_map,
+            accept_mass_deletion=accept_mass_deletion,
         )
+        db_total_pages = persist_result.total_pages
     except Exception as exc:
         if emitter is not None:
             emitter.error(str(exc))
@@ -1907,6 +1938,7 @@ def run_update(
             console.print(f"[yellow]Knowledge-graph export skipped: {exc}[/yellow]")
             degraded.append(f"Knowledge-graph export: {exc}")
 
+    prior_prune_state = dict(state)
     state["last_sync_commit"] = head
     state["last_docs_commit"] = head
     # Real DB total, not an accumulation: regeneration upserts existing pages,
@@ -1914,6 +1946,14 @@ def run_update(
     state["total_pages"] = db_total_pages
     state["config_fingerprint"] = config_fingerprint(repo_path)
     state["renderer_fingerprint"] = _current_renderer_fingerprint(repo_path)
+    from repowise.core.pipeline.prune_state import apply_prune_outcome
+
+    apply_prune_outcome(
+        state,
+        prior_prune_state,
+        persist_result.prune_outcome,
+        from_commit=base_ref,
+    )
     save_state(repo_path, state)
 
     # --- Pending-marker cleanup --------------------------------------------

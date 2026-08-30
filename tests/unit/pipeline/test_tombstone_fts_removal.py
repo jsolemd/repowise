@@ -16,11 +16,13 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
 from repowise.core.persistence.crud import upsert_page, upsert_repository
 from repowise.core.persistence.database import init_db
+from repowise.core.persistence.models import Page
 from repowise.core.persistence.search import FullTextSearch
 from repowise.core.pipeline.persist import mark_tombstone_pages, tombstone_candidates
 
@@ -98,6 +100,69 @@ async def test_a_tombstoned_page_is_deleted_from_the_full_text_index(session, en
     await fts.delete_many(marked)
 
     assert [r.page_id for r in await fts.search("xylophone", limit=10)] == ["file_page:src/kept.py"]
+
+
+async def test_a_deleted_file_tombstones_every_file_derived_page_and_fts_row(session, engine):
+    """File, spotlight, API, and infrastructure pages leave serving together."""
+    fts = FullTextSearch(engine)
+    await fts.ensure_index()
+    repo_id = await _seed(session, fts, "src/gone.py", "src/kept.py")
+    derived = (
+        (
+            "symbol_spotlight:src/gone.py::Widget.render",
+            "symbol_spotlight",
+            "src/gone.py::Widget.render",
+        ),
+        ("api_contract:src/gone.py", "api_contract", "src/gone.py"),
+        ("infra_page:src/gone.py", "infra_page", "src/gone.py"),
+        # A structural target is not a file even when its spelling collides
+        # with one. It must not inherit the file's tombstone.
+        ("module_page:src/gone.py", "module_page", "src/gone.py"),
+    )
+    for page_id, page_type, target_path in derived:
+        await upsert_page(
+            session,
+            page_id=page_id,
+            repository_id=repo_id,
+            page_type=page_type,
+            title=page_id,
+            content=f"# {page_id}\n\nTunes xylophones.",
+            summary="The derived page.",
+            target_path=target_path,
+            source_hash="h",
+            model_name="mock",
+            provider_name="mock",
+        )
+        await fts.index(
+            page_id,
+            page_id,
+            f"# {page_id}\n\nTunes xylophones.",
+            summary="The derived page.",
+            target_path=target_path,
+        )
+    await session.commit()
+
+    marked = await mark_tombstone_pages(session, repo_id, [("src/gone.py", [])])
+    await session.commit()
+    await fts.delete_many(marked)
+
+    expected = {
+        "file_page:src/gone.py",
+        "symbol_spotlight:src/gone.py::Widget.render",
+        "api_contract:src/gone.py",
+        "infra_page:src/gone.py",
+    }
+    assert set(marked) == expected
+    rows = await session.execute(select(Page.id, Page.freshness_status).where(Page.id.in_(marked)))
+    assert dict(rows.all()) == {page_id: "tombstone" for page_id in expected}
+    structural = await session.execute(
+        select(Page.freshness_status).where(Page.id == "module_page:src/gone.py")
+    )
+    assert structural.scalar_one() == "fresh"
+    assert {hit.page_id for hit in await fts.search("xylophone", limit=10)} == {
+        "file_page:src/kept.py",
+        "module_page:src/gone.py",
+    }
 
 
 async def test_marking_nothing_returns_an_empty_list(session, engine):

@@ -22,7 +22,6 @@ from repowise.core.source_search.chunks import (
 from repowise.core.source_search.fts import SourceFTSIndex
 from repowise.core.source_search.generation import GenerationRef
 from repowise.core.source_search.manifest import EmbedderIdentity
-from repowise.core.source_search.worktree import WorkingTreeDivergence
 from repowise.core.source_search.status import (
     CODE_COUNT_MISMATCH,
     CODE_MISSING,
@@ -36,6 +35,7 @@ from repowise.core.source_search.status import (
     IntegrityFinding,
     SourceIndexStatus,
 )
+from repowise.core.source_search.worktree import WorkingTreeDivergence
 from repowise.server.services.job_queue import IndexJobQueueResult
 
 
@@ -176,6 +176,74 @@ async def test_status_verifies_both_stores_and_reports_exact_uncapped_queue_coun
     assert result["degraded"] is False
     assert "degraded_reason" not in result
     assert "degradation_findings" not in result
+
+
+@pytest.mark.asyncio
+async def test_persisted_prune_refusal_degrades_trust_and_surfaces_a_finding(
+    tmp_path,
+    monkeypatch,
+    session,
+    factory,
+    repo_id,
+    vector_store,
+    fts,
+) -> None:
+    module = importlib.import_module("repowise.server.mcp_server.tool_index_status")
+    repo_path = tmp_path / "repo"
+    repo_path.mkdir()
+    await _wire_repo(
+        module=module,
+        monkeypatch=monkeypatch,
+        session=session,
+        factory=factory,
+        repo_id=repo_id,
+        repo_path=repo_path,
+        vector_store=vector_store,
+        fts=fts,
+    )
+    status = _status()
+    monkeypatch.setattr(module, "inspect_source_index", AsyncMock(return_value=status))
+    monkeypatch.setattr(module, "get_head_commit", lambda _path: "indexed-head")
+    monkeypatch.setattr(
+        module,
+        "read_repo_state",
+        lambda _path: {
+            "prune_refusals": {
+                "from_commit": "prior-head",
+                "findings": [
+                    {
+                        "table": "graph_nodes",
+                        "candidate_paths": 448,
+                        "persisted_paths": 776,
+                    }
+                ],
+            }
+        },
+    )
+    monkeypatch.setattr(
+        module,
+        "_runtime_identities",
+        lambda _ctx: (status.embedder, status.parser_fingerprint, None),
+    )
+
+    result = await module.get_index_status()
+
+    assert result["trust"] == {
+        "search_results": "stale",
+        "reasons": ["prune_refused: graph_nodes 448/776"],
+    }
+    assert result["degraded"] is True
+    assert result["degradation_findings"] == [
+        {
+            "component": "deleted-file prune",
+            "code": "prune_refused",
+            "detail": (
+                "Deleted-file prune refused for graph_nodes: 448 of 776 paths looked "
+                "deleted, which reads as a broken run rather than a commit. Re-run with "
+                "--accept-mass-deletion after confirming the deletion."
+            ),
+        }
+    ]
 
 
 @pytest.mark.asyncio
@@ -703,10 +771,12 @@ def test_hard_unknown_reasons_come_from_the_component_not_the_message() -> None:
         head_commit=status.indexed_commit,
         runtime_embedder=status.embedder,
         runtime_parser=status.parser_fingerprint,
+        prune_refusals=(module.PruneRefusal("graph_nodes", 448, 776),),
     )
 
     assert trust == "unknown"
     assert "source_queue_unverified" in reasons
+    assert "prune_refused: graph_nodes 448/776" in reasons
 
 
 def test_every_declared_component_has_a_label_bound_to_the_name_it_displays() -> None:

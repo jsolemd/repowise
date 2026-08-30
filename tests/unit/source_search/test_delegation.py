@@ -243,6 +243,46 @@ def test_a_mock_embedder_builds_no_coordinator(tmp_path):
     assert _build(tmp_path, SimpleNamespace(_embedder=KeylessEmbedder()), None) is None
 
 
+async def test_wiki_tombstone_lookup_reads_the_current_page_state(tmp_path):
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+    from sqlalchemy.pool import StaticPool
+
+    from repowise.core.persistence import get_session, init_db, upsert_page, upsert_repository
+    from repowise.server.source_search_wiring import _wiki_tombstone_ids
+
+    engine = create_async_engine(
+        "sqlite+aiosqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    try:
+        await init_db(engine)
+        factory = async_sessionmaker(engine, expire_on_commit=False)
+        async with get_session(factory) as session:
+            repo = await upsert_repository(session, name="repo", local_path=str(tmp_path))
+            for page_id, status in (
+                ("file_page:gone.py", "tombstone"),
+                ("file_page:live.py", "fresh"),
+            ):
+                await upsert_page(
+                    session,
+                    page_id=page_id,
+                    repository_id=repo.id,
+                    page_type="file_page",
+                    title=page_id,
+                    content=page_id,
+                    target_path=page_id.split(":", 1)[1],
+                    source_hash="h",
+                    model_name="mock",
+                    provider_name="mock",
+                    freshness_status=status,
+                )
+
+        assert await _wiki_tombstone_ids(tmp_path, factory) == frozenset({"file_page:gone.py"})
+    finally:
+        await engine.dispose()
+
+
 @pytest.mark.parametrize(
     ("db_url", "expected"),
     [
