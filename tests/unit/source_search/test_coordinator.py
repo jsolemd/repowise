@@ -2251,7 +2251,13 @@ async def test_a_ts_local_function_that_already_wins_keeps_its_own_name(tmp_path
 
 
 async def test_a_disambiguated_id_does_not_carry_its_discriminator(tmp_path):
-    """Two same-named nested symbols get ``~<hash>`` ids; the name is the name."""
+    """A pre-F42 store's ``~<hash>`` id still renders as the name it names.
+
+    The parser stopped minting these ids in F42, so no new index produces one.
+    The chunk id here is hand-built for that reason: it stands in for a store
+    written before the change, which is the only place the stripper still has
+    work to do.
+    """
     path = "src/a.py"
     nested = _hit(
         "inner",

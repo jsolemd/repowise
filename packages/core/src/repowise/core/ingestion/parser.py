@@ -24,7 +24,6 @@ Capture-name conventions (shared across ALL .scm files):
 
 from __future__ import annotations
 
-import hashlib
 import re
 from collections.abc import Iterable
 from functools import cache
@@ -1172,36 +1171,16 @@ class ASTParser:
             if is_local(index):
                 symbol.visibility = "local"
 
-        # Contained overloads and sibling collisions keep readable names while
-        # receiving deterministic fetchable IDs. Top-level IDs remain exactly
-        # compatible with the pre-A3 contract.
-        groups: dict[str, list[int]] = {}
-        for index, symbol in enumerate(symbols):
-            if keep[index] and parents[index] is not None:
-                groups.setdefault(symbol.id, []).append(index)
-        for base_id, indices in groups.items():
-            if len(indices) < 2:
-                continue
-            by_discriminator: dict[str, list[int]] = {}
-            for index in indices:
-                symbol = symbols[index]
-                normalized = re.sub(r"\s+", " ", symbol.signature.strip())
-                discriminator = hashlib.sha256(f"{symbol.kind}\0{normalized}".encode()).hexdigest()[
-                    :8
-                ]
-                by_discriminator.setdefault(discriminator, []).append(index)
-            for discriminator, collisions in by_discriminator.items():
-                ordered = sorted(
-                    collisions,
-                    key=lambda item: (
-                        symbols[item].start_line,
-                        symbols[item].end_line,
-                        symbols[item].kind,
-                    ),
-                )
-                for position, item in enumerate(ordered, start=1):
-                    suffix = discriminator if len(ordered) == 1 else f"{discriminator}-{position}"
-                    symbols[item].id = f"{base_id}~{suffix}"
+        # Contained siblings that collide on a lexical id keep that one id.
+        # An overload set is one symbol, and the resolver is what reads it as
+        # one: it folds declaration ids through its declaration-to-definition
+        # map and resolves the global rung when several rows reach a single
+        # symbol (``call_resolver._collapse_declarations``). Minting a
+        # per-signature ``~<hash>`` here handed every overload its own id, so
+        # nothing ever collapsed, and a call into an overload set read as an
+        # ambiguity the resolver then refused. Addressability does not need
+        # the suffix: ``get_symbol`` serves every candidate row with its
+        # signature and line range, and accepts a ``path:start-end`` target.
 
         for index, symbol in enumerate(symbols):
             if not keep[index]:

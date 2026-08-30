@@ -223,7 +223,17 @@ class TestPythonParser:
         assert by_name["m"].id == "pkg/factories.py::make::Helper::m"
         assert by_name["m"].parent_symbol_id == "pkg/factories.py::make::Helper"
 
-    def test_same_named_locals_get_stable_fetchable_collision_ids(self, parser: ASTParser) -> None:
+    def test_same_named_locals_share_the_one_id_they_name(self, parser: ASTParser) -> None:
+        """Both rows survive under one lexical id; only the id is shared.
+
+        Until F42 each row took a ``~<hash>`` suffix built from its signature,
+        which made two ids for what the call resolver has to read as one
+        symbol. Addressability does not come from the suffix: both rows keep
+        their own signature and line range, and ``get_symbol`` serves every
+        candidate row for a path-qualified target that matches several
+        (``tool_symbol._render_ambiguous``), or takes a ``path:start-end``
+        range when the caller already knows which one it wants.
+        """
         src = (
             b"def outer():\n"
             b"    def helper(value): return value\n"
@@ -235,9 +245,13 @@ class TestPythonParser:
         helpers = [symbol for symbol in first.symbols if symbol.name == "helper"]
 
         assert len(helpers) == 2
-        assert len({symbol.id for symbol in helpers}) == 2
-        assert all(symbol.id.startswith("pkg/collisions.py::outer::helper~") for symbol in helpers)
+        assert {symbol.id for symbol in helpers} == {"pkg/collisions.py::outer::helper"}
         assert all(symbol.parent_symbol_id == "pkg/collisions.py::outer" for symbol in helpers)
+        # What tells the two apart, now that the id does not.
+        assert [(s.signature, s.start_line) for s in helpers] == [
+            ("def helper(value)", 2),
+            ("def helper(value, fallback)", 3),
+        ]
         assert [symbol.id for symbol in helpers] == [
             symbol.id for symbol in second.symbols if symbol.name == "helper"
         ]
