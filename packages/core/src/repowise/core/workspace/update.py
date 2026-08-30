@@ -662,6 +662,7 @@ async def update_workspace(
     exclude_patterns: list[str] | None = None,
     include_working_tree: bool = False,
     accept_mass_deletion: bool = False,
+    force_aliases: set[str] | None = None,
     on_repo_start: Callable[[str], None] | None = None,
     on_repo_done: Callable[[RepoUpdateResult], None] | None = None,
 ) -> list[RepoUpdateResult]:
@@ -688,6 +689,9 @@ async def update_workspace(
             repo it is watching normally has no new commits at all.
         accept_mass_deletion: Cross the deleted-file ratio floor for this run
             and reopen any commit range a prior refusal recorded.
+        force_aliases: Indexed repositories that must run even when their
+            commit pointer is current (for example, source-recipe drift found
+            by the CLI host).
         on_repo_start: Called with alias when a repo update begins.
         on_repo_done: Called with result when a repo update finishes.
 
@@ -753,6 +757,8 @@ async def update_workspace(
             is_stale = has_working_tree_changes(abs_path) or bool(state.get("working_tree_paths"))
         if not is_stale and accept_mass_deletion:
             is_stale = bool(state_prune_refusals(state))
+        if not is_stale and force_aliases is not None:
+            is_stale = entry.alias in force_aliases
 
         if not is_stale:
             # Nothing to regenerate, but the DB freshness stamp can still be
@@ -911,7 +917,9 @@ async def update_workspace(
 
     changed_aliases: list[str] = []
     for r in update_results:
-        if isinstance(r, Exception):
+        if isinstance(r, BaseException):
+            if not isinstance(r, Exception):
+                raise r
             results.append(
                 RepoUpdateResult(
                     alias="unknown",
@@ -1054,7 +1062,7 @@ async def _run_phases(
         finally:
             timings.on_phase_done(phase)
 
-    overlay_result, store_result = await asyncio.gather(
+    phase_results = await asyncio.gather(
         _timed(
             "cross_repo_analysis", run_cross_repo_analysis(ws_config, workspace_root, changed_repos)
         ),
@@ -1071,6 +1079,8 @@ async def _run_phases(
         ),
         return_exceptions=True,
     )
+    overlay_result: CrossRepoOverlay | BaseException = phase_results[0]
+    store_result: ContractStore | BaseException = phase_results[1]
 
     # Cancellation and interpreter-level exits are not phase failures — the old
     # `except Exception` let them propagate by construction, and gather's
@@ -1081,14 +1091,14 @@ async def _run_phases(
             raise result
 
     overlay = CrossRepoOverlay()
-    if isinstance(overlay_result, Exception):
+    if isinstance(overlay_result, BaseException):
         _log.warning("Cross-repo analysis failed", exc_info=overlay_result)
     else:
         overlay = overlay_result
 
     store = ContractStore()
-    extraction_ok = not isinstance(store_result, Exception)
-    if isinstance(store_result, Exception):
+    extraction_ok = not isinstance(store_result, BaseException)
+    if isinstance(store_result, BaseException):
         _log.warning("Contract extraction failed", exc_info=store_result)
     else:
         store = store_result

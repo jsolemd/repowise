@@ -128,9 +128,13 @@ async def mark_tombstone_pages(
 
 
 async def tombstone_absent_file_pages(
-    session: Any, repo_id: str, repo_path: Path | str
+    session: Any,
+    repo_id: str,
+    repo_path: Path | str,
+    *,
+    excluded_paths: set[str] | frozenset[str] | None = None,
 ) -> list[str]:
-    """Tombstone every file-derived page whose file is no longer on disk.
+    """Tombstone file-derived pages whose file is absent or newly excluded.
 
     :func:`mark_tombstone_pages` works from a diff, so it only ever sees a
     file that was deleted or renamed *between two commits this run compared*.
@@ -141,11 +145,12 @@ async def tombstone_absent_file_pages(
     That page is the trap the tombstone exists to close: retrieval serves it,
     agents cite it, and the index-age metadata says nothing is wrong.
 
-    The check is a plain existence test against the checkout rather than a
-    comparison with what this run parsed. A file can be present but unparsed —
-    an unsupported extension, a parse failure, a changed exclude list — and
-    such a file is stale, not deleted. Calling it deleted would put a
-    ``successor_paths: []`` on a page whose file a reader can still open.
+    Absence is checked against the checkout rather than this run's parse, so a
+    transient parse failure cannot masquerade as a deletion. Exclusion is the
+    one intentional exception: an explicitly excluded file is outside the
+    index even though it still exists. Callers that mutate the other derived
+    stores pass the paths approved by :func:`plan_excluded_file_prune`, keeping
+    this page sweep under the same mass-deletion floor.
 
     Returns the page ids marked, so the caller can drop them from the
     full-text index once its session has closed, on the same terms as
@@ -167,10 +172,26 @@ async def tombstone_absent_file_pages(
     if not live:
         return []
 
-    absent = [
-        page for page in live if not (root / (page.target_path or "").partition("::")[0]).exists()
+    if excluded_paths is None:
+        from repowise.core.exclusion import build_exclude_spec, is_excluded
+
+        exclude_spec = build_exclude_spec(root)
+        excluded_paths = frozenset(
+            target
+            for page in live
+            if (target := (page.target_path or "").partition("::")[0])
+            and is_excluded(target, exclude_spec)
+        )
+
+    inactive = [
+        page
+        for page in live
+        if (
+            (target := (page.target_path or "").partition("::")[0]) in excluded_paths
+            or not (root / target).exists()
+        )
     ]
-    if not absent:
+    if not inactive:
         return []
 
     # Every page absent means the paths are not being resolved against the
@@ -179,6 +200,11 @@ async def tombstone_absent_file_pages(
     # on that reading is worse than leaving it, and unlike a partial mistake
     # it is not recoverable by re-indexing a file. Refuse, loudly, and let the
     # rest of the run proceed.
+    absent = [
+        page
+        for page in inactive
+        if (page.target_path or "").partition("::")[0] not in excluded_paths
+    ]
     if len(absent) == len(live):
         _log.error(
             "tombstone_sweep_refused repo_id=%s file_pages=%d root=%s: every "
@@ -191,7 +217,7 @@ async def tombstone_absent_file_pages(
         return []
 
     marked: list[str] = []
-    for page in absent:
+    for page in inactive:
         page.freshness_status = "tombstone"
         try:
             meta = json.loads(page.metadata_json or "{}")
@@ -207,7 +233,8 @@ async def tombstone_absent_file_pages(
         "file_pages_tombstoned_absent",
         repo_id=repo_id,
         count=len(marked),
-        sample=[p.target_path for p in absent[:3]],
+        excluded=sum((p.target_path or "").partition("::")[0] in excluded_paths for p in inactive),
+        sample=[p.target_path for p in inactive[:3]],
     )
     return marked
 
@@ -756,7 +783,9 @@ async def _prune_stale_file_rows(
     repo_id: str,
     current_graph_file_paths: set[str],
     current_git_file_paths: set[str],
-) -> None:
+    *,
+    protected_paths: set[str] | frozenset[str] = frozenset(),
+) -> int:
     """Delete file-scoped rows for files absent from the latest full pipeline run.
 
     The parser and git indexer disagree on the file set — a file can be
@@ -787,6 +816,8 @@ async def _prune_stale_file_rows(
         WikiSymbol,
     )
 
+    pruned_paths: set[str] = set()
+
     async def _delete_stale_by_paths(model: Any, column: Any, current: set[str]) -> None:
         # Diff persisted paths against *current* in Python so the IN (...) is
         # bounded by the stale set, not the whole repo (SQLite param limit).
@@ -797,7 +828,8 @@ async def _prune_stale_file_rows(
             .scalars()
             .all()
         )
-        stale = [p for p in existing if p not in current]
+        stale = [p for p in existing if p not in current and p not in protected_paths]
+        pruned_paths.update(stale)
         for i in range(0, len(stale), _PRUNE_CHUNK):
             await session.execute(
                 delete(model).where(
@@ -826,7 +858,13 @@ async def _prune_stale_file_rows(
                 and file_path is not None
                 and file_path not in current_graph_file_paths
             )
+            if (node_id if node_type == "file" else file_path) not in protected_paths
         ]
+        pruned_paths.update(
+            node_id if node_type == "file" else file_path
+            for node_id, node_type, file_path in node_rows
+            if node_id in stale_node_ids
+        )
         for i in range(0, len(stale_node_ids), _PRUNE_CHUNK):
             batch = stale_node_ids[i : i + _PRUNE_CHUNK]
             await session.execute(
@@ -859,6 +897,7 @@ async def _prune_stale_file_rows(
     )
     await _delete_stale_by_paths(HealthFinding, HealthFinding.file_path, current_graph_file_paths)
     await _delete_stale_by_paths(GitMetadata, GitMetadata.file_path, current_git_file_paths)
+    return len(pruned_paths)
 
 
 # A prune that would take more than this share of a table is read as a broken
@@ -896,8 +935,127 @@ def _git_tracked_paths(root: Path) -> frozenset[str]:
     return frozenset(p for p in out.decode("utf-8", "replace").split("\0") if p)
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class ExclusionPrunePlan:
+    """Previously-persisted paths an exclusion change is allowed to retire."""
+
+    paths: frozenset[str] = frozenset()
+    refusals: tuple[PruneRefusal, ...] = ()
+
+    @property
+    def actionable_paths(self) -> frozenset[str]:
+        """Excluded paths to sweep, empty when any table crossed the floor."""
+        return frozenset() if self.refusals else self.paths
+
+
+async def plan_excluded_file_prune(
+    session: Any,
+    repo_id: str,
+    repo_path: Path | str,
+    *,
+    accept_mass_deletion: bool = False,
+) -> ExclusionPrunePlan:
+    """Find newly-excluded persisted paths and apply the F45 floor up front.
+
+    Reference sites, pages, FTS and vectors are separate derived stores. If
+    each made its own exclusion decision, one could sweep while a larger SQL
+    table refused, leaving a store that was neither old nor new. This preflight
+    asks the existing file-scoped tables first; any refusal protects the same
+    paths in every downstream store. ``--accept-mass-deletion`` removes that
+    one-run protection exactly as it does for deleted files.
+    """
+    from sqlalchemy import select
+
+    from repowise.core.analysis.dead_code.analyzer import _is_synthetic_node
+    from repowise.core.exclusion import build_exclude_spec, is_excluded
+    from repowise.core.persistence.models import (
+        DeadCodeFinding,
+        GitMetadata,
+        GraphMetric,
+        GraphNode,
+        HealthFileMetric,
+        HealthFinding,
+        Page,
+        SecurityFinding,
+        WikiSymbol,
+    )
+    from repowise.core.refsites.schema import ReferenceSite
+
+    spec = build_exclude_spec(repo_path)
+    if spec is None:
+        return ExclusionPrunePlan()
+
+    node_rows = (
+        await session.execute(
+            select(GraphNode.node_id, GraphNode.node_type, GraphNode.file_path).where(
+                GraphNode.repository_id == repo_id
+            )
+        )
+    ).all()
+    node_paths = {
+        (node_id if node_type == "file" else file_path)
+        for node_id, node_type, file_path in node_rows
+        if node_type == "file" or file_path
+    }
+    tables: list[tuple[str, set[str | None]]] = [("graph_nodes", node_paths)]
+    page_paths = {
+        (target or "").partition("::")[0]
+        for target in (
+            await session.execute(
+                select(Page.target_path).where(
+                    Page.repository_id == repo_id,
+                    Page.page_type.in_(_FILE_DERIVED_PAGE_TYPES),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    }
+    page_paths.discard("")
+    tables.append(("wiki_pages", page_paths))
+    for label, model, column in (
+        ("graph_metrics", GraphMetric, GraphMetric.node_id),
+        ("wiki_symbols", WikiSymbol, WikiSymbol.file_path),
+        ("security_findings", SecurityFinding, SecurityFinding.file_path),
+        ("dead_code_findings", DeadCodeFinding, DeadCodeFinding.file_path),
+        ("health_file_metrics", HealthFileMetric, HealthFileMetric.file_path),
+        ("health_findings", HealthFinding, HealthFinding.file_path),
+        ("git_metadata", GitMetadata, GitMetadata.file_path),
+        ("reference_sites", ReferenceSite, ReferenceSite.file_path),
+    ):
+        persisted = set(
+            (await session.execute(select(column).where(model.repository_id == repo_id).distinct()))
+            .scalars()
+            .all()
+        )
+        tables.append((label, persisted))
+
+    all_excluded: set[str] = set()
+    refusals: list[PruneRefusal] = []
+    for label, raw_paths in tables:
+        persisted = {
+            path for path in raw_paths if path is not None and not _is_synthetic_node(path)
+        }
+        excluded = {path for path in persisted if is_excluded(path, spec)}
+        all_excluded.update(excluded)
+        if (
+            not accept_mass_deletion
+            and len(excluded) > _PRUNE_FLOOR_MIN_ROWS
+            and len(excluded) > _PRUNE_MAX_FRACTION * len(persisted)
+        ):
+            refusals.append(
+                PruneRefusal(
+                    table=label,
+                    candidate_paths=len(excluded),
+                    persisted_paths=len(persisted),
+                )
+            )
+
+    return ExclusionPrunePlan(frozenset(all_excluded), tuple(refusals))
+
+
 class _FileLiveness:
-    """Is this path still a real file, judged without consulting this run's parser.
+    """Is this path still index-owned, judged without this run's parser.
 
     Two witnesses, neither of which is the parse: the file is present on disk,
     or git still tracks it. A path has to fail both to count as deleted.
@@ -909,18 +1067,22 @@ class _FileLiveness:
     The disk check answers for that case; git covers the narrower one where the
     stat itself fails (``Path.exists()`` reports False on a permission error).
 
-    The deliberate cost of taking the union: a file that a config change has
-    newly *excluded* still exists and is still tracked, so its rows survive an
-    incremental update. That matches the behaviour before this guard existed
-    (which pruned nothing at all on this path), and a full reindex still clears
-    it, so nothing regresses.
+    A path approved by the exclusion preflight is dead to the index even if it
+    exists and git tracks it. That explicit set is what distinguishes a policy
+    change from a transient parse failure without weakening either witness.
 
     ``git ls-files`` is spawned lazily, on the first path that is not on disk,
     so an update with no deletions never pays for it.
     """
 
-    def __init__(self, repo_path: Any) -> None:
+    def __init__(
+        self,
+        repo_path: Any,
+        *,
+        excluded_paths: set[str] | frozenset[str] = frozenset(),
+    ) -> None:
         self._root = Path(repo_path)
+        self._excluded_paths = excluded_paths
         self._tracked: frozenset[str] | None = None
         # The same path is asked about once per table it has rows in, and a
         # stat under an antivirus scanner is not free.
@@ -934,6 +1096,8 @@ class _FileLiveness:
         return answer
 
     def _is_live(self, path: str) -> bool:
+        if path in self._excluded_paths:
+            return False
         if (self._root / path).exists():
             return True
         if self._tracked is None:
@@ -948,8 +1112,9 @@ async def prune_deleted_file_rows(
     *,
     live_hint: set[str] | None = None,
     accept_mass_deletion: bool = False,
+    exclusion_plan: ExclusionPrunePlan | None = None,
 ) -> tuple[int, list[PruneRefusal]]:
-    """Delete file-scoped rows for files that are gone, on an incremental update.
+    """Delete rows for files that are gone or explicitly excluded.
 
     The incremental path never pruned anything: deleting a file tombstoned its
     wiki page and left its graph nodes, edges, metrics, symbols, health rows and
@@ -1005,8 +1170,18 @@ async def prune_deleted_file_rows(
     )
 
     hint = live_hint or set()
-    liveness = _FileLiveness(repo_path)
-    refusals: list[PruneRefusal] = []
+    if exclusion_plan is None:
+        exclusion_plan = await plan_excluded_file_prune(
+            session,
+            repo_id,
+            repo_path,
+            accept_mass_deletion=accept_mass_deletion,
+        )
+    liveness = _FileLiveness(
+        repo_path,
+        excluded_paths=exclusion_plan.actionable_paths,
+    )
+    refusals: list[PruneRefusal] = list(exclusion_plan.refusals)
     deleted: set[str] = set()
 
     def _dead(persisted: set[str], label: str) -> list[str]:
@@ -1875,10 +2050,86 @@ async def persist_kg(kg: Any, session: Any, repo_id: str) -> None:
         await upsert_kg_node_meta(session, repo_id, file_node_meta)
 
 
+async def persist_post_index_result(
+    result: Any,
+    session: Any,
+    repo_id: str,
+    *,
+    repo_path: Path | str | None = None,
+    exclusion_plan: ExclusionPrunePlan | None = None,
+) -> list[str]:
+    """Persist every authoritative hook that follows graph/git/symbol writes.
+
+    A resume-controlled CLI run checkpoints the index phase before its final
+    persistence pass, while the ordinary full route writes that phase here.
+    Both routes still own the same analysis/generation outputs and derived-store
+    hooks. Keeping that sequence in one seam prevents a new full-route hook from
+    silently missing every normal incremental-persistence ``init``.
+
+    ``repo_path`` is optional for the full route, whose parsed files/repository
+    row can recover it. The CLI checkpoint route passes it explicitly because a
+    rehydrated result need not retain enough absolute-path information.
+    """
+    await persist_analysis(result, session, repo_id)
+
+    # Retired rows predate this run by definition. Sweep them before the page
+    # upsert so a legacy/synthetic producer that still hands us one cannot make
+    # the shared CLI route delete a page it just wrote. Current production
+    # generators emit no retired types; the ordering mainly preserves the
+    # existing checkpoint-route contract while still running the full hook.
+    swept_page_ids = await sweep_retired_pages(session, repo_id)
+
+    await persist_generation(result, session, repo_id)
+
+    # A full replacement from an empty/degraded parse would erase every site it
+    # failed to re-derive. Both routes therefore share the same whole-tree guard.
+    parsed_files = getattr(result, "parsed_files", None)
+    if parsed_files and not (exclusion_plan and exclusion_plan.refusals):
+        try:
+            await persist_reference_sites(
+                session,
+                repo_id,
+                parsed_files,
+                repo_path=repo_path,
+            )
+        except Exception as exc:
+            logger.warning("reference_sites_persist_skipped", error=str(exc))
+
+    swept_page_ids += await _sweep_stale_generated_pages(
+        session,
+        repo_id,
+        result.generated_pages,
+        getattr(result, "authoritative_page_types", None),
+        getattr(result, "preserved_page_ids", None),
+    )
+    # Placement depends on the complete post-sweep page set.
+    from .page_tree_sync import rebuild_page_tree
+
+    await rebuild_page_tree(session, repo_id)
+
+    # Record the authoritative source snapshot in the same transaction as the
+    # symbol rows it consumes. The caller reconciles only after commit.
+    from repowise.core.source_search import source_search_enabled
+
+    if source_search_enabled() and not (exclusion_plan and exclusion_plan.refusals):
+        from repowise.core.source_search.outbox import enqueue_full_update
+
+        await enqueue_full_update(
+            session,
+            repo_id,
+            repo_path,
+            parsed_files=parsed_files,
+        )
+
+    return swept_page_ids
+
+
 async def persist_pipeline_result(
     result: Any,
     session: Any,
     repo_id: str,
+    *,
+    exclusion_plan: ExclusionPrunePlan | None = None,
 ) -> list[str]:
     """Persist all outputs from a :class:`PipelineResult` into the database.
 
@@ -1920,55 +2171,25 @@ async def persist_pipeline_result(
         for gm in result.git_metadata_list
     }
     current_git_file_paths.discard("")
-    await _prune_stale_file_rows(session, repo_id, current_graph_file_paths, current_git_file_paths)
+    protected_paths: set[str] | frozenset[str] = (
+        exclusion_plan.paths if exclusion_plan is not None and exclusion_plan.refusals else set()
+    )
+    pruned = await _prune_stale_file_rows(
+        session,
+        repo_id,
+        current_graph_file_paths,
+        current_git_file_paths,
+        protected_paths=protected_paths,
+    )
 
     symbol_count = await persist_ingestion(result, session, repo_id)
     await persist_git(result, session, repo_id)
-    await persist_analysis(result, session, repo_id)
-    await persist_generation(result, session, repo_id)
-
-    # Refresh the reference-site store from this run's own parse. Best-effort:
-    # the store serves two opt-in tools, so its failure must degrade to a log
-    # line rather than fail the whole index.
-    try:
-        await persist_reference_sites(session, repo_id, result.parsed_files)
-    except Exception as exc:
-        logger.warning("reference_sites_persist_skipped", error=str(exc))
-
-    # Sweep structurally-keyed generated pages (module/layer/scc) that this
-    # run did not reproduce — their ids drift between runs, so without the
-    # sweep every re-index strands the previous set as duplicates. Full runs
-    # only, same rule as _prune_stale_file_rows.
-    swept_page_ids = await _sweep_stale_generated_pages(
+    swept_page_ids = await persist_post_index_result(
+        result,
         session,
         repo_id,
-        result.generated_pages,
-        getattr(result, "authoritative_page_types", None),
-        getattr(result, "preserved_page_ids", None),
+        exclusion_plan=exclusion_plan,
     )
-    # Rows of a page type that no longer exists at all. Independent of what
-    # this run produced, so it runs on every path rather than only here.
-    swept_page_ids += await sweep_retired_pages(session, repo_id)
-
-    # Placement depends on the whole page set, so it is computed here rather
-    # than during generation, after the sweep has retired anything stale.
-    from .page_tree_sync import rebuild_page_tree
-
-    await rebuild_page_tree(session, repo_id)
-
-    # Source retrieval is a derived store, but its work request is not: record
-    # the authoritative full snapshot in this same transaction as the symbol
-    # rows it will consume.  The reconciler runs only after the caller commits.
-    from repowise.core.source_search import source_search_enabled
-
-    if source_search_enabled():
-        from repowise.core.source_search.outbox import enqueue_full_update
-
-        await enqueue_full_update(
-            session,
-            repo_id,
-            parsed_files=result.parsed_files,
-        )
 
     logger.info(
         "pipeline_result_persisted",
@@ -1977,5 +2198,6 @@ async def persist_pipeline_result(
         graph_nodes=result.graph_builder.graph().number_of_nodes(),
         symbols=symbol_count,
         git_files=len(result.git_metadata_list),
+        pruned_file_paths=pruned,
     )
     return swept_page_ids

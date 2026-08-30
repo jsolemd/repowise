@@ -56,11 +56,12 @@ class PruneRefusal:
 
 @dataclass(frozen=True, slots=True)
 class DeletedFilePruneOutcome:
-    """What the deleted-file prune established during one persistence run."""
+    """What the deleted/excluded-file prune established in one persistence run."""
 
     attempted: bool = False
     pruned_paths: int = 0
     refusals: tuple[PruneRefusal, ...] = ()
+    tombstoned_page_ids: tuple[str, ...] = ()
 
 
 def state_prune_refusals(state: dict[str, Any]) -> tuple[PruneRefusal, ...]:

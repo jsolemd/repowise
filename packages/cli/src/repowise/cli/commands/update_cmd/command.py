@@ -71,6 +71,31 @@ from .workspace import _workspace_update
 
 log = structlog.get_logger(__name__)
 
+_EMPTY_TREE_SHA = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+
+
+def _resolve_user_since(repo_path: Any, ref: str) -> str:
+    """Resolve a person-supplied ``--since`` to a commit or fail loudly.
+
+    The core change detector deliberately soft-fails stale stored pointers so a
+    rebased workspace can self-heal. At this boundary the value came directly
+    from a person, so returning an empty diff would instead claim a lookup that
+    failed was a clean range.
+    """
+    from git import Repo
+
+    try:
+        return Repo(repo_path).commit(ref).hexsha
+    except Exception as exc:
+        message = (
+            f"--since {ref!r} does not resolve to a commit in {repo_path}. "
+            "If you meant to diff the whole tree, wrap Git's empty tree in a commit:\n\n"
+            f"  git commit-tree {_EMPTY_TREE_SHA} -m anchor\n\n"
+            "Then rerun with --since <that sha>."
+        )
+        raise click.ClickException(message) from exc
+
+
 #: How far back the hook-efficacy classifier re-reads transcripts on an update.
 #: Wider than the update cadence on purpose: a firing near the end of a session
 #: has no following tool calls yet, so re-running over the same transcript later
@@ -614,6 +639,12 @@ def run_update(
     target.notice(console, command="update")
 
     if target.is_workspace:
+        # Validate the person's ref against every selected repository before an
+        # orchestrator can turn an unresolvable value into an empty-diff success.
+        if since is not None and target.ws_root is not None and target.ws_config is not None:
+            for entry in target.ws_config.repos:
+                if target.repo_filter is None or entry.alias == target.repo_filter:
+                    _resolve_user_since((target.ws_root / entry.path).resolve(), since)
         if full:
             raise click.ClickException(
                 "--full is single-repo only. Run it inside a specific repo "
@@ -673,6 +704,8 @@ def run_update(
     # --- Single-repo path from here on. ---
     repo_path = target.repo_path
     assert repo_path is not None  # single mode always sets repo_path
+    if since is not None:
+        since = _resolve_user_since(repo_path, since)
 
     # Repo-local dotenv is a supported deployment-policy source. Load it
     # before worktree seeding or the --full fast path so neither can delegate
@@ -792,14 +825,12 @@ def run_update(
     # an explicit one-run acceptance reopens that exact range so the override
     # cannot be swallowed by the "already up to date" gate below. An explicit
     # --since still names the user's range and wins.
-    if since is None and accept_mass_deletion:
-        from repowise.core.pipeline.prune_state import prune_repair_base
+    from repowise.core.pipeline.prune_state import prune_repair_base, state_prune_refusals
 
-        if prune_base := prune_repair_base(state):
-            base_ref = prune_base
-            console.print(
-                f"[dim]Re-checking the refused mass deletion from {prune_base[:8]}.[/dim]"
-            )
+    prune_retry = bool(accept_mass_deletion and state_prune_refusals(state))
+    if since is None and accept_mass_deletion and (prune_base := prune_repair_base(state)):
+        base_ref = prune_base
+        console.print(f"[dim]Re-checking the refused mass deletion from {prune_base[:8]}.[/dim]")
 
     # Re-cover a range a previous update failed to fully persist. The pointer
     # advanced past it anyway (so every other reader stays current), and the
@@ -855,6 +886,14 @@ def run_update(
     curr_renderer_fp = _current_renderer_fingerprint(repo_path)
     renderer_changed = prev_renderer_fp is not None and prev_renderer_fp != curr_renderer_fp
 
+    source_recipe_changes: tuple[str, ...] = ()
+    try:
+        from repowise.cli.source_search_runtime import configured_source_recipe_changes
+
+        source_recipe_changes = run_async(configured_source_recipe_changes(repo_path))
+    except Exception as exc:
+        log.debug("source_recipe_drift_check_skipped", error=str(exc))
+
     # Uncommitted work, when the caller asked for it. Computed before the
     # "already up to date" gate below, because on a watched repo that gate is
     # exactly what the change set has to get past: with no new commits,
@@ -892,6 +931,8 @@ def run_update(
         and head == base_ref
         and not config_changed
         and not renderer_changed
+        and not source_recipe_changes
+        and not prune_retry
         and not working_tree_diffs
     ):
         console.print("[green]Already up to date.[/green]")
@@ -1108,7 +1149,46 @@ def run_update(
         working_tree_diffs,
     )
 
-    if not file_diffs and not config_changed and not renderer_changed:
+    if (
+        not file_diffs
+        and source_recipe_changes
+        and not config_changed
+        and not renderer_changed
+        and not prune_retry
+    ):
+        moved = "; ".join(source_recipe_changes)
+        console.print(f"[yellow]Source index recipe changed: {moved}. Rebuilding.[/yellow]")
+        if dry_run:
+            console.print("[yellow]Dry run — source index would be rebuilt.[/yellow]")
+            if emitter is not None:
+                emitter.done(
+                    ok=True,
+                    pages_generated=0,
+                    cost_usd=0.0,
+                    duration_s=time.monotonic() - start,
+                    outcome=UpdateOutcome.DRY_RUN.value,
+                )
+            return UpdateOutcome.DRY_RUN
+        from repowise.cli.source_search_runtime import reconcile_configured_source_index
+
+        run_async(reconcile_configured_source_index(repo_path, force_full=True))
+        if emitter is not None:
+            emitter.done(
+                ok=True,
+                pages_generated=0,
+                cost_usd=0.0,
+                duration_s=time.monotonic() - start,
+                outcome=UpdateOutcome.REGENERATED.value,
+            )
+        return UpdateOutcome.REGENERATED
+
+    if (
+        not file_diffs
+        and not config_changed
+        and not renderer_changed
+        and not source_recipe_changes
+        and not prune_retry
+    ):
         console.print("[green]No changed files detected.[/green]")
         # Always advance the sync pointer so the on-disk freshness marker stays
         # current on no-op syncs. In docs mode, no changed files means no docs
@@ -1152,7 +1232,7 @@ def run_update(
             )
         return UpdateOutcome.NOOP
 
-    if config_changed:
+    if config_changed or prune_retry:
         # Full re-score (not the partial update) so unchanged files pick up the
         # new rules/excludes instead of being left stale.
         console.print("[yellow]Config files changed — re-running health analysis.[/yellow]")
@@ -1166,7 +1246,7 @@ def run_update(
     # changed files present we fall through to the normal incremental path and
     # force the full re-score at its existing hook, which reuses the graph that
     # path already builds — same re-score, no second traverse.
-    if config_changed and not file_diffs:
+    if (config_changed or prune_retry) and not file_diffs:
         if dry_run:
             console.print("[yellow]Dry run — health would be re-scored. No changes made.[/yellow]")
             if emitter is not None:
@@ -1179,11 +1259,18 @@ def run_update(
                 )
             return UpdateOutcome.DRY_RUN
         cfg = load_config(repo_path)
-        exclude_patterns = list(cfg.get("exclude_patterns") or [])
+        config_exclude_patterns = list(cfg.get("exclude_patterns") or [])
         if emitter is not None:
             emitter.stage("rescore_health")
         try:
-            _run_full_health_rescore(repo_path, exclude_patterns, state, head, curr_config_fp)
+            _run_full_health_rescore(
+                repo_path,
+                config_exclude_patterns,
+                state,
+                head,
+                curr_config_fp,
+                accept_mass_deletion=accept_mass_deletion,
+            )
         except Exception as exc:
             if emitter is not None:
                 emitter.error(str(exc))
@@ -1761,6 +1848,7 @@ def run_update(
         if emitter is not None:
             emitter.total_known(total)
         else:
+            assert gen_progress is not None
             gen_progress.update(gen_task, total=total)
 
     def _on_page_done(_page_id: str) -> None:
@@ -1776,6 +1864,7 @@ def run_update(
                 completed=completed_pages, total=total_pages, cost_usd=cost_tracker.session_cost
             )
         else:
+            assert gen_progress is not None
             gen_progress.update(
                 gen_task, advance=1, total=total_pages, cost=cost_tracker.session_cost
             )
@@ -1825,6 +1914,7 @@ def run_update(
         # the real count; snap total to completed so the bar reads N of N at
         # 100% instead of stalling short (issue #922).
         if gen_task is not None:
+            assert gen_progress is not None
             gen_progress.update(gen_task, total=completed_pages, completed=completed_pages)
 
     # Surface the FAQ-weighted budget tilt when session demand shaped this run

@@ -269,6 +269,48 @@ class TestUpdateWorkspace:
         assert results[0].updated is False
         assert results[0].skipped_reason == "up_to_date"
 
+    def test_force_alias_updates_only_recipe_drifted_current_repo(self, tmp_path: Path) -> None:
+        """A host-detected recipe mismatch survives the core commit re-check."""
+        stale_recipe = _make_git_repo(tmp_path, "stale-recipe")
+        current = _make_git_repo(tmp_path, "current")
+        stale_head = get_head_commit(stale_recipe)
+        current_head = get_head_commit(current)
+        _write_state(stale_recipe, stale_head)
+        _write_state(current, current_head)
+        ws_config = WorkspaceConfig(
+            repos=[
+                RepoEntry(
+                    path="stale-recipe",
+                    alias="stale-recipe",
+                    last_commit_at_index=stale_head,
+                ),
+                RepoEntry(path="current", alias="current", last_commit_at_index=current_head),
+            ]
+        )
+        updated = RepoUpdateResult(alias="stale-recipe", updated=True)
+
+        async def _run():
+            with patch(
+                "repowise.core.workspace.update.update_single_repo_index",
+                new_callable=AsyncMock,
+                return_value=updated,
+            ) as update_one:
+                results = await update_workspace(
+                    tmp_path,
+                    ws_config,
+                    force_aliases={"stale-recipe"},
+                )
+                return results, update_one
+
+        import asyncio
+
+        results, update_one = asyncio.run(_run())
+        update_one.assert_awaited_once()
+        assert update_one.await_args.args[0] == stale_recipe.resolve()
+        assert {(r.alias, r.skipped_reason) for r in results if not r.updated} == {
+            ("current", "up_to_date")
+        }
+
     def test_up_to_date_repo_reconciles_freshness_stamp(self, tmp_path: Path) -> None:
         """An up-to-date workspace sync still refreshes the repo row timestamp."""
         from repowise.core.persistence import (

@@ -175,6 +175,79 @@ def test_update_refreshes_every_index_layer(tmp_path: Path) -> None:
     assert state.get("knowledge_graph", {}).get("fingerprint")
 
 
+def test_exclusion_change_converges_update_and_next_full_index(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """F15: a tracked, still-present file leaves every file-scoped SQL surface."""
+    repo = _make_git_repo(tmp_path)
+    dropped = repo / "generated" / "drop.py"
+    dropped.parent.mkdir()
+    dropped.write_text("def obsolete():\n    return 1\n", encoding="utf-8")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "add generated source")
+    _index_full(repo)
+
+    from repowise.cli.helpers import config_fingerprint, save_state
+
+    base = _git(repo, "rev-parse", "HEAD")
+    save_state(
+        repo,
+        {
+            "last_sync_commit": base,
+            "docs_enabled": False,
+            "config_fingerprint": config_fingerprint(repo),
+        },
+    )
+    config = repo / ".repowise" / "config.yaml"
+    config.write_text("exclude_patterns:\n  - generated/**\n", encoding="utf-8")
+    _git(repo, "add", "-f", ".repowise/config.yaml")
+    _git(repo, "commit", "-m", "exclude generated source")
+
+    async def _reconcile(*_args, **_kwargs):
+        return None
+
+    from repowise.cli import source_search_runtime
+
+    monkeypatch.setattr(source_search_runtime, "reconcile_configured_source_index", _reconcile)
+    result = CliRunner().invoke(
+        cli,
+        ["update", str(repo), "--no-workspace", "--index-only"],
+    )
+    assert result.exit_code == 0, result.output
+    assert "deleted or excluded file(s)" in result.output
+
+    async def _paths() -> tuple[set[str], set[str], set[str]]:
+        from repowise.core.persistence import (
+            create_engine,
+            create_session_factory,
+            get_session,
+        )
+        from repowise.core.persistence.database import resolve_db_url
+        from repowise.core.persistence.models import GitMetadata, GraphNode, WikiSymbol
+
+        engine = create_engine(resolve_db_url(repo))
+        try:
+            sf = create_session_factory(engine)
+            async with get_session(sf) as session:
+                graph = set((await session.execute(select(GraphNode.node_id))).scalars())
+                symbols = set((await session.execute(select(WikiSymbol.file_path))).scalars())
+                git = set((await session.execute(select(GitMetadata.file_path))).scalars())
+                return graph, symbols, git
+        finally:
+            await engine.dispose()
+
+    for paths in asyncio.run(_paths()):
+        assert "generated/drop.py" not in paths
+
+    # The authoritative init/full-index route converges to the same state.
+    from repowise.core.pipeline.full_index import index_repo_full
+
+    asyncio.run(index_repo_full(repo, exclude_patterns=["generated/**"]))
+    for paths in asyncio.run(_paths()):
+        assert "generated/drop.py" not in paths
+
+
 def test_update_recovers_idle_file_decayed_health(tmp_path: Path, monkeypatch) -> None:
     """#728: an idle file's time-decayed history must recover on a plain git
     update. a.py churns hard, then only b.py changes six months later — a.py is

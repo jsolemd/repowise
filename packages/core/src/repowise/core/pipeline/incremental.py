@@ -1458,6 +1458,14 @@ async def persist_incremental_index(
         async with get_session(sf) as session:
             repo = await upsert_repository(session, name=repo_path.name, local_path=str(repo_path))
             repo_id = repo.id
+            from repowise.core.pipeline.persist import plan_excluded_file_prune
+
+            exclusion_plan = await plan_excluded_file_prune(
+                session,
+                repo_id,
+                repo_path,
+                accept_mass_deletion=accept_mass_deletion,
+            )
 
             # Delete rows of pages retired since this index was built. This
             # path never regenerates a repo-wide page, so nothing else here
@@ -1494,6 +1502,18 @@ async def persist_incremental_index(
                     )
                 except Exception as exc:
                     _skip("Tombstone marking", exc, range_scoped=True)
+
+            if exclusion_plan.actionable_paths:
+                try:
+                    from repowise.core.pipeline.persist import mark_tombstone_pages
+
+                    tombstoned_page_ids += await mark_tombstone_pages(
+                        session,
+                        repo_id,
+                        [(path, []) for path in exclusion_plan.actionable_paths],
+                    )
+                except Exception as exc:
+                    _skip("Excluded-page tombstone marking", exc)
 
             # Placement depends on the whole page set, which on an incremental
             # run lives in the store rather than in the pages just generated.
@@ -1585,7 +1605,7 @@ async def persist_incremental_index(
             # definition re-binds sites in files that did not themselves
             # change. Whole-repo re-derive, so it heals on the next update and
             # is not range-scoped.
-            if parsed_files:
+            if parsed_files and not exclusion_plan.refusals:
                 try:
                     from repowise.core.pipeline.persist import persist_reference_sites
 
@@ -1701,20 +1721,26 @@ async def persist_incremental_index(
                     for node, data in graph.nodes(data=True)
                     if data.get("node_type", "file") == "file"
                 }
+                prune_kwargs: dict[str, Any] = {
+                    "live_hint": live_hint,
+                    "accept_mass_deletion": accept_mass_deletion,
+                }
+                if exclusion_plan.paths or exclusion_plan.refusals:
+                    prune_kwargs["exclusion_plan"] = exclusion_plan
                 pruned, refusals = await prune_deleted_file_rows(
                     session,
                     repo_id,
                     repo_path,
-                    live_hint=live_hint,
-                    accept_mass_deletion=accept_mass_deletion,
+                    **prune_kwargs,
                 )
                 prune_outcome = DeletedFilePruneOutcome(
                     attempted=True,
                     pruned_paths=pruned,
                     refusals=tuple(refusals),
+                    tombstoned_page_ids=tuple(dict.fromkeys(tombstoned_page_ids)),
                 )
                 if pruned:
-                    log(f"Pruned rows for [cyan]{pruned}[/cyan] deleted file(s)")
+                    log(f"Pruned rows for [cyan]{pruned}[/cyan] deleted or excluded file(s)")
                 for refusal in refusals:
                     log(f"[yellow]{refusal.message}[/yellow]")
                     if degraded is not None:
@@ -1729,17 +1755,29 @@ async def persist_incremental_index(
             from repowise.core.source_search import source_search_enabled
 
             if source_search_enabled():
-                from repowise.core.source_search.outbox import enqueue_incremental_update
+                if exclusion_plan.actionable_paths:
+                    from repowise.core.source_search.outbox import enqueue_full_update
 
-                await enqueue_incremental_update(
-                    session,
-                    repo_id,
-                    repo_path,
-                    file_diffs=file_diffs,
-                    parsed_files=parsed_files,
-                    upstream_ready=source_symbol_error is None,
-                    upstream_error=source_symbol_error,
-                )
+                    await enqueue_full_update(
+                        session,
+                        repo_id,
+                        repo_path,
+                        parsed_files=parsed_files,
+                        upstream_ready=source_symbol_error is None,
+                        upstream_error=source_symbol_error,
+                    )
+                else:
+                    from repowise.core.source_search.outbox import enqueue_incremental_update
+
+                    await enqueue_incremental_update(
+                        session,
+                        repo_id,
+                        repo_path,
+                        file_diffs=file_diffs,
+                        parsed_files=parsed_files,
+                        upstream_ready=source_symbol_error is None,
+                        upstream_error=source_symbol_error,
+                    )
 
         # After the session closes: on SQLite the full-text index shares the
         # database file, so writing to it while the session holds a write lock
@@ -1771,14 +1809,17 @@ async def persist_incremental_index(
                 # Tagging still recovers strictly more than not tagging.
                 _skip("Tombstone full-text removal", exc, range_scoped=True)
 
-        # Ceiling: the swept pages' *vector* embeddings survive this path.
-        # There is no store here to delete them from, and building one would
-        # pull the lancedb import onto the post-commit hook, which
-        # ``deterministic.py`` avoids on purpose — and with the default mock
-        # embedder this path never wrote a page embedding in the first place.
-        # LanceDB hydrates a hit from its own columns, so a residual embedding
-        # can still surface in semantic search until the next docs-mode update
-        # (which does delete it) or a reindex.
+        # The core path deliberately does not construct the host-owned page
+        # vector store. Tombstoned ids ride on ``prune_outcome`` so the CLI
+        # host can delete those embeddings with its configured adapter after
+        # this transaction commits.
     finally:
         await engine.dispose()
+    if tombstoned_page_ids and not prune_outcome.tombstoned_page_ids:
+        prune_outcome = DeletedFilePruneOutcome(
+            attempted=prune_outcome.attempted,
+            pruned_paths=prune_outcome.pruned_paths,
+            refusals=prune_outcome.refusals,
+            tombstoned_page_ids=tuple(dict.fromkeys(tombstoned_page_ids)),
+        )
     return prune_outcome

@@ -20,6 +20,7 @@ from .persist import (
     persist_git,
     persist_ingestion,
     persist_pipeline_result,
+    persist_post_index_result,
     tombstone_absent_file_pages,
 )
 from .phase_timing import PhaseTimingRecorder
@@ -37,6 +38,7 @@ __all__ = [
     "persist_git",
     "persist_ingestion",
     "persist_pipeline_result",
+    "persist_post_index_result",
     "rehydrate_graph_builder",
     "reparse_repo",
     "run_generation",

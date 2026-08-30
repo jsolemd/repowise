@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import tempfile
 
 from click.testing import CliRunner
@@ -142,12 +143,28 @@ class TestUpdateProgressJsonCli:
     def test_up_to_date_emits_start_stage_done(self):
         runner = _split_output_runner()
         with tempfile.TemporaryDirectory() as td:
+            subprocess.run(["git", "init", "-q", td], check=True)
+            subprocess.run(["git", "-C", td, "config", "user.name", "Test"], check=True)
+            subprocess.run(
+                ["git", "-C", td, "config", "user.email", "test@example.invalid"],
+                check=True,
+            )
+            with open(os.path.join(td, "app.py"), "w") as source:
+                source.write("value = 1\n")
+            subprocess.run(["git", "-C", td, "add", "app.py"], check=True)
+            subprocess.run(["git", "-C", td, "commit", "-qm", "seed"], check=True)
+            head = subprocess.run(
+                ["git", "-C", td, "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
             os.makedirs(os.path.join(td, ".repowise"))
             state_path = os.path.join(td, ".repowise", "state.json")
             with open(state_path, "w") as f:
-                json.dump({"last_sync_commit": "deadbeef"}, f)
+                json.dump({"last_sync_commit": head}, f)
 
-            result = runner.invoke(cli, ["update", td, "--since", "deadbeef", "--progress", "json"])
+            result = runner.invoke(cli, ["update", td, "--since", "HEAD", "--progress", "json"])
 
         assert result.exit_code == 0
         lines = [line for line in result.stdout.splitlines() if line.strip()]
@@ -162,10 +179,10 @@ class TestUpdateProgressJsonCli:
             "duration_s": events[-1]["duration_s"],
             "degraded": [],
         }
-        # Informational Rich output (repo header, "No changed files detected.")
+        # Informational Rich output ("Already up to date.")
         # went to stderr, not stdout.
-        assert "No changed files detected" not in result.stdout
-        assert "No changed files detected" in result.stderr
+        assert "Already up to date" not in result.stdout
+        assert "Already up to date" in result.stderr
 
     def test_rich_mode_is_unaffected_default(self):
         """Default --progress rich must not emit any JSON lines."""

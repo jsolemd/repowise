@@ -46,10 +46,38 @@ def _print_repo_result(result: Any) -> None:
         )
         if result.prune_outcome.pruned_paths:
             console.print(
-                f"      Pruned rows for {result.prune_outcome.pruned_paths} deleted file(s)"
+                f"      Pruned rows for {result.prune_outcome.pruned_paths} "
+                "deleted or excluded file(s)"
             )
         for refusal in result.prune_outcome.refusals:
             console.print(f"      [yellow]{refusal.message}[/yellow]")
+
+
+def _remove_tombstoned_page_vectors(ws_root: Path, ws_config: Any, results: list[Any]) -> None:
+    """Let the CLI host apply core persistence's page-vector delete contract."""
+    from repowise.cli.helpers import load_config
+
+    from .incremental import _build_update_vector_store
+
+    by_alias = {result.alias: result for result in results}
+    for entry in ws_config.repos:
+        result = by_alias.get(entry.alias)
+        page_ids = (
+            result.prune_outcome.tombstoned_page_ids
+            if result is not None and result.updated
+            else ()
+        )
+        if not page_ids:
+            continue
+        repo_path = (ws_root / entry.path).resolve()
+        try:
+            store = _build_update_vector_store(repo_path, load_config(repo_path))
+            if store is not None:
+                run_async(store.delete_many(list(page_ids)))
+        except Exception as exc:
+            console.print(
+                f"  [yellow]{entry.alias}: tombstone vector removal deferred: {exc}[/yellow]"
+            )
 
 
 def _workspace_update(
@@ -117,6 +145,7 @@ def _workspace_update(
     # never-indexed repos, which can only be first-time indexed index-only, and
     # a follow-up ``--docs`` run generates their pages once they have an index.
     docs_aliases: set[str] = set()
+    recipe_drift_aliases: set[str] = set()
     for entry in ws_config.repos:
         if repo_alias and entry.alias != repo_alias:
             continue
@@ -124,6 +153,20 @@ def _workspace_update(
         stored = entry.last_commit_at_index
         commit_stale, head, behind = check_repo_staleness(abs_path, stored)
         indexed = (abs_path / ".repowise").is_dir()
+        recipe_changes: tuple[str, ...] = ()
+        if indexed:
+            try:
+                from repowise.cli.source_search_runtime import (
+                    configured_source_recipe_changes,
+                )
+
+                recipe_changes = run_async(configured_source_recipe_changes(abs_path))
+            except Exception:
+                # The source lane reports its own unavailable/degraded state;
+                # inability to inspect it must not block the primary update.
+                recipe_changes = ()
+        if recipe_changes:
+            recipe_drift_aliases.add(entry.alias)
         repo_state = (
             load_state(abs_path)
             if indexed and (include_working_tree or accept_mass_deletion)
@@ -145,6 +188,7 @@ def _workspace_update(
             or has_uncommitted_changes
             or has_working_tree_cleanup
             or has_accepted_prune
+            or bool(recipe_changes)
         )
         if not indexed:
             status = "[dim]not indexed[/dim]"
@@ -158,6 +202,7 @@ def _workspace_update(
                 reasons.append("working-tree cleanup")
             if has_accepted_prune:
                 reasons.append("accepted mass-deletion repair")
+            reasons.extend(recipe_changes)
             status = f"[yellow]{', '.join(reasons)}[/yellow]"
         else:
             status = "[green]up to date[/green]"
@@ -250,6 +295,7 @@ def _workspace_update(
             progress=progress,
             include_working_tree=include_working_tree,
             accept_mass_deletion=accept_mass_deletion,
+            recipe_drift_aliases=recipe_drift_aliases,
         )
         return
 
@@ -267,8 +313,10 @@ def _workspace_update(
             on_repo_done=_print_repo_result,
             include_working_tree=include_working_tree,
             accept_mass_deletion=accept_mass_deletion,
+            force_aliases=recipe_drift_aliases,
         )
     )
+    _remove_tombstoned_page_vectors(ws_root, ws_config, results)
 
     # Each member committed its own transactional source outbox. Drain those
     # queues after the parallel SQL updates complete; one unavailable backend
@@ -394,6 +442,7 @@ def _workspace_docs_update(
     progress: str,
     include_working_tree: bool,
     accept_mass_deletion: bool,
+    recipe_drift_aliases: set[str],
 ) -> None:
     """Update a workspace where at least one stale repo wants docs.
 
@@ -447,8 +496,10 @@ def _workspace_docs_update(
                 on_repo_done=_print_repo_result,
                 include_working_tree=include_working_tree,
                 accept_mass_deletion=accept_mass_deletion,
+                force_aliases=recipe_drift_aliases,
             )
         )
+        _remove_tombstoned_page_vectors(ws_root, ws_config, core_results)
         changed_aliases.extend(r.alias for r in core_results if r.updated)
         from repowise.cli.source_search_runtime import reconcile_configured_source_indexes
 

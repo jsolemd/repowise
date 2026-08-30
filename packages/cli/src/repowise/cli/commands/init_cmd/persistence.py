@@ -122,12 +122,11 @@ async def persist_result(result: Any, repo_path: Path, progress: Any | None = No
     from repowise.core.persistence import FullTextSearch, get_session, upsert_repository
     from repowise.core.persistence.crud import upsert_generation_job
     from repowise.core.pipeline import (
-        persist_analysis,
-        persist_generation,
         persist_pipeline_result,
-        sweep_stale_generated_pages,
+        persist_post_index_result,
         tombstone_absent_file_pages,
     )
+    from repowise.core.pipeline.persist import plan_excluded_file_prune
 
     engine, sf, _repo_id = await open_repo_db(repo_path, repo_name=result.repo_name)
 
@@ -164,67 +163,28 @@ async def persist_result(result: Any, repo_path: Path, progress: Any | None = No
                 existing = {}
             existing["tech_stack"] = result.tech_stack
             repo.settings_json = _json.dumps(existing)
+        exclusion_plan = await plan_excluded_file_prune(session, repo.id, repo_path)
+        for refusal in exclusion_plan.refusals:
+            logger.error("excluded_file_prune_refused", detail=refusal.message)
         swept_page_ids: list[str] = []
         if index_done:
-            await persist_analysis(result, session, repo.id)
-            await persist_generation(result, session, repo.id)
-            # persist_generation has already upserted the current pages, so the
-            # sweep only retires structurally-keyed pages this run did not
-            # reproduce. Without it the incremental-index path (every normal
-            # single-repo init) strands stale community-N / scc / layer pages
-            # forever. A type is swept when the run produced pages of it OR
-            # declared authority over it (curated runs are authoritative for
-            # module/layer pages even when every module page was skipped as
-            # 1:1 with a layer); types that are neither stay protected. Pages a
-            # resumed run skipped count as reproduced — they are absent from
-            # ``generated_pages`` precisely because they already exist.
-            swept_page_ids = await sweep_stale_generated_pages(
+            # The resume controller already committed graph/git/symbol rows.
+            # Everything after that write is shared with the full persister so
+            # new hooks cannot drift between the two routes again.
+            swept_page_ids = await persist_post_index_result(
+                result,
                 session,
                 repo.id,
-                result.generated_pages,
-                getattr(result, "authoritative_page_types", None),
-                getattr(result, "preserved_page_ids", None),
+                repo_path=repo_path,
+                exclusion_plan=exclusion_plan,
             )
-            # Same bypass, same repair: persist_pipeline_result also owns the
-            # reference-site refresh, so on this branch a fresh index finished
-            # with the store empty and the two tools that read it dark. A
-            # later no-change ``update`` does not heal it — it skips the
-            # re-parse, so the sites never appear at all.
-            #
-            # ``parsed_files`` is the whole tree on both routes into this
-            # branch (a checkpointed run parsed it; a rehydrated resume
-            # re-parses it), which is the precondition the seam requires. The
-            # guard is for the degenerate empty parse, where a full replace
-            # would delete every site rather than re-derive it. Best-effort for
-            # the same reason as the other call site: the store serves two
-            # opt-in tools, so its failure degrades to a log line.
-            parsed_files = getattr(result, "parsed_files", None)
-            if parsed_files:
-                from repowise.core.pipeline.persist import persist_reference_sites
-
-                try:
-                    await persist_reference_sites(
-                        session, repo.id, parsed_files, repo_path=repo_path
-                    )
-                except Exception as exc:
-                    logger.warning("reference_sites_persist_skipped", error=str(exc))
-
-            # The resume controller already committed the symbol phase, so it
-            # bypasses persist_pipeline_result's source-search hook. Capture a
-            # full reconcile here, in the final authoritative transaction.
-            from repowise.core.source_search import source_search_enabled
-
-            if source_search_enabled():
-                from repowise.core.source_search.outbox import enqueue_full_update
-
-                await enqueue_full_update(
-                    session,
-                    repo.id,
-                    repo_path,
-                    parsed_files=result.parsed_files,
-                )
         else:
-            swept_page_ids = await persist_pipeline_result(result, session, repo.id)
+            swept_page_ids = await persist_pipeline_result(
+                result,
+                session,
+                repo.id,
+                exclusion_plan=exclusion_plan,
+            )
 
         # Tombstone pages whose file is simply gone. The other tombstone path
         # reads a diff, and an init compares nothing, so until here a page
@@ -235,7 +195,12 @@ async def persist_result(result: Any, repo_path: Path, progress: Any | None = No
         try:
             swept_page_ids = [
                 *swept_page_ids,
-                *await tombstone_absent_file_pages(session, repo.id, repo_path),
+                *await tombstone_absent_file_pages(
+                    session,
+                    repo.id,
+                    repo_path,
+                    excluded_paths=exclusion_plan.actionable_paths,
+                ),
             ]
         except Exception as exc:  # one stale page must not fail a whole index
             logger.warning("tombstone_absent_sweep_failed", error=str(exc))
