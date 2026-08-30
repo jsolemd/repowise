@@ -956,8 +956,28 @@ export function GraphFlow(props: GraphFlowProps) {
     setCtxMenu(null);
   }, [ctxMenu, setCtxMenu]);
 
+  // A full-bleed `Skeleton` and nothing else, which is what this was, does not
+  // read as a loading state at canvas size: it paints `--color-bg-elevated`
+  // (#fbf4ee in light) across the whole panel, a pulse too slight to see
+  // against the page, for the several seconds the community graph takes to
+  // arrive and lay out. Reviewers reported it as a blank panel, which is
+  // exactly what it looks like. The skeleton stays as the ground — it holds
+  // the layout — and a line on top says what is happening. `role="status"`
+  // because a bare pulsing div announces nothing at all to a screen reader.
   if (isLoading || isAwaitingAsyncBuild || (isBuildingGraph && !sigmaGraph))
-    return <Skeleton className="h-full w-full rounded-lg" />;
+    return (
+      <div className="relative h-full w-full">
+        <Skeleton className="h-full w-full rounded-lg" />
+        <div
+          role="status"
+          className="absolute inset-0 flex items-center justify-center"
+        >
+          <span className="text-sm text-[var(--color-text-tertiary)]">
+            Loading the graph&hellip;
+          </span>
+        </div>
+      </div>
+    );
 
   // What the top-left status panel has to say, if anything. It is one bordered
   // panel now, so it must not render when every row inside it is empty — an
