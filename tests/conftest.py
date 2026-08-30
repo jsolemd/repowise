@@ -2,9 +2,35 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """Drop the deployment no-generative policy before anything is collected.
+
+    This is the same reset as :func:`_no_ambient_generative_policy`, one phase
+    earlier, and both are needed. A fixture cannot cover this case: test
+    modules do work at *import* time, and collection runs before any fixture
+    exists. ``tests/unit/cli/test_agent_matrix.py`` binds ``COUNTS =
+    GEN.tool_counts()`` at module scope, and ``tool_counts`` calls
+    ``ensure_full_surface`` — so with ``REPOWISE_TOOLS_NO_GENERATIVE`` inherited
+    from the environment, the generative tools are stripped from the
+    process-wide FastMCP singleton and from ``_tool_selection._full_surface``
+    while pytest is still collecting.
+
+    That snapshot is taken once and kept ("first non-empty snapshot wins"), and
+    every later ``apply_tool_selection`` rebuilds the advertised surface from
+    it, so a single import decides what the server can serve for the rest of
+    the session. ``pytest_configure`` runs before the first test module is
+    imported, which is the last moment where clearing the variable still
+    reaches that snapshot.
+    """
+    from repowise.core.generative_policy import NO_GENERATIVE_ENV
+
+    os.environ.pop(NO_GENERATIVE_ENV, None)
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -138,6 +164,45 @@ def _no_real_home_config_writes(tmp_path_factory: pytest.TempPathFactory):
         pass
     yield
     mp.undo()
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_generative_policy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Start every test with the hard no-generative policy *off*.
+
+    ``REPOWISE_TOOLS_NO_GENERATIVE`` is a deployment switch, not a test knob:
+    ``generative_calls_disabled`` reads it straight off the process
+    environment, and a truthy value is fail-closed everywhere it is consulted.
+    The CLI refuses any model-written ``init``/``update`` outright, the server
+    refuses chat, provider validation and generative jobs, and
+    ``snapshot_full_surface`` deletes the generative tools from the singleton
+    FastMCP server the first time a test builds the surface.
+
+    No test sets it — a *deployment* does, and hands it to pytest through the
+    inherited environment (SoleMD pins it in the RepoWise service unit and
+    carries the same pin in its test recipe). Every docs-generating test then
+    fails while the ``--index-only`` test beside it passes, and the same run
+    from a plain shell is green. That reads as flakiness and has been
+    misfiled as test-ordering pollution; it is neither, because it does not
+    depend on order at all.
+
+    Clearing it per test makes the policy something a test opts *into*, which
+    is what the tests that exercise it already do (``monkeypatch.setenv``);
+    the defensive ``monkeypatch.delenv`` several of them carry becomes
+    redundant rather than wrong. Being function-scoped is the point: a test
+    that writes the variable through raw ``os.environ`` rather than
+    ``monkeypatch`` cannot leak it into the next one.
+
+    :func:`pytest_configure` above clears the same variable before collection,
+    which is what protects the import-time readers this fixture is too late
+    for. Keep both.
+
+    Repo- and workspace-local ``.repowise/.env`` policy is deliberately left
+    alone: those files are written by the tests that assert on them.
+    """
+    from repowise.core.generative_policy import NO_GENERATIVE_ENV
+
+    monkeypatch.delenv(NO_GENERATIVE_ENV, raising=False)
 
 
 @pytest.fixture(autouse=True)
