@@ -432,6 +432,19 @@ export interface UseSigmaOptions {
 
 export interface UseSigmaReturn {
   sigma: Sigma | null;
+  /**
+   * Why the renderer never started, when it did not.
+   *
+   * Sigma is WebGL-only and its constructor throws when the browser hands back
+   * no context — a machine with WebGL disabled, a blocked GPU driver, a
+   * software-rendering policy. The init effect is an async IIFE, so before
+   * this that throw became an unhandled promise rejection: `sigma` stayed
+   * null, every downstream effect took its `if (!sigma) return` early exit,
+   * and the canvas painted nothing. A blank rectangle where a graph belongs
+   * looks exactly like a graph with no data, so the host renders this instead
+   * of leaving the reader to guess which one they are looking at.
+   */
+  initError: Error | null;
   /** Ease the camera onto a node. `ratio` controls the resting zoom (smaller =
    *  closer); defaults to 0.15 (tight, for small file nodes). Pass a larger
    *  ratio for big constellation hubs so the surrounding cluster stays visible. */
@@ -474,6 +487,7 @@ export function useSigmaRenderer(options: UseSigmaOptions): UseSigmaReturn {
 
   const sigmaRef = useRef<Sigma | null>(null);
   const [sigmaReady, setSigmaReady] = useState<Sigma | null>(null);
+  const [initError, setInitError] = useState<Error | null>(null);
   const selectedRef = useRef<string | null>(null);
   const highlightedPathRef = useRef<Set<string>>(new Set());
   const highlightedEdgesRef = useRef<Set<string>>(new Set());
@@ -624,8 +638,9 @@ export function useSigmaRenderer(options: UseSigmaOptions): UseSigmaReturn {
 
     let cancelled = false;
     let sigmaInstance: Sigma | null = null;
+    setInitError(null);
 
-    (async () => {
+    void (async () => {
       const [{ default: SigmaConstructor }, edgeCurveModule, sigmaRendering, graphologyModule] =
         await Promise.all([
           import("sigma"),
@@ -789,7 +804,12 @@ export function useSigmaRenderer(options: UseSigmaOptions): UseSigmaReturn {
       sigmaInstance = sigma;
       sigmaRef.current = sigma;
       setSigmaReady(sigma);
-    })();
+    })().catch((err: unknown) => {
+      // Not swallowed and not left to the window: a failure here is the whole
+      // view, so it goes into state where the host can say so.
+      if (cancelled) return;
+      setInitError(err instanceof Error ? err : new Error(String(err)));
+    });
 
     return () => {
       cancelled = true;
@@ -860,6 +880,7 @@ export function useSigmaRenderer(options: UseSigmaOptions): UseSigmaReturn {
 
   return {
     sigma: sigmaReady,
+    initError,
     focusNode,
     fitView,
     zoomIn,

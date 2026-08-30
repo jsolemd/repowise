@@ -742,8 +742,19 @@ body {
 .react-flow {
   --xy-background-color: transparent;
   --xy-minimap-background-color: var(--color-bg-surface);
-  --xy-minimap-mask-background: rgba(36, 27, 44, 0.4);
-  --xy-minimap-mask-stroke: none;
+  /* `--xy-minimap-mask-background` / `--xy-minimap-mask-stroke` are React Flow
+     v11 names. v12 reads `…-mask-background-color` / `…-mask-stroke-color`, so
+     the old spellings set nothing and the mask fell back to the library
+     default. */
+  --xy-minimap-mask-background-color: rgba(36, 27, 44, 0.4);
+  --xy-minimap-mask-stroke-color: transparent;
+  /* The silhouettes. React Flow only ships a light and a dark default for
+     these, and it picks between them on `.react-flow.dark` — a class set by
+     its own `colorMode` prop, which nothing here passes. So both themes got
+     the light default (#e2e2e2): invisible on the white `--color-bg-surface`
+     the minimap ground is painted with, and the minimap drew an empty box.
+     Painting them from a token removes the dependency on that prop. */
+  --xy-minimap-node-background-color: var(--color-text-tertiary);
   --xy-controls-button-background-color: var(--color-bg-elevated);
   --xy-controls-button-background-color-hover: var(--color-bg-overlay);
   --xy-controls-button-border-color: var(--color-border-default);
@@ -755,8 +766,29 @@ body {
 }
 
 .dark .react-flow {
-  --xy-minimap-mask-background: rgba(0, 0, 0, 0.6);
+  --xy-minimap-mask-background-color: rgba(0, 0, 0, 0.6);
   --xy-edge-stroke: rgba(245, 149, 32, 0.3);
+}
+
+/* -------------------------------------------------------------------- */
+/* Categorical node tones (C4, arch graph, Live System Map)              */
+/* -------------------------------------------------------------------- */
+
+/* `NodeShell` emits both readings of its tone as custom properties and this
+   decides which one applies. The tone table itself is literal hex because the
+   static SVG exporter needs it that way; the choice of theme is not something
+   the exporter has an opinion about, so it is made here. Dark keeps the table
+   verbatim. */
+[data-c4-tone] {
+  --tone-bg: var(--tone-bg-light);
+  --tone-band: var(--tone-band-light);
+  --tone-ink: var(--tone-ink-light);
+}
+
+.dark [data-c4-tone] {
+  --tone-bg: var(--tone-bg-dark);
+  --tone-band: var(--tone-band-dark);
+  --tone-ink: var(--tone-ink-dark);
 }
 
 @keyframes graph-path-pulse {

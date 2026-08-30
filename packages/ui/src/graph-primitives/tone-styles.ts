@@ -37,6 +37,43 @@ export function getTone(name: string): ToneStyle {
   return TONE_STYLES[name as ToneName] ?? TONE_STYLES.external;
 }
 
+/**
+ * The same tone, read for a light ground.
+ *
+ * `TONE_STYLES` above is a dark-only table: near-black plum fills carrying
+ * white text. It has to stay literal hex — the static SVG exporter writes
+ * these straight into an attribute, where a `var()` cannot resolve — but every
+ * on-screen consumer of it (the C4 diagram, the arch graph, the Live System
+ * Map) also renders under the light theme, which is the default, and there the
+ * cards came out as dark plum slabs on warm paper.
+ *
+ * Rather than a second hand-tuned table of twenty pairings, the light reading
+ * is derived from the one value that already carries the tone's identity: the
+ * hue in `band`. The fill is that hue as a wash over the page's own surface
+ * token and the ink is the page's own text token, so the card reads as a card
+ * and the hue still says which kind of thing it is. The hue itself is
+ * unchanged in both directions — a legend swatch painted from `band` matches
+ * the node in either theme.
+ *
+ * `transparent` is preserved rather than washed: a tone that deliberately has
+ * no fill (the `portal` pass-through) must not acquire one here.
+ */
+export function toneLightVars(style: ToneStyle): {
+  bg: string;
+  band: string;
+  ink: string;
+} {
+  const surface = "var(--color-bg-surface)";
+  return {
+    bg:
+      style.bg === "transparent"
+        ? "transparent"
+        : `color-mix(in srgb, ${style.band} 12%, ${surface})`,
+    band: `color-mix(in srgb, ${style.band} 24%, ${surface})`,
+    ink: "var(--color-text-primary)",
+  };
+}
+
 export const ARCH_NODE_SIZES = {
   file:         { width: 300, height: 140 },
   function:     { width: 260, height: 110 },

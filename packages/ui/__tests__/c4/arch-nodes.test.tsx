@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from "vitest";
 import { fireEvent, render } from "@testing-library/react";
 import type { NodeProps } from "@xyflow/react";
 import { NodeShell } from "../../src/graph-primitives/node-shell";
+import { TONE_STYLES } from "../../src/graph-primitives/tone-styles";
 import { ArchFileNode } from "../../src/c4/nodes/ArchFileNode";
 import { LayerClusterNode } from "../../src/c4/nodes/LayerClusterNode";
 import { useArchitectureStore } from "../../src/c4/store/use-architecture-store";
@@ -20,6 +21,28 @@ describe("NodeShell", () => {
     );
     const root = container.firstElementChild as HTMLElement;
     expect(root.style.borderLeft).toContain("--color-viz-selection");
+  });
+
+  it("hands the theme both readings of the tone rather than a dark literal", () => {
+    // The node used to set `background: <dark hex>` and `color: #ffffff`
+    // inline, so under the light theme — the default — an arch diagram or the
+    // Live System Map was a field of near-black plum slabs on warm paper. An
+    // inline style cannot be overridden by a stylesheet, so the fix is to make
+    // the inline style a consumer: it sets both readings as custom properties
+    // and `[data-c4-tone]` in globals.css decides which one `--tone-bg`
+    // resolves to.
+    const { container } = render(
+      <NodeShell tone="service" kindLabel="SERVICE" title="api" />,
+    );
+    const root = container.firstElementChild as HTMLElement;
+    expect(root.getAttribute("data-c4-tone")).toBe("service");
+    expect(root.style.background).toBe("var(--tone-bg)");
+    expect(root.style.color).toBe("var(--tone-ink)");
+    expect(root.style.getPropertyValue("--tone-bg-dark")).toBe(TONE_STYLES.service.bg);
+    expect(root.style.getPropertyValue("--tone-bg-light")).toContain("color-mix");
+    expect(root.style.getPropertyValue("--tone-ink-light")).toBe(
+      "var(--color-text-primary)",
+    );
   });
 
   it("renders tour highlight with accentPulse animation", () => {

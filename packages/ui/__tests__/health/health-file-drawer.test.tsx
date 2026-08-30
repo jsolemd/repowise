@@ -374,7 +374,20 @@ describe("HealthFileDrawer metrics", () => {
   it("leads with the file's own score and band", () => {
     render(<HealthFileDrawer open onClose={() => {}} metric={metric({ score: 1.0 })} />);
     expect(screen.getByText("1.0")).toBeInTheDocument();
-    expect(screen.getByText("Critical")).toBeInTheDocument();
+    // "Alert", not "Critical". The drawer reads `healthBand`, which now reads
+    // `bandForScore` — the vocabulary the distribution bar, the badge and the
+    // workspace repo list have always used. It said "Critical" only because
+    // `healthBand` carried a five-step ladder of its own.
+    expect(screen.getByText("Alert")).toBeInTheDocument();
+  });
+
+  it("bands a 6.8 the way every other surface does", () => {
+    // The regression that made this worth pinning: 6.8 read "Good" in green
+    // here and on the repo overview, and "Warning" in amber on /workspace and
+    // in the health distribution — one file, one score, two verdicts.
+    render(<HealthFileDrawer open onClose={() => {}} metric={metric({ score: 6.8 })} />);
+    expect(screen.getByText("Warning")).toBeInTheDocument();
+    expect(screen.queryByText("Good")).toBeNull();
   });
 
   it("offers one link to the full page", () => {
