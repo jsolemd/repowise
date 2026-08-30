@@ -1361,6 +1361,9 @@ async def _structured_search(
 
 @mcp.tool(
     surface_order=40,
+    artifact_type="search_results",
+    presentation="search_results",
+    evidence_basis="inferred",
     recipes=(
         ToolRecipe(
             "find_raw_hits",

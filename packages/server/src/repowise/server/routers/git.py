@@ -33,6 +33,7 @@ from repowise.core.analysis.change_risk import (
     scores_excluding,
 )
 from repowise.core.analysis.risk_semantics import change_risk_authority
+from repowise.core.co_change import MIN_CO_CHANGE_SUPPORT, parse_partners
 from repowise.core.ingestion.git_indexer._constants import (
     EVOLUTION_CATEGORIES,
     classify_commit_category,
@@ -63,6 +64,7 @@ from repowise.server.schemas import (
     RiskHistogramBucket,
     RiskRangeResponse,
 )
+from repowise.server.services.module_health import top_level_module
 from repowise.server.services.reviewer_suggestions import suggest_reviewers
 
 # Below this many sampled commits a percentile isn't worth showing; mirrors
@@ -559,9 +561,7 @@ async def get_ownership(
     else:
         modules: dict[str, list] = {}
         for m in all_meta:
-            parts = m.file_path.split("/")
-            module = parts[0] if len(parts) > 1 else "root"
-            modules.setdefault(module, []).append(m)
+            modules.setdefault(top_level_module(m.file_path), []).append(m)
 
         entries = []
         for module_path, files in sorted(modules.items()):
@@ -601,16 +601,20 @@ async def get_ownership(
 async def get_co_changes(
     repo_id: str,
     file_path: str = Query(..., description="Relative file path"),
-    min_count: int = Query(3, ge=1),
+    min_count: int = Query(MIN_CO_CHANGE_SUPPORT, ge=1),
     session: AsyncSession = Depends(get_db_session),
 ) -> dict:
-    """Get files that frequently change together with the given file."""
+    """Get files that frequently change together with the given file.
+
+    ``min_count`` is a number of shared commits, not the decayed weight.
+    """
     meta = await crud.get_git_metadata(session, repo_id, file_path)
     if meta is None:
         raise HTTPException(status_code=404, detail="Git metadata not found")
 
-    partners = json.loads(meta.co_change_partners_json)
-    filtered = [p for p in partners if p.get("co_change_count", 0) >= min_count]
+    filtered = [
+        p.record for p in parse_partners(meta.co_change_partners_json) if p.support >= min_count
+    ]
 
     return {
         "file_path": file_path,

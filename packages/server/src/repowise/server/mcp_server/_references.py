@@ -125,6 +125,25 @@ def stable_entity_id(prefix: str, repository: str, coordinates: Mapping[str, obj
     return f"{prefix}_{content_id(identity)}"
 
 
+def refactoring_plan_id(suggestion: Any, repository: str) -> str:
+    """Return the public ID for one refactoring plan, ORM row or dataclass.
+
+    Delegates to the refactoring layer's identity kernel, which is the one owner
+    of what makes two plans the same plan and is the id the row is stored under.
+    Deriving a second one here let the emitted id churn whenever an incidental
+    plan detail moved, so an agent that quoted it yesterday could not resolve it.
+
+    *repository* is accepted for call-site compatibility and does not
+    participate: storage scopes uniqueness by repository already, and hashing a
+    local path or alias into the string would make the same plan carry different
+    ids locally and hosted.
+    """
+
+    from repowise.core.analysis.health.refactoring.identity import refactoring_public_id
+
+    return refactoring_public_id(suggestion)
+
+
 # Compatibility aliases for the get_why-specific module that originally
 # owned these primitives. Keeping the private spellings prevents a mechanical
 # promotion from changing sealed evidence identities or downstream imports.
@@ -138,6 +157,7 @@ __all__ = [
     "content_id",
     "omission_reference",
     "path_identity",
+    "refactoring_plan_id",
     "reference",
     "repository_identity",
     "source_reference",

@@ -1,8 +1,7 @@
 import * as React from "react";
-import { bandForScore, HEALTH_BAND_LABEL } from "@repowise-dev/types/health";
 import type { RepoIndexStatus } from "@repowise-dev/types/repos";
-import { healthInk } from "../health/tokens";
 import { formatNumber, formatRelativeTime } from "../lib/format";
+import { healthBand } from "./health-lede";
 import { RepoAvatar } from "./repo-avatar";
 
 export interface RepoRow {
@@ -101,12 +100,13 @@ function figuresFor(repo: RepoRow): string[] {
  * the ribbon above it.
  *
  * Health leads the right-hand column because it is the figure that decides
- * which repo you open. It is painted on `bandForScore`, the canonical three
- * bands. `healthBand` in `overview/health-lede` reads the same function now —
- * it used to carry a five-step ladder of its own, and the note here used to
- * argue that the ladder was safe in a lede "where nothing adjacent contradicts
- * it". It was not: this column and the lede on the page it opens describe one
- * repository at one score, and they disagreed about what to call it.
+ * which repo you open. It is painted on `healthBand`, the same reading the
+ * repo overview and the code health page use, so the number that sends you
+ * into a repo means there what it meant here. `healthBand` resolves through
+ * `bandForScore` — the canonical three bands — rather than the five-step
+ * ladder it used to carry of its own: this column and the lede on the page it
+ * opens describe one repository at one score, and while they ran on separate
+ * ladders one repo read amber in the list and green the moment you opened it.
  */
 export function RepoRows({ repos, LinkComponent, actionsFor }: RepoRowsProps) {
   const A = LinkComponent ?? "a";
@@ -117,7 +117,7 @@ export function RepoRows({ repos, LinkComponent, actionsFor }: RepoRowsProps) {
       {repos.map((repo) => {
         const figures = figuresFor(repo);
         const actions = actionsFor?.(repo);
-        const band = repo.health === null ? null : bandForScore(repo.health);
+        const band = repo.health === null ? null : healthBand(repo.health);
 
         return (
           <li key={repo.id} className="group">
@@ -179,15 +179,15 @@ export function RepoRows({ repos, LinkComponent, actionsFor }: RepoRowsProps) {
                     <>
                       <p
                         className="mt-1 text-[22px] font-semibold leading-none tabular-nums"
-                        style={{ color: healthInk(repo.health) }}
+                        style={{ color: band.color }}
                       >
                         {repo.health.toFixed(1)}
                       </p>
                       <p
                         className="mt-1 text-[11px]"
-                        style={{ color: healthInk(repo.health) }}
+                        style={{ color: band.color }}
                       >
-                        {HEALTH_BAND_LABEL[band]}
+                        {band.label}
                       </p>
                     </>
                   )}

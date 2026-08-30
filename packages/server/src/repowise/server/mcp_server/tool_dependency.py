@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import json
 from itertools import islice
 from typing import Any
 
 from sqlalchemy import select
 
+from repowise.core.co_change import parse_partners
 from repowise.core.ingestion.models import TEMPORAL_EDGE_TYPES
 from repowise.core.persistence.database import get_session
 from repowise.core.persistence.models import GitMetadata, GraphEdge, GraphNode
@@ -121,12 +121,12 @@ async def _attach_co_change_signal(
         src_meta = src_res.scalar_one_or_none()
     if not src_meta or not src_meta.co_change_partners_json:
         return
-    for partner in json.loads(src_meta.co_change_partners_json):
-        if partner.get("file_path", "") != target:
+    for partner in parse_partners(src_meta.co_change_partners_json):
+        if partner.file_path != target:
             continue
         result["co_change_signal"] = {
-            "co_change_count": partner.get("co_change_count", partner.get("count", 0)),
-            "last_co_change": partner.get("last_co_change"),
+            "co_change_count": partner.weight,
+            "last_co_change": partner.last_co_change,
             "note": (
                 "No import dependency, but these files co-change frequently — "
                 "likely logical coupling."
@@ -135,7 +135,14 @@ async def _attach_co_change_signal(
         return
 
 
-@mcp.tool(default=False, surface_order=220, trust_kind="structural")
+@mcp.tool(
+    default=False,
+    surface_order=220,
+    trust_kind="structural",
+    artifact_type="dependency_path",
+    presentation="dependency_path",
+    evidence_basis="inferred",
+)
 async def get_dependency_path(
     source: str,
     target: str,

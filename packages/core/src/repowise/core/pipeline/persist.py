@@ -1665,11 +1665,9 @@ async def persist_ingestion(result: Any, session: Any, repo_id: str) -> int:
     external_systems = getattr(result, "external_systems", None) or []
     if external_systems:
         id_map = await bulk_upsert_external_systems(session, repo_id, external_systems)
-        # Collapse multi-manifest duplicates: any id for a given name is fine
-        # (renderer only needs name/category/ecosystem which are stable).
-        name_to_id: dict[str, int] = {}
-        for (name, _declared_in), sys_id in id_map.items():
-            name_to_id.setdefault(name, sys_id)
+        from repowise.core.persistence.crud import build_external_system_link_map
+
+        name_to_id = build_external_system_link_map(external_systems, id_map)
         await link_graph_nodes_to_external_systems(session, repo_id, name_to_id)
 
     # ---- Symbols -------------------------------------------------------------
@@ -1788,6 +1786,105 @@ async def persist_git(result: Any, session: Any, repo_id: str) -> None:
         )
 
 
+async def _analyzed_commit(session: Any, repo_id: str) -> str | None:
+    """Live HEAD of the repo being indexed, for stamping health rows.
+
+    Read off disk rather than from ``Repository.head_commit``: the health pass
+    just scored the working tree, and the stored column is written by a
+    different step whose ordering relative to this one is not guaranteed.
+    ``None`` on any failure — an unstamped row reads as "not recorded", which
+    is honest, while a wrong sha would not be. Both index paths read it here;
+    the pipeline result carries no sha, so the full path used to stamp ``NULL``.
+    """
+    from repowise.core.persistence.models import Repository
+    from repowise.core.workspace.update import get_head_commit
+
+    try:
+        repo = await session.get(Repository, repo_id)
+        local_path = getattr(repo, "local_path", None) if repo else None
+        return get_head_commit(Path(local_path)) if local_path else None
+    except Exception:
+        return None
+
+
+async def save_full_health_report(
+    session: Any,
+    repo_id: str,
+    health_report: Any,
+    *,
+    analyzed_commit: str | None,
+) -> None:
+    """Full-replace a repository's health rows and everything derived from them.
+
+    Both callers that re-score every file land here: the analysis phase of an
+    index, and the update command's periodic/config-triggered re-score. The
+    metrics, the findings, the non-performance refactoring suggestions and the
+    two materialized read models move together, so a re-score cannot leave the
+    queues describing findings that were deleted out from under them.
+
+    ``analyzed_commit`` stamps the metric rows and the read models with the
+    commit these scores were computed against; ``None`` reads as "not
+    recorded", which is honest, while a wrong sha would not be.
+    """
+    from repowise.core.persistence.crud import (
+        finalize_performance_opportunities,
+        finalize_refactoring_opportunities,
+        save_health_findings,
+        save_health_metrics,
+        save_refactoring_suggestions,
+    )
+
+    hr = health_report
+    metrics = list(getattr(hr, "metrics", None) or [])
+    findings = list(getattr(hr, "findings", None) or [])
+    if not metrics and not findings:
+        # A pass that scored nothing is a broken pass, not a clean repository.
+        # Every write below replaces the repository's rows wholesale, so
+        # honouring an empty report would delete every metric, resolve every
+        # open plan a person has triaged, and empty both queues on the strength
+        # of a parse failure or an exclude pattern that matched everything.
+        return
+    await save_health_metrics(
+        session, repo_id, metrics, analyzed_commit=analyzed_commit
+    )
+    # One savepoint over the findings and everything derived from them, so a
+    # rebuild that failed halfway cannot leave the queue describing findings
+    # that were never stored. It runs on an empty finding set too: the queue
+    # has to be reconciled to nothing just the same.
+    async with session.begin_nested():
+        if findings:
+            await save_health_findings(session, repo_id, findings)
+        # Structured refactoring suggestions (Extract Class, ...). Repo-wide
+        # reconciliation: an unchanged plan keeps its id and its triage state,
+        # and one nobody detects any more resolves rather than disappearing.
+        # Performance plans are excluded: the finalizer below owns them, so
+        # they are generated once, from the merged stored findings, by the same
+        # writer on every path.
+        await save_refactoring_suggestions(
+            session,
+            repo_id,
+            [
+                suggestion
+                for suggestion in (getattr(hr, "refactoring_suggestions", None) or [])
+                if getattr(suggestion, "refactoring_type", None) != "performance_fix"
+            ],
+        )
+        # Group the stored performance findings into the materialized causal
+        # read model, then reconcile lifecycle and plans.
+        await finalize_performance_opportunities(
+            session,
+            repo_id,
+            analyzed_commit=analyzed_commit,
+            plan_policy=getattr(hr, "performance_plan_policy", None),
+        )
+        # Fold the plans just written into per-file opportunities. Last in the
+        # savepoint because it composes over the stored rows, so it has to see
+        # the reconciliation above rather than the detector output.
+        await finalize_refactoring_opportunities(
+            session, repo_id, analyzed_commit=analyzed_commit
+        )
+
+
 async def persist_analysis(result: Any, session: Any, repo_id: str) -> None:
     """Persist analysis-phase outputs: dead code, health, decisions, governance.
 
@@ -1802,10 +1899,7 @@ async def persist_analysis(result: Any, session: Any, repo_id: str) -> None:
         recompute_decision_staleness,
         save_coverage_files,
         save_dead_code_findings,
-        save_health_findings,
-        save_health_metrics,
         save_health_snapshot,
-        save_refactoring_suggestions,
         upsert_git_function_blame_bulk,
     )
 
@@ -1819,10 +1913,8 @@ async def persist_analysis(result: Any, session: Any, repo_id: str) -> None:
         # Hoisted out of the coverage branch below: the same sha now stamps the
         # metric rows, so a reader can tell how far the health pass lags the
         # index instead of assuming the two moved together.
-        head_sha = getattr(result, "head_commit", None) or getattr(result, "commit_sha", None)
-        await save_health_metrics(session, repo_id, hr.metrics or [], analyzed_commit=head_sha)
-        if hr.findings:
-            await save_health_findings(session, repo_id, hr.findings)
+        head_sha = await _analyzed_commit(session, repo_id)
+        await save_full_health_report(session, repo_id, hr, analyzed_commit=head_sha)
         # Resolved coverage rows, when a report was ingested this run.
         coverage_files = getattr(hr, "coverage_files", None)
         if coverage_files:
@@ -1832,12 +1924,8 @@ async def persist_analysis(result: Any, session: Any, repo_id: str) -> None:
                 coverage_files,
                 source_format=getattr(hr, "coverage_format", None) or "lcov",
                 ingested_commit_sha=head_sha,
+                mapping_partial=bool(getattr(hr, "coverage_mapping_partial", False)),
             )
-        # Structured refactoring suggestions (Extract Class, ...). Repo-wide
-        # delete-then-insert like findings; empty list clears prior rows.
-        await save_refactoring_suggestions(
-            session, repo_id, getattr(hr, "refactoring_suggestions", None) or []
-        )
         # Per-function blame rollup (FULL tier only; empty otherwise).
         fn_blame_rows = getattr(hr, "function_blame_rows", None)
         if fn_blame_rows:
@@ -1986,6 +2074,24 @@ async def persist_analysis(result: Any, session: Any, repo_id: str) -> None:
                 repo_id=repo_id,
                 count=len(_gov_findings),
             )
+            # The refactoring queue is a fold over the stored findings and was
+            # composed above, before these rows existed, so without a second
+            # pass a fresh index ranks every opportunity against a finding set
+            # holding none of its governance causes. Only this queue: the
+            # performance finalizer reads ``performance`` findings, and every
+            # governance biomarker is ``organizational``.
+            from repowise.core.persistence.crud import (
+                finalize_refactoring_opportunities,
+            )
+
+            # Savepointed like the first composition: this writer reconciles
+            # the whole queue, so a half-failed one would leave it half-described.
+            async with session.begin_nested():
+                await finalize_refactoring_opportunities(
+                    session,
+                    repo_id,
+                    analyzed_commit=await _analyzed_commit(session, repo_id),
+                )
     except Exception as _gov_err:
         logger.debug("governance_findings_skipped", error=str(_gov_err))
 

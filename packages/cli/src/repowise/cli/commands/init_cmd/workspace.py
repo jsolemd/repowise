@@ -37,6 +37,7 @@ from repowise.cli.helpers import (
     get_head_commit,
     load_config,
     load_state,
+    resolve_explicit_provider_or_prompt,
     resolve_max_file_pages,
     resolve_provider,
     resolve_reasoning,
@@ -389,8 +390,7 @@ def _ingest_and_generate_repo(repo: Any, idx: int, total: int, ctx: _WorkspaceCt
         pages_generated = len(generated_pages)
         docs_mode = "deterministic"
         console.print(
-            f"    [{OK}]✓[/] Rendered {len(generated_pages)} pages from structure "
-            "(no model)\n"
+            f"    [{OK}]✓[/] Rendered {len(generated_pages)} pages from structure (no model)\n"
         )
 
     if ctx.dry_run:
@@ -679,7 +679,11 @@ def _workspace_init(
             index_only = True
         elif mode == "advanced":
             selection = interactive_provider_config_select(
-                console, model, reasoning, repo_path=primary_repo.path
+                console,
+                model,
+                reasoning,
+                repo_path=primary_repo.path,
+                save_key=save_key,
             )
             provider_name = selection.provider_name
             model = selection.model
@@ -708,7 +712,11 @@ def _workspace_init(
         elif not index_only:
             # "full" mode
             selection = interactive_provider_config_select(
-                console, model, reasoning, repo_path=primary_repo.path
+                console,
+                model,
+                reasoning,
+                repo_path=primary_repo.path,
+                save_key=save_key,
             )
             provider_name = selection.provider_name
             model = selection.model
@@ -720,7 +728,13 @@ def _workspace_init(
     provider = None
     if not index_only:
         try:
-            provider = resolve_provider(provider_name, model, primary_repo.path)
+            provider = resolve_explicit_provider_or_prompt(
+                provider_name,
+                model,
+                primary_repo.path,
+                interactive=sys.stdin.isatty() and not yes and not index_only,
+                save_key=save_key,
+            )
             # Re-resolve the embedder now that interactive provider selection
             # may have set the provider's API key in os.environ. Without
             # this, full-mode runs would display "mock" forever because
@@ -734,6 +748,8 @@ def _workspace_init(
             if resolved_reasoning != "auto":
                 console.print(f"  Reasoning: [{VALUE}]{resolved_reasoning}[/]\n")
         except Exception as exc:
+            if provider_name is not None:
+                raise
             console.print(
                 f"  [{WARN}]Provider setup failed ({exc}); falling back to index-only.[/]"
             )

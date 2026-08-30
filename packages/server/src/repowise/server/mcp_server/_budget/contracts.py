@@ -55,14 +55,27 @@ _CONTRACTS: dict[str, ResponseBudgetContract] = {
     "get_change_risk": ResponseBudgetContract(
         "blocks",
         (
+            # Cheapest loss first. Diff-shape context and history go before the
+            # delta and the tests, so what to do survives what the diff weighs.
             "exclude_patterns",
-            "prior_fixes",
-            "impacted_tests",
-            "cross_repo",
+            "change_shape",
             "fix_history.files[]",
             "fix_history.files",
+            "fix_history",
+            "prior_fixes",
+            "cross_repo",
+            "impacted_tests",
+            "health_delta.limits",
+            "health_delta.skipped",
+            "health_delta.top_findings[]",
         ),
-        protected=("classification", "risk_percentile", "risk_authority", "score"),
+        protected=(
+            "directive",
+            "health_delta",
+            "classification",
+            "risk_percentile",
+            "score",
+        ),
     ),
     "get_answer": ResponseBudgetContract(
         "blocks",
@@ -85,21 +98,45 @@ _CONTRACTS: dict[str, ResponseBudgetContract] = {
         expansion_argument="include",
         protected=("answer", "confidence", "citations", "next_action_hint"),
     ),
+    # Whole-block drops served 0 of 50 pages, 0 of 12 episodes and 0 of 58
+    # mined rationale comments across the two modes. Trimming runs to
+    # exhaustion before anything is dropped.
+    #
+    # origin_story and git_archaeology are path mode's; related_documentation is
+    # search mode's; code_rationale is set by both.
     "get_why": ResponseBudgetContract(
         "blocks",
         (
-            "related_documentation",
-            "episodes",
+            # Titles the decisions lane already carries.
             "origin_story.linked_decisions",
+            # Every tail trimmed before any lane is dropped, cheapest loss
+            # first. Episodes last here; the path fitter sheds them first for a
+            # different reason, documented on _fit_path_response.
             "decisions[]",
-            "code_rationale",
+            "git_archaeology.file_commits[]",
+            "git_archaeology.cross_references[]",
+            "git_archaeology.git_log[]",
+            "related_documentation[]",
+            "code_rationale[]",
+            "episodes[]",
+            # Whole-block drops, only once trimming has run out.
             "git_archaeology.file_commits",
             "git_archaeology.cross_references",
             "git_archaeology.git_log",
+            "related_documentation",
+            "code_rationale",
             "origin_story",
         ),
         expansion_argument=None,
-        protected=("mode", "query", "path", "paths", "target_context", "alignment"),
+        protected=(
+            "mode",
+            "query",
+            "path",
+            "paths",
+            "target_context",
+            "alignment",
+            "answer_basis",
+        ),
     ),
     "get_overview": ResponseBudgetContract(
         "blocks",
@@ -140,13 +177,23 @@ _CONTRACTS: dict[str, ResponseBudgetContract] = {
             "trends[]",
             "metrics[]",
             "refactoring_plans[]",
+            "refactoring_opportunities[]",
+            "refactoring_summary",
             "performance_opportunities[]",
+            "performance_summary",
             "high_leverage_files[]",
             "secondary_rankings",
         ),
         protected=(
             "mode",
             "directive",
+            # Both pillar leads are bounded by construction and are the only
+            # actionable content a bare dashboard carries for them, so shedding
+            # one would leave that pillar with counts and nothing to do.
+            "performance_directive",
+            "refactoring_directive",
+            "opportunity_id",
+            "model_state",
             "targets",
             "unresolved",
             "known_modules",
@@ -369,6 +416,12 @@ def enforce_response_budget(
             headroom=0,
             record_counts=True,
         )
+        if tool == "get_why":
+            # Re-derived after shedding: the basis names a lane, and a lane
+            # this pass emptied must not leave the claim standing.
+            from repowise.server.mcp_server.tool_why import _stamp_answer_basis
+
+            _stamp_answer_basis(result)
         if tool == "get_health":
             plans = result.get("refactoring_plans")
             profiles = result.get("validation_profiles")

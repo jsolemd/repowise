@@ -21,7 +21,7 @@ from repowise.core.reasoning import (
 from repowise.core.reasoning import (
     resolve_reasoning as resolve_core_reasoning,
 )
-from repowise.core.repo_config import CONFIG_FILENAME, load_repo_config
+from repowise.core.repo_config import CONFIG_FILENAME, RepoConfigError, load_repo_config
 
 # Update lock — coordinates concurrent `repowise update` invocations and lets
 # the augment hook suppress stale-wiki warnings while a refresh is in flight.
@@ -605,8 +605,19 @@ def head_commit_ts(repo_path: Path) -> float | None:
 
 
 def load_config(repo_path: Path) -> dict[str, Any]:
-    """Load ``.repowise/config.yaml`` or return an empty dict if absent."""
-    return load_repo_config(repo_path)
+    """Load ``.repowise/config.yaml`` or return an empty dict if absent.
+
+    A broken config is surfaced as a warning (to stderr, so ``--format json``
+    stays parseable) and degrades to an empty dict rather than crashing the
+    command or silently using defaults — issue #852: configuration errors must
+    be visible, not swallowed. Callers keep their current behaviour either
+    way; the warning is the fix.
+    """
+    try:
+        return load_repo_config(repo_path)
+    except RepoConfigError as exc:
+        err_console.print(f"[yellow]Warning:[/yellow] {exc}")
+        return {}
 
 
 def resolve_reasoning(
@@ -988,6 +999,61 @@ def resolve_provider(
         "an authenticated Codex CLI subscription, or REPOWISE_PROVIDER=opencode "
         "to use opencode."
     )
+
+
+def resolve_explicit_provider_or_prompt(
+    provider_name: str | None,
+    model: str | None,
+    repo_path: Path,
+    *,
+    interactive: bool,
+    save_key: bool = True,
+) -> Any:
+    """Resolve an explicit provider, onboarding missing credentials in a TTY.
+
+    ``resolve_provider`` stays non-interactive because hooks, CI, and library
+    callers must never block on stdin. ``init`` can opt into this wrapper when
+    it has a real terminal: a missing explicit provider key gets the same
+    inline setup as the provider picker, and an explicit OpenAI provider also
+    gets the endpoint question used by local gateways.
+    """
+    from repowise.cli.ui.provider_selection import interactive_provider_credentials
+
+    if interactive and provider_name == "openai":
+        # A pty can report TTY while stdin is not readable. Let the normal
+        # resolution below produce the actionable provider error instead of
+        # replacing it with Abort.
+        with contextlib.suppress(EOFError, click.Abort):
+            interactive_provider_credentials(
+                console,
+                provider_name,
+                repo_path=repo_path,
+                save_key=save_key,
+            )
+
+        return resolve_provider(provider_name, model, repo_path=repo_path)
+
+    try:
+        return resolve_provider(provider_name, model, repo_path=repo_path)
+    except click.ClickException as original_error:
+        if not interactive or provider_name is None:
+            raise
+
+        try:
+            configured = interactive_provider_credentials(
+                console,
+                provider_name,
+                repo_path=repo_path,
+                save_key=save_key,
+            )
+        except (EOFError, click.Abort):
+            # A pty can report TTY while stdin is not readable. Preserve the
+            # actionable provider error instead of replacing it with Abort.
+            raise original_error from None
+
+        if not configured:
+            raise original_error
+        return resolve_provider(provider_name, model, repo_path=repo_path)
 
 
 def resolve_provider_or_prompt(

@@ -10,6 +10,7 @@ from typing import Any
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from repowise.core.co_change import parse_partners
 from repowise.core.persistence.models import (
     GitMetadata,
     Repository,
@@ -290,22 +291,17 @@ def _build_co_changes(
     is a recency-decayed sum (``exp(-age_days / tau)`` per shared commit), so it
     is fractional. Named ``count`` it read as "5.52 co-changes" to every agent.
     """
-    partners = json.loads(meta.co_change_partners_json)
-    partners_sorted = sorted(
-        partners,
-        key=lambda p: p.get("co_change_count", p.get("count", 0)) or 0,
-        reverse=True,
-    )
+    partners_sorted = parse_partners(meta.co_change_partners_json)
     relation_types = structural_related if isinstance(structural_related, dict) else {}
     related_paths = set(structural_related)
     rows = []
     for partner in partners_sorted:
-        path = partner.get("file_path", partner.get("path", ""))
+        path = partner.file_path
         types = sorted(relation_types.get(path, ()))
         row = {
             "file_path": path,
-            "weight": partner.get("co_change_count", partner.get("count", 0)),
-            "last_co_change": partner.get("last_co_change"),
+            "weight": partner.weight,
+            "last_co_change": partner.last_co_change,
             "relationship_type": "co_change",
             "direction": "undirected",
             "evidence_kind": "historical",
@@ -317,9 +313,8 @@ def _build_co_changes(
         }
         if types:
             row["structural_relationship_types"] = types
-        support = partner.get("frequency", partner.get("shared_commit_count"))
-        if support is not None:
-            row["support"] = support
+        if partner.support:
+            row["support"] = partner.support
         rows.append(row)
     population = filter_dicts_by_key(rows, "file_path", exclude_spec)
     return population, len(population)

@@ -38,6 +38,7 @@ from repowise.cli.helpers import (
     head_commit_ts,
     load_config,
     load_state,
+    resolve_explicit_provider_or_prompt,
     resolve_max_file_pages,
     resolve_provider,
     resolve_reasoning,
@@ -419,7 +420,9 @@ def _run_generation_phase(
     help=(
         "LLM provider name (anthropic, openai, openrouter, gemini, "
         "deepseek, kimi, ollama, litellm, codex_cli, claude_cli, opencode, "
-        "edenai, mock)."
+        "edenai, mock). "
+        "In a terminal, a missing key is prompted for; openai also asks for "
+        "an optional OpenAI-compatible Base URL."
     ),
 )
 @click.option("--model", default=None, help="Model identifier override.")
@@ -851,34 +854,52 @@ def init_command(
             repo_paths=[r.path for r in scan.repos],
             seed_base=seed_base,
             include_submodules=include_submodules,
+            dry_run=dry_run,
         )
         if seeded:
+            if dry_run:
+                console.print(
+                    "[dim]Dry run: Would seed worktree index and delegate to update.[/dim]"
+                )
+                return
+
             console.print(f"[{OK}]Worktree index seeded successfully. Delegating to update...[/]")
             from repowise.cli.commands.update_cmd.command import run_update
 
             is_workspace = len(scan.repos) > 1 and not no_workspace
 
-            # Delegate to update
-            run_update(
-                path=str(repo_path),
-                provider_name=provider_name,
-                model=model,
-                since=None,
-                reasoning=reasoning,
-                cascade_budget=None,
-                dry_run=dry_run,
-                workspace=is_workspace,
-                no_workspace=no_workspace,
-                repo_alias=None,
-                index_only=index_only,
-                docs_flag=None,
-                full=force,
-                agents_md=agents_md,
-                concurrency=concurrency,
-                no_cost_tracking=no_cost_tracking,
-                verbose=verbose,
-                progress=progress,
-            )
+            from repowise.core.persistence.database import DB_ENV_VARS
+
+            # Strip db-pin env vars to enforce worktree DB resolution (note: potential process-global race condition).
+            old_db_urls = {}
+            for env_key in DB_ENV_VARS:
+                if env_key in os.environ:
+                    old_db_urls[env_key] = os.environ.pop(env_key)
+
+            try:
+                # Delegate to update
+                run_update(
+                    path=str(repo_path),
+                    provider_name=provider_name,
+                    model=model,
+                    since=None,
+                    reasoning=reasoning,
+                    cascade_budget=None,
+                    dry_run=dry_run,
+                    workspace=is_workspace,
+                    no_workspace=no_workspace,
+                    repo_alias=None,
+                    index_only=index_only,
+                    docs_flag=None,
+                    full=force,
+                    agents_md=agents_md,
+                    concurrency=concurrency,
+                    no_cost_tracking=no_cost_tracking,
+                    verbose=verbose,
+                    progress=progress,
+                )
+            finally:
+                os.environ.update(old_db_urls)
             if hard_no_generative:
                 # Delegated update is the successful completion boundary for
                 # a seeded init, so it must emit the same terminal witnesses
@@ -1025,6 +1046,7 @@ def init_command(
                 model,
                 reasoning,
                 repo_path=repo_path,
+                save_key=save_key,
             )
             provider_name = selection.provider_name
             model = selection.model
@@ -1209,16 +1231,19 @@ def init_command(
                     f"Decision extraction provider: [{VALUE}]{decision_provider.provider_name}[/]"
                 )
     else:
-        # No prompt here. ``is_interactive`` (line ~800) is already false only
-        # when the user passed --provider, --index-only or --yes, or stdin is
-        # not a terminal — so the old fallback picker in this branch fired
-        # exactly on ``--yes``, which means "do not ask me". On shells where
-        # isatty() claims a terminal it cannot actually read from (Windows
-        # mintty, ``docker run -t`` without -i) that prompt hit EOF and killed
-        # the run instead. A --yes run with no key now lands in the template
-        # wiki below rather than in a question or a crash.
+        # An explicit provider may onboard its missing key (and, for the
+        # OpenAI-compatible adapter, its endpoint) here when stdin is a real
+        # terminal. Auto-detection and scripted runs remain non-interactive:
+        # a --yes run with no key lands in the template wiki below rather than
+        # in a question or a crash.
         try:
-            provider = resolve_provider(provider_name, model, repo_path)
+            provider = resolve_explicit_provider_or_prompt(
+                provider_name,
+                model,
+                repo_path,
+                interactive=sys.stdin.isatty() and not yes and not index_only,
+                save_key=save_key,
+            )
         except click.ClickException as exc:
             # Nothing configured anywhere. Workspace init, workspace update
             # and the OSS server all render a template wiki in this exact
@@ -1562,7 +1587,6 @@ def init_command(
     # ---- Post-run: config, state, MCP, editor project files ----
     if commit_limit is not None:
         save_config_partial(repo_path, commit_limit=resolved_commit_limit)
-
     # One flag, one meaning: --no-editor-setup now suppresses the project-local
     # writes as well as the global registration. The paths come back so the
     # completion panel can name what landed in the working tree.

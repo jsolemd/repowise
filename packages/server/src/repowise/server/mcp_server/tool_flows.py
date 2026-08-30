@@ -80,7 +80,14 @@ def _step(index: int, node: GraphNode | None, node_id: str, via: str | None) -> 
     return step
 
 
-@mcp.tool(default=False, surface_order=230, trust_kind="structural")
+@mcp.tool(
+    default=False,
+    surface_order=230,
+    trust_kind="structural",
+    artifact_type="call_path",
+    presentation="call_path",
+    evidence_basis="inferred",
+)
 async def get_execution_flows(
     top_n: int = 10,
     max_depth: int = 8,
