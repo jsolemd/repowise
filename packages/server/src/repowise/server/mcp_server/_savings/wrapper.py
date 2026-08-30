@@ -105,6 +105,7 @@ def _emit_telemetry(tool: str, result: Any, duration_ms: int) -> None:
 
     telemetry.record_event("mcp_tool_call", _telemetry_properties(tool, result, duration_ms))
 
+
 #: ``_meta`` key a tool sets to declare its own counterfactual (see
 #: :func:`declare_replaced`). The wrapper reads and then leaves it in place as a
 #: transparency annotation.

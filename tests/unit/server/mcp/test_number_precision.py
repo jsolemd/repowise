@@ -133,9 +133,7 @@ def _offending_floats(obj, path="$"):
 
 def test_the_detector_actually_detects():
     """Guard the guard — a walker that never fires would make this file inert."""
-    assert _offending_floats({"a": {"b": [0.791581408944753]}}) == [
-        ("$.a.b[0]", 0.791581408944753)
-    ]
+    assert _offending_floats({"a": {"b": [0.791581408944753]}}) == [("$.a.b[0]", 0.791581408944753)]
     assert _offending_floats({"a": float("nan")})
     assert _offending_floats({"ok": 0.7916, "n": 12, "flag": True}) == []
 
