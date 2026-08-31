@@ -275,12 +275,26 @@ async def test_context_used_by_and_relations_recover_in_one_bounded_query_shape(
     relation_recovered = await _recover_one(relation_result, "Type025")
     assert "Type025" in relation_recovered
     assert "Type000" not in relation_recovered
-    # Upstream pins 20 for both. The fork's get_context target resolution
-    # (tool_context/targets.py: the near-miss path pool over GitMetadata / Page /
-    # GraphNode plus the qualified WikiSymbol lookup) adds four statements to
-    # the relations call; measured 24 on the v0.46.0 merge. Program ticket F40:
-    # gate the pool behind an exact-hit miss so this returns to 20.
-    assert relation_statements <= 24 and used_by_statements <= 20
+    # Upstream pins 20 for both. Two fork additions sit on top, both measured
+    # and both ticketed:
+    #
+    #   +4  get_context target resolution (tool_context/targets.py: the
+    #       near-miss path pool over GitMetadata / Page / GraphNode plus the
+    #       qualified WikiSymbol lookup). Measured 24 on the v0.46.0 merge.
+    #       Ticket F40: gate the pool behind an exact-hit miss, returning -4.
+    #   +2  the test-linkage graph rung's call walk (F29). `tests_reaching_by_tier`
+    #       opens with its own repo-wide test-file scan and a `defines` lookup
+    #       before the walk can start, and this rung asks it once per target.
+    #       Per-file cost on the fixture: a graph-answered file 3 -> 5, a
+    #       naming-answered file 5 -> 6 (the swap costs 2, merging the naming
+    #       rung's two node scans into one gives 1 back), a test file 1 -> 1.
+    #       Ticket F29-follow: resolve the rung for a whole target list in one
+    #       call so the walk is paid once per request, not once per file.
+    #
+    # The +2 buys the recall this rung was swapped for: upstream measures the
+    # 1-hop import relation this replaced at 19.5% of provably-executed files
+    # against the call walk's 27.7%, at higher precision (72.1% -> 91.7%).
+    assert relation_statements <= 26 and used_by_statements <= 20
 
 
 @pytest.mark.asyncio
