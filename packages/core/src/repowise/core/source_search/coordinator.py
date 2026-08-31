@@ -1168,7 +1168,7 @@ class SourceSearchCoordinator:
         hard = [failure for failure in failures if failure.hard]
         deduped = self._dedupe_by_file(ranked)
         window = deduped[:limit]
-        owner, reason = self._select_owner(window, intent=intent)
+        owner, reason = self._select_owner(window, intent=intent, ranked=ranked)
         if owner is not None and deduped and deduped[0] is not owner:
             # The owner is the answer, so it leads the list the caller reads
             # and the candidate paths derived from it. Identity, not equality:
@@ -1743,7 +1743,12 @@ class SourceSearchCoordinator:
     # -- owner and confidence ---------------------------------------------
 
     @staticmethod
-    def _select_owner(window: Sequence[_Item], *, intent: QueryIntent) -> tuple[_Item | None, str]:
+    def _select_owner(
+        window: Sequence[_Item],
+        *,
+        intent: QueryIntent,
+        ranked: Sequence[_Item] = (),
+    ) -> tuple[_Item | None, str]:
         """Select an owner through named, intent-bounded policy stages.
 
         Preference applies only inside :data:`OWNER_SCORE_BAND` of the best
@@ -1755,6 +1760,13 @@ class SourceSearchCoordinator:
         stage narrows only when its query shape applies and a matching candidate
         exists.  Retrieval score then decides among the survivors; path, line,
         and stable key are used only for a true score tie.
+
+        *ranked* is the full pre-deduplication ranking, read only by the
+        declaration-anchor stage below — the same "every other retrieved item
+        for this file" lookup :meth:`_upgrade_line_evidence` and
+        :meth:`_name_contained_symbols` already make. It defaults to empty so a
+        caller holding only a window still gets every stage that a window can
+        answer; with no ranking there are no anchors and that stage is inert.
         """
         if not window:
             return None, ""
@@ -1767,7 +1779,15 @@ class SourceSearchCoordinator:
         def narrow(rule: str, matching: Sequence[_Item]) -> None:
             nonlocal candidates, applied_rule
             selected = list(matching)
-            if not selected or len(selected) == len(candidates):
+            # "Changed nothing" is decided on identity, not on length. Every
+            # stage below passes an order-preserving sublist, for which the two
+            # tests agree exactly — but the symptom rescue passes a candidate
+            # the band never held, and a length test would read that
+            # replacement as a no-op and drop it.
+            if not selected or (
+                len(selected) == len(candidates)
+                and all(kept is chosen for kept, chosen in zip(candidates, selected, strict=True))
+            ):
                 return
             displaced_incumbent = candidates[0] not in selected
             candidates = selected
@@ -1786,7 +1806,10 @@ class SourceSearchCoordinator:
         if intent.wants_tests:
             narrow("explicit test owner", [item for item in candidates if item.is_test])
         elif intent.repair:
-            narrow("symptom test demotion", [item for item in candidates if not item.is_test])
+            non_test = [item for item in candidates if not item.is_test]
+            if not non_test:
+                non_test = _symptom_rescue(window)
+            narrow("symptom test demotion", non_test)
 
         # 4. Complete subject evidence must be co-located on the proposed owner.
         # A small relative advantage is not called "complete": the same 0.80
@@ -1880,6 +1903,84 @@ class SourceSearchCoordinator:
                 "operational file preservation",
                 [item for item in candidates if item.source == SOURCE_FILE_WINDOW],
             )
+
+        # 8. A page that declares nothing must not settle a near-tie on prose.
+        #
+        # Per-file deduplication keeps one item per file, so when a file's
+        # generated page outranks the file's own chunks the page is the only
+        # thing left standing for that path — and the page names no symbol,
+        # carries no lines, and draws its evidence from prose written *about*
+        # the file. Two such pages can sit a fraction of a percent apart while
+        # the declarations behind them are ordered the other way round, and the
+        # response then serves the losing file's declaration (the citation
+        # upgrade puts it back) under the winning file's name.
+        #
+        # Measured on the two shapes this was written for. ``pipeline.py``'s
+        # page beat ``tools/search.py``'s by 0.3% and owned a query whose
+        # subject ``search.py`` carried four times as much of — while
+        # ``search.py``'s declaration outranked ``pipeline.py``'s by 13%.
+        # ``engines/brand/assets.py``'s page beat ``cli/brand.py``'s function
+        # by 0.6%, and ``cli/brand.py``'s declaration outranked
+        # ``assets.py``'s. In both, the answer the reader wanted was already
+        # retrieved and already served; only the ownership claim was wrong.
+        #
+        # Last on purpose, and the weakest claim here: it decides only what the
+        # named policy stages left undecided, so it can never suppress one of
+        # them. It reads the ranking rather than the window because the losing
+        # declaration is exactly what deduplication removed. Inert whenever the
+        # incumbent names a symbol of its own (a source chunk, a file window, a
+        # symbol spotlight) — a candidate that declares something is entitled to
+        # its own fused position, whatever its lane.
+        #
+        # And inert whenever the page carries the *complete* subject, on the
+        # same :data:`CONFIDENT_CONCEPT_COVERAGE` floor stage 4 calls
+        # completeness. A page matching every concept the query asked about
+        # earned its position on evidence rather than on being a page, and the
+        # declaration behind a neighbour is not grounds to take it: measured on
+        # "which module updates Zotero tags to match the paper pipeline
+        # status", where ``zotero/service/reconcile.py``'s page covers the
+        # subject completely and a sibling's class declaration ranked 4% above
+        # ``reconcile``'s own. The two shapes above sit at 0.06 and 0.70
+        # coverage — pages that had not earned it.
+        incumbent = candidates[0]
+        incumbent_profile = incumbent.evidence_profile
+        incumbent_complete = (
+            incumbent_profile is None
+            or incumbent_profile.concept_coverage >= CONFIDENT_CONCEPT_COVERAGE
+        )
+        if (
+            len(candidates) > 1
+            and incumbent.lane == LANE_WIKI
+            and not incumbent.match_name
+            and not incumbent_complete
+        ):
+            anchors = _declaration_anchors(ranked)
+            # This is a comparison, and a comparison needs both sides. A page
+            # the corpus retrieved no declaration for has nothing to enter into
+            # it — excluding it would turn "there is nothing to compare" into
+            # "you lose", which is how a documentation page asked for by name
+            # loses its own query to the source file beside it. It abstains
+            # instead, and the fusion's answer stands.
+            anchored = (
+                [item for item in candidates if item.file in anchors]
+                if incumbent.file in anchors
+                else []
+            )
+            if anchored:
+                best_anchor = max(anchors[item.file].fused_score for item in anchored)
+                narrow(
+                    "declaration-ranked near-tie",
+                    [
+                        item
+                        for item in anchored
+                        if math.isclose(
+                            anchors[item.file].fused_score,
+                            best_anchor,
+                            rel_tol=0.0,
+                            abs_tol=1e-12,
+                        )
+                    ],
+                )
 
         winner = _policy_tie_break(candidates)
         if (
@@ -2294,6 +2395,66 @@ def _basename_stem(path: str) -> str:
 
     tail = path.rsplit("/", 1)[-1]
     return tail.split(".", 1)[0].casefold()
+
+
+def _symptom_rescue(window: Sequence[_Item]) -> list[_Item]:
+    """The implementation a repair query wanted, when the band held only tests.
+
+    A repair query names a failing test because that is where the failure
+    showed up, and :meth:`SourceSearchCoordinator._rank` deliberately skips the
+    generic test demotion for one so the test stays *visible*. The owner policy
+    is then the only thing standing between "fix the failing X test" and a test
+    file owning the answer — and it is band-bounded, so when the tests around
+    the symptom fill the whole band the demotion has nothing to narrow to and
+    silently does not fire. Measured: a test file owned a repair query
+    *confidently* with the implementation sitting at rank 2, 13% below the top
+    fused score and 3 points outside a 10% band.
+
+    So the demotion reaches past the band, but only for one thing and only on
+    one condition: the best-ranked non-test candidate the window actually
+    retrieved, and only when that candidate carries at least half the query's
+    subject. The floor is :data:`NO_MATCH_CONCEPT_COVERAGE`, the same coverage
+    that separates a plausible answer from no answer at all — below it there is
+    no implementation to prefer, and the existing comment's case holds: a test
+    is sometimes the only place a behaviour is written down, and it keeps the
+    answer.
+
+    Returns a one-item list to hand straight to ``narrow``, or empty for "no
+    rescue", which leaves the stage the no-op it is today.
+    """
+    for item in window:
+        if item.is_test or not item.file:
+            continue
+        profile = item.evidence_profile
+        if profile is None:
+            # Co-location evidence did not survive retrieval. It cannot license
+            # displacing a candidate the fusion put first.
+            return []
+        if profile.concept_coverage >= NO_MATCH_CONCEPT_COVERAGE:
+            return [item]
+        return []
+    return []
+
+
+def _declaration_anchors(ranked: Sequence[_Item]) -> dict[str, _Item]:
+    """The best-ranked retrieved declaration for each file in *ranked*.
+
+    "Declaration" is the same shape :meth:`SourceSearchCoordinator._select_owner`
+    stage 6 already means by it — an indexed source symbol whose kind defines
+    something — with no subject test attached, because this is not deciding
+    whether a declaration may own, only which of two files retrieval found more
+    of. *ranked* is in fused order, so the first hit per file is the best one.
+    """
+    anchors: dict[str, _Item] = {}
+    for item in ranked:
+        if (
+            item.file
+            and item.lane == LANE_SOURCE
+            and item.source == SOURCE_SYMBOL
+            and item.kind in _DEFINITION_KINDS
+        ):
+            anchors.setdefault(item.file, item)
+    return anchors
 
 
 def _declaration_carries_subject(item: _Item) -> bool:

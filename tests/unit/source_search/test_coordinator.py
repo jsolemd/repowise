@@ -2508,3 +2508,298 @@ async def test_a_re_seated_row_is_the_one_that_gets_named(tmp_path):
     assert row["symbol_path"] == "mmr_diversify"
     # And the row that survived the re-seat is the one carrying the name.
     assert row["contains_symbols"] == ["mmr_diversify::_sim"]
+
+
+# ---------------------------------------------------------------------------
+# Owner selection — the symptom rescue (F46)
+# ---------------------------------------------------------------------------
+
+
+def _repair_corpus(implementation_score: float = 0.83) -> list[SourceChunkHit]:
+    """Eight test chunks around one symptom, then the code under them.
+
+    Deduplication collapses the eight to one served row, so the *window* is two
+    items — but the fused gap between them is what matters: rank 1 against rank
+    9 is 12% and the owner band is 10%, which is the measured shape (a repair
+    query whose top ten retrieved chunks were all the same test file).
+    """
+    return [
+        _hit(f"test_widget_case_{n}", "tests/test_alpha.py", 0.90 - n * 0.005, is_test=True)
+        for n in range(8)
+    ] + [_hit("alpha_thing", "src/alpha.py", implementation_score)]
+
+
+async def test_a_repair_query_reaches_past_the_band_for_the_implementation(tmp_path):
+    """The demotion is the whole point of a repair query; the band cannot mute it."""
+    coordinator = _coordinator(
+        tmp_path,
+        source_dense=_repair_corpus(),
+        source_term_files={
+            "widget": {"src/alpha.py", "tests/test_alpha.py"},
+            "gadget": {"src/alpha.py", "tests/test_alpha.py"},
+        },
+    )
+
+    response = await coordinator.search("fix the failing widget gadget test", limit=5)
+
+    assert response["selected_owner"]["file"] == "src/alpha.py"
+    assert response["selected_owner"]["reason"].startswith("owner policy: symptom test demotion")
+    # Demoted from ownership, not from the answer: the symptom is still where
+    # the reader saw the failure.
+    assert "tests/test_alpha.py" in _files(response)
+
+
+async def test_the_symptom_rescue_needs_an_implementation_that_carries_the_subject(tmp_path):
+    """Below the no-match coverage floor there is no implementation to prefer."""
+    coordinator = _coordinator(
+        tmp_path,
+        source_dense=_repair_corpus(),
+        source_active_paths={"src/alpha.py", "tests/test_alpha.py"},
+        source_term_files={
+            "widget": {"tests/test_alpha.py"},
+            "gadget": {"tests/test_alpha.py"},
+        },
+    )
+
+    response = await coordinator.search("fix the failing widget gadget test", limit=5)
+
+    assert response["selected_owner"]["file"] == "tests/test_alpha.py"
+    assert "symptom test demotion" not in response["selected_owner"]["reason"]
+
+
+async def test_the_symptom_rescue_is_inert_when_tests_are_the_subject(tmp_path):
+    coordinator = _coordinator(
+        tmp_path,
+        source_dense=_repair_corpus(),
+        source_term_files={
+            "widget": {"src/alpha.py", "tests/test_alpha.py"},
+            "gadget": {"src/alpha.py", "tests/test_alpha.py"},
+        },
+    )
+
+    response = await coordinator.search("which fixture covers the widget gadget", limit=5)
+
+    assert response["selected_owner"]["file"] == "tests/test_alpha.py"
+
+
+async def test_a_repair_query_with_only_tests_keeps_the_test(tmp_path):
+    """Sometimes a test is the only place a behaviour is written down."""
+    coordinator = _coordinator(
+        tmp_path,
+        source_dense=[
+            _hit(f"test_widget_case_{n}", "tests/test_alpha.py", 0.90 - n * 0.005, is_test=True)
+            for n in range(8)
+        ],
+    )
+
+    response = await coordinator.search("fix the failing widget gadget test", limit=5)
+
+    assert response["selected_owner"]["file"] == "tests/test_alpha.py"
+
+
+async def test_an_in_band_implementation_still_takes_ownership_the_old_way(tmp_path):
+    """The rescue is a fallback: with the code in the band nothing reaches past it."""
+    coordinator = _coordinator(
+        tmp_path,
+        source_dense=[
+            _hit("test_widget", "tests/test_alpha.py", 0.90, is_test=True),
+            _hit("alpha_thing", "src/alpha.py", 0.89),
+        ],
+    )
+
+    response = await coordinator.search("fix the failing widget gadget test", limit=5)
+
+    assert response["selected_owner"]["file"] == "src/alpha.py"
+    assert response["selected_owner"]["reason"].startswith("owner policy: symptom test demotion")
+
+
+# ---------------------------------------------------------------------------
+# Owner selection — the declaration-ranked near-tie (F47)
+# ---------------------------------------------------------------------------
+
+#: One concept per file, so neither page carries the complete subject and the
+#: completeness stage above cannot decide.  Split evidence is the condition the
+#: near-tie stage exists for.
+_SPLIT_SUBJECT = {
+    "widget": {"src/alpha_page.py"},
+    "gadget": {"src/beta_impl.py"},
+}
+#: Both concepts on both files: two complete subjects, and a page that carries
+#: one has earned its position.
+_WHOLE_SUBJECT = {
+    "widget": {"src/alpha_page.py", "src/beta_impl.py"},
+    "gadget": {"src/alpha_page.py", "src/beta_impl.py"},
+}
+
+
+def _near_tie_pages() -> list[Any]:
+    return [
+        _PageHit("file_page:src/alpha_page.py", "src/alpha_page.py", 0.90),
+        _PageHit("file_page:src/beta_impl.py", "src/beta_impl.py", 0.89),
+    ]
+
+
+async def test_a_page_that_declares_nothing_loses_a_near_tie_to_the_better_declared_file(
+    tmp_path,
+):
+    """Dedupe hides the losing declaration; owner selection must still see it.
+
+    Both files are represented in the window by their generated page, because
+    each page outranked its own file's chunks. The pages sit 1.6% apart and the
+    declarations behind them are ordered the other way round — and it is the
+    declaration the response goes on to cite.
+    """
+    coordinator = _coordinator(
+        tmp_path,
+        wiki_dense=_near_tie_pages(),
+        source_dense=[
+            _hit("beta_thing", "src/beta_impl.py", 0.88),
+            _hit("alpha_thing", "src/alpha_page.py", 0.87),
+        ],
+        source_term_files=_SPLIT_SUBJECT,
+    )
+
+    response = await coordinator.search("the widget and the gadget", limit=5)
+
+    assert response["selected_owner"]["file"] == "src/beta_impl.py"
+    assert response["selected_owner"]["reason"].startswith(
+        "owner policy: declaration-ranked near-tie"
+    )
+
+
+async def test_the_incumbent_keeps_the_answer_when_its_own_file_declares_best(tmp_path):
+    coordinator = _coordinator(
+        tmp_path,
+        wiki_dense=_near_tie_pages(),
+        source_dense=[
+            _hit("alpha_thing", "src/alpha_page.py", 0.88),
+            _hit("beta_thing", "src/beta_impl.py", 0.87),
+        ],
+        source_term_files=_SPLIT_SUBJECT,
+    )
+
+    response = await coordinator.search("the widget and the gadget", limit=5)
+
+    assert response["selected_owner"]["file"] == "src/alpha_page.py"
+    assert "declaration-ranked near-tie" not in response["selected_owner"]["reason"]
+
+
+async def test_a_page_carrying_the_complete_subject_is_not_displaced(tmp_path):
+    """Measured regression: a page matching every concept earned its position.
+
+    Same retrieval as the firing case — the neighbour's declaration still ranks
+    higher — and the only difference is that this page covers the whole
+    subject. That is evidence, not shape, and the near-tie stage does not
+    overturn it.
+    """
+    coordinator = _coordinator(
+        tmp_path,
+        wiki_dense=_near_tie_pages(),
+        source_dense=[
+            _hit("beta_thing", "src/beta_impl.py", 0.88),
+            _hit("alpha_thing", "src/alpha_page.py", 0.87),
+        ],
+        source_term_files=_WHOLE_SUBJECT,
+    )
+
+    response = await coordinator.search("the widget and the gadget", limit=5)
+
+    assert response["selected_owner"]["file"] == "src/alpha_page.py"
+    assert "declaration-ranked near-tie" not in response["selected_owner"]["reason"]
+
+
+async def test_a_page_that_names_its_own_symbol_is_not_displaced(tmp_path):
+    """A symbol spotlight declares something; only a nameless page does not."""
+    coordinator = _coordinator(
+        tmp_path,
+        wiki_dense=[
+            _PageHit(
+                "symbol_spotlight:src/alpha_page.py::Alpha",
+                "src/alpha_page.py::Alpha",
+                0.90,
+                page_type="symbol_spotlight",
+            ),
+            _PageHit("file_page:src/beta_impl.py", "src/beta_impl.py", 0.89),
+        ],
+        source_dense=[
+            _hit("beta_thing", "src/beta_impl.py", 0.88),
+            _hit("alpha_thing", "src/alpha_page.py", 0.87),
+        ],
+        source_term_files=_SPLIT_SUBJECT,
+    )
+
+    response = await coordinator.search("the widget and the gadget", limit=5)
+
+    assert response["selected_owner"]["file"] == "src/alpha_page.py"
+    assert "declaration-ranked near-tie" not in response["selected_owner"]["reason"]
+
+
+async def test_a_source_incumbent_is_not_displaced_by_a_better_declared_neighbour(tmp_path):
+    """A file window is its file; the stage only ever second-guesses prose."""
+    coordinator = _coordinator(
+        tmp_path,
+        source_dense=[
+            _hit(
+                "alpha_page.py",
+                "src/alpha_page.py",
+                0.90,
+                source="file_window",
+                kind="file_window",
+                chunk_id="file:src/alpha_page.py:1-40",
+            ),
+            _hit("beta_thing", "src/beta_impl.py", 0.88),
+            _hit("alpha_thing", "src/alpha_page.py", 0.87),
+        ],
+        wiki_dense=[_PageHit("file_page:src/beta_impl.py", "src/beta_impl.py", 0.89)],
+        source_term_files=_SPLIT_SUBJECT,
+    )
+
+    response = await coordinator.search("the widget and the gadget", limit=5)
+
+    assert response["selected_owner"]["file"] == "src/alpha_page.py"
+    assert "declaration-ranked near-tie" not in response["selected_owner"]["reason"]
+
+
+async def test_a_rival_outside_the_band_never_reaches_the_near_tie_stage(tmp_path):
+    """The band is still the boundary: only a *near* tie is a tie to break."""
+    incumbent = _PageHit("file_page:src/alpha_page.py", "src/alpha_page.py", 0.90)
+    coordinator = _coordinator(
+        tmp_path,
+        wiki_dense=[
+            incumbent,
+            _PageHit("file_page:src/beta_impl.py", "src/beta_impl.py", 0.89),
+        ],
+        wiki_lexical=[incumbent],
+        source_dense=[
+            _hit("beta_thing", "src/beta_impl.py", 0.88),
+            _hit("alpha_thing", "src/alpha_page.py", 0.87),
+        ],
+        source_term_files=_SPLIT_SUBJECT,
+    )
+
+    response = await coordinator.search("the widget and the gadget", limit=5)
+
+    assert response["selected_owner"]["file"] == "src/alpha_page.py"
+    assert "declaration-ranked near-tie" not in response["selected_owner"]["reason"]
+
+
+async def test_a_page_with_no_declaration_behind_it_abstains_from_the_comparison(tmp_path):
+    """No declaration on the incumbent's side is no comparison, not a loss.
+
+    Caught by ``test_explicit_docs_intent_does_not_apply_source_owner_bias``: a
+    markdown page has no indexed declaration, so ranking the candidates by
+    "whose declaration retrieved best" excludes it outright and hands its own
+    query to the source file beside it. Excluding a candidate from a comparison
+    is not the same as it losing one.
+    """
+    coordinator = _coordinator(
+        tmp_path,
+        wiki_dense=[_PageHit("file_page:docs/beta.md", "docs/beta.md", 0.90, snippet="widget")],
+        source_dense=[_hit("beta_thing", "src/beta_impl.py", 0.89)],
+        source_term_files={"widget": {"docs/beta.md"}, "gadget": {"src/beta_impl.py"}},
+    )
+
+    response = await coordinator.search("the widget and the gadget", limit=5)
+
+    assert response["selected_owner"]["file"] == "docs/beta.md"
+    assert "declaration-ranked near-tie" not in response["selected_owner"]["reason"]
