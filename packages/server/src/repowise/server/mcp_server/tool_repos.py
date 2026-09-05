@@ -38,6 +38,7 @@ def _workspace_repos(registry: Any) -> list[dict[str, Any]]:
                 "path": None,
                 "absolute_path": None,
                 "is_default": alias == default_alias,
+                "federated": True,
             }
             for alias in registry.get_all_aliases()
         ]
@@ -53,6 +54,10 @@ def _workspace_repos(registry: Any) -> list[dict[str, Any]]:
                 "is_default": entry.alias == default_alias,
                 "indexed_at": entry.indexed_at,
                 "last_commit_at_index": entry.last_commit_at_index,
+                # Whether repo="all" reaches this one. Discovery has to say so:
+                # a caller that sees an alias listed and gets no rows from it in
+                # a fan-out would otherwise read that as a broken index.
+                "federated": entry.federated,
             }
         )
     return repos

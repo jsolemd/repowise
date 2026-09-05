@@ -42,11 +42,23 @@ class RepoEntry:
     # for architecture conformance rules. A rule like ``frontend !-> db`` matches
     # by tag via ``tag:<name>``; every service node in this repo inherits these.
     tags: list[str] = field(default_factory=list)
+    # Whether ``repo="all"`` fans out to this repository. A repo can be worth
+    # indexing and reachable by its own alias without belonging in every
+    # workspace-wide answer: the engine's own source tree is the case this
+    # exists for — 2.5x the product repos combined, so its files captured
+    # federated rank 1 for questions about the products.
+    #
+    # Defaults to True and is written out only when False, so an entry nothing
+    # has opted out stays byte-identical and every rewrite of the config file
+    # preserves an opt-out somebody set by hand.
+    federated: bool = True
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {"path": self.path, "alias": self.alias}
         if self.is_primary:
             d["is_primary"] = True
+        if not self.federated:
+            d["federated"] = False
         if self.indexed_at is not None:
             d["indexed_at"] = self.indexed_at
         if self.last_commit_at_index is not None:
@@ -66,6 +78,7 @@ class RepoEntry:
             indexed_at=data.get("indexed_at"),
             last_commit_at_index=data.get("last_commit_at_index"),
             tags=[str(t) for t in data.get("tags", [])],
+            federated=bool(data.get("federated", True)),
         )
 
 

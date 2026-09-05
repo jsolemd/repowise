@@ -137,8 +137,24 @@ class RepoRegistry:
         return self._ws_config
 
     def get_all_aliases(self) -> list[str]:
-        """Return aliases of all repos in the workspace config."""
+        """Return aliases of all repos in the workspace config.
+
+        Every configured repo, federated or not. This is the discovery and
+        validation set: what ``list_repos`` shows, what an explicit ``repo=``
+        may name, and what an unknown-alias error lists. Only the fan-out is
+        narrower — see :meth:`get_federated_aliases`.
+        """
         return [r.alias for r in self._ws_config.repos]
+
+    def get_federated_aliases(self) -> list[str]:
+        """Aliases ``repo="all"`` fans out to.
+
+        Opting a repository out of the fan-out is not the same as removing it:
+        it stays indexed, stays addressable by its own alias, and stays in
+        ``list_repos``. What it stops doing is competing for rank in answers
+        about the other repositories.
+        """
+        return [r.alias for r in self._ws_config.repos if r.federated]
 
     def get_default_alias(self) -> str:
         """Return the alias of the default/primary repo."""
@@ -163,7 +179,7 @@ class RepoRegistry:
         if repo is None:
             return self.get_default_alias()
         if repo == "all":
-            return self.get_all_aliases()
+            return self.get_federated_aliases()
         # Alias is canonical, but ``list_repos`` also emits each repository's
         # config-relative and absolute path. Accept those identities directly
         # so a discovery result never needs caller-side translation.

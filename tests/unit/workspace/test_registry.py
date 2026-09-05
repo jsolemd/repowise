@@ -119,6 +119,28 @@ class TestResolveRepoParam:
         registry = RepoRegistry(tmp_path, config)
         assert registry.resolve_repo_param("frontend") == "frontend"
 
+    def test_all_skips_a_repo_opted_out_of_federation(self, tmp_path: Path) -> None:
+        """Opting out removes it from the fan-out, not from the workspace.
+
+        The engine's own source tree is the case: worth indexing, worth asking
+        about by name, and 2.5x the product repos combined — so in a fan-out its
+        files won rank 1 for questions about the products.
+        """
+        config = _make_workspace(tmp_path, ["backend", "frontend", "engine"])
+        engine = next(r for r in config.repos if r.alias == "engine")
+        engine.federated = False
+        registry = RepoRegistry(tmp_path, config)
+
+        assert set(registry.resolve_repo_param("all")) == {"backend", "frontend"}
+        # Still configured, still discoverable, still addressable by name.
+        assert set(registry.get_all_aliases()) == {"backend", "frontend", "engine"}
+        assert registry.resolve_repo_param("engine") == "engine"
+
+    def test_all_is_every_repo_when_none_opts_out(self, tmp_path: Path) -> None:
+        config = _make_workspace(tmp_path, ["backend", "frontend"])
+        registry = RepoRegistry(tmp_path, config)
+        assert set(registry.resolve_repo_param("all")) == set(registry.get_all_aliases())
+
     def test_list_repos_path_identities_round_trip(self, tmp_path: Path) -> None:
         config = _make_workspace(tmp_path, ["backend", "frontend"])
         registry = RepoRegistry(tmp_path, config)

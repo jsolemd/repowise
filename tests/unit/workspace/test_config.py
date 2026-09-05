@@ -55,6 +55,27 @@ class TestRepoEntry:
         assert entry.indexed_at is None
         assert entry.last_commit_at_index is None
 
+    def test_federated_defaults_true_and_is_not_serialized(self) -> None:
+        """An entry nobody opted out stays byte-identical in the yaml."""
+        entry = RepoEntry(path="backend", alias="backend")
+        assert entry.federated is True
+        assert "federated" not in entry.to_dict()
+
+    def test_a_federation_opt_out_survives_a_yaml_round_trip(self) -> None:
+        """RepoWise rewrites this file on every index; the opt-out must persist.
+
+        Written out only when False, so the flag is invisible until somebody
+        sets it and impossible to lose once they have.
+        """
+        entry = RepoEntry(path="engine", alias="repowise", federated=False)
+        d = entry.to_dict()
+        assert d["federated"] is False
+        assert RepoEntry.from_dict(d).federated is False
+
+    def test_from_dict_defaults_federated_true(self) -> None:
+        """Every config written before the field existed federates, as it did."""
+        assert RepoEntry.from_dict({"path": "lib", "alias": "lib"}).federated is True
+
     def test_to_dict_primary(self) -> None:
         entry = RepoEntry(path="backend", alias="backend", is_primary=True)
         d = entry.to_dict()

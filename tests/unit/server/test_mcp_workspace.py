@@ -115,6 +115,7 @@ class _MockRegistry:
                     path=ctx.path.relative_to(self.workspace_root).as_posix(),
                     indexed_at=None,
                     last_commit_at_index=None,
+                    federated=True,
                 )
                 for alias, ctx in contexts.items()
             ]
@@ -123,6 +124,9 @@ class _MockRegistry:
     def get_all_aliases(self) -> list[str]:
         return list(self._contexts.keys())
 
+    def get_federated_aliases(self) -> list[str]:
+        return [entry.alias for entry in self.ws_config.repos if entry.federated]
+
     def get_default_alias(self) -> str:
         return self._default_alias
 
@@ -130,7 +134,7 @@ class _MockRegistry:
         if repo is None:
             return self._default_alias
         if repo == "all":
-            return self.get_all_aliases()
+            return self.get_federated_aliases()
         for entry in self.ws_config.repos:
             identities = {
                 entry.alias,
@@ -835,6 +839,31 @@ async def test_overview_all_includes_cross_repo_topology(workspace_mcp_with_enri
     result = await get_overview(repo="all")
     assert "cross_repo_topology" in result
     assert result["cross_repo_topology"]["co_change_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_list_repos_says_whether_a_repo_joins_the_fan_out(workspace_mcp):
+    """Discovery has to disclose the opt-out, or a listed alias looks broken.
+
+    A caller that sees a repo in ``list_repos`` and gets no rows from it under
+    ``repo="all"`` has no way to tell a deliberate opt-out from a dead index.
+    """
+    from repowise.server.mcp_server import _state, list_repos
+
+    result = await list_repos()
+    assert all(repo["federated"] is True for repo in result["repos"])
+
+    registry = _state._registry
+    frontend = next(e for e in registry.ws_config.repos if e.alias == "frontend")
+    frontend.federated = False
+
+    result = await list_repos()
+    flags = {repo["alias"]: repo["federated"] for repo in result["repos"]}
+    assert flags == {"backend": True, "frontend": False}
+    # Still listed, still addressable — only the fan-out is narrower.
+    assert registry.resolve_repo_param("all") == ["backend"]
+    assert registry.resolve_repo_param("frontend") == "frontend"
+    frontend.federated = True
 
 
 @pytest.mark.asyncio
