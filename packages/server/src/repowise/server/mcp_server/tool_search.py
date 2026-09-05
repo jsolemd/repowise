@@ -1411,11 +1411,14 @@ async def search_codebase(
     Find an owner, then use get_symbol for a named body or get_context for
     file triage. `candidates` lists distinct openable files, best first.
 
-    Auto routes identifiers to indexed symbols and paths to file lookup;
-    questions use concept search, mixed queries use hybrid. Symbol/path modes
-    and explicit filters use native indexed resolvers, never semantic fallback
-    for an exact miss. With source search enabled, unfiltered concept/hybrid
-    queries fuse source and wiki evidence. Verbose queries expose query_plan.
+    Explicit symbol/path modes, filename lookups and filters use native indexed
+    resolvers, never semantic fallback for an exact miss. With source search
+    enabled, unfiltered auto/concept/hybrid queries retain source-owner evidence,
+    including bare identifiers. Without it, auto classifies identifiers as native
+    symbol lookups. Native rows need not carry source-owner confidence.
+    Verbose queries are served whole by default; query_plan appears only when
+    the optional query-focus planner is enabled. Budgeted excerpts carry
+    snippet_truncated; open the symbol, file or omission ref for the full text.
     Read visible `trust` for stale generations and degraded retrieval.
 
     Args:
