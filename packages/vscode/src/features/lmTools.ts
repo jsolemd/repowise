@@ -165,11 +165,19 @@ export function registerLmTools(ctx: RepowiseContext): vscode.Disposable {
       // The fork's api-client normalizes either wire shape into one envelope;
       // the ranked hits are its `results`.
       const envelope = await search(input.query, { limit, repo_id: repoId });
+      // SearchHit is the normalized union of both hosts' rows: `name` is a
+      // symbol's name, a file's basename or a page's title; `kind` is a symbol
+      // kind, "file_window" or a page type; `file` is "" for a page nothing on
+      // disk backs. Scores compare within one response only.
       const payload = envelope.results.map((r) => ({
-        title: r.title,
-        page_type: r.page_type,
-        target_path: r.target_path,
-        score: r.score,
+        title: r.name,
+        page_type: r.kind,
+        source: r.source,
+        target_path: r.file,
+        page_id: r.page_id,
+        start_line: r.start_line,
+        end_line: r.end_line,
+        score: r.relevance_score,
         snippet: r.snippet,
       }));
       return jsonResult(payload);
