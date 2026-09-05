@@ -1,7 +1,7 @@
 """Add the transactional source-index update outbox.
 
-Revision ID: 0061
-Revises: 0060
+Revision ID: 0064
+Revises: 0063
 Create Date: 2026-08-17
 """
 
@@ -12,8 +12,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0061"
-down_revision: str | None = "0060"
+revision: str = "0064"
+down_revision: str | None = "0063"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

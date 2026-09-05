@@ -5,8 +5,8 @@ lets performance analysis bind a loop/lock call to that resolved edge instead
 of repeating a bare-name lookup. Existing rows default to an empty list and use
 the documented compatibility fallback until the next index refresh.
 
-Revision ID: 0064
-Revises: 0063
+Revision ID: 0067
+Revises: 0066
 Create Date: 2026-08-20
 
 Re-headed from 0055/0054 at integration: upstream v0.45.0 and the fork both
@@ -23,8 +23,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0064"
-down_revision: str | None = "0063"
+revision: str = "0067"
+down_revision: str | None = "0066"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

@@ -71,7 +71,7 @@ def _names(db_path: Path, kind: str) -> set[str]:
 @pytest.fixture
 def migrated(tmp_path: Path) -> Path:
     db_path = tmp_path / "wiki.db"
-    _run_migration(db_path, "0063")
+    _run_migration(db_path, "0066")
     return db_path
 
 
@@ -178,10 +178,10 @@ def test_position_uniqueness_is_enforced_by_the_database(migrated: Path):
 
 def test_downgrade_removes_everything_it_added(tmp_path: Path):
     db_path = tmp_path / "wiki.db"
-    _run_migration(db_path, "0063")
+    _run_migration(db_path, "0066")
     before_tables = _names(db_path, "table")
 
-    _run_migration(db_path, "0062", downgrade=True)
+    _run_migration(db_path, "0065", downgrade=True)
 
     remaining = _names(db_path, "table")
     assert not set(_TABLES) & remaining

@@ -15,8 +15,8 @@ at the schema level; a reference site names symbol ids as text, exactly as
 It exists so a query that returns no sites can distinguish "this symbol is
 unreferenced" from "nobody taught the extractor to read this language".
 
-Revision ID: 0063
-Revises: 0062
+Revision ID: 0066
+Revises: 0065
 Create Date: 2026-08-22
 """
 
@@ -27,8 +27,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0063"
-down_revision: str | None = "0062"
+revision: str = "0066"
+down_revision: str | None = "0065"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
