@@ -479,7 +479,71 @@ def finalize_trust_envelope(result: Any, *, evidence_kind: str | None = None) ->
         if isinstance(existing, dict):
             state = {**existing, **state}
         meta["state"] = state
+    visible = agent_trust(meta)
+    if visible:
+        existing = result.get("trust")
+        result["trust"] = {**visible, **existing} if isinstance(existing, dict) else visible
     return result
+
+
+def agent_trust(envelope: dict[str, Any]) -> dict[str, Any]:
+    """Agent-visible trust evidence, prepared before budgeting and accounting.
+
+    MCP hosts may discard protocol metadata before invoking the model. Keep
+    evidence limitations in the answer, while timings, cost estimates and
+    retrieval diagnostics remain protocol-only. Reuse the same projection on
+    federated members so fan-out does not copy their entire diagnostic logs.
+    """
+    fields = (
+        "index_behind",
+        "indexed_commit",
+        "live_head",
+        "stale_warning",
+        "embedder_degraded",
+        "retrieval_degraded",
+        "retrieval_degraded_reason",
+        "evidence_kind",
+        "runtime_breakage_proven",
+        "existing_verified_code",
+    )
+    trust = {key: envelope[key] for key in fields if key in envelope}
+    freshness = envelope.get("repo_freshness")
+    if isinstance(freshness, dict):
+        trust["repo_freshness"] = {
+            alias: {key: member[key] for key in fields if key in member}
+            for alias, member in freshness.items()
+            if isinstance(member, dict)
+        }
+    source = envelope.get("source_search")
+    if isinstance(source, dict):
+        facts = _source_trust(source)
+        members = source.get("repos")
+        if isinstance(members, dict):
+            facts["repos"] = {
+                alias: _source_trust(member)
+                for alias, member in members.items()
+                if isinstance(member, dict)
+            }
+        if facts:
+            trust["source_search"] = facts
+    return trust
+
+
+def _source_trust(source: dict[str, Any]) -> dict[str, Any]:
+    fields = (
+        "status",
+        "status_error",
+        "generation_id",
+        "published_generation_id",
+        "indexed_commit",
+        "degraded",
+        "degraded_reason",
+        "failed_legs",
+        "working_tree",
+        "errored",
+        "unavailable",
+    )
+    return {key: source[key] for key in fields if key in source}
 
 
 def _embedder_meta() -> dict[str, Any]:

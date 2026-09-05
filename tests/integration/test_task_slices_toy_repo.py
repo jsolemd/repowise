@@ -340,6 +340,42 @@ async def test_explicit_entry_point_beats_the_query(indexed) -> None:
     assert any("requested explicitly" in r for r in seed.reasons)
 
 
+async def test_exact_symbol_seed_does_not_promote_sibling_definitions(indexed) -> None:
+    """An exact call-path seed spends the slice on its graph, not its filemates."""
+    session, repo_id, store, root = indexed
+    exact = "app/service.py::AuthService::login"
+    record = await build_slice(
+        session,
+        repo_id=repo_id,
+        repo_path=str(root),
+        task="change login and verify its callers and tests",
+        store=store,
+        entry_points=[exact],
+        policy=WalkPolicy(
+            downstream_depth=1,
+            upstream_depth=1,
+            include_tests=True,
+            seed_symbol_fanout=50,
+            max_members=30,
+        ),
+    )
+
+    seeds = {member.node_id for member in record.members if member.is_seed}
+    sibling_ids = {
+        member.node_id
+        for member in record.members
+        if member.file_path == "app/service.py" and member.node_id != exact
+    }
+
+    assert seeds == {exact}
+    assert "app/service.py" in {member.node_id for member in record.members}
+    assert not (sibling_ids & seeds), sibling_ids
+    assert any(
+        member.file_path in {"app/api.py", "app/main.py", "tests/test_service.py"}
+        for member in record.members
+    ), "the exact seed should reach a caller/test before unrelated siblings"
+
+
 async def test_unresolvable_entry_point_is_an_error_not_an_empty_slice(indexed) -> None:
     from repowise.core.slices import EntryPointsUnresolvedError
 

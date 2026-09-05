@@ -73,6 +73,7 @@ async def test_get_why_natural_language_with_targets(setup_mcp):
     result = await get_why(
         "authentication approach",
         targets=["src/auth/service.py"],
+        include=["supporting"],
     )
     assert result["mode"] == "search"
     assert len(result["decisions"]) >= 1
@@ -271,9 +272,7 @@ async def test_get_why_targets_surfaces_code_rationale(setup_mcp, tmp_path):
 
     (tmp_path / "src" / "other").mkdir(parents=True)
     (tmp_path / "src" / "other" / "cache.py").write_text(
-        "import time\n"
-        "# TTL is 30s because shorter windows thrash the backing store\n"
-        "TTL = 30\n",
+        "import time\n# TTL is 30s because shorter windows thrash the backing store\nTTL = 30\n",
         encoding="utf-8",
     )
     mcp_mod._repo_path = str(tmp_path)
@@ -349,7 +348,7 @@ async def test_get_why_semantic_decision_namespace_filtering(session, setup_mcp)
         },
     )
 
-    result = await get_why("why use Redis for caching")
+    result = await get_why("why use Redis for caching", include=["supporting"])
     assert result["mode"] == "search"
 
     decision_ids = [d["id"] for d in result["decisions"]]
@@ -448,10 +447,7 @@ def test_path_final_fit_composes_episode_construction_counts(tmp_path, monkeypat
         "mode": "path",
         "path": "src/large.py",
         "decisions": [],
-        "episodes": [
-            {"subject": f"episode-{index}", "recorded": "x" * 5000}
-            for index in range(3)
-        ],
+        "episodes": [{"subject": f"episode-{index}", "recorded": "x" * 5000} for index in range(3)],
         "episodes_total": 8,
         "episodes_emitted": 3,
         "episodes_reduced_reason": "construction_cap",
@@ -459,18 +455,14 @@ def test_path_final_fit_composes_episode_construction_counts(tmp_path, monkeypat
         "episodes_omitted": 5,
         "_meta": {},
     }
-    collector = OmissionCollector(
-        "get_why", store_path=tmp_path / "omissions.sqlite3"
-    )
+    collector = OmissionCollector("get_why", store_path=tmp_path / "omissions.sqlite3")
 
     result = _fit_path_response(response, tmp_path, collector)
 
     assert result["episodes_total"] == 8
     assert result["episodes_emitted"] == 0
     assert result["episodes_omitted"] == 8
-    assert result["episodes_reduced_reason"] == (
-        "construction_cap_and_response_budget"
-    )
+    assert result["episodes_reduced_reason"] == ("construction_cap_and_response_budget")
     assert result["_meta"]["omitted"]["refs"]
 
 
@@ -531,9 +523,7 @@ async def test_get_why_asks_git_about_the_top_record_only(session, setup_mcp, mo
 async def test_get_why_stays_silent_when_git_cannot_decide(session, setup_mcp, monkeypatch):
     from repowise.server.mcp_server import get_why, tool_why
 
-    monkeypatch.setattr(
-        tool_why, "describe_decision_currency", lambda root, **kw: None
-    )
+    monkeypatch.setattr(tool_why, "describe_decision_currency", lambda root, **kw: None)
 
     result = await get_why("src/auth/service.py")
 
@@ -569,7 +559,9 @@ async def test_get_why_path_leaves_a_small_response_untouched(session, setup_mcp
 
 
 @pytest.mark.asyncio
-async def test_get_why_path_fits_with_one_enormous_record(session, setup_mcp, monkeypatch, tmp_path):
+async def test_get_why_path_fits_with_one_enormous_record(
+    session, setup_mcp, monkeypatch, tmp_path
+):
     """The last record is droppable too — a cap on the count is not a bound.
 
     One governing record whose free text alone busts the budget is the case a

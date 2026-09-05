@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime, timedelta
 
 from repowise.core.source_search.query_log import (
     FAILED_LEGS_LOGGED,
@@ -172,3 +173,49 @@ def test_an_unserialisable_event_is_swallowed_too(tmp_path):
     log = QueryLog(tmp_path / "query_log.jsonl")
     assert log.append(_event(query=_Unserialisable())) is False
     assert not log.path.exists()
+
+
+def test_query_text_is_a_bounded_diagnostic_not_an_unbounded_payload(tmp_path):
+    log = QueryLog(tmp_path / "query_log.jsonl")
+    assert log.append(_event(query="q" * 10_000)) is True
+
+    record = json.loads(log.path.read_text(encoding="utf-8"))
+    assert len(record["query"]) == 1000
+
+
+def test_append_prunes_rows_outside_the_retention_window(tmp_path):
+    path = tmp_path / "query_log.jsonl"
+    old = _event(
+        query="expired",
+        ts=(datetime.now(UTC) - timedelta(days=8)).isoformat(),
+    )
+    path.write_text(json.dumps(old.to_dict()) + "\n", encoding="utf-8")
+
+    log = QueryLog(path, retention_days=7)
+    assert log.append(_event(query="current")) is True
+
+    records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    assert [record["query"] for record in records] == ["current"]
+
+
+def test_size_compaction_keeps_the_newest_complete_rows(tmp_path):
+    path = tmp_path / "query_log.jsonl"
+    events = [_event(query=f"event-{index}") for index in range(3)]
+    encoded = [
+        (json.dumps(event.to_dict(), ensure_ascii=False, separators=(",", ":")) + "\n").encode()
+        for event in events
+    ]
+    max_bytes = len(encoded[1]) + len(encoded[2])
+    log = QueryLog(path, max_bytes=max_bytes)
+
+    assert all(log.append(event) for event in events)
+
+    assert path.stat().st_size <= max_bytes
+    records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    assert [record["query"] for record in records] == ["event-1", "event-2"]
+
+
+def test_one_event_larger_than_the_hard_cap_is_dropped(tmp_path):
+    path = tmp_path / "query_log.jsonl"
+    assert QueryLog(path, max_bytes=32).append(_event()) is False
+    assert not path.exists()

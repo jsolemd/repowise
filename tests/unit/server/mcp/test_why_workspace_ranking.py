@@ -44,9 +44,7 @@ def _decision(rec_id: str, repo_id: str, title: str, body: str, **kw) -> Decisio
 def _install(contexts: dict, default: str, root) -> _MockRegistry:
     import repowise.server.mcp_server as mcp_mod
 
-    registry = _MockRegistry(
-        contexts=contexts, default_alias=default, workspace_root=root
-    )
+    registry = _MockRegistry(contexts=contexts, default_alias=default, workspace_root=root)
     primary = contexts[default]
     mcp_mod._registry = registry
     mcp_mod._workspace_root = str(root)
@@ -67,9 +65,7 @@ async def _uninstall(registry: _MockRegistry) -> None:
         setattr(mcp_mod, attr, None)
 
 
-async def _store(
-    tmp_path, alias: str, records: list, *, repo_name: str | None = None
-) -> tuple:
+async def _store(tmp_path, alias: str, records: list, *, repo_name: str | None = None) -> tuple:
     repo_dir = tmp_path / alias
     repo_dir.mkdir()
     return await _make_repo_context(
@@ -174,7 +170,8 @@ async def test_the_merge_keeps_each_store_s_own_tiebreaks(tmp_path):
     registry = _install({"alpha": alpha, "beta": beta}, "alpha", tmp_path)
     try:
         result = await get_why(query="why is Redis the session cache backend", repo="all")
-        assert [d["id"] for d in result["decisions"]] == ["b-1", "a-1"]
+        assert [d["id"] for d in result["decisions"]] == ["b-1"]
+        assert result["candidate_decisions"][0]["id"] == "a-1"
     finally:
         await _uninstall(registry)
 
@@ -243,7 +240,9 @@ async def test_workspace_search_serves_five_of_nine_answers(tmp_path, monkeypatc
         # word none of them holds would be refused outright instead, since an unseen
         # term takes the rarest weight the store can award.
         result = await tool_middleware(get_why)(
-            query="why is Redis the session cache backend", repo="all"
+            query="why is Redis the session cache backend",
+            repo="all",
+            include=["supporting"],
         )
         assert len(result["decisions"]) == 5
         assert result["decisions_total"] == 9

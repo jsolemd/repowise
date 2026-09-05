@@ -39,6 +39,7 @@ import pytest
 from repowise.core.refsites.pipeline import extract_repository
 from repowise.core.refsites.store import SqlReferenceSiteStore
 from repowise.core.refsites.taxonomy import TIER_AST, TIER_TEXTUAL, ReferenceKind
+from repowise.core.source_search.generation import GenerationRef
 from repowise.core.source_search.worktree import WorkingTreeDivergence
 from repowise.server import source_search_wiring as w
 
@@ -447,7 +448,7 @@ async def test_a_served_window_names_the_parent_and_its_nested_arrow(
         _Inner({"results": [row], "mode": "hybrid", "confidence": "confident", "_meta": {}}),
         nesting_repo,
         object(),
-        object(),
+        SimpleNamespace(generation=GenerationRef("g1", 1)),
         session_factory,
     )
 

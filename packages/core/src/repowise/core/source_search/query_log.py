@@ -1,4 +1,4 @@
-"""What each retrieval was asked, and what evidence it had for its answer.
+"""What recent retrievals were asked, and what evidence they had.
 
 One JSON object per query, appended to ``.repowise/source_search/query_log.jsonl``.
 It records the *evidence* behind a result — which leg found it, at what cosine,
@@ -6,10 +6,11 @@ at what lexical rank — rather than the result text, so a later reader can ask
 why retrieval was confident without re-running anything. The reader is
 :mod:`.query_report`.
 
-The record grows by addition only. A field may be appended with a default that
-reproduces the old behaviour; no field may be removed, renamed, or have its
-meaning changed, because lines written by an older build stay in the file
-forever and the reporter has to keep understanding them.
+The log is a short-lived diagnostic window, not a permanent activity ledger.
+It keeps at most seven days and four MiB, compacted opportunistically under a
+cross-process lock. A field may be appended with a default that reproduces the
+old behaviour; the reporter still accepts older rows until retention removes
+them.
 
 Every write is fire-and-forget. A search that succeeded and then failed to
 record itself has still succeeded, and a full disk, a read-only checkout or a
@@ -17,25 +18,30 @@ concurrent writer must not turn into a failed query. :meth:`QueryLog.append`
 therefore swallows everything it can raise, and is the only place in this
 package that does.
 
-Appends are line-atomic by construction: one ``write()`` of one line under
-``O_APPEND``, which is what keeps two processes sharing a repository from
-interleaving halves of a record.
+Appends and compaction share a file lock, and each append remains one write
+under ``O_APPEND``. A logging or lock failure never affects retrieval.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import Any
+
+from filelock import FileLock
 
 from .fts import SOURCE_SEARCH_DIRNAME
 
 __all__ = [
     "FAILED_LEGS_LOGGED",
     "QUERY_LOG_FILENAME",
+    "QUERY_LOG_MAX_BYTES",
+    "QUERY_LOG_RETENTION_DAYS",
     "STATUS_ERROR",
     "STATUS_OK",
     "TOP_EVENTS_LOGGED",
@@ -46,6 +52,17 @@ __all__ = [
 ]
 
 QUERY_LOG_FILENAME = "query_log.jsonl"
+
+#: Hard bound for the complete diagnostic log, including malformed legacy
+#: rows. Four MiB is thousands of ordinary searches and still cheap to compact.
+QUERY_LOG_MAX_BYTES = 4 * 1024 * 1024
+
+#: Raw query text is useful for retrieval regression triage, but only while it
+#: is recent enough to act on. It is not an analytics record.
+QUERY_LOG_RETENTION_DAYS = 7
+
+#: One malformed client query must not monopolise the bounded log.
+QUERY_LOG_QUERY_CHARS = 1000
 
 #: A search that reached at least one corpus, whatever it then found.
 STATUS_OK = "ok"
@@ -146,7 +163,7 @@ class QueryEvent:
     def to_dict(self) -> dict[str, Any]:
         return {
             "ts": self.ts,
-            "query": self.query,
+            "query": self.query[:QUERY_LOG_QUERY_CHARS],
             "mode": self.mode,
             "limit": self.limit,
             "latency_ms": self.latency_ms,
@@ -164,7 +181,7 @@ class QueryEvent:
 
 
 class QueryLog:
-    """Append-only JSONL sink for :class:`QueryEvent`.
+    """Bounded JSONL sink for :class:`QueryEvent`.
 
     Holds a path, not a handle: the file is opened per append. A retrieval
     costs tens of milliseconds against two indexes, so an open cannot be the
@@ -172,8 +189,64 @@ class QueryLog:
     lifespan that currently has no reason to know this exists.
     """
 
-    def __init__(self, path: Path | str) -> None:
+    def __init__(
+        self,
+        path: Path | str,
+        *,
+        max_bytes: int = QUERY_LOG_MAX_BYTES,
+        retention_days: float = QUERY_LOG_RETENTION_DAYS,
+    ) -> None:
         self.path = Path(path)
+        self.max_bytes = max(1, int(max_bytes))
+        self.retention_days = max(0.0, float(retention_days))
+        self._maintained_day: str | None = None
+
+    @staticmethod
+    def _event_epoch(line: bytes) -> float | None:
+        """Read one row's ISO timestamp; malformed/legacy rows are size-only."""
+        try:
+            value = json.loads(line).get("ts")
+            if not isinstance(value, str):
+                return None
+            stamped = datetime.fromisoformat(value)
+            if stamped.tzinfo is None:
+                stamped = stamped.replace(tzinfo=UTC)
+            return stamped.timestamp()
+        except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+            return None
+
+    def _compact(self, *, now: datetime, incoming_bytes: int) -> None:
+        """Keep recent complete rows that fit, newest first, then replace."""
+        if not self.path.exists():
+            return
+        cutoff = now.timestamp() - self.retention_days * 86400
+        rows = self.path.read_bytes().splitlines(keepends=True)
+        recent = [
+            row for row in rows if (epoch := self._event_epoch(row)) is None or epoch >= cutoff
+        ]
+        allowance = max(0, self.max_bytes - incoming_bytes)
+        kept_reversed: list[bytes] = []
+        used = 0
+        for row in reversed(recent):
+            if used + len(row) > allowance:
+                break
+            kept_reversed.append(row)
+            used += len(row)
+        payload = b"".join(reversed(kept_reversed))
+
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path: Path | None = None
+        try:
+            with NamedTemporaryFile(
+                dir=self.path.parent, prefix=".query-log-", delete=False
+            ) as tmp:
+                tmp.write(payload)
+                temp_path = Path(tmp.name)
+            os.replace(temp_path, self.path)
+            temp_path = None
+        finally:
+            if temp_path is not None:
+                temp_path.unlink(missing_ok=True)
 
     def append(self, event: QueryEvent) -> bool:
         """Record *event*. Returns whether it was written; never raises.
@@ -185,8 +258,19 @@ class QueryLog:
         try:
             line = json.dumps(event.to_dict(), ensure_ascii=False, separators=(",", ":"))
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            with self.path.open("a", encoding="utf-8") as handle:
-                handle.write(line + "\n")
+            encoded = (line + "\n").encode("utf-8")
+            if len(encoded) > self.max_bytes:
+                return False
+            now = datetime.now(UTC)
+            day = now.date().isoformat()
+            lock = FileLock(str(self.path) + ".lock", timeout=0.25)
+            with lock:
+                projected = (self.path.stat().st_size if self.path.exists() else 0) + len(encoded)
+                if day != self._maintained_day or projected > self.max_bytes:
+                    self._compact(now=now, incoming_bytes=len(encoded))
+                    self._maintained_day = day
+                with self.path.open("ab") as handle:
+                    handle.write(encoded)
             return True
         except Exception:
             # Debug, not warning: a repository whose log cannot be written

@@ -1383,30 +1383,20 @@ async def search_codebase(
 ) -> dict:
     """Find code by concept, symbol, or path — hybrid codebase search.
 
-    For QUESTIONS ("how does X work", "where is Y handled", "why is Z like
-    this"), call get_answer instead: it runs this same hybrid retrieval
-    internally and synthesizes a cited answer, so searching first is a wasted
-    round-trip. Use this tool when you want the raw ranked hits themselves —
-    enumerating matches, resolving an identifier to a symbol_id, or scoping a
-    later get_context call.
+    Find an owner, then use get_symbol for a named body or get_context for
+    file triage. `candidates` lists distinct openable files, best first.
 
-    mode="auto" (default) routes the query: identifier-shaped queries search
-    the indexed symbols (returns symbol_id/file/line bounds — pipe into
-    get_symbol), path-shaped queries resolve files (pipe into get_context),
-    and conceptual queries run wiki-semantic search. Mixed queries run hybrid,
-    symbol hits first. Decision records rank below file pages unless the query
-    is why-shaped.
-
-    `candidates` lists up to `limit` distinct openable file paths, best first.
-    Some results are pages, not files; this is what to Read.
+    Auto routes identifiers to indexed symbols and paths to file lookup;
+    questions use concept search, mixed queries use hybrid. Symbol/path modes
+    and explicit filters use native indexed resolvers, never semantic fallback
+    for an exact miss. With source search enabled, unfiltered concept/hybrid
+    queries fuse source and wiki evidence. Verbose queries expose query_plan.
+    Read visible `trust` for stale generations and degraded retrieval.
 
     Args:
         query: identifier, path, or natural-language query.
         limit: max results (default 5).
-        page_type: restrict to one page type. Common: file_page (per-file
-            docs, always present) or module_page (subsystem/concept pages).
-            Any stored type filters (repo_overview, layer_page, scc_page,
-            api_contract, infra_page, symbol_spotlight).
+        page_type: one stored page type, e.g. file_page or module_page.
         kind: implementation | test | config | doc (concept/symbol modes).
         repo: workspace only. Alias, or "all" (rows carry `repo`).
         mode: auto | concept | symbol | path | hybrid.
@@ -1436,10 +1426,14 @@ async def search_codebase(
     if repo == "all" and not _is_workspace_mode():
         repo = None
 
-    # Source+wiki hybrid retrieval, behind REPOWISE_SOURCE_SEARCH and off by
-    # default. Path queries stay on the stock resolver: a path is a filename
-    # lookup, not a retrieval, and fusing it against a corpus can only blur it.
-    if source_search_enabled() and resolved_mode != "path":
+    # Exact symbol/path lookup and filtered searches already have native
+    # resolvers. Preserve their argument semantics; the source coordinator
+    # owns unfiltered concept/hybrid retrieval, not an alternate filter API.
+    if (
+        source_search_enabled()
+        and resolved_mode not in {"path", "symbol"}
+        and not any((kind, symbol_kind, page_type))
+    ):
         if _is_workspace_mode():
             # A workspace has no corpus of its own — each member repo does.
             # The singleton below binds to the served path (inert at a
@@ -1448,10 +1442,10 @@ async def search_codebase(
             # repo=<alias> scopes, repo="all" federates, repo=None means the
             # default repo — the same resolution the wiki lane applies. None
             # falls through to the stock path, same as single-repo mode.
+            from repowise.server.mcp_server import _state
             from repowise.server.mcp_server._source_federation import (
                 workspace_source_search,
             )
-            from repowise.server.mcp_server import _state
 
             ws_response = await workspace_source_search(
                 query,

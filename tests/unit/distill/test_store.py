@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import sqlite3
 import time
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from repowise.core.distill.store import OmissionStore, content_ref, default_store_path
@@ -160,17 +162,26 @@ def test_distill_summary_excludes_mcp_rows(store: OmissionStore) -> None:
 
     # Distill surface rows…
     store.record_saving(
-        filter_name="test_output", source="cli", command="pytest",
-        raw_tokens=1000, distilled_tokens=100,
+        filter_name="test_output",
+        source="cli",
+        command="pytest",
+        raw_tokens=1000,
+        distilled_tokens=100,
     )
     store.record_saving(
-        filter_name="git_log", source="hook-bash", command="git log",
-        raw_tokens=500, distilled_tokens=50,
+        filter_name="git_log",
+        source="hook-bash",
+        command="git log",
+        raw_tokens=500,
+        distilled_tokens=50,
     )
     # …and an MCP counterfactual row in the same ledger, which distill must skip.
     store.record_saving(
-        filter_name="get_context", source="mcp:get_context", command=None,
-        raw_tokens=4000, distilled_tokens=400,
+        filter_name="get_context",
+        source="mcp:get_context",
+        command=None,
+        raw_tokens=4000,
+        distilled_tokens=400,
     )
 
     summary = distill_summary(store._conn)
@@ -187,16 +198,25 @@ def test_mcp_savings_summary_counterfactual_precedence(store: OmissionStore) -> 
     # Counterfactual ledger rows for two tools (these subsume their own
     # truncation, since delivered is measured post-truncation).
     store.record_saving(
-        filter_name="get_symbol", source="mcp:get_symbol", command=None,
-        raw_tokens=3000, distilled_tokens=300,
+        filter_name="get_symbol",
+        source="mcp:get_symbol",
+        command=None,
+        raw_tokens=3000,
+        distilled_tokens=300,
     )
     store.record_saving(
-        filter_name="get_symbol", source="mcp:get_symbol", command=None,
-        raw_tokens=1000, distilled_tokens=200,
+        filter_name="get_symbol",
+        source="mcp:get_symbol",
+        command=None,
+        raw_tokens=1000,
+        distilled_tokens=200,
     )
     store.record_saving(
-        filter_name="get_context", source="mcp:get_context", command=None,
-        raw_tokens=2000, distilled_tokens=500,
+        filter_name="get_context",
+        source="mcp:get_context",
+        command=None,
+        raw_tokens=2000,
+        distilled_tokens=500,
     )
     # Truncation drops: get_symbol also has drops (must NOT be added on top —
     # counterfactual wins); get_risk has ONLY drops (its sole signal).
@@ -210,14 +230,20 @@ def test_mcp_savings_summary_counterfactual_precedence(store: OmissionStore) -> 
 
     # get_symbol → counterfactual saved 2700+800=3500, drops ignored.
     assert by_tool["get_symbol"] == {
-        "tool": "get_symbol", "events": 2, "tokens": 3500, "kind": "counterfactual",
+        "tool": "get_symbol",
+        "events": 2,
+        "tokens": 3500,
+        "kind": "counterfactual",
     }
     # get_context → counterfactual saved 1500.
     assert by_tool["get_context"]["tokens"] == 1500
     assert by_tool["get_context"]["kind"] == "counterfactual"
     # get_risk → truncation only.
     assert by_tool["get_risk"] == {
-        "tool": "get_risk", "events": 1, "tokens": 700, "kind": "truncation",
+        "tool": "get_risk",
+        "events": 1,
+        "tokens": 700,
+        "kind": "truncation",
     }
     # queries counts counterfactual events only; tokens is the merged total.
     assert summary["queries"] == 3
@@ -232,6 +258,108 @@ def test_mcp_savings_summary_empty(store: OmissionStore) -> None:
 
     summary = mcp_savings_summary(store._conn)
     assert summary == {"events": 0, "tokens": 0, "queries": 0, "per_tool": []}
+
+
+def test_mcp_usage_is_one_daily_aggregate_without_query_or_path_fields(
+    store: OmissionStore,
+) -> None:
+    store.record_mcp_usage(
+        tool="search_codebase",
+        duration_ms=40,
+        error=False,
+        no_match=False,
+        degraded=False,
+        replaced_tokens=1000,
+        delivered_tokens=250,
+    )
+    store.record_mcp_usage(
+        tool="search_codebase",
+        duration_ms=60,
+        error=False,
+        no_match=True,
+        degraded=True,
+        replaced_tokens=0,
+        delivered_tokens=100,
+    )
+
+    assert store._conn.execute("SELECT COUNT(*) FROM mcp_usage_daily").fetchone()[0] == 1
+    columns = {
+        row[1] for row in store._conn.execute("PRAGMA table_info(mcp_usage_daily)").fetchall()
+    }
+    assert {"query", "path", "target", "session", "created_at", "id"}.isdisjoint(columns)
+    summary = store.mcp_usage_summary()
+    assert summary["calls"] == 2
+    assert summary["no_match_calls"] == 1
+    assert summary["degraded_calls"] == 1
+    assert summary["avg_duration_ms"] == 50.0
+    assert summary["per_tool"][0]["saved_tokens"] == 750
+    assert summary["per_tool"][0]["saving_calls"] == 1
+
+
+def test_mcp_usage_write_prunes_days_outside_the_fixed_window(store: OmissionStore) -> None:
+    from repowise.core.distill.tracking import record_mcp_usage
+
+    old = (datetime.now(UTC) - timedelta(days=40)).timestamp()
+    record_mcp_usage(
+        store._conn,
+        tool="get_context",
+        duration_ms=1,
+        error=False,
+        no_match=False,
+        degraded=False,
+        replaced_tokens=0,
+        delivered_tokens=10,
+        occurred_at=old,
+    )
+    store.record_mcp_usage(
+        tool="get_context",
+        duration_ms=2,
+        error=False,
+        no_match=False,
+        degraded=False,
+        replaced_tokens=0,
+        delivered_tokens=10,
+    )
+
+    days = [row[0] for row in store._conn.execute("SELECT day FROM mcp_usage_daily")]
+    assert days == [datetime.now(UTC).date().isoformat()]
+
+
+def test_open_migrates_and_deletes_legacy_per_call_mcp_rows(tmp_path: Path) -> None:
+    db_path = tmp_path / "omissions.db"
+    OmissionStore(db_path).close()
+    conn = sqlite3.connect(db_path)
+    now = time.time()
+    conn.executemany(
+        """
+        INSERT INTO savings
+            (created_at, filter, source, command, raw_tokens, distilled_tokens)
+        VALUES (?, ?, ?, NULL, ?, ?)
+        """,
+        [
+            (now, "get_symbol", "mcp:get_symbol", 3000, 300),
+            (now, "get_symbol", "mcp:get_symbol:dead_end", 0, 100),
+        ],
+    )
+    conn.commit()
+    conn.close()
+
+    migrated = OmissionStore(db_path)
+    try:
+        assert (
+            migrated._conn.execute(
+                "SELECT COUNT(*) FROM savings WHERE source LIKE 'mcp:%'"
+            ).fetchone()[0]
+            == 0
+        )
+        usage = migrated.mcp_usage_summary()["per_tool"][0]
+        assert usage["calls"] == 2
+        assert usage["error_calls"] == 1
+        assert usage["saved_tokens"] == 2600
+        assert usage["saving_calls"] == 2
+        assert migrated.savings_summary()["saved_tokens"] == 2600
+    finally:
+        migrated.close()
 
 
 def test_default_store_path_finds_repowise_dir(tmp_path: Path) -> None:

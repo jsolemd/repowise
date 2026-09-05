@@ -10,12 +10,13 @@ core stays decoupled from this package.
 from __future__ import annotations
 
 from .counterfactual import replaced_tokens_for
-from .recorder import record_mcp_saving
+from .recorder import record_mcp_call, record_mcp_saving
 from .wrapper import declare_replaced, instrument
 
 __all__ = [
     "declare_replaced",
     "instrument",
+    "record_mcp_call",
     "record_mcp_saving",
     "replaced_tokens_for",
 ]

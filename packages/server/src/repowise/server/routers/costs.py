@@ -19,6 +19,7 @@ from repowise.server.schemas import (
     DistillSavingsGroup,
     DistillSavingsResponse,
     McpDropGroup,
+    McpUsageGroup,
 )
 
 router = APIRouter(
@@ -171,6 +172,7 @@ async def get_distill_savings(
         # Unified MCP view: counterfactual ledger merged with truncation drops,
         # counterfactual taking precedence per tool (no double counting).
         mcp = tracking.mcp_savings_summary(conn, since=since_ts)
+        usage = tracking.mcp_usage_summary(conn, since=since_ts)
     except sqlite3.Error:
         return DistillSavingsResponse(available=False)
     finally:
@@ -228,6 +230,13 @@ async def get_distill_savings(
             )
             for row in mcp["per_tool"]
         ],
+        mcp_usage_calls=usage["calls"],
+        mcp_usage_error_calls=usage["error_calls"],
+        mcp_usage_no_match_calls=usage["no_match_calls"],
+        mcp_usage_degraded_calls=usage["degraded_calls"],
+        mcp_usage_avg_duration_ms=usage["avg_duration_ms"],
+        mcp_usage_window_days=usage["window_days"],
+        mcp_usage_per_tool=[McpUsageGroup(**row) for row in usage["per_tool"]],
         missed_events=missed["events"],
         missed_tokens_est=missed["est_saved_tokens"],
         missed_window_days=missed["window_days"],

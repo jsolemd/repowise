@@ -127,7 +127,6 @@ _CONTRACTS: dict[str, ResponseBudgetContract] = {
             "code_rationale",
             "origin_story",
         ),
-        expansion_argument=None,
         protected=(
             "mode",
             "query",
@@ -241,21 +240,29 @@ async def resolve_response_budget_repo_root(
     signature: inspect.Signature,
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
+    *,
+    fallback_to_default: bool = True,
 ) -> str | Path | None:
-    """Resolve the selected repository so omission refs round-trip by alias."""
+    """Resolve the selected repository so sidecars follow the workspace alias.
+
+    Budget enforcement keeps the historical default fallback because it still
+    needs somewhere to bank a shaped error. Usage attribution passes
+    ``fallback_to_default=False``: an invalid explicit alias must not turn into
+    a call credited to an unrelated repository.
+    """
     try:
         bound = signature.bind_partial(*args, **kwargs)
         repo = bound.arguments.get("repo")
         if repo == "all":
             from repowise.server.mcp_server import _state
 
-            return getattr(_state, "_workspace_root", None) or getattr(
-                _state, "_repo_path", None
-            )
+            return getattr(_state, "_workspace_root", None) or getattr(_state, "_repo_path", None)
         from repowise.server.mcp_server._helpers import _resolve_repo_context
 
         return (await _resolve_repo_context(repo)).path
     except Exception:
+        if not fallback_to_default:
+            return None
         from repowise.server.mcp_server import _state
 
         return getattr(_state, "_repo_path", None)
@@ -268,7 +275,7 @@ def _emergency_fit(
     limit: int,
 ) -> None:
     """Bound an unexpectedly huge protected core without a false fit claim."""
-    protected = {*contract.protected, "_meta"}
+    protected = {*contract.protected, "_meta", "trust"}
     removable = [
         key
         for key in result
@@ -300,7 +307,7 @@ def _emergency_fit(
                 return
             for key, child in value.items():
                 child_path = f"{path}.{key}" if path else key
-                if child_path.startswith("_meta") or key.endswith(
+                if child_path.split(".", 1)[0] in {"_meta", "trust"} or key.endswith(
                     ("_total", "_emitted", "_reduced_reason")
                 ):
                     continue
@@ -339,9 +346,7 @@ def _emergency_fit(
             kept = value[: len(value) // 2] if len(value) > 1 else []
             collector.add(f"{path} reduced by final budget guard", dropped)
             container[key] = kept
-            container[f"{key}_total"] = max(
-                len(value), int(container.get(f"{key}_total") or 0)
-            )
+            container[f"{key}_total"] = max(len(value), int(container.get(f"{key}_total") or 0))
             container[f"{key}_emitted"] = len(kept)
             container[f"{key}_reduced_reason"] = "response_budget"
         else:
@@ -438,7 +443,10 @@ def enforce_response_budget(
                 ]
                 dropped_profiles = [profile for profile in profiles if profile not in kept_profiles]
                 if dropped_profiles:
-                    collector.add("validation_profiles no longer referenced after response budgeting", dropped_profiles)
+                    collector.add(
+                        "validation_profiles no longer referenced after response budgeting",
+                        dropped_profiles,
+                    )
                     result["validation_profiles"] = kept_profiles
                     result["validation_profiles_emitted"] = len(kept_profiles)
                     result["validation_profiles_reduced_reason"] = "response_budget"
@@ -457,9 +465,9 @@ def enforce_response_budget(
         result.setdefault("_meta", {}).setdefault("state", {})["truncated"] = True
     _stamp_accounting(result, limit=limit, tier=tier)
     if response_chars(result) > limit:
-        result.setdefault("_meta", {}).setdefault("response_budget", {})[
-            "enforcement_error"
-        ] = "protected response fields exceed the declared budget"
+        result.setdefault("_meta", {}).setdefault("response_budget", {})["enforcement_error"] = (
+            "protected response fields exceed the declared budget"
+        )
         _stamp_accounting(result, limit=limit, tier=tier)
     return result
 

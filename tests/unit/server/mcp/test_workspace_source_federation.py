@@ -1212,6 +1212,8 @@ async def test_a_broken_repo_never_outranks_an_honest_abstention(monkeypatch):
     alpha_meta = resp["_meta"]["source_search"]["repos"]["alpha"]
     assert alpha_meta["degraded"] is True
     assert alpha_meta["errored"] == "all_legs_failed"
+    assert "any workspace repository" not in resp["note"]
+    assert "could not be searched" in resp["note"]
 
 
 @pytest.mark.asyncio
@@ -1236,6 +1238,159 @@ async def test_all_legs_error_composes_an_error_not_an_answer(monkeypatch):
     assert repos["alpha"]["errored"] == "lance_down"
     assert repos["beta"]["errored"] == "fts_down"
     assert resp["_meta"]["source_search"]["repo_order"] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("all_failed", [False, True])
+async def test_error_members_keep_read_provenance_and_failed_legs(monkeypatch, all_failed):
+    from repowise.server.mcp_server._meta import agent_trust
+
+    registry = _StubRegistry(["alpha", "beta"], default="alpha")
+    error = _error_envelope()
+    error["_meta"]["source_search"].update({
+        "generation_id": "reader-alpha",
+        "published_generation_id": "published-alpha",
+        "failed_legs": ["source dense", "source lexical"],
+    })
+    _wire(monkeypatch, {
+        "alpha": _StubCoordinator(error),
+        "beta": _StubCoordinator(
+            _error_envelope() if all_failed else _envelope([("b.py", 1.0)], "caution")
+        ),
+    })
+
+    response = await workspace_source_search(
+        "owner", limit=5, mode="concept", repo="all",
+        registry=registry, build_meta=_META,
+    )
+    source = agent_trust(response["_meta"])["source_search"]["repos"]["alpha"]
+    assert source["generation_id"] == "reader-alpha"
+    assert source["published_generation_id"] == "published-alpha"
+    assert source["failed_legs"] == ["source dense", "source lexical"]
+    assert source["errored"] == "all_legs_failed"
+
+
+def test_composition_does_not_modify_member_answers():
+    import copy
+
+    from repowise.server.mcp_server._source_federation import _compose_answer, _FederatedAnswers
+
+    envelopes = [
+        ("alpha", _envelope([("a.py", 1.0)], "confident", owner="a.py", cosine=0.9)),
+        ("beta", _envelope([("b.py", 0.5)], "caution")),
+    ]
+    before = copy.deepcopy(envelopes)
+    response = _compose_answer(
+        "owner", _FederatedAnswers(envelopes=envelopes),
+        limit=5, mode="concept", base_meta=_META(),
+    )
+    assert envelopes == before
+    response["results"][0]["evidence"]["exact_name"] = True
+    response["_meta"]["source_search"]["repos"]["alpha"]["generation_id"] = "other"
+    assert envelopes == before
+
+
+def test_all_error_composition_keeps_member_metadata_independent():
+    import copy
+
+    from repowise.server.mcp_server._source_federation import _compose_all_error, _FederatedAnswers
+
+    error = _error_envelope()
+    error["_meta"]["source_search"]["failed_legs"] = ["source dense"]
+    before = copy.deepcopy(error)
+    response = _compose_all_error(
+        _FederatedAnswers(errored=[("alpha", error)]), mode="concept", base_meta=_META(),
+    )
+    response["_meta"]["source_search"]["repos"]["alpha"]["failed_legs"].clear()
+    assert error == before
+
+
+@pytest.mark.asyncio
+async def test_readers_remain_borrowed_through_freshness_enrichment(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from repowise.server import source_search_wiring as wiring
+
+    monkeypatch.setattr(wiring, "_retired", [])
+    monkeypatch.setattr(wiring, "_borrowers", {})
+    registry = _StubRegistry(["alpha", "beta"], default="alpha")
+    coordinators = {
+        alias: _StubCoordinator(_envelope([(f"{alias}.py", 1.0)], "caution"))
+        for alias in registry.contexts
+    }
+    for coordinator in coordinators.values():
+        coordinator.close = AsyncMock()
+    _wire(monkeypatch, coordinators)
+
+    async def freshness(contexts, rows):
+        for coordinator in coordinators.values():
+            assert wiring._borrowers[id(coordinator)] == 1
+            wiring._retire(coordinator)
+        await wiring._sweep_retired()
+        for coordinator in coordinators.values():
+            coordinator.close.assert_not_awaited()
+        return {"index_behind": False}
+
+    monkeypatch.setattr(
+        "repowise.server.mcp_server.tool_search._federated_freshness", freshness,
+    )
+    response = await workspace_source_search(
+        "owner", limit=5, mode="concept", repo="all",
+        registry=registry, build_meta=_META,
+    )
+    assert response["_meta"]["index_behind"] is False
+    assert wiring._borrowers == {}
+    for coordinator in coordinators.values():
+        coordinator.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_workspace_query_releases_all_readers(monkeypatch):
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from repowise.server import source_search_wiring as wiring
+
+    monkeypatch.setattr(wiring, "_retired", [])
+    monkeypatch.setattr(wiring, "_borrowers", {})
+    entered = {alias: asyncio.Event() for alias in ["alpha", "beta"]}
+    stopped = set()
+
+    class WaitingCoordinator:
+        def __init__(self, alias):
+            self.alias = alias
+            self.close = AsyncMock()
+
+        async def search(self, *args, **kwargs):
+            entered[self.alias].set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                stopped.add(self.alias)
+
+    registry = _StubRegistry(list(entered), default="alpha")
+    coordinators = {alias: WaitingCoordinator(alias) for alias in entered}
+    _wire(monkeypatch, coordinators)
+    task = asyncio.create_task(workspace_source_search(
+        "owner", limit=5, mode="concept", repo="all",
+        registry=registry, build_meta=_META,
+    ))
+    try:
+        await asyncio.wait_for(asyncio.gather(*(e.wait() for e in entered.values())), timeout=2)
+        for coordinator in coordinators.values():
+            wiring._retire(coordinator)
+        await wiring._sweep_retired()
+        for coordinator in coordinators.values():
+            coordinator.close.assert_not_awaited()
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    assert stopped == set(entered)
+    assert wiring._borrowers == {}
+    assert wiring._retired == []
+    for coordinator in coordinators.values():
+        coordinator.close.assert_awaited_once()
 
 
 @pytest.mark.asyncio

@@ -13,6 +13,8 @@ export type {
   DistillSavingsGroup,
   McpDropGroup,
 } from "./distill-savings-card";
+export { McpUsageCard } from "./mcp-usage-card";
+export type { McpUsageCardProps, McpUsageData, McpUsageTool } from "./mcp-usage-card";
 export { RoiCard } from "./roi-card";
 export type { RoiCardProps } from "./roi-card";
 export { SavingsTrendChart } from "./savings-trend-chart";

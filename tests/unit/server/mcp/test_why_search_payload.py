@@ -132,14 +132,14 @@ async def test_search_keeps_records_citing_different_commits_apart(session, setu
     )
 
     result = await get_why("why zebrafish caching")
-    served = {d["id"] for d in result["decisions"]}
+    served = {d["id"] for d in result["decisions"] + result["candidate_decisions"]}
 
     assert {"ev1", "ev2"} <= served
 
 
 @pytest.mark.asyncio
 async def test_search_caps_full_bodies(session, setup_mcp):
-    """Three whole records, not eight thinned ones."""
+    """The default is one body; broader evidence is an explicit expansion."""
     from repowise.server.mcp_server import get_why
     from repowise.server.mcp_server.tool_why import _MAX_SEARCH_DECISIONS
 
@@ -155,7 +155,56 @@ async def test_search_caps_full_bodies(session, setup_mcp):
     result = await get_why("why zebrafish caching decision")
     bodies = [d for d in result["decisions"] if "decision" in d]
 
-    assert len(bodies) == _MAX_SEARCH_DECISIONS
+    assert len(bodies) == 1
+    assert result["response_scope"] == "primary"
+    assert len(result["candidate_decisions"]) == 5
+    assert all("decision" not in row for row in result["candidate_decisions"])
+    assert result["expansion_handles"][0]["arguments"]["id"] == bodies[0]["id"]
+    assert result["expansion_handles"][1]["arguments"]["include"] == ["supporting"]
+
+    expanded = await get_why("why zebrafish caching decision", include=["supporting"])
+    expanded_bodies = [d for d in expanded["decisions"] if "decision" in d]
+    assert len(expanded_bodies) == _MAX_SEARCH_DECISIONS
+    assert expanded["response_scope"] == "supporting"
+
+
+@pytest.mark.asyncio
+async def test_primary_search_does_not_build_weaker_supporting_lanes(
+    session, setup_mcp, monkeypatch
+):
+    import repowise.server.mcp_server.tool_why as why_mod
+    from repowise.server.mcp_server import get_why
+
+    await _seed(
+        session,
+        setup_mcp,
+        id_="primary-only",
+        title="Zebrafish caching primary rationale",
+        decision="Use zebrafish caching",
+        rationale="It bounds latency",
+        files=["src/cache.py"],
+    )
+
+    async def forbidden(*args, **kwargs):
+        raise AssertionError("supporting lane ran during primary response")
+
+    def forbidden_sync(*args, **kwargs):
+        raise AssertionError("episode lane ran during primary response")
+
+    monkeypatch.setattr(why_mod, "_semantic_lanes", forbidden)
+    monkeypatch.setattr(why_mod, "_build_target_context", forbidden)
+    monkeypatch.setattr(why_mod, "episode_evidence", forbidden_sync)
+
+    result = await get_why("why zebrafish caching", targets=["src/cache.py"])
+
+    assert [row["id"] for row in result["decisions"]] == ["primary-only"]
+    assert "related_documentation" not in result
+    assert "episodes" not in result
+    assert "target_context" not in result
+    supporting = next(
+        row for row in result["expansion_handles"] if row["label"] == "supporting_evidence"
+    )
+    assert supporting["arguments"]["targets"] == ["src/cache.py"]
 
 
 @pytest.mark.asyncio
@@ -193,7 +242,7 @@ async def test_search_embeds_the_query_once(session, setup_mcp, monkeypatch):
     monkeypatch.setattr(vs, "embed_texts", _counting)
     monkeypatch.setattr(vs, "search", _forbidden)
 
-    await get_why("why is JWT used for authentication")
+    await get_why("why is JWT used for authentication", include=["supporting"])
 
     # One embedding, and no fall-through to the text-embedding search path.
     assert calls.count("embed_texts") == 1, calls
@@ -235,11 +284,10 @@ async def test_related_documentation_excludes_decision_pages(session, setup_mcp)
         },
     )
 
-    result = await get_why("why zebrafish caching keeps latency down")
+    result = await get_why("why zebrafish caching keeps latency down", include=["supporting"])
 
     assert all(
-        not r["page_id"].startswith(DECISION_VECTOR_PREFIX)
-        for r in result["related_documentation"]
+        not r["page_id"].startswith(DECISION_VECTOR_PREFIX) for r in result["related_documentation"]
     ), result["related_documentation"]
 
 
@@ -275,7 +323,7 @@ async def test_breadth_does_not_outscore_relevance(session, setup_mcp):
     )
 
     result = await get_why("why zebrafish caching")
-    ids = [d["id"] for d in result["decisions"]]
+    ids = [d["id"] for d in result["decisions"] + result["candidate_decisions"]]
 
     # The wide record matches the question on nothing but its file paths, so it
     # now scores zero and is not a candidate at all.
@@ -334,6 +382,6 @@ async def test_status_breaks_ties_without_gating(session, setup_mcp):
     )
 
     result = await get_why("why zebrafish caching strategy")
-    ids = [d["id"] for d in result["decisions"]]
+    ids = [d["id"] for d in result["decisions"] + result["candidate_decisions"]]
 
     assert ids.index("strong-proposed") < ids.index("weak-active"), ids

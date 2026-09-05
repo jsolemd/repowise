@@ -1,11 +1,11 @@
-"""Instrumentation middleware — measure & record per-tool MCP savings.
+"""Instrumentation middleware — bounded local usage and MCP savings.
 
 :func:`instrument` wraps a registered MCP tool so that every call, after the
 tool produces its (already budget-trimmed) response, measures the delivered
 token count, derives the counterfactual raw-exploration cost it replaced, and
-records a ``mcp:<tool>`` row in the unified savings ledger. It optionally stamps
-``_meta.tokens_saved`` / ``_meta.replaced_tokens`` onto the response for
-transparency.
+folds the call into one repo-local ``tool × UTC day`` aggregate. It optionally
+stamps ``_meta.tokens_saved`` / ``_meta.replaced_tokens`` onto the response for
+transparency. No query, target, path, session, or per-call record is persisted.
 
 Two non-negotiables:
 
@@ -38,7 +38,7 @@ from repowise.core.distill.budget import estimate_tokens
 from repowise.server.mcp_server._signature import preserve
 
 from . import counterfactual
-from .recorder import record_mcp_dead_end, record_mcp_saving
+from .recorder import record_mcp_call
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +71,7 @@ def _telemetry_properties(tool: str, result: Any, duration_ms: int) -> dict[str,
 
     Only coarse enums / booleans / bucketed counts — no user-identifying data.
     """
-    is_error = isinstance(result, dict) and bool(result.get("error"))
+    is_error, _, _ = _result_signals(result)
     props: dict[str, Any] = {
         "tool": tool,
         "status": "error" if is_error else "ok",
@@ -96,7 +96,7 @@ def _telemetry_properties(tool: str, result: Any, duration_ms: int) -> dict[str,
 def _emit_telemetry(tool: str, result: Any, duration_ms: int) -> None:
     """Emit one anonymous ``mcp_tool_call`` event. Best-effort, never raises.
 
-    This is the field-visibility counterpart to the local savings ledger: it
+    This is the field-visibility counterpart to the local bounded aggregate: it
     tells us which tools agents actually reach for, at what confidence, and how
     often results come back stale/degraded — the adoption signal the local
     ledger can't aggregate across installs.
@@ -147,35 +147,71 @@ def _delivered_tokens(result: Any) -> int:
     return estimate_tokens(text)
 
 
-def _record(tool: str, result: Any) -> None:
-    """Measure, derive the counterfactual, and record — all best-effort."""
+def _result_signals(result: Any) -> tuple[bool, bool, bool]:
+    """Return coarse ``(error, no_match, degraded)`` outcome flags."""
+    if not isinstance(result, dict):
+        return False, False, False
+    status = result.get("status")
+    confidence = result.get("confidence")
+    error = bool(result.get("error")) or status in {"error", "failed"}
+    no_match = (
+        result.get("no_match") is True
+        or confidence == "no_match"
+        or status in {"no_match", "not_found"}
+    )
+    meta = result.get("_meta")
+    meta = meta if isinstance(meta, dict) else {}
+    degraded = any(
+        value is True
+        for value in (
+            result.get("retrieval_degraded"),
+            meta.get("retrieval_degraded"),
+            meta.get("index_behind"),
+            meta.get("embedder_degraded"),
+        )
+    )
+    return error, no_match, degraded
+
+
+async def _record(
+    tool: str,
+    result: Any,
+    duration_ms: int,
+    signature: inspect.Signature,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> None:
+    """Measure and aggregate one call in the repository selected by ``repo=``."""
     declared = _declared_tokens(result)
     replaced = (
         declared if declared is not None else counterfactual.replaced_tokens_for(tool, result)
     )
-    if replaced <= 0:
-        # Dead-end debit: an error response delivered tokens and replaced
-        # nothing — net negative for the session, and the ledger must say so.
-        if isinstance(result, dict) and result.get("error"):
-            from repowise.server.mcp_server import _state
-
-            record_mcp_dead_end(
-                getattr(_state, "_repo_path", None), tool, _delivered_tokens(result)
-            )
-        return
-
     delivered = _delivered_tokens(result)
+    error, no_match, degraded = _result_signals(result)
 
-    # Resolve the repo the MCP server is scoped to. Lazy import keeps this
-    # module free of package import-ordering coupling.
-    from repowise.server.mcp_server import _state
+    # Resolve the actual workspace alias selected by this invocation. Using
+    # the server's default repo here silently attributed cross-repo calls to
+    # whichever repository happened to boot the process.
+    from repowise.server.mcp_server._budget import resolve_response_budget_repo_root
 
-    repo_root = getattr(_state, "_repo_path", None)
-    if record_mcp_saving(repo_root, tool, replaced, delivered) and isinstance(result, dict):
+    repo_root = await resolve_response_budget_repo_root(
+        signature, args, kwargs, fallback_to_default=False
+    )
+    written = record_mcp_call(
+        repo_root,
+        tool,
+        duration_ms=duration_ms,
+        error=error,
+        no_match=no_match,
+        degraded=degraded,
+        replaced_tokens=max(0, replaced),
+        delivered_tokens=delivered,
+    )
+    if written and replaced > delivered and isinstance(result, dict):
         meta = result.setdefault("_meta", {})
         if isinstance(meta, dict):
             meta["replaced_tokens"] = replaced
-            meta["tokens_saved"] = max(0, replaced - delivered)
+            meta["tokens_saved"] = replaced - delivered
 
 
 def instrument(fn: Callable[..., Any]) -> Callable[..., Any]:
@@ -188,6 +224,7 @@ def instrument(fn: Callable[..., Any]) -> Callable[..., Any]:
         return fn
 
     tool = getattr(fn, "__name__", "tool")
+    signature = inspect.signature(fn)
 
     @functools.wraps(fn)
     async def _wrapped(*args: Any, **kwargs: Any) -> Any:
@@ -197,7 +234,7 @@ def instrument(fn: Callable[..., Any]) -> Callable[..., Any]:
         result = await fn(*args, **kwargs)
         duration_ms = int((time.perf_counter() - _t0) * 1000)
         try:
-            _record(tool, result)
+            await _record(tool, result, duration_ms, signature, args, kwargs)
         except Exception:  # pragma: no cover - defensive; savings never break a tool
             logger.debug("mcp savings instrumentation failed for %s", tool, exc_info=True)
         try:

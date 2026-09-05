@@ -68,8 +68,7 @@ def _has_archaeology(archaeology: Any) -> bool:
     only that it ran.
     """
     return isinstance(archaeology, dict) and any(
-        archaeology.get(lane)
-        for lane in ("file_commits", "cross_references", "git_log")
+        archaeology.get(lane) for lane in ("file_commits", "cross_references", "git_log")
     )
 
 
@@ -86,9 +85,7 @@ def _stamp_answer_basis(result: dict) -> dict:
     lane it names; clears first to stay correct on that second call.
     """
     result.pop("answer_basis", None)
-    entries = [
-        e for e in (result.get("target_context") or {}).values() if isinstance(e, dict)
-    ]
+    entries = [e for e in (result.get("target_context") or {}).values() if isinstance(e, dict)]
     if result.get("decisions") or any(e.get("governing_decisions") for e in entries):
         result["answer_basis"] = "decision"
     elif result.get("episodes"):
@@ -123,6 +120,7 @@ async def get_why(
     repo: str | None = None,
     id: str | None = None,
     reference: dict[str, Any] | None = None,
+    include: list[str] | None = None,
 ) -> dict:
     """Why this code is shaped this way — decision records + evidence commits.
 
@@ -135,7 +133,10 @@ async def get_why(
     mean shared evidence, not independent corroboration. ``answer_basis`` names
     the strongest lane the response rests on (decision, episode, rationale,
     archaeology, documentation); only a decision is a ruling, the rest are
-    evidence to weigh.
+    evidence to weigh. Natural-language search returns the single strongest
+    decision first, plus compact decision ids and structured expansion handles.
+    Pass ``include=["supporting"]`` only when the broader documentation,
+    episode, target-context, and secondary-decision lanes are needed.
 
     Args:
         query: question, file/module path, or omit for the dashboard.
@@ -145,15 +146,13 @@ async def get_why(
         id: decision or ``ev_...`` evidence id emitted by this or another tool.
         reference: structured evidence reference. Its id and repository are
             accepted together without caller translation.
+        include: ``["supporting"]`` expands natural-language search beyond its
+            primary decision. Omit for the compact agent-first answer.
     """
     if reference:
         if id is None and isinstance(reference.get("id"), str):
             id = reference["id"]
-        if (
-            repo is None
-            and _is_workspace_mode()
-            and isinstance(reference.get("repository"), str)
-        ):
+        if repo is None and _is_workspace_mode() and isinstance(reference.get("repository"), str):
             repo = reference["repository"]
     if id:
         if repo == "all":
@@ -164,7 +163,9 @@ async def get_why(
     if repo == "all":
         if not query:
             return _unsupported_repo_all("get_why (health dashboard)")
-        return _stamp_answer_basis(await _why_workspace_search(query))
+        return _stamp_answer_basis(
+            await _why_workspace_search(query, supporting="supporting" in (include or []))
+        )
 
     # --- Mode 1: No query → the targets, or the health dashboard ---
     # Targets first: a caller who named files and asked nothing has asked about
@@ -183,7 +184,14 @@ async def get_why(
         return _stamp_answer_basis(await _why_path(query, repo))
 
     # --- Mode 3: Natural language → target-aware search ---
-    return _stamp_answer_basis(await _why_search(query, targets, repo))
+    return _stamp_answer_basis(
+        await _why_search(
+            query,
+            targets,
+            repo,
+            supporting="supporting" in (include or []),
+        )
+    )
 
 
 async def _why_reference(
@@ -198,7 +206,7 @@ async def _why_reference(
     async with get_session(ctx.session_factory) as session:
         await _attach_decision_evidence(session, records)
 
-    payload = {
+    payload: dict[str, Any] = {
         "decisions": [
             _governing_decision_entry(
                 record,
@@ -230,16 +238,10 @@ async def _why_reference(
         if ref["id"] == reference_id
     }
     if not matches and reference_id.startswith("ev_"):
-        live_ref = _resolve_unattached_evidence_reference(
-            reference_id, ctx.alias, ctx.path
-        )
+        live_ref = _resolve_unattached_evidence_reference(reference_id, ctx.alias, ctx.path)
         if live_ref is not None:
             matching_refs[live_ref["id"]] = live_ref
-    if (
-        reference is not None
-        and matching_refs
-        and _evidence_reference_matches_id(reference)
-    ):
+    if reference is not None and matching_refs and _evidence_reference_matches_id(reference):
         matching_refs[reference_id] = dict(reference)
     meta = _build_meta(repository=repository)
     persistence = (payload.get("_meta") or {}).get("reference_persistence")
@@ -263,7 +265,7 @@ def _evidence_reference_matches_id(value: dict[str, Any]) -> bool:
     identifier = value.get("id")
     repository = value.get("repository")
     kind = value.get("kind")
-    if not all(isinstance(item, str) for item in (identifier, repository, kind)):
+    if not (isinstance(identifier, str) and isinstance(repository, str) and isinstance(kind, str)):
         return False
     coordinate_keys = {
         "commit": ("commit",),
@@ -296,7 +298,7 @@ def _resolve_unattached_evidence_reference(
     ) or resolve_persisted_evidence_reference(repository, reference_id, repo_root)
 
 
-async def _why_workspace_search(query: str) -> dict:
+async def _why_workspace_search(query: str, *, supporting: bool = False) -> dict:
     """repo="all": the question single-repo search answers, across the workspace.
 
     This used to be the whole tool as it stood before the relevance work: match
@@ -352,10 +354,9 @@ async def _why_workspace_search(query: str) -> dict:
     # as they do within one repo; alias and id only settle what those three leave
     # equal, and are here so the answer is the same on two runs.
     scored.sort(key=lambda t: (t[0], t[1], t[3]))
-    selected = scored
-    collector = OmissionCollector(
-        "get_why", repo_root=selected[0][2].path if selected else None
-    )
+    candidate_rows = scored
+    selected = candidate_rows if supporting else candidate_rows[:1]
+    collector = OmissionCollector("get_why", repo_root=selected[0][2].path if selected else None)
     for selected_ctx in {entry[2].alias: entry[2] for entry in selected}.values():
         selected_records = [entry[4] for entry in selected if entry[2] is selected_ctx]
         async with get_session(selected_ctx.session_factory) as session:
@@ -391,9 +392,27 @@ async def _why_workspace_search(query: str) -> dict:
         "mode": "search",
         "query": query,
         "workspace": True,
+        "response_scope": "supporting" if supporting else "primary",
         "decisions": decisions,
         "_meta": _build_meta(),
     }
+    if not supporting:
+        result["candidate_decisions"] = [
+            _decision_handle(record, alias)
+            for _, alias, _ctx, _id, record, _folded in candidate_rows[
+                1 : 1 + _MAX_SEARCH_ALTERNATIVES
+            ]
+        ]
+        result["candidate_decisions_total"] = max(0, len(candidate_rows) - 1)
+        result["candidate_decisions_emitted"] = len(result["candidate_decisions"])
+        result["expansion_handles"] = _search_expansion_handles(
+            query,
+            None,
+            "all",
+            decisions[0]["id"] if decisions else None,
+            decisions[0].get("repo") if decisions else None,
+        )
+        return result
     cap_collection(
         result,
         "decisions",
@@ -538,9 +557,65 @@ _PATH_STATUS_ORDER = {"active": 0, "proposed": 1, "deprecated": 2, "superseded":
 # padded answer is the failure mode, and thinning every record to keep eight of
 # them is padding with extra steps.
 
-#: Records kept by search mode. Three whole beats eight thinned: past the third
-#: hit the ranking is not trustworthy enough to spend an agent's context on.
+#: Records kept only by explicit ``include=["supporting"]`` search mode.
 _MAX_SEARCH_DECISIONS = 3
+
+#: Default search serves one ruling and only enough alternative handles to let
+#: an agent expand deliberately. Handles are metadata, not weaker prose.
+_MAX_SEARCH_ALTERNATIVES = 5
+
+
+def _decision_handle(record: Any, repository: str) -> dict[str, Any]:
+    """Compact, directly expandable metadata for one secondary decision."""
+    return {
+        "id": record.id,
+        "title": record.title,
+        "status": record.status,
+        "source": record.source,
+        "confidence": record.confidence,
+        "expand": {
+            "tool": "get_why",
+            "arguments": {"id": record.id, "repo": repository},
+        },
+    }
+
+
+def _search_expansion_handles(
+    query: str,
+    targets: list[str] | None,
+    repository: str,
+    primary_id: str | None,
+    primary_repository: str | None = None,
+) -> list[dict[str, Any]]:
+    """Machine-readable next calls for a compact search response."""
+    handles: list[dict[str, Any]] = []
+    if primary_id:
+        handles.append(
+            {
+                "label": "primary_decision",
+                "tool": "get_why",
+                "arguments": {
+                    "id": primary_id,
+                    "repo": primary_repository or repository,
+                },
+            }
+        )
+    supporting_args: dict[str, Any] = {
+        "query": query,
+        "repo": repository,
+        "include": ["supporting"],
+    }
+    if targets:
+        supporting_args["targets"] = targets
+    handles.append(
+        {
+            "label": "supporting_evidence",
+            "tool": "get_why",
+            "arguments": supporting_args,
+        }
+    )
+    return handles
+
 
 #: Records kept by workspace search. Above the single-repo three because the
 #: answer can genuinely live in more than one store and the repo is part of it;
@@ -747,12 +822,15 @@ def _prepare_episode_bodies(
             visible_pending.append((entry, label, body))
         else:
             entry["recorded"] = body
-    return bank_overflow(
-        visible_pending,
-        tool="get_why",
-        repo_root=repo_root,
-        collector=collector,
-    ) or collector
+    return (
+        bank_overflow(
+            visible_pending,
+            tool="get_why",
+            repo_root=repo_root,
+            collector=collector,
+        )
+        or collector
+    )
 
 
 def _fit_path_response(
@@ -1215,11 +1293,7 @@ async def _lineage_for_records(
             visited.add(current)
             order.append((current, relation))
             edge = next(
-                (
-                    row
-                    for row in outgoing.get(current, [])
-                    if row.dst_decision_id not in visited
-                ),
+                (row for row in outgoing.get(current, []) if row.dst_decision_id not in visited),
                 None,
             )
             if edge is None:
@@ -1427,9 +1501,7 @@ async def _build_target_context(
         return target_context
 
 
-def _cap_target_context(
-    target_context: dict[str, Any], collector: OmissionCollector
-) -> None:
+def _cap_target_context(target_context: dict[str, Any], collector: OmissionCollector) -> None:
     """Cap evidence-enriched per-target decision lanes independently."""
     for target, entry in target_context.items():
         decisions = entry.get("governing_decisions")
@@ -1440,9 +1512,7 @@ def _cap_target_context(
                 decisions,
                 _MAX_PATH_DECISIONS,
                 collector,
-                label=(
-                    f"{target} :: governing_decisions beyond cap={_MAX_PATH_DECISIONS}"
-                ),
+                label=(f"{target} :: governing_decisions beyond cap={_MAX_PATH_DECISIONS}"),
             )
 
 
@@ -1491,9 +1561,7 @@ async def _why_no_match(
         if rationale:
             result["code_rationale"] = rationale
     await _hydrate_response_decision_evidence(ctx, result, all_decisions)
-    await annotate_response_evidence_async(
-        result, ctx.alias, all_decisions, repo_root=ctx.path
-    )
+    await annotate_response_evidence_async(result, ctx.alias, all_decisions, repo_root=ctx.path)
     if collector is not None:
         _cap_supporting_lanes(result, collector, label=query)
         _cap_target_context(result["target_context"], collector)
@@ -1571,9 +1639,7 @@ async def _attach_response_decision_evidence(
                 visit(child)
 
     visit(result)
-    await _attach_decision_evidence(
-        session, [record for record in records if record.id in ids]
-    )
+    await _attach_decision_evidence(session, [record for record in records if record.id in ids])
 
 
 async def _hydrate_response_decision_evidence(
@@ -1633,8 +1699,14 @@ async def _why_targets(targets: list[str], repo: str | None) -> dict:
     return result_data
 
 
-async def _why_search(query: str, targets: list[str] | None, repo: str | None) -> dict:
-    """Mode 3: natural-language, target-aware decision + documentation search."""
+async def _why_search(
+    query: str,
+    targets: list[str] | None,
+    repo: str | None,
+    *,
+    supporting: bool = False,
+) -> dict:
+    """Mode 3: one primary decision, or the explicit supporting expansion."""
     ctx, repository, all_decisions, target_git = await _load_corpus(repo, targets)
 
     target_set = set(targets) if targets else set()
@@ -1645,21 +1717,54 @@ async def _why_search(query: str, targets: list[str] | None, repo: str | None) -
         return await _why_no_match(query, targets, ctx, repository, all_decisions, target_git)
     collector = OmissionCollector("get_why", repo_root=ctx.path)
     collapsed = _collapse_restatements(ranked)
+
+    if not supporting:
+        primary = collapsed[:1]
+        # Lineage is supporting evidence too: even one correct ruling can drag
+        # a long supersession chain into the first response. The explicit
+        # supporting expansion computes it when the agent asks.
+        decisions = _merge_decisions(primary, [], {}, collector)
+        candidates = [
+            _decision_handle(record, ctx.alias)
+            for record, _folded in collapsed[1 : 1 + _MAX_SEARCH_ALTERNATIVES]
+        ]
+        result_data: dict[str, Any] = {
+            "mode": "search",
+            "query": query,
+            "response_scope": "primary",
+            "decisions": decisions,
+            "candidate_decisions": candidates,
+            "candidate_decisions_total": max(0, len(collapsed) - 1),
+            "candidate_decisions_emitted": len(candidates),
+            "expansion_handles": _search_expansion_handles(
+                query,
+                targets,
+                ctx.alias,
+                decisions[0]["id"] if decisions else None,
+            ),
+        }
+        await _hydrate_response_decision_evidence(ctx, result_data, all_decisions)
+        await annotate_response_evidence_async(
+            result_data, ctx.alias, all_decisions, repo_root=ctx.path
+        )
+        result_data["_meta"] = _build_meta(
+            repository=repository, targets=targets if targets else None
+        )
+        collector.attach(result_data)
+        return result_data
+
     decision_results, doc_results = await _semantic_lanes(ctx, query)
-    lineage_by_id = await _lineage_for_matches(
-        ctx, [d for d, _ in collapsed], all_decisions
-    )
-    merged_decisions = _merge_decisions(
-        collapsed, decision_results, lineage_by_id, collector
-    )
+    lineage_by_id = await _lineage_for_matches(ctx, [d for d, _ in collapsed], all_decisions)
+    merged_decisions = _merge_decisions(collapsed, decision_results, lineage_by_id, collector)
 
     # No further slice: the cap is on *bodies*, applied to ``collapsed`` above.
     # Semantic hits append as id-plus-snippet at roughly 200 chars each, so
     # dropping them to fit a record count would cost the lane that carries a
     # calibrated relevance score for the sake of no measurable payload.
-    result_data: dict[str, Any] = {
+    result_data = {
         "mode": "search",
         "query": query,
+        "response_scope": "supporting",
         "decisions": merged_decisions,
         "related_documentation": [
             {

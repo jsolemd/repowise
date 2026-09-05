@@ -87,12 +87,11 @@ class RepoRegistry:
         self._contexts: dict[str, RepoContext] = {}
         self._access_order: dict[str, float] = {}
         self._vs_tasks: dict[str, asyncio.Task[None]] = {}
+        self._load_lock = asyncio.Lock()
         self._validate_public_identities()
 
     def _identity_key(self, value: str | Path) -> str:
-        return os.path.normcase(Path(value).as_posix().rstrip("/") or ".").replace(
-            "\\", "/"
-        )
+        return os.path.normcase(Path(value).as_posix().rstrip("/") or ".").replace("\\", "/")
 
     @staticmethod
     def _alias_key(value: str) -> str:
@@ -190,18 +189,19 @@ class RepoRegistry:
             self._access_order[alias] = time.monotonic()
             return self._contexts[alias]
 
-        # Evict if at capacity.  The default repo is protected from eviction, so
-        # only count non-default contexts against the cap — this prevents the
-        # cap from being silently bypassed when the default is always loaded.
-        default_alias = self.get_default_alias()
-        evictable = [a for a in self._contexts if a != default_alias]
-        if len(evictable) >= self.MAX_LOADED:
-            await self._evict_lru()
-
-        ctx = await self._load_context(alias)
-        self._contexts[alias] = ctx
-        self._access_order[alias] = time.monotonic()
-        return ctx
+        # Serialize cache misses and capacity changes. Warm reads above never
+        # wait; vector-store loading continues independently in its background
+        # task. A second cold request must share the first request's context.
+        async with self._load_lock:
+            if alias not in self._contexts:
+                default_alias = self.get_default_alias()
+                evictable = [a for a in self._contexts if a != default_alias]
+                if alias != default_alias and len(evictable) >= self.MAX_LOADED:
+                    await self._evict_lru()
+                ctx = await self._load_context(alias)
+                self._contexts[alias] = ctx
+            self._access_order[alias] = time.monotonic()
+            return self._contexts[alias]
 
     async def get_default(self) -> RepoContext:
         """Shortcut for ``get(default_alias)``."""
@@ -209,10 +209,11 @@ class RepoRegistry:
 
     async def close(self) -> None:
         """Dispose all loaded engines and close stores."""
-        for alias in list(self._contexts):
-            await self._dispose_context(alias)
-        self._contexts.clear()
-        self._access_order.clear()
+        async with self._load_lock:
+            for alias in list(self._contexts):
+                await self._dispose_context(alias)
+            self._contexts.clear()
+            self._access_order.clear()
 
     # -- Internal ----------------------------------------------------------
 

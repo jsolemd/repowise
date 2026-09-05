@@ -3,7 +3,7 @@
 import { useState } from "react";
 import useSWR from "swr";
 import { useParams } from "next/navigation";
-import { DollarSign } from "lucide-react";
+import { Activity, DollarSign } from "lucide-react";
 import { MetricCard } from "@repowise-dev/ui/shared/metric-card";
 import { PageShell } from "@repowise-dev/ui/shared/page-shell";
 import { ApiError } from "@repowise-dev/ui/shared/api-error";
@@ -16,6 +16,7 @@ import {
   CostHeatmap,
   DailySpendChart,
   DistillSavingsCard,
+  McpUsageCard,
   ProviderComparison,
   OperationBreakdown,
   RoiCard,
@@ -95,9 +96,9 @@ export default function CostsPage() {
   return (
     <PageShell
       maxWidth="wide"
-      icon={<DollarSign className="h-5 w-5 text-[var(--color-success)]" />}
-      title="Cost Tracking"
-      description="What repowise saved your coding agent — and what generating the docs cost."
+      icon={<Activity className="h-5 w-5 text-[var(--color-accent-primary)]" />}
+      title="Usage & savings"
+      description="Which RepoWise tools agents use, how they behave, what they save, and what documentation generation costs."
     >
       {/* Hero: the honest results surface — all tokens & dollars saved for the
           coding agent, across distill (CLI + hook) and MCP tool responses. */}
@@ -112,7 +113,10 @@ export default function CostsPage() {
           </CardContent>
         </Card>
       ) : (
-        <DistillSavingsCard data={distillSavings} />
+        <>
+          <DistillSavingsCard data={distillSavings} />
+          <McpUsageCard data={distillSavings} />
+        </>
       )}
 
       {/* ROI and the savings trend are gated on `available`, which is a

@@ -36,6 +36,18 @@ export interface McpDropGroup {
   kind?: string;
 }
 
+export interface McpUsageTool {
+  tool: string;
+  calls: number;
+  error_calls: number;
+  no_match_calls: number;
+  degraded_calls: number;
+  avg_duration_ms: number;
+  saving_calls: number;
+  positive_saving_calls: number;
+  saved_tokens: number;
+}
+
 export interface DistillSavings {
   available: boolean;
   events: number;
@@ -55,6 +67,14 @@ export interface DistillSavings {
   /** Count of counterfactual MCP queries answered ("N MCP queries answered"). */
   mcp_queries: number;
   mcp_per_tool: McpDropGroup[];
+  /** Rolling local tool/day aggregates; never per-call query or target history. */
+  mcp_usage_calls: number;
+  mcp_usage_error_calls: number;
+  mcp_usage_no_match_calls: number;
+  mcp_usage_degraded_calls: number;
+  mcp_usage_avg_duration_ms: number;
+  mcp_usage_window_days: number;
+  mcp_usage_per_tool: McpUsageTool[];
   /** Raw (non-distilled) agent commands a filter would have caught. */
   missed_events: number;
   missed_tokens_est: number;

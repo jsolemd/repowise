@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -21,7 +22,9 @@ from repowise.core.workspace.registry import RepoContext, RepoRegistry
 _NOW = datetime(2026, 4, 12, 10, 0, 0, tzinfo=UTC)
 
 
-def _make_workspace(tmp_path: Path, repo_names: list[str], default: str | None = None) -> WorkspaceConfig:
+def _make_workspace(
+    tmp_path: Path, repo_names: list[str], default: str | None = None
+) -> WorkspaceConfig:
     """Create repo dirs with .repowise/wiki.db and return a WorkspaceConfig."""
     entries = []
     for name in repo_names:
@@ -70,23 +73,25 @@ async def _seed_repo_db(repo_path: Path, repo_name: str) -> None:
             updated_at=_NOW,
         )
         session.add(repo)
-        session.add(Page(
-            id=f"repo_overview:{repo_name}",
-            repository_id=repo.id,
-            page_type="repo_overview",
-            title=f"{repo_name} Overview",
-            content=f"# {repo_name}\n\nOverview of {repo_name}.",
-            target_path=repo_name,
-            source_hash="abc",
-            model_name="mock",
-            provider_name="mock",
-            generation_level=6,
-            confidence=1.0,
-            freshness_status="fresh",
-            metadata_json="{}",
-            created_at=_NOW,
-            updated_at=_NOW,
-        ))
+        session.add(
+            Page(
+                id=f"repo_overview:{repo_name}",
+                repository_id=repo.id,
+                page_type="repo_overview",
+                title=f"{repo_name} Overview",
+                content=f"# {repo_name}\n\nOverview of {repo_name}.",
+                target_path=repo_name,
+                source_hash="abc",
+                model_name="mock",
+                provider_name="mock",
+                generation_level=6,
+                confidence=1.0,
+                freshness_status="fresh",
+                metadata_json="{}",
+                created_at=_NOW,
+                updated_at=_NOW,
+            )
+        )
         await session.commit()
     await engine.dispose()
 
@@ -144,9 +149,7 @@ class TestResolveRepoParam:
         with pytest.raises(ValueError, match="identities collide"):
             RepoRegistry(tmp_path, config)
 
-    def test_alias_cannot_shadow_another_repo_path_by_case(
-        self, tmp_path: Path
-    ) -> None:
+    def test_alias_cannot_shadow_another_repo_path_by_case(self, tmp_path: Path) -> None:
         config = WorkspaceConfig(
             repos=[
                 RepoEntry(path="services/api", alias="foo"),
@@ -182,6 +185,35 @@ class TestResolveRepoParam:
 
 
 class TestLazyLoading:
+    async def test_concurrent_cold_requests_share_one_context(self, tmp_path, monkeypatch):
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock
+
+        registry = RepoRegistry(tmp_path, _make_workspace(tmp_path, ["backend"]))
+        entered, release = asyncio.Event(), asyncio.Event()
+        ctx = SimpleNamespace(
+            _engine=SimpleNamespace(dispose=AsyncMock()),
+            vector_store=SimpleNamespace(close=AsyncMock()),
+        )
+
+        async def load(alias):
+            entered.set()
+            await release.wait()
+            return ctx
+
+        loader = AsyncMock(side_effect=load)
+        monkeypatch.setattr(registry, "_load_context", loader)
+        first = asyncio.create_task(registry.get("backend"))
+        await entered.wait()
+        second = asyncio.create_task(registry.get("backend"))
+        await asyncio.sleep(0)
+        release.set()
+        assert await first is await second
+        assert loader.await_count == 1
+        await registry.close()
+        ctx._engine.dispose.assert_awaited_once()
+        ctx.vector_store.close.assert_awaited_once()
+
     @pytest.mark.asyncio
     async def test_get_loads_context(self, tmp_path: Path) -> None:
         config = _make_workspace(tmp_path, ["backend"])

@@ -41,6 +41,8 @@ import copy
 import logging
 import re
 from collections.abc import Callable
+from contextlib import AsyncExitStack
+from dataclasses import dataclass, field
 from typing import Any
 
 from repowise.core.source_search.coordinator import NO_MATCH_CONCEPT_COVERAGE
@@ -120,9 +122,7 @@ def _name_tokens(raw_name: str) -> set[str]:
         part
         for part in re.split(
             r"[^a-z0-9]+",
-            re.sub(
-                r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])", " ", raw_name
-            ).lower(),
+            re.sub(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])", " ", raw_name).lower(),
         )
         if part
     }
@@ -280,7 +280,7 @@ def _query_concept_tokens(envelopes: list[tuple[str, dict[str, Any]]]) -> set[st
         sources = [env.get("selected_owner") or {}]
         sources.extend((env.get("results") or [])[:1])
         for source in sources:
-            for concept in ((source.get("evidence") or {}).get("concepts") or []):
+            for concept in (source.get("evidence") or {}).get("concepts") or []:
                 token = str(concept.get("token") or "").strip().lower()
                 if token:
                     tokens.add(token)
@@ -330,9 +330,7 @@ def _same_name_rivals(
         offered.extend(cand.get("path") for cand in (env.get("candidates") or []))
         for path in offered:
             if path and path.rsplit("/", 1)[-1].lower() == name:
-                rivals.append(
-                    {"repo": alias, "file": path, "reason": "same filename"}
-                )
+                rivals.append({"repo": alias, "file": path, "reason": "same filename"})
                 break
     return rivals
 
@@ -379,6 +377,42 @@ def _federated_window(
     return ordered[:head_len] + owed[: limit - head_len]
 
 
+@dataclass
+class _FederatedAnswers:
+    """One request's outcomes; failed reads never join the ranked answers."""
+
+    envelopes: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
+    errored: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
+    unavailable: dict[str, str] = field(default_factory=dict)
+
+    def record(self, alias: str, result: dict[str, Any] | BaseException) -> None:
+        if isinstance(result, BaseException):
+            log.warning("source-search: federated leg %s failed: %r", alias, result)
+            self.unavailable[alias] = f"search failed: {type(result).__name__}"
+        elif _is_error_envelope(result):
+            self.errored.append((alias, result))
+        else:
+            self.envelopes.append((alias, result))
+
+    def source_meta(self, repo_order: list[str]) -> dict[str, Any]:
+        """One disclosure policy for partial answers and all-error responses."""
+        per_repo = {
+            alias: dict((env.get("_meta") or {}).get("source_search") or {})
+            for alias, env in [*self.envelopes, *self.errored]
+        }
+        for alias, env in self.errored:
+            per_repo[alias].update(
+                {
+                    "errored": (env.get("error") or {}).get("code") or "search error",
+                    "degraded": True,
+                }
+            )
+        per_repo.update(
+            (alias, {"unavailable": reason}) for alias, reason in self.unavailable.items()
+        )
+        return {"federated": True, "repo_order": repo_order, "repos": per_repo}
+
+
 async def workspace_source_search(
     query: str,
     *,
@@ -388,45 +422,67 @@ async def workspace_source_search(
     registry: Any,
     build_meta: Callable[[], dict[str, Any]],
 ) -> dict[str, Any] | None:
-    """Serve one source-search call in workspace mode, or ``None`` to fall
-    through to the stock path (the same fail-soft contract as single-repo:
-    a missing lane must degrade to the search that existed before it, never
-    to an error the stock path would not have produced).
+    """Route, borrow readers, and attach freshness to a composed answer.
 
-    ``repo=None`` scopes to the workspace's default repo and ``repo="all"``
-    federates — the same resolution the wiki lane applies, so the two lanes
-    cannot disagree about what an argument means.
+    None scopes to the default repository; "all" federates. A missing source
+    lane returns None so the caller can use native search. Every borrowed
+    reader stays alive through search, composition, and freshness enrichment.
     """
-    from repowise.server.source_search_wiring import context_coordinator
+    from repowise.server.source_search_wiring import context_coordinator, coordinator_lease
 
     resolved = registry.resolve_repo_param(repo)
+    async with AsyncExitStack() as readers:
+        if isinstance(resolved, str):
+            ctx = await registry.get(resolved)
+            coordinator = await context_coordinator(ctx)
+            if coordinator is None:
+                return None
+            await readers.enter_async_context(coordinator_lease(coordinator))
+            response = await coordinator.search(
+                query, limit=limit, mode=mode, base_meta=build_meta()
+            )
+            _tag_scoped(response, resolved)
+            await _attach_workspace_freshness(response, {resolved: ctx}, [resolved])
+            return response
 
-    if isinstance(resolved, str):
-        ctx = await registry.get(resolved)
-        coordinator = await context_coordinator(ctx)
-        if coordinator is None:
+        answers = _FederatedAnswers()
+        contexts, live = await _collect_readers(resolved, registry, readers, answers.unavailable)
+        if not live:
             return None
-        response = await coordinator.search(
-            query, limit=limit, mode=mode, base_meta=build_meta()
+        searches = await asyncio.gather(
+            *(c.search(query, limit=limit, mode=mode, base_meta={}) for _, c in live),
+            return_exceptions=True,
         )
-        _tag_scoped(response, resolved)
-        # One freshness vocabulary for workspace mode, scoped and federated
-        # alike: the per-repo map plus the roll-up, never a bare single-repo
-        # commit published as though it described the workspace.
-        await _attach_workspace_freshness(response, {resolved: ctx}, [resolved])
+        for (alias, _), result in zip(live, searches, strict=True):
+            answers.record(alias, result)
+        if not answers.envelopes:
+            if answers.errored:
+                return _compose_all_error(answers, mode=mode, base_meta=build_meta())
+            return None
+
+        response = _compose_answer(query, answers, limit=limit, mode=mode, base_meta=build_meta())
+        aliases = response["_meta"]["source_search"]["repo_order"]
+        await _attach_workspace_freshness(response, contexts, aliases)
         return response
 
-    unavailable: dict[str, str] = {}
-    contexts_by_alias: dict[str, Any] = {}
+
+async def _collect_readers(
+    aliases: list[str],
+    registry: Any,
+    readers: AsyncExitStack,
+    unavailable: dict[str, str],
+) -> tuple[dict[str, Any], list[tuple[str, Any]]]:
+    """Acquire each coordinator while its context is live, and lease it at once.
+
+    A two-pass load can evict early contexts before their stores are ready on
+    workspaces larger than the registry's LRU. Sequential acquisition keeps
+    that bound; the caller runs the completed readers' searches in parallel.
+    """
+    from repowise.server.source_search_wiring import context_coordinator, coordinator_lease
+
+    contexts: dict[str, Any] = {}
     live: list[tuple[str, Any]] = []
-    # Context and coordinator are resolved together, per repo, in one pass.
-    # Two-pass collection (all contexts, then all coordinators) breaks on a
-    # workspace larger than the registry's LRU cap: fetching the sixth context
-    # evicts the first while it is still in hand, its background store load is
-    # cancelled, and its readiness event never fires. Building the coordinator
-    # immediately gives each context its stores while the context is
-    # guaranteed live. The searches below still run in parallel.
-    for alias in resolved:
+    for alias in aliases:
         try:
             ctx = await registry.get(alias)
         except Exception as exc:
@@ -435,120 +491,58 @@ async def workspace_source_search(
         try:
             coordinator = await context_coordinator(ctx)
         except Exception as exc:
-            # Guarded for the same reason the search gather below is: one
-            # member repo's broken wiring must degrade to that repo being
-            # disclosed as unavailable, never to the whole workspace erroring
-            # where the stock path would have answered.
-            log.warning(
-                "source-search: coordinator construction for %s failed: %r",
-                alias,
-                exc,
-            )
+            log.warning("source-search: coordinator construction for %s failed: %r", alias, exc)
             unavailable[alias] = f"coordinator failed: {type(exc).__name__}"
             continue
         if coordinator is None:
             unavailable[alias] = "source index unavailable"
-        else:
-            contexts_by_alias[alias] = ctx
-            live.append((alias, coordinator))
-    if not live:
-        return None
+            continue
+        await readers.enter_async_context(coordinator_lease(coordinator))
+        contexts[alias] = ctx
+        live.append((alias, coordinator))
+    return contexts, live
 
-    searches = await asyncio.gather(
-        *(c.search(query, limit=limit, mode=mode, base_meta={}) for _, c in live),
-        return_exceptions=True,
-    )
-    envelopes: list[tuple[str, dict[str, Any]]] = []
-    errored: list[tuple[str, dict[str, Any]]] = []
-    for (alias, _), result in zip(live, searches):
-        if isinstance(result, BaseException):
-            log.warning(
-                "source-search: federated leg %s failed: %r", alias, result
-            )
-            unavailable[alias] = f"search failed: {type(result).__name__}"
-        elif _is_error_envelope(result):
-            # A repo that read no corpus produced no answer. It never ranks,
-            # never wins, and never lends its placeholder caution to the
-            # composition — it is disclosed beside the other unavailability.
-            errored.append((alias, result))
-        else:
-            envelopes.append((alias, result))
 
-    if not envelopes:
-        if errored:
-            return _compose_all_error(
-                errored, unavailable, mode=mode, build_meta=build_meta
-            )
-        return None
-
-    ranked = sorted(envelopes, key=_order_key)
-    winner_alias, winner = ranked[0]
-
-    confident = [
-        (alias, env["selected_owner"])
-        for alias, env in envelopes
-        if env.get("confidence") == "confident" and env.get("selected_owner")
-    ]
-    conflict = len({alias for alias, _ in confident}) >= 2
-    confidence = _CAUTION if conflict else (winner.get("confidence") or _CAUTION)
-
+def _compose_windows(
+    ranked: list[tuple[str, dict[str, Any]]], limit: int
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Reserve the same per-repo visibility in result and openable-path windows."""
     blocks: list[tuple[str, list[dict[str, Any]]]] = []
-    for alias, env in ranked:
-        rows = env.get("results") or []
-        for row in rows:
-            row["repo"] = alias
-        blocks.append((alias, list(rows)))
-    results = _federated_window(blocks, limit)
-
-    # Same tail reserve as the results window, for the same reason. This block
-    # is documented as the one to Read, so starving the losing repo out of it
-    # takes away the only openable path that repo offered — the results row
-    # names a file, the candidate is what a caller opens.
-    seen: set[tuple[str, str]] = set()
     cand_blocks: list[tuple[str, list[dict[str, Any]]]] = []
     for alias, env in ranked:
+        blocks.append((alias, [{**row, "repo": alias} for row in env.get("results") or []]))
+        seen: set[str] = set()
         paths: list[dict[str, Any]] = []
         for cand in env.get("candidates") or []:
             path = cand.get("path")
-            if not path or (alias, path) in seen:
-                continue
-            seen.add((alias, path))
-            paths.append({"path": path, "repo": alias})
+            if path and path not in seen:
+                seen.add(path)
+                paths.append({"path": path, "repo": alias})
         cand_blocks.append((alias, paths))
-    candidates = _federated_window(cand_blocks, limit)
+    return _federated_window(blocks, limit), _federated_window(cand_blocks, limit)
 
-    owner = winner.get("selected_owner")
-    if owner:
-        owner = dict(owner)
-        owner["repo"] = winner_alias
 
-    # A query that names a kind of file rather than a repository is answerable
-    # by every repo that has one. Disclose the rest rather than picking one
-    # silently, and hedge — downward only, so a caution answer stays caution.
-    rivals = _same_name_rivals(winner_alias, (owner or {}).get("file") or "", envelopes)
-    if rivals and _CONF_ORDER.get(confidence, 0) > _CONF_ORDER[_CAUTION]:
-        confidence = _CAUTION
+def _compose_answer(
+    query: str,
+    answers: _FederatedAnswers,
+    *,
+    limit: int,
+    mode: str,
+    base_meta: dict[str, Any],
+) -> dict[str, Any]:
+    """Compose finished evidence without I/O or modifying a member's answer."""
+    ranked = sorted(answers.envelopes, key=_order_key)
+    winner_alias, winner = ranked[0]
+    results, candidates = _compose_windows(ranked, limit)
 
-    per_repo: dict[str, Any] = {}
-    for alias, env in envelopes:
-        per_repo[alias] = (env.get("_meta") or {}).get("source_search") or {}
-    for alias, env in errored:
-        per_repo[alias] = {
-            "errored": ((env.get("error") or {}).get("code") or "search error"),
-            "degraded": True,
-        }
-    for alias, reason in unavailable.items():
-        per_repo[alias] = {"unavailable": reason}
-
-    # Compose by copying the winner's envelope and overriding, never by
-    # rebuilding an enumerated key set. Every field the coordinator serves
-    # that this layer does not explicitly own — a note, an exact_match flag,
-    # anything added later — survives the trip, which is what keeps the
-    # federated and scoped lanes speaking the same response contract.
-    response: dict[str, Any] = copy.deepcopy(winner)
+    # Copy by override, never rebuild an enumerated schema: fields this layer
+    # does not own (including future ones) must survive. Copy the final bounded
+    # answer deeply once, below, so callers cannot modify the input envelopes.
+    response = dict(winner)
     response["results"] = results
-    response["confidence"] = confidence
-    response["selected_owner"] = owner
+    response["confidence"] = winner.get("confidence") or _CAUTION
+    owner = winner.get("selected_owner")
+    response["selected_owner"] = {**owner, "repo": winner_alias} if owner else None
     response.setdefault("mode", mode)
     if candidates:
         response["candidates"] = candidates
@@ -556,19 +550,12 @@ async def workspace_source_search(
         response.pop("candidates", None)
 
     meta = dict(response.get("_meta") or {})
-    meta.update(build_meta())
-    meta["source_search"] = {
-        "federated": True,
-        "repo_order": [alias for alias, _ in ranked],
-        "repos": per_repo,
-    }
-    # timing_ms is a field this layer owns and must override: the deep copy
-    # carried the WINNER leg's timing, and a 12ms winner beside an 880ms loser
-    # published 12ms for a call that took at least 880. The legs ran in
-    # parallel, so the call's floor is the slowest leg.
+    meta.update(base_meta)
+    meta["source_search"] = answers.source_meta([alias for alias, _ in ranked])
+    # Parallel work cannot take less than its slowest leg, including errors.
     leg_timings = [
         value
-        for _, env in envelopes
+        for _, env in [*answers.envelopes, *answers.errored]
         for value in [((env.get("_meta") or {}).get("timing_ms"))]
         if isinstance(value, (int, float))
     ]
@@ -576,46 +563,66 @@ async def workspace_source_search(
         meta["timing_ms"] = max(leg_timings)
     response["_meta"] = meta
 
-    if conflict:
-        # Ranked order, with the owners' evidence intact: the reader deciding
-        # between claims should not need a second round-trip, and this list
-        # must never resurrect the workspace-config order the ranking left.
-        confident_by_alias = dict(confident)
+    _disclose_competition(response, ranked)
+    if response["confidence"] == _NO_MATCH:
+        scope = (
+            "the repositories that completed retrieval"
+            if answers.errored or answers.unavailable
+            else "any workspace repository"
+        )
+        response["note"] = (
+            f"No indexed match for {query!r} in {scope}. The results (if any) "
+            "are nearest neighbours, not evidence."
+        )
+        if answers.errored or answers.unavailable:
+            response["note"] += (
+                " Other repositories could not be searched; this is not a workspace-wide "
+                "absence claim. trust.source_search.repos names their limitations."
+            )
+    return copy.deepcopy(response)
+
+
+def _disclose_competition(
+    response: dict[str, Any], ranked: list[tuple[str, dict[str, Any]]]
+) -> None:
+    """Disagreement can lower confidence, never upgrade a member's claim."""
+    confident = {
+        alias: env["selected_owner"]
+        for alias, env in ranked
+        if env.get("confidence") == "confident" and env.get("selected_owner")
+    }
+    if len(confident) >= 2:
+        response["confidence"] = _CAUTION
         response["competing_owners"] = [
             {
                 "repo": alias,
-                "file": confident_by_alias[alias].get("file"),
-                "reason": confident_by_alias[alias].get("reason"),
-                "evidence": confident_by_alias[alias].get("evidence"),
+                "file": owner.get("file"),
+                "reason": owner.get("reason"),
+                "evidence": owner.get("evidence"),
             }
-            for alias, _ in ranked
-            if alias in confident_by_alias
+            for alias, owner in confident.items()
         ]
         response["note"] = (
             f"{len(confident)} repositories each returned a confident owner for "
             "this query. The federated confidence is caution until the query "
             "names one (repo=<alias>); competing_owners lists them all."
         )
-    elif rivals:
-        name = ((owner or {}).get("file") or "").rsplit("/", 1)[-1]
-        response["competing_owners"] = rivals
-        response["note"] = (
-            f"{len(rivals) + 1} repositories hold a file named {name!r}, and "
-            "this query names none of them. The owner below is this "
-            "workspace's best single answer, not its only plausible one; "
-            "competing_owners lists the rest. Name a repository "
-            "(repo=<alias>) for that repository's own answer."
-        )
-    elif confidence == _NO_MATCH:
-        response["note"] = (
-            f"No indexed match for {query!r} in any workspace repository. The "
-            "results (if any) are nearest neighbours, not evidence — "
-            "_meta.source_search.repos names each corpus and commit consulted."
-        )
-    await _attach_workspace_freshness(
-        response, contexts_by_alias, [alias for alias, _ in ranked]
+        return
+
+    winner_alias, _ = ranked[0]
+    owner_file = (response.get("selected_owner") or {}).get("file") or ""
+    rivals = _same_name_rivals(winner_alias, owner_file, ranked)
+    if not rivals:
+        return
+    if _CONF_ORDER.get(response["confidence"], 0) > _CONF_ORDER[_CAUTION]:
+        response["confidence"] = _CAUTION
+    response["competing_owners"] = rivals
+    response["note"] = (
+        f"{len(rivals) + 1} repositories hold a file named {owner_file.rsplit('/', 1)[-1]!r}, "
+        "and this query names none of them. The owner below is this workspace's best "
+        "single answer, not its only plausible one; competing_owners lists the rest. "
+        "Name a repository (repo=<alias>) for that repository's own answer."
     )
-    return response
 
 
 async def _attach_workspace_freshness(
@@ -623,14 +630,10 @@ async def _attach_workspace_freshness(
     contexts_by_alias: dict[str, Any],
     aliases: list[str],
 ) -> None:
-    """M9: give the workspace answer the freshness envelope it never had.
+    """Use the native lane's freshness adapter for scoped and federated reads.
 
-    Delegates to the wiki lane's adapter so both lanes read one Repository row
-    per consulted repo and scope each repo's warning to the paths it actually
-    contributed — one implementation, one vocabulary (``repo_freshness`` plus
-    the roll-up). Fail-soft as everything here: an enrichment failure leaves
-    the answer standing, because freshness is disclosure about the response,
-    never a reason not to serve it.
+    One Repository read per consulted repo, scoped to the contributed paths.
+    An enrichment failure never takes down an otherwise useful search.
     """
     from repowise.server.mcp_server.tool_search import _federated_freshness
 
@@ -647,43 +650,17 @@ async def _attach_workspace_freshness(
 
 
 def _compose_all_error(
-    errored: list[tuple[str, dict[str, Any]]],
-    unavailable: dict[str, str],
-    *,
-    mode: str,
-    build_meta: Callable[[], dict[str, Any]],
+    answers: _FederatedAnswers, *, mode: str, base_meta: dict[str, Any]
 ) -> dict[str, Any]:
-    """Every reachable repo read no corpus: compose an error, not an answer.
-
-    The per-repo error envelope exists so a caller cannot mistake "nothing
-    was searched" for "nothing matched"; a workspace of them must make the
-    same statement. The first repo's envelope is copied whole — ``status``,
-    ``error`` block, its deliberate ``caution`` — and the federation meta
-    discloses every leg. Nothing here is an answer, and no field pretends
-    otherwise.
-    """
-    first_alias, first = errored[0]
-    response = copy.deepcopy(first)
+    """No reachable repo read a corpus: retain the error, not an empty answer."""
+    _, first = answers.errored[0]
+    response = dict(first)
     response["results"] = []
     response.pop("candidates", None)
     response["selected_owner"] = None
     response.setdefault("mode", mode)
-
-    per_repo: dict[str, Any] = {}
-    for alias, env in errored:
-        per_repo[alias] = {
-            "errored": ((env.get("error") or {}).get("code") or "search error"),
-            "degraded": True,
-        }
-    for alias, reason in unavailable.items():
-        per_repo[alias] = {"unavailable": reason}
-
     meta = dict(response.get("_meta") or {})
-    meta.update(build_meta())
-    meta["source_search"] = {
-        "federated": True,
-        "repo_order": [],
-        "repos": per_repo,
-    }
+    meta.update(base_meta)
+    meta["source_search"] = answers.source_meta([])
     response["_meta"] = meta
-    return response
+    return copy.deepcopy(response)

@@ -64,6 +64,20 @@ class McpDropGroup(BaseModel):
     kind: str = "truncation"
 
 
+class McpUsageGroup(BaseModel):
+    """Bounded local usage/outcome totals for one MCP tool."""
+
+    tool: str
+    calls: int
+    error_calls: int
+    no_match_calls: int
+    degraded_calls: int
+    avg_duration_ms: float
+    saving_calls: int
+    positive_saving_calls: int
+    saved_tokens: int
+
+
 class DistillSavingsResponse(BaseModel):
     """Savings rollup for the Costs page hero card.
 
@@ -96,6 +110,15 @@ class DistillSavingsResponse(BaseModel):
     mcp_tokens: int = 0
     mcp_queries: int = 0
     mcp_per_tool: list[McpDropGroup] = []
+    # Thirty-day, tool/day aggregates. These are operational counters, not a
+    # query ledger: no prompt, target, path, session, or per-call row exists.
+    mcp_usage_calls: int = 0
+    mcp_usage_error_calls: int = 0
+    mcp_usage_no_match_calls: int = 0
+    mcp_usage_degraded_calls: int = 0
+    mcp_usage_avg_duration_ms: float = 0.0
+    mcp_usage_window_days: int = 30
+    mcp_usage_per_tool: list[McpUsageGroup] = []
     # Missed savings — raw (non-distilled) agent commands a filter would have
     # caught, scanned best-effort from local Claude Code transcripts.
     missed_events: int = 0

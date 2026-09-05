@@ -1,14 +1,10 @@
 """What an MCP client sees, as distinct from what a tool function returns.
 
-The fork's trust envelope — ``contract_version``, ``timing_ms``,
-``embedder_degraded``, ``source_search``, ``repo_freshness``,
-``index_age_days``, ``index_behind`` and the rest — is metadata *about* an
-answer, not part of it. MCP has a channel for exactly that: ``_meta`` on the
-JSON-RPC result. Until this module the envelope rode inside the payload under a
-``_meta`` key, where an agent reads it as one more field of the answer and has
-to know to skip it, and where it was serialised a second time into the text
-content block. :func:`wire` moves it to the protocol and sends the payload
-flat.
+The full envelope rides on the JSON-RPC result's ``_meta``. A compact ``trust``
+projection stays in the flat payload: hosts do not reliably pass protocol
+metadata to their model, and stale or degraded evidence must remain visible.
+The shared trust middleware prepares that projection before the response is
+budgeted and measured. Timings and other diagnostics remain protocol-only.
 
 :func:`wire` is the outermost middleware layer (see
 ``mcp_server.tool_middleware``) and the only place the envelope is lifted off.
@@ -39,6 +35,7 @@ from typing import Annotated, Any
 import pydantic_core
 from mcp.types import CallToolResult, TextContent
 
+from repowise.server.mcp_server._meta import agent_trust
 from repowise.server.mcp_server._signature import PAYLOAD_ANNOTATION, evaluated_signature, freeze
 
 
@@ -92,6 +89,13 @@ def as_call_tool_result(payload: Any) -> Any:
     # value it was handed makes the object delivered differ from the object
     # accounted for. One shallow top-level copy against a full serialisation.
     flat = {key: value for key, value in payload.items() if key != "_meta"}
+    # Many MCP hosts deliver only content/structuredContent to the model.
+    # Preserve actionable trust facts there; protocol-only diagnostics cannot
+    # help an agent decide whether it may rely on an answer.
+    trust = agent_trust(envelope)
+    if trust:
+        existing = flat.get("trust")
+        flat["trust"] = {**trust, **existing} if isinstance(existing, dict) else trust
     # ``CallToolResult.meta`` is ``Field(alias="_meta")`` on a model that does
     # not populate by field name, so a ``meta=`` keyword is accepted as an
     # *extra* key called ``meta`` and leaves ``_meta`` null — silently, because
@@ -103,13 +107,12 @@ def as_call_tool_result(payload: Any) -> Any:
 def text_block(payload: dict[str, Any]) -> list[TextContent]:
     """The unstructured content block, mirroring the flat payload.
 
-    Rendered exactly as FastMCP renders a dict result
-    (``func_metadata._convert_to_content``), so the only change a client sees
-    in the text is the absent ``_meta``. Absent on purpose: leaving the
-    envelope in the block every client displays would put a second copy of it
-    back on the wire, which is the defect this module exists to remove.
+    Compact JSON avoids spending the agent's context budget on presentation
+    whitespace. Source strings retain their own line breaks and indentation.
+    The trust projection is visible; the full diagnostic envelope is not
+    duplicated in the text.
     """
-    text = pydantic_core.to_json(payload, fallback=str, indent=2).decode()
+    text = pydantic_core.to_json(payload, fallback=str).decode()
     return [TextContent(type="text", text=text)]
 
 

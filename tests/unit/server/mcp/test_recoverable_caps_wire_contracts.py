@@ -173,9 +173,7 @@ async def test_context_real_adversarial_wire_recovers_independent_tails(
 ) -> None:
     _configure_omissions(tmp_path)
     target = await _seed_context_fanout(session, setup_mcp, 63)
-    result = await tool_middleware(get_context)(
-        [target], include=["callers", "callees"]
-    )
+    result = await tool_middleware(get_context)([target], include=["callers", "callees"])
 
     _assert_wire(result, "targets", EXPANDED_RESPONSE_CHARS)
     card = result["targets"][target]
@@ -251,9 +249,7 @@ async def test_context_used_by_and_relations_recover_in_one_bounded_query_shape(
     engine = session.bind.sync_engine
     event.listen(engine, "before_cursor_execute", count_statement)
     try:
-        relation_result = await tool_middleware(get_context)(
-            [target], include=["callers"]
-        )
+        relation_result = await tool_middleware(get_context)([target], include=["callers"])
         relation_statements = statements
         statements = 0
         used_by_result = await tool_middleware(get_context)(["AuthService"])
@@ -298,18 +294,14 @@ async def test_context_used_by_and_relations_recover_in_one_bounded_query_shape(
 
 
 @pytest.mark.asyncio
-async def test_risk_real_minimum_and_typical_wire_shapes(
-    setup_mcp: str, tmp_path: Path
-) -> None:
+async def test_risk_real_minimum_and_typical_wire_shapes(setup_mcp: str, tmp_path: Path) -> None:
     _configure_omissions(tmp_path)
     wrapped = tool_middleware(get_risk)
 
     minimum = await wrapped(["src/auth/service.py"])
     _assert_wire(minimum, "targets", DEFAULT_RESPONSE_CHARS)
 
-    typical = await wrapped(
-        ["src/auth/service.py"], changed_files=["src/auth/service.py"]
-    )
+    typical = await wrapped(["src/auth/service.py"], changed_files=["src/auth/service.py"])
     _assert_wire(typical, "directive", DEFAULT_RESPONSE_CHARS)
     assert next(iter(typical["directive"])) == "may_break"
     for key in ("breaking_changes", "conformance_violations", "dependency_cycles"):
@@ -403,9 +395,7 @@ async def test_risk_real_adversarial_wire_recovers_each_directive_lane(
             "coverage": {"status": "available", "freshness": {"status": "fresh"}},
             "inference": {"status": "available"},
             "analysis": {"status": "available"},
-            "files_without_measured_tests": [
-                f"src/NO_MEASURED_{i}.py" for i in range(12)
-            ],
+            "files_without_measured_tests": [f"src/NO_MEASURED_{i}.py" for i in range(12)],
             "unknown_files": [f"src/UNKNOWN_{i}.py" for i in range(12)],
         }
         payload["test_gaps"] = list(changed_files)
@@ -414,9 +404,7 @@ async def test_risk_real_adversarial_wire_recovers_each_directive_lane(
 
     monkeypatch.setattr(PRBlastRadiusAnalyzer, "analyze_files", sealed_analyze)
     changed = [f"src/gap_{i}.py" for i in range(6)]
-    result = await tool_middleware(get_risk)(
-        ["src/auth/service.py"], changed_files=changed
-    )
+    result = await tool_middleware(get_risk)(["src/auth/service.py"], changed_files=changed)
 
     _assert_wire(result, "directive", DEFAULT_RESPONSE_CHARS)
     directive = result["directive"]
@@ -440,8 +428,7 @@ async def test_risk_real_adversarial_wire_recovers_each_directive_lane(
         "construction_cap_and_response_budget"
     )
     assert directive["test_recommendations_omitted"] == (
-        directive["test_recommendations_total"]
-        - directive["test_recommendations_emitted"]
+        directive["test_recommendations_total"] - directive["test_recommendations_emitted"]
     )
     recovered = await _recover_one(
         result,
@@ -459,9 +446,7 @@ async def test_risk_real_adversarial_wire_recovers_each_directive_lane(
     assert "sealed_7" in recovered
     assert "cochange_7" in recovered
     assert "REC_14" in recovered and '"basis": "measured"' in recovered
-    rec_14_row = recovered.split('"test_id": "tests/REC_14.py::test_it"', 1)[1][
-        :5000
-    ]
+    rec_14_row = recovered.split('"test_id": "tests/REC_14.py::test_it"', 1)[1][:5000]
     assert '"basis": "measured"' in rec_14_row
     assert "REC_DETAIL_14" in rec_14_row
     assert "GUARD_13" in recovered
@@ -507,9 +492,7 @@ async def test_risk_breaking_and_conformance_caps_are_counted_and_recoverable(
         }
         for index in range(7)
     ]
-    cycles = [
-        {"nodes": ["repowise", f"cycle-{index}"], "length": 2} for index in range(5)
-    ]
+    cycles = [{"nodes": ["repowise", f"cycle-{index}"], "length": 2} for index in range(5)]
     enricher = SimpleNamespace(
         has_breaking_changes=True,
         has_conformance=True,
@@ -571,24 +554,24 @@ async def _seed_why_decisions(session: Any, rid: str, count: int) -> None:
                     updated_at=_NOW,
                 ),
                 DecisionRecord(
-                id=f"sealed-why-{index}",
-                repository_id=rid,
-                title=f"Use sealed response contract {index}",
-                status="active" if index == 0 else "proposed",
-                context="sealed response context " + "x" * 1200,
-                decision="Use sealed response contract for recovery.",
-                rationale=f"WHY_SENTINEL_{index}_" + "r" * 800,
-                affected_files_json=json.dumps(["src/auth/service.py"]),
-                affected_modules_json="[]",
-                alternatives_json="[]",
-                consequences_json="[]",
-                tags_json='["sealed", "response"]',
-                source="session",
-                evidence_commits_json=json.dumps([f"{index + 1:040x}"]),
-                confidence=0.9 - index / 100,
-                staleness_score=0.0,
-                created_at=_NOW,
-                updated_at=_NOW,
+                    id=f"sealed-why-{index}",
+                    repository_id=rid,
+                    title=f"Use sealed response contract {index}",
+                    status="active" if index == 0 else "proposed",
+                    context="sealed response context " + "x" * 1200,
+                    decision="Use sealed response contract for recovery.",
+                    rationale=f"WHY_SENTINEL_{index}_" + "r" * 800,
+                    affected_files_json=json.dumps(["src/auth/service.py"]),
+                    affected_modules_json="[]",
+                    alternatives_json="[]",
+                    consequences_json="[]",
+                    tags_json='["sealed", "response"]',
+                    source="session",
+                    evidence_commits_json=json.dumps([f"{index + 1:040x}"]),
+                    confidence=0.9 - index / 100,
+                    staleness_score=0.0,
+                    created_at=_NOW,
+                    updated_at=_NOW,
                 ),
                 DecisionEdge(
                     id=f"sealed-lineage-{index}",
@@ -605,9 +588,7 @@ async def _seed_why_decisions(session: Any, rid: str, count: int) -> None:
 
 
 @pytest.mark.asyncio
-async def test_why_real_minimum_and_typical_wire_shapes(
-    setup_mcp: str, tmp_path: Path
-) -> None:
+async def test_why_real_minimum_and_typical_wire_shapes(setup_mcp: str, tmp_path: Path) -> None:
     _configure_omissions(tmp_path)
     wrapped = tool_middleware(get_why)
 
@@ -670,9 +651,10 @@ async def test_why_real_adversarial_wire_recovers_decisions_docs_and_episodes(
     result = await tool_middleware(get_why)(
         "why use sealed response contract",
         targets=["src/auth/service.py"],
+        include=["supporting"],
     )
 
-    _assert_wire(result, "mode", DEFAULT_RESPONSE_CHARS)
+    _assert_wire(result, "mode", EXPANDED_RESPONSE_CHARS)
     assert result["decisions_total"] >= 9
     assert result["decisions_emitted"] <= 3
     assert "construction_cap" in result["decisions_reduced_reason"]
@@ -693,21 +675,15 @@ async def test_why_real_adversarial_wire_recovers_decisions_docs_and_episodes(
     assert "EPISODE_SENTINEL_7" in recovered
     assert '"evidence_refs"' in recovered
     assert "sealed-why-ancestor" in recovered
-    omitted_decisions = json.loads(
-        _omission_section(recovered, "search decisions beyond cap=3")
-    )
+    omitted_decisions = json.loads(_omission_section(recovered, "search decisions beyond cap=3"))
     why_8_row = next(row for row in omitted_decisions if row["id"] == "sealed-why-8")
-    assert any(
-        row["id"] == "sealed-why-ancestor-8" for row in why_8_row["lineage"]
-    )
+    assert any(row["id"] == "sealed-why-ancestor-8" for row in why_8_row["lineage"])
     assert why_8_row["evidence_refs"]
     assert "repowise#" in result["episodes"][0]["recorded"]
     hidden_body_refs = [
         ref
         for ref in result["_meta"]["omitted"]["refs"]
-        if "_END_7" in (
-            await get_symbol(ref)
-        ).get("content", "")
+        if "_END_7" in (await get_symbol(ref)).get("content", "")
     ]
     assert len(hidden_body_refs) == 1
     emitted_ids = {row["id"] for row in result["decisions"] if "id" in row}
@@ -748,12 +724,9 @@ async def test_why_health_and_targets_only_modes_are_bounded_and_recoverable(
             "stale_decisions": records,
             "proposed_awaiting_review": records,
             "ungoverned_hotspots": [
-                {"file_path": f"src/HEALTH_HOTSPOT_{index}.py"}
-                for index in range(12)
+                {"file_path": f"src/HEALTH_HOTSPOT_{index}.py"} for index in range(12)
             ],
-            "conflicts": [
-                {"detail": f"HEALTH_CONFLICT_{index}"} for index in range(12)
-            ],
+            "conflicts": [{"detail": f"HEALTH_CONFLICT_{index}"} for index in range(12)],
         }
 
     monkeypatch.setattr(crud_mod, "get_decision_health_summary", sealed_health)
@@ -779,21 +752,15 @@ async def test_why_health_and_targets_only_modes_are_bounded_and_recoverable(
     )
     assert "sealed response contract 8" in health_recovered.lower()
     stale_tail = json.loads(
-        _omission_section(
-            health_recovered, "health stale_decisions beyond cap=5"
-        )
+        _omission_section(health_recovered, "health stale_decisions beyond cap=5")
     )
     proposed_tail = json.loads(
-        _omission_section(
-            health_recovered, "health proposed_awaiting_review beyond cap=5"
-        )
+        _omission_section(health_recovered, "health proposed_awaiting_review beyond cap=5")
     )
     assert any(row["id"] == "sealed-why-8" for row in stale_tail)
     assert any(row["id"] == "sealed-why-8" for row in proposed_tail)
 
-    targets_only = await wrapped(
-        targets=["src/auth/service.py", "src/auth/middleware.py"]
-    )
+    targets_only = await wrapped(targets=["src/auth/service.py", "src/auth/middleware.py"])
     _assert_wire(targets_only, "mode", DEFAULT_RESPONSE_CHARS)
     context = targets_only["target_context"]["src/auth/service.py"]
     assert context["governing_decisions_total"] >= 9
@@ -840,9 +807,7 @@ async def test_why_fallback_archaeology_and_rationale_wire_recover_annotated_tai
                     [
                         {
                             "sha": f"{index + 200:040x}",
-                            "message": (
-                                f"fallback.py CROSS_REFERENCE_SENTINEL_{index}"
-                            ),
+                            "message": (f"fallback.py CROSS_REFERENCE_SENTINEL_{index}"),
                             "author": "sealed",
                             "date": f"2026-07-{index + 1:02d}",
                         }

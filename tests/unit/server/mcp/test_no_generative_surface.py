@@ -41,6 +41,7 @@ def rebind():
     """
     mcp = ensure_full_surface()
     saved = _tool_selection._full_surface
+    saved_selected = _tool_selection._selected_surface
     full = dict(saved) if saved is not None else dict(mcp._tool_manager._tools)
 
     def _rebind():
@@ -52,6 +53,7 @@ def rebind():
     yield _rebind
 
     _tool_selection._full_surface = saved
+    _tool_selection._selected_surface = saved_selected
     mcp._tool_manager._tools = dict(full)
 
 
@@ -157,6 +159,21 @@ async def test_flag_on_defeats_every_override(monkeypatch, rebind, repo, overrid
     # The rest of the surface is untouched — this is a two-tool exclusion, not
     # a lockdown mode.
     assert "search_codebase" in await _served(mcp)
+
+
+@pytest.mark.asyncio
+async def test_served_tool_guidance_never_requires_the_suppressed_answer_tool(
+    monkeypatch, rebind, repo
+):
+    """The descriptions a client receives are part of the deployed contract."""
+    monkeypatch.setenv(NO_GENERATIVE_ENV, "1")
+    mcp = rebind()
+    apply_tool_selection(mcp, repo_path=repo, override="all")
+
+    listed = {tool.name: tool.description or "" for tool in await mcp.list_tools()}
+    assert "get_answer" not in listed
+    for tool in ("search_codebase", "get_symbol"):
+        assert "get_answer" not in listed[tool]
 
 
 @pytest.mark.asyncio

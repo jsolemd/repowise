@@ -56,7 +56,7 @@ from repowise.core.providers.embedding.base import Embedder
 
 from .chunks import SOURCE_FILE_WINDOW, SOURCE_SYMBOL, language_for_path, window_eligible
 from .fts import SourceFTSIndex, tokenize
-from .manifest import default_manifest_path, read_manifest
+from .manifest import SourceIndexManifest, default_manifest_path, read_manifest
 from .query_log import QueryEvent, QueryLog, TopEntry, default_query_log_path
 from .vector_store import SourceChunkVectorStore
 
@@ -77,6 +77,7 @@ __all__ = [
     "LEG_WIKI_LEXICAL",
     "LEXICAL_WEIGHT",
     "MAX_CONTAINED_SYMBOLS",
+    "MAX_QUERY_CONCEPTS",
     "MIN_SUFFIX_SEGMENTS",
     "MIN_TAIL_CHARS",
     "NO_MATCH_CONCEPT_COVERAGE",
@@ -162,6 +163,13 @@ MAX_CONCEPT_FILE_FRACTION = 0.20
 #: initialized repositories keep their terms; otherwise every one-file term is
 #: simultaneously "100% common" and the profile contains no evidence at all.
 MIN_FILES_FOR_FREQUENCY_FILTER = 20
+
+#: Maximum distinct subject concepts sent to retrieval and confidence scoring
+#: for one prose query.  Above this, the query is usually an agent-written task
+#: sentence that names several implementation concerns plus connective prose.
+#: A single file cannot carry all of them, so treating the whole sentence as
+#: one indivisible subject dilutes both retrieval and the confidence gate.
+MAX_QUERY_CONCEPTS = 8
 
 #: Below this cosine, with no exact name and nothing lexical, there is no
 #: answer here — say so rather than serving the nearest noise.
@@ -642,6 +650,37 @@ class QueryIntent:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class _QueryPlan:
+    """Bounded retrieval input and the intent slots that produced it.
+
+    The original query remains the public request and the query-log key.  Only
+    the string sent to the retrievers and the concepts used by the confidence
+    profile are focused.  This keeps a verbose task from demanding that one
+    owner file contain every concern while making the interpretation visible
+    to the caller instead of silently rewriting its words.
+    """
+
+    retrieval_query: str
+    concepts: tuple[str, ...]
+    identifiers: tuple[str, ...] = ()
+    path: str | None = None
+    omitted_concepts: tuple[str, ...] = ()
+    focused: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "strategy": "automatic_focus",
+            "retrieval_query": self.retrieval_query,
+            "intent_slots": {
+                "identifiers": list(self.identifiers),
+                "path": self.path,
+                "concepts": list(self.concepts),
+            },
+            "omitted_concepts": list(self.omitted_concepts),
+        }
+
+
 #: A collision-disambiguated symbol id ends in ``~`` plus eight hex digits,
 #: optionally ``-N`` for a same-signature group. The parser stopped minting
 #: these in F42 (an overload set is one id now), so nothing appends one to a
@@ -1115,6 +1154,7 @@ class SourceSearchCoordinator:
         wiki_fts: WikiFullTextSearch | None = None,
         wiki_tombstones: Callable[[], Awaitable[frozenset[str]]] | None = None,
         query_log: QueryLog | None = None,
+        manifest: SourceIndexManifest | None = None,
     ) -> None:
         self.repo_path = Path(repo_path)
         self._embedder = embedder
@@ -1124,10 +1164,92 @@ class SourceSearchCoordinator:
         self._wiki_fts = wiki_fts
         self._wiki_tombstones = wiki_tombstones
         self._query_log = query_log or QueryLog(default_query_log_path(self.repo_path))
-        self._manifest_meta: dict[str, Any] | None = None
+        snapshot = manifest or read_manifest(default_manifest_path(self.repo_path))
+        self._manifest_meta: dict[str, Any] = (
+            {
+                "generation": snapshot.corpus_hash[:12],
+                "generation_id": snapshot.generation_id,
+                "generation_sequence": snapshot.generation_sequence,
+                "indexed_commit": snapshot.indexed_commit,
+                "symbol_chunks": snapshot.symbol_chunks,
+                "file_window_chunks": snapshot.file_window_chunks,
+            }
+            if snapshot is not None
+            else {"generation": None, "indexed_commit": None}
+        )
         self._path_token_files: dict[str, frozenset[str]] | None = None
 
     # -- public surface ---------------------------------------------------
+
+    def _plan_query(self, query: str, intent: QueryIntent) -> _QueryPlan:
+        """Focus verbose prose into bounded, evidence-backed intent slots.
+
+        Frequency comes from the active source generation, not a global stop
+        list: a term common in one repository can be the rare subject in
+        another. Unseen terms cannot locate a file and corpus-common terms
+        cannot distinguish one, so neither consumes the bounded concept slot.
+        If the evidence lookup itself fails, retrieval keeps the original
+        query and its existing degradation path remains authoritative.
+        """
+        raw = _concept_tokens(query)
+        identifiers = (intent.identifier,) if intent.identifier else intent.embedded_identifiers
+        if len(raw) <= MAX_QUERY_CONCEPTS:
+            return _QueryPlan(
+                retrieval_query=query,
+                concepts=raw,
+                identifiers=tuple(identifiers),
+                path=intent.exact_target,
+            )
+
+        try:
+            active_paths = self._source_fts.active_file_paths()
+            term_files = self._source_fts.term_file_evidence(raw)
+        except Exception:
+            return _QueryPlan(
+                retrieval_query=query,
+                concepts=raw,
+                identifiers=tuple(identifiers),
+                path=intent.exact_target,
+            )
+
+        corpus_size = max(len(active_paths), 1)
+        eligible: list[tuple[int, int, str]] = []
+        for position, token in enumerate(raw):
+            frequency = len(term_files.get(token, frozenset()))
+            if frequency == 0:
+                continue
+            if (
+                corpus_size >= MIN_FILES_FOR_FREQUENCY_FILTER
+                and frequency / corpus_size > MAX_CONCEPT_FILE_FRACTION
+            ):
+                continue
+            eligible.append((frequency, position, token))
+
+        # Rarity chooses the bounded set; original order keeps the focused
+        # string readable and deterministic. If the index can support fewer
+        # than two concepts, the original query is a safer dense input.
+        chosen = sorted(eligible, key=lambda row: (row[0], row[1]))[:MAX_QUERY_CONCEPTS]
+        if len(chosen) < 2:
+            return _QueryPlan(
+                retrieval_query=query,
+                concepts=raw,
+                identifiers=tuple(identifiers),
+                path=intent.exact_target,
+            )
+        selected = tuple(row[2] for row in sorted(chosen, key=lambda row: row[1]))
+        selected_set = set(selected)
+        omitted = tuple(token for token in raw if token not in selected_set)
+
+        pieces = [*identifiers, *selected]
+        retrieval_query = " ".join(dict.fromkeys(piece for piece in pieces if piece))
+        return _QueryPlan(
+            retrieval_query=retrieval_query or query,
+            concepts=selected,
+            identifiers=tuple(identifiers),
+            path=intent.exact_target,
+            omitted_concepts=omitted,
+            focused=True,
+        )
 
     async def search(
         self,
@@ -1146,7 +1268,8 @@ class SourceSearchCoordinator:
         """
         started = time.perf_counter()
         intent = _query_intent(query)
-        items, failures = await self._retrieve(query)
+        plan = self._plan_query(query, intent)
+        items, failures = await self._retrieve(plan.retrieval_query)
         hard = [failure for failure in failures if failure.hard]
         if hard and _all_legs_lost(hard, self._attempted_legs()):
             # Nothing was read. An empty result set here would be a claim about
@@ -1162,7 +1285,12 @@ class SourceSearchCoordinator:
         ranked = self._rank(items, intent)
         evidence_failure = None
         if not any(failure.hard and failure.leg == LEG_SOURCE_LEXICAL for failure in failures):
-            evidence_failure = self._profile_candidates(query, ranked, source_files)
+            evidence_failure = self._profile_candidates(
+                plan.retrieval_query,
+                ranked,
+                source_files,
+                concepts=plan.concepts,
+            )
         if evidence_failure is not None:
             failures.append(evidence_failure)
         hard = [failure for failure in failures if failure.hard]
@@ -1200,8 +1328,9 @@ class SourceSearchCoordinator:
             latency_ms=latency_ms,
             base_meta=base_meta,
             hard_failures=hard,
+            query_plan=plan if plan.focused else None,
         )
-        self._record(query, mode, limit, latency_ms, confidence, window, owner)
+        self._record(query, mode, limit, latency_ms, confidence, window, owner, hard_failures=hard)
         return response
 
     # -- retrieval --------------------------------------------------------
@@ -1461,6 +1590,8 @@ class SourceSearchCoordinator:
         query: str,
         ranked: Sequence[_Item],
         source_files: set[str],
+        *,
+        concepts: Sequence[str] | None = None,
     ) -> LegFailure | None:
         """Attach one immutable, co-located evidence profile to every item.
 
@@ -1472,7 +1603,7 @@ class SourceSearchCoordinator:
         often declare themselves in their path rather than in an AST symbol.
         """
 
-        raw_concepts = _concept_tokens(query)
+        raw_concepts = tuple(concepts) if concepts is not None else _concept_tokens(query)
         try:
             active_paths = self._source_fts.active_file_paths()
             indexed_term_files = self._source_fts.term_file_evidence(raw_concepts)
@@ -1517,7 +1648,7 @@ class SourceSearchCoordinator:
             # candidate had earned it.
             name_tokens = set(tokenize(item.match_name))
             file_level = item.source == SOURCE_FILE_WINDOW
-            concepts: list[_ConceptEvidence] = []
+            concept_evidence: list[_ConceptEvidence] = []
             for token, files in concept_files.items():
                 document_frequency = len(files)
                 weight = math.log((corpus_file_count + 1) / (document_frequency + 1)) + 1.0
@@ -1525,7 +1656,7 @@ class SourceSearchCoordinator:
                 content_carried = matched and (
                     file_level or token not in path_tokens or token in name_tokens
                 )
-                concepts.append(
+                concept_evidence.append(
                     _ConceptEvidence(
                         token=token,
                         document_frequency=document_frequency,
@@ -1546,7 +1677,7 @@ class SourceSearchCoordinator:
                     and len(lanes_by_file.get(item.file, set())) > 1
                 ),
                 corpus_file_count=corpus_file_count,
-                concepts=tuple(concepts),
+                concepts=tuple(concept_evidence),
             )
         return None
 
@@ -2094,6 +2225,7 @@ class SourceSearchCoordinator:
         latency_ms: float,
         base_meta: dict[str, Any] | None,
         hard_failures: Sequence[LegFailure] = (),
+        query_plan: _QueryPlan | None = None,
     ) -> dict[str, Any]:
         meta = dict(base_meta or {})
         meta["timing_ms"] = round(latency_ms, 2)
@@ -2114,6 +2246,8 @@ class SourceSearchCoordinator:
             "confidence": confidence,
             "_meta": meta,
         }
+        if query_plan is not None:
+            response["query_plan"] = query_plan.to_dict()
         candidates = _candidates(deduped, limit)
         if candidates:
             response["candidates"] = candidates
@@ -2185,28 +2319,21 @@ class SourceSearchCoordinator:
             },
             "_meta": meta,
         }
-        self._record(query, mode, limit, latency_ms, CAUTION, [], None)
+        self._record(
+            query,
+            mode,
+            limit,
+            latency_ms,
+            CAUTION,
+            [],
+            None,
+            hard_failures=hard_failures,
+            error_code=ERROR_ALL_LEGS_FAILED,
+        )
         return response
 
     def _source_meta(self) -> dict[str, Any]:
-        """The generation this response was served from, read once per process.
-
-        Cached because the manifest is written by a rebuild, and a rebuild
-        replaces the stores this coordinator holds anyway — a process that
-        outlives one is already answering from the index it opened.
-        """
-        if self._manifest_meta is None:
-            manifest = read_manifest(default_manifest_path(self.repo_path))
-            self._manifest_meta = (
-                {
-                    "generation": manifest.corpus_hash[:12],
-                    "indexed_commit": manifest.indexed_commit,
-                    "symbol_chunks": manifest.symbol_chunks,
-                    "file_window_chunks": manifest.file_window_chunks,
-                }
-                if manifest is not None
-                else {"generation": None, "indexed_commit": None}
-            )
+        """The immutable publication snapshot used to open this reader."""
         return dict(self._manifest_meta)
 
     def _record(
@@ -2218,6 +2345,9 @@ class SourceSearchCoordinator:
         confidence: str,
         window: Sequence[_Item],
         owner: _Item | None,
+        *,
+        hard_failures: Sequence[LegFailure] = (),
+        error_code: str | None = None,
     ) -> None:
         """Append the query-quality event. Never raises — see :mod:`.query_log`."""
         self._query_log.append(
@@ -2254,6 +2384,10 @@ class SourceSearchCoordinator:
                 selected_owner_file=owner.file if owner is not None else None,
                 selected_owner_evidence=owner.evidence() if owner is not None else None,
                 no_match=confidence == NO_MATCH,
+                status="error" if error_code else "ok",
+                error_code=error_code,
+                failed_legs=[failure.to_dict() for failure in hard_failures],
+                generation=self._source_meta().get("generation_id"),
             )
         )
 

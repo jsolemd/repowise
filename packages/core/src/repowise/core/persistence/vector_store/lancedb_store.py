@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 from repowise.core.providers.embedding.base import Embedder
 
 from ..search import _SNIPPET_LEN, SearchResult, snippet_around
@@ -78,6 +80,7 @@ class LanceDBVectorStore(VectorStore):
         self._table_name = table_name or self._TABLE_NAME
         self._db = None
         self._table = None
+        self._connect_lock = asyncio.Lock()
 
     async def _ensure_connected(self) -> None:
         if self._db is not None:
@@ -89,12 +92,16 @@ class LanceDBVectorStore(VectorStore):
                 "LanceDB is not installed. Install it with: pip install repowise-core[search]"
             ) from exc
 
-        self._db = await lancedb.connect_async(self._db_path)
-        table_names = await self._db.table_names()
-        if self._table_name in table_names:
-            self._table = await self._db.open_table(self._table_name)
-        else:
-            self._table = None  # will be created on first upsert
+        async with self._connect_lock:
+            if self._db is not None:
+                return
+            db = await lancedb.connect_async(self._db_path)
+            table_names = await db.table_names()
+            table = (
+                await db.open_table(self._table_name) if self._table_name in table_names else None
+            )
+            self._table = table
+            self._db = db
 
     @staticmethod
     def _existing_vector_dim(schema) -> int | None:

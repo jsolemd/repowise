@@ -134,6 +134,32 @@ async def test_concurrent_first_queries_build_one_coordinator(monkeypatch):
     assert all(item is built[0] for item in out)
 
 
+async def test_replacement_is_delivered_without_yielding_after_publication(monkeypatch):
+    state, built = _fixed(monkeypatch)
+    ctx = _ctx("alpha", "/ws/alpha", _Store())
+    first = await w.context_coordinator(ctx)
+    closing, release = asyncio.Event(), asyncio.Event()
+
+    async def slow_close():
+        closing.set()
+        await release.wait()
+        first.closed = True
+
+    first.close = slow_close
+    state["gen"] = _G2
+    replacement = asyncio.create_task(w.context_coordinator(ctx))
+    await closing.wait()
+    try:
+        # A published but not yet delivered replacement has no borrower and
+        # could be reclaimed by a concurrent publication or LRU eviction.
+        assert Path("/ws/alpha") not in w._ctx_coordinators
+    finally:
+        release.set()
+        received = await replacement
+    assert received is built[-1]
+    assert received.closed is False
+
+
 async def test_stores_still_loading_stay_on_the_stock_path(monkeypatch):
     _, built = _fixed(monkeypatch)
     monkeypatch.setattr(w, "_READY_TIMEOUT", 0.05)
@@ -162,44 +188,42 @@ async def test_a_replaced_coordinator_is_not_closed_under_its_caller(monkeypatch
 
     borrowed = await w.context_coordinator(ctx)
 
-    state["gen"] = _G2
-    replacement = await w.context_coordinator(ctx)
-    assert replacement is not borrowed
+    async with w.coordinator_lease(borrowed):
+        state["gen"] = _G2
+        replacement = await w.context_coordinator(ctx)
+        assert replacement is not borrowed
+        assert borrowed.closed is False
+        assert await borrowed.search("q", limit=5, mode="concept", base_meta={}) is not None
+    assert borrowed.closed is True
 
-    assert borrowed.closed is False
-    assert await borrowed.search("q", limit=5, mode="concept", base_meta={}) is not None
 
-
-async def test_a_retired_coordinator_is_closed_once_its_grace_has_passed(monkeypatch):
-    """Deferred, not leaked: the close still happens, on a later pass."""
+async def test_a_retired_coordinator_closes_after_its_last_borrower(monkeypatch):
     state, _ = _fixed(monkeypatch)
-    monkeypatch.setattr(w, "_RETIRE_GRACE", 0.0)
     ctx = _ctx("alpha", "/ws/alpha", _Store())
 
     borrowed = await w.context_coordinator(ctx)
-    state["gen"] = _G2
-    await w.context_coordinator(ctx)
-
-    # The sweep runs at the head of the next call, so the retirement outlives
-    # the cycle that made it however short the grace.
-    await w.context_coordinator(ctx)
-
+    async with w.coordinator_lease(borrowed):
+        async with w.coordinator_lease(borrowed):
+            state["gen"] = _G2
+            await w.context_coordinator(ctx)
+            await w._sweep_retired()
+            assert borrowed.closed is False
+        assert borrowed.closed is False
     assert borrowed.closed is True
     assert w._retired == []
 
 
 async def test_retirements_cannot_pile_up_without_bound(monkeypatch):
-    """Past the hard cap the oldest are closed early — memory beats the grace."""
+    """Idle readers are reclaimed immediately; active readers own their lifetime."""
     state, built = _fixed(monkeypatch)
-    monkeypatch.setattr(w, "_RETIRE_MAX", 2)
     ctx = _ctx("alpha", "/ws/alpha", _Store())
 
     for sequence in range(6):
         state["gen"] = ("g", sequence, "recipe", "tbl", "fts.db")
         await w.context_coordinator(ctx)
 
-    assert len(w._retired) <= 2
-    assert sum(1 for coordinator in built if coordinator.closed) >= 3
+    assert w._retired == []
+    assert sum(1 for coordinator in built if coordinator.closed) == 5
 
 
 # ---------------------------------------------------------------------------
@@ -211,7 +235,6 @@ async def test_a_removed_source_index_evicts_and_retires_its_coordinator(monkeyp
     """A vanished manifest used to early-return before any cache maintenance,
     pinning an open reader onto a generation that no longer exists."""
     state, _ = _fixed(monkeypatch)
-    monkeypatch.setattr(w, "_RETIRE_GRACE", 0.0)
     ctx = _ctx("alpha", "/ws/alpha", _Store())
 
     coordinator = await w.context_coordinator(ctx)
@@ -316,8 +339,7 @@ async def test_cold_repos_wait_concurrently_not_one_after_another(monkeypatch):
     monkeypatch.setattr(w, "_READY_TIMEOUT", 0.15)
 
     contexts = [
-        _ctx(alias, f"/ws/{alias}", _Store(), ready=asyncio.Event())
-        for alias in ("a", "b", "c")
+        _ctx(alias, f"/ws/{alias}", _Store(), ready=asyncio.Event()) for alias in ("a", "b", "c")
     ]
 
     loop = asyncio.get_running_loop()

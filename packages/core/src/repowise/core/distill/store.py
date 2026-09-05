@@ -57,8 +57,23 @@ CREATE TABLE IF NOT EXISTS savings (
     raw_tokens INTEGER NOT NULL,
     distilled_tokens INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS mcp_usage_daily (
+    day TEXT NOT NULL,
+    tool TEXT NOT NULL,
+    calls INTEGER NOT NULL DEFAULT 0 CHECK(calls >= 0),
+    error_calls INTEGER NOT NULL DEFAULT 0 CHECK(error_calls >= 0),
+    no_match_calls INTEGER NOT NULL DEFAULT 0 CHECK(no_match_calls >= 0),
+    degraded_calls INTEGER NOT NULL DEFAULT 0 CHECK(degraded_calls >= 0),
+    duration_ms_total INTEGER NOT NULL DEFAULT 0 CHECK(duration_ms_total >= 0),
+    saving_calls INTEGER NOT NULL DEFAULT 0 CHECK(saving_calls >= 0),
+    positive_saving_calls INTEGER NOT NULL DEFAULT 0 CHECK(positive_saving_calls >= 0),
+    replaced_tokens INTEGER NOT NULL DEFAULT 0 CHECK(replaced_tokens >= 0),
+    delivered_tokens INTEGER NOT NULL DEFAULT 0 CHECK(delivered_tokens >= 0),
+    PRIMARY KEY(day, tool)
+);
 CREATE INDEX IF NOT EXISTS idx_omissions_created ON omissions(created_at);
 CREATE INDEX IF NOT EXISTS idx_savings_created ON savings(created_at);
+CREATE INDEX IF NOT EXISTS idx_mcp_usage_tool ON mcp_usage_daily(tool);
 """
 
 
@@ -109,6 +124,10 @@ class OmissionStore:
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
+        # MCP instrumentation used to append one row per call to ``savings``.
+        # Collapse those legacy rows once, transactionally, into the bounded
+        # daily table before any new write can be recorded.
+        tracking.migrate_legacy_mcp_savings(self._conn)
 
     @classmethod
     def open_default(cls, start: Path | None = None) -> OmissionStore:
@@ -209,9 +228,7 @@ class OmissionStore:
 
     # -- machine-joinable evidence references -----------------------------
 
-    def put_evidence_reference(
-        self, ref: str, content: str, *, repository: str
-    ) -> None:
+    def put_evidence_reference(self, ref: str, content: str, *, repository: str) -> None:
         """Persist one exact evidence object under its canonical public id."""
 
         blob = zlib.compress(content.encode("utf-8"))
@@ -254,6 +271,22 @@ class OmissionStore:
         distilled_tokens: int,
     ) -> None:
         """Append one distillation event to the savings ledger."""
+        if source.startswith("mcp:"):
+            # Keep the old public seam safe: an older caller may still submit
+            # an MCP counterfactual through ``record_saving``. Route it into
+            # the bounded aggregate instead of recreating the per-call ledger.
+            tool = source.removeprefix("mcp:").removesuffix(":dead_end")
+            tracking.record_mcp_usage(
+                self._conn,
+                tool=tool,
+                duration_ms=0,
+                error=source.endswith(":dead_end"),
+                no_match=False,
+                degraded=False,
+                replaced_tokens=raw_tokens,
+                delivered_tokens=distilled_tokens,
+            )
+            return
         tracking.record_saving(
             self._conn,
             filter_name=filter_name,
@@ -270,6 +303,33 @@ class OmissionStore:
     def savings_rollup(self, *, by: str = "filter", since: float | None = None) -> list[dict]:
         """Grouped ledger totals (see :func:`tracking.savings_rollup`)."""
         return tracking.savings_rollup(self._conn, by=by, since=since)
+
+    def record_mcp_usage(
+        self,
+        *,
+        tool: str,
+        duration_ms: int,
+        error: bool,
+        no_match: bool,
+        degraded: bool,
+        replaced_tokens: int,
+        delivered_tokens: int,
+    ) -> None:
+        """Fold one MCP call into the bounded per-tool/day aggregate."""
+        tracking.record_mcp_usage(
+            self._conn,
+            tool=tool,
+            duration_ms=duration_ms,
+            error=error,
+            no_match=no_match,
+            degraded=degraded,
+            replaced_tokens=replaced_tokens,
+            delivered_tokens=delivered_tokens,
+        )
+
+    def mcp_usage_summary(self, *, since: float | None = None) -> dict:
+        """Return the retained MCP usage window without per-call history."""
+        return tracking.mcp_usage_summary(self._conn, since=since)
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -289,8 +349,8 @@ def _filter_lines(content: str, query: str) -> str:
 
     try:
         pattern = re.compile(query)
-        matcher = pattern.search
     except re.error:
-        matcher = lambda line: query in line  # noqa: E731
-    matched = [line for line in content.splitlines() if matcher(line)]
+        matched = [line for line in content.splitlines() if query in line]
+    else:
+        matched = [line for line in content.splitlines() if pattern.search(line)]
     return "\n".join(matched)

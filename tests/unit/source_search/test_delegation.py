@@ -77,9 +77,9 @@ async def test_mcp_flag_on_delegates(mcp_guard, monkeypatch):
     slot.append(coordinator)
     monkeypatch.setenv(SOURCE_SEARCH_ENV, "1")
 
-    assert await search_codebase("MyClass.method", limit=7) == COORDINATED
+    assert await search_codebase("how retrieval works", limit=7, mode="hybrid") == COORDINATED
     assert asked == [1]
-    assert coordinator.queries == [("MyClass.method", 7)]
+    assert coordinator.queries == [("how retrieval works", 7)]
 
 
 async def test_mcp_falls_back_when_the_repo_has_no_source_index(mcp_guard, monkeypatch):
@@ -89,19 +89,20 @@ async def test_mcp_falls_back_when_the_repo_has_no_source_index(mcp_guard, monke
     asked, _ = mcp_guard
     monkeypatch.setenv(SOURCE_SEARCH_ENV, "1")
 
-    assert await search_codebase("MyClass.method") == STOCK
+    assert await search_codebase("how retrieval works", mode="hybrid") == STOCK
     assert asked == [1]
 
 
-async def test_mcp_path_queries_stay_on_the_stock_resolver(mcp_guard, monkeypatch):
-    """A path is a filename lookup; fusing it against a corpus only blurs it."""
+@pytest.mark.parametrize("query", ["src/pkg/module.py", "MyClass.method"])
+async def test_mcp_exact_queries_stay_on_the_stock_resolver(mcp_guard, monkeypatch, query):
+    """Exact file and symbol intent must not become a semantic guess."""
     from repowise.server.mcp_server.tool_search import search_codebase
 
     asked, slot = mcp_guard
     slot.append(_Coordinator())
     monkeypatch.setenv(SOURCE_SEARCH_ENV, "1")
 
-    assert await search_codebase("src/pkg/module.py") == STOCK
+    assert await search_codebase(query) == STOCK
     assert asked == []
 
 

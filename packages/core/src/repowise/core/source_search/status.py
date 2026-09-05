@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from .fts import SourceFTSIndex
 from .generation import GenerationRef
@@ -168,85 +169,104 @@ async def _source_update_snapshot(
     *,
     active_sequence: int,
     active_generation_id: str | None,
+    session_factory: async_sessionmaker[AsyncSession] | None = None,
 ) -> _SourceUpdateSnapshot:
+    """Own a short session; dispose only engines this inspection created."""
     from repowise.core.persistence.database import (
         create_engine,
         create_session_factory,
         resolve_db_url,
     )
+
+    engine = None
+    try:
+        if session_factory is None:
+            engine = create_engine(db_url or resolve_db_url(repo))
+            session_factory = create_session_factory(engine)
+        async with session_factory() as session:
+            return await _read_source_updates(session, repo, active_sequence, active_generation_id)
+    finally:
+        if engine is not None:
+            await engine.dispose()
+
+
+async def _read_source_updates(
+    session: AsyncSession,
+    repo: Path,
+    active_sequence: int,
+    active_generation_id: str | None,
+) -> _SourceUpdateSnapshot:
+    """Read this repository's publication and outstanding queue in one session."""
     from repowise.core.persistence.models import Repository, SourceIndexUpdate
 
-    engine = create_engine(db_url or resolve_db_url(repo))
-    try:
-        factory = create_session_factory(engine)
-        async with factory() as session:
-            repositories = list((await session.execute(select(Repository))).scalars().all())
-            repository_id = None
-            for row in repositories:
-                try:
-                    if row.local_path and Path(row.local_path).resolve() == repo:
-                        repository_id = row.id
-                        break
-                except OSError:
-                    continue
-            if repository_id is None and len(repositories) == 1:
-                repository_id = repositories[0].id
-            if repository_id is None:
-                return _SourceUpdateSnapshot(None, {}, 0, None)
+    repositories = list((await session.execute(select(Repository))).scalars().all())
+    repository_id = None
+    for row in repositories:
+        try:
+            if row.local_path and Path(row.local_path).resolve() == repo:
+                repository_id = row.id
+                break
+        except OSError:
+            continue
+    if repository_id is None and len(repositories) == 1:
+        repository_id = repositories[0].id
+    if repository_id is None:
+        return _SourceUpdateSnapshot(None, {}, 0, None)
 
-            active_candidate = None
-            if active_sequence > 0:
-                active_candidate = (
-                    (
-                        await session.execute(
-                            select(SourceIndexUpdate).where(
-                                SourceIndexUpdate.repository_id == repository_id,
-                                SourceIndexUpdate.sequence == active_sequence,
-                            )
-                        )
-                    )
-                    .scalars()
-                    .one_or_none()
-                )
-            outstanding_filter = (
-                SourceIndexUpdate.repository_id == repository_id,
-                SourceIndexUpdate.sequence > active_sequence,
-            )
-            count_rows = (
+    active_candidate = None
+    if active_sequence > 0:
+        active_candidate = (
+            (
                 await session.execute(
-                    select(SourceIndexUpdate.state, func.count())
-                    .where(*outstanding_filter)
-                    .group_by(SourceIndexUpdate.state)
-                )
-            ).all()
-            counts = {str(state): int(count) for state, count in count_rows}
-            last_error_value = (
-                await session.execute(
-                    select(SourceIndexUpdate.last_error)
-                    .where(
-                        *outstanding_filter,
-                        SourceIndexUpdate.last_error.is_not(None),
-                        SourceIndexUpdate.last_error != "",
+                    select(SourceIndexUpdate).where(
+                        SourceIndexUpdate.repository_id == repository_id,
+                        SourceIndexUpdate.sequence == active_sequence,
                     )
-                    .order_by(SourceIndexUpdate.sequence.desc())
-                    .limit(1)
                 )
-            ).scalar_one_or_none()
-            active = (
-                active_candidate
-                if active_candidate is not None
-                and active_candidate.generation_id == active_generation_id
-                and active_candidate.state in {"ready", "published"}
-                else None
             )
-            return _SourceUpdateSnapshot(
-                active=active,
-                counts=counts,
-                outstanding_total=sum(counts.values()),
-                last_error=str(last_error_value) if last_error_value else None,
+            .scalars()
+            .one_or_none()
+        )
+    outstanding_filter = (
+        SourceIndexUpdate.repository_id == repository_id,
+        SourceIndexUpdate.sequence > active_sequence,
+    )
+    count_rows = (
+        await session.execute(
+            select(SourceIndexUpdate.state, func.count())
+            .where(*outstanding_filter)
+            .group_by(SourceIndexUpdate.state)
+        )
+    ).all()
+    counts = {str(state): int(count) for state, count in count_rows}
+    last_error_value = None
+    # The grouped read already proves an empty queue has no error.
+    if counts:
+        last_error_value = (
+            await session.execute(
+                select(SourceIndexUpdate.last_error)
+                .where(
+                    *outstanding_filter,
+                    SourceIndexUpdate.last_error.is_not(None),
+                    SourceIndexUpdate.last_error != "",
+                )
+                .order_by(SourceIndexUpdate.sequence.desc())
+                .limit(1)
             )
-    finally:
-        await engine.dispose()
+        ).scalar_one_or_none()
+    active = (
+        active_candidate
+        if active_candidate is not None
+        and active_candidate.generation_id == active_generation_id
+        and active_candidate.state in {"ready", "published"}
+        else None
+    )
+    return _SourceUpdateSnapshot(
+        active=active,
+        counts=counts,
+        outstanding_total=sum(counts.values()),
+        last_error=str(last_error_value) if last_error_value else None,
+    )
 
 
 def _read_fts_facts(
@@ -280,6 +300,7 @@ async def inspect_source_index(
     *,
     embedder: Any | None = None,
     db_url: str | None = None,
+    session_factory: async_sessionmaker[AsyncSession] | None = None,
     verify_stores: bool = True,
     fts: SourceFTSIndex | None = None,
     working_tree_max_age: float = 0.0,
@@ -296,6 +317,11 @@ async def inspect_source_index(
     *working_tree_max_age* is how stale a cached live-git read may be. Zero,
     the default, always re-reads: a caller asking this function what the index
     is worth should not be answered from a cache.
+
+    *session_factory* reuses the host's database engine, when supplied. Each
+    inspection still opens and closes its own session and reads the queue
+    live; the engine's lifecycle remains with the host. Standalone callers
+    resolve *db_url* and own a temporary engine as before.
     """
 
     repo = Path(repo_path).resolve()
@@ -317,6 +343,7 @@ async def inspect_source_index(
             db_url,
             active_sequence=active_sequence,
             active_generation_id=manifest.generation_id if manifest is not None else None,
+            session_factory=session_factory,
         )
     except Exception as exc:
         updates = _SourceUpdateSnapshot(None, {}, 0, None)

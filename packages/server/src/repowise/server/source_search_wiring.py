@@ -23,9 +23,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-import time
 import weakref
 from collections import OrderedDict
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
@@ -169,11 +169,18 @@ class _StatusCoordinator:
         self._repository_id: Any = False
 
     async def search(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        async with coordinator_lease(self):
+            return await self._search(*args, **kwargs)
+
+    async def _search(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
         response = await self._inner.search(*args, **kwargs)
         divergence: Any = None
         try:
             from repowise.core.source_search.status import inspect_source_index
-            from repowise.core.source_search.worktree import HOT_PATH_CACHE_TTL
+            from repowise.core.source_search.worktree import (
+                HOT_PATH_CACHE_TTL,
+                WorkingTreeDivergence,
+            )
 
             # ``fts`` is the store this coordinator already holds open, which
             # is what lets a ``verify_stores=False`` read still answer which
@@ -181,16 +188,20 @@ class _StatusCoordinator:
             # tree has moved out from under this very response.
             status = await inspect_source_index(
                 self._repo,
+                session_factory=self._session_factory,
                 verify_stores=False,
                 fts=self._source_fts,
                 working_tree_max_age=HOT_PATH_CACHE_TTL,
             )
             meta = response.setdefault("_meta", {}).setdefault("source_search", {})
+            reader_generation = self._source_fts.generation
+            same_generation = reader_generation.generation_id == status.generation_id
             meta.update(
                 {
-                    "status": status.state,
-                    "generation_id": status.generation_id,
-                    "generation_sequence": status.generation_sequence,
+                    "status": status.state if same_generation else "stale",
+                    "generation_id": reader_generation.generation_id,
+                    "generation_sequence": reader_generation.sequence,
+                    "published_generation_id": status.generation_id,
                     "pending_updates": status.pending_updates,
                     "blocked_updates": status.blocked_updates,
                     "building_updates": status.building_updates,
@@ -204,7 +215,16 @@ class _StatusCoordinator:
             # have since changed or stopped existing. A count alone cannot,
             # because a repo may diverge on files this query never touched.
             served = _served_paths(response)
-            divergence = status.working_tree
+            # The live inspector used the published manifest's ingest hashes.
+            # They cannot verify an older reader; do not use them to certify
+            # its snippets or enrich their definitions from a newer index.
+            divergence = (
+                status.working_tree
+                if same_generation
+                else WorkingTreeDivergence(
+                    checked=False, unavailable_reason="reader_generation_changed"
+                )
+            )
             meta["working_tree"] = {
                 "checked": divergence.checked,
                 "modified": len(divergence.modified),
@@ -218,8 +238,11 @@ class _StatusCoordinator:
             if status.degraded:
                 meta["degraded"] = True
                 meta.setdefault("degraded_reason", status.last_error or status.state)
-        except Exception:
+        except Exception as exc:
             log.debug("source-search: status enrichment failed", exc_info=True)
+            response.setdefault("_meta", {}).setdefault("source_search", {}).update(
+                {"status": "unknown", "status_error": type(exc).__name__}
+            )
         try:
             await self._name_contained_definitions(response, divergence)
         except Exception:
@@ -528,7 +551,7 @@ def _build(
     generation = GenerationRef(manifest.generation_id, manifest.generation_sequence)
 
     try:
-        source_fts = SourceFTSIndex(fts_path, generation=generation)
+        source_fts = SourceFTSIndex(fts_path, generation=generation, read_only=True)
     except Exception:
         log.debug("source-search: could not open the FTS sidecar", exc_info=True)
         return None
@@ -548,6 +571,7 @@ def _build(
         embedder=embedder,
         source_vectors=source_vectors,
         source_fts=source_fts,
+        manifest=manifest,
         # A wiki store without its page-status database cannot prove which
         # rows are still serveable. Keep the independent source lanes, but do
         # not admit an unverified wiki lane.
@@ -603,6 +627,7 @@ async def mcp_coordinator() -> Any:
         # on a coordinator it took from here with nothing held in between.
         _retire(old)
         await _sweep_retired()
+        generation = _manifest_key(repo_path)
         try:
             _mcp_coordinator = _build(
                 repo_path, _state._vector_store, _state._fts, _state._session_factory
@@ -624,11 +649,14 @@ async def rest_coordinator(app_state: Any) -> Any:
         return existing
 
     async with _rest_lock:
+        generation = _manifest_key(repo_path) if repo_path is not None else None
         existing = getattr(app_state, _REST_ATTR, None)
         if existing is not None and generation == getattr(app_state, _REST_GENERATION_ATTR, None):
             return existing
         if existing is not None:
-            await existing.close()
+            _retire(existing)
+        await _sweep_retired()
+        generation = _manifest_key(repo_path) if repo_path is not None else None
         coordinator = None
         if repo_path is None:
             setattr(app_state, _REST_ATTR, None)
@@ -698,30 +726,26 @@ _CTX_CACHE_MAX = 8
 #: coordinators they guard.
 _ctx_locks: dict[Path, asyncio.Lock] = {}
 
-#: Coordinators removed from the cache and awaiting close, oldest first.
-#:
-#: A caller takes a coordinator from the cache and then awaits ``search()`` on
-#: it, holding no lock in between — so closing one at the moment it is replaced
-#: closes a live query's stores out from under it ("Cannot operate on a closed
-#: database", raised out of ``search_codebase`` on the scoped lane). Nothing
-#: here can observe that a search is still in flight — the caller borrows the
-#: object with no protocol to give it back — so replacement retires rather than
-#: closes, and the close happens on a later pass, once no search that could
-#: have started before the swap can still be running.
-_retired: list[tuple[float, Any]] = []
+# Retired readers close after their final borrower releases them. Active
+# requests own the memory bound; elapsed time never proves a reader is idle.
+_retired: list[Any] = []
+_borrowers: dict[int, int] = {}
 
-#: How long a retired coordinator is left open before it is closed. Longer
-#: than any search that could still be holding one; short enough that a repo
-#: republishing its index does not accumulate generations. A grace period is
-#: the honest shape of this: it is a bound on how long a borrowed object can
-#: still be in use, which is the only fact available here.
-_RETIRE_GRACE = 30.0
 
-#: Hard cap on retirements awaiting close. Reached only by a repo republishing
-#: faster than the grace period, and bounded memory beats a perfect grace: past
-#: this the oldest are closed early, on the same reasoning that made the grace
-#: period a heuristic in the first place.
-_RETIRE_MAX = 16
+@asynccontextmanager
+async def coordinator_lease(coordinator: Any):
+    """Keep a reader alive across awaits, including federation preparation."""
+    key = id(coordinator)
+    _borrowers[key] = _borrowers.get(key, 0) + 1
+    try:
+        yield coordinator
+    finally:
+        remaining = _borrowers[key] - 1
+        if remaining:
+            _borrowers[key] = remaining
+        else:
+            del _borrowers[key]
+            await _sweep_retired()
 
 
 def _store_token(store: Any) -> Any:
@@ -767,12 +791,12 @@ def _lock_for(repo_path: Path) -> asyncio.Lock:
 
 def _retire(coordinator: Any) -> None:
     """Hand a coordinator over for closing later (see ``_retired``)."""
-    if coordinator is not None:
-        _retired.append((time.monotonic(), coordinator))
+    if coordinator is not None and not any(item is coordinator for item in _retired):
+        _retired.append(coordinator)
 
 
-async def _sweep_retired(*, drain: bool = False) -> None:
-    """Close retired coordinators whose grace period has run out.
+async def _sweep_retired() -> None:
+    """Close retired coordinators with no remaining borrower.
 
     Claims its victims before the first ``await`` — the slice and the delete
     are one uninterruptible step — so two concurrent sweeps cannot close the
@@ -780,18 +804,9 @@ async def _sweep_retired(*, drain: bool = False) -> None:
     """
     if not _retired:
         return
-    now = time.monotonic()
-    expired = 0
-    for retired_at, _ in _retired:  # oldest first, by construction
-        if not (drain or now - retired_at >= _RETIRE_GRACE):
-            break
-        expired += 1
-    count = max(expired, len(_retired) - _RETIRE_MAX)
-    if count <= 0:
-        return
-    doomed = _retired[:count]
-    del _retired[:count]
-    for _, coordinator in doomed:
+    doomed = [item for item in _retired if not _borrowers.get(id(item))]
+    _retired[:] = [item for item in _retired if _borrowers.get(id(item))]
+    for coordinator in doomed:
         try:
             await coordinator.close()
         except Exception:
@@ -874,6 +889,14 @@ async def context_coordinator(ctx: Any) -> Any:
             _ctx_coordinators.move_to_end(repo_path)
             return cached[0]
         _evict(repo_path)
+        # Reclaim before publishing the replacement. An await after inserting
+        # it would let another request retire/close it before this caller can
+        # take its lease. Re-read publication after the asynchronous close.
+        await _sweep_retired()
+        generation = _manifest_key(repo_path)
+        if generation is None:
+            return None
+        wiki_vs = getattr(ctx, "vector_store", None)
         try:
             built = _build(
                 repo_path,
@@ -895,8 +918,8 @@ async def context_coordinator(ctx: Any) -> Any:
         while len(_ctx_coordinators) > _CTX_CACHE_MAX:
             _, evicted = _ctx_coordinators.popitem(last=False)
             _retire(evicted[0])
-    # Outside the lock: sweeping awaits, and nothing above it needs holding.
-    await _sweep_retired()
+    # No await between publication and delivery. LRU retirements close on the
+    # next acquisition or when this request releases its reader lease.
     return built
 
 
@@ -922,7 +945,7 @@ def reset_for_tests() -> None:
     _mcp_coordinator = None
     _mcp_generation = None
     retired, _retired[:] = list(_retired), []
-    for _, coordinator in retired:
+    for coordinator in retired:
         _close_detached(coordinator)
 
 

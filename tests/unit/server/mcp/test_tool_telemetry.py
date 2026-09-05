@@ -54,7 +54,9 @@ async def test_instrument_emits_one_event(monkeypatch: pytest.MonkeyPatch):
     from repowise.core.platform import telemetry
 
     calls: list[tuple[str, dict]] = []
-    monkeypatch.setattr(telemetry, "record_event", lambda event, props: calls.append((event, props)))
+    monkeypatch.setattr(
+        telemetry, "record_event", lambda event, props: calls.append((event, props))
+    )
 
     async def get_answer(question: str) -> dict:
         return {"answer": "x", "confidence": "medium", "_meta": {}}
@@ -77,6 +79,9 @@ async def test_telemetry_failure_never_breaks_the_tool(monkeypatch: pytest.Monke
         raise RuntimeError("telemetry backend down")
 
     monkeypatch.setattr(telemetry, "record_event", boom)
+    # Keep this assertion about the failing telemetry backend; local usage
+    # accounting has its own tests and may legitimately add savings metadata.
+    monkeypatch.setattr(wrapper, "record_mcp_call", lambda *a, **k: False)
 
     async def get_overview() -> dict:
         return {"ok": True, "_meta": {}}
@@ -84,3 +89,31 @@ async def test_telemetry_failure_never_breaks_the_tool(monkeypatch: pytest.Monke
     # The tool result must survive a telemetry emit that raises.
     out = await wrapper.instrument(get_overview)()
     assert out == {"ok": True, "_meta": {}}
+
+
+@pytest.mark.asyncio
+async def test_local_usage_follows_the_selected_workspace_alias(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+):
+    from repowise.server.mcp_server import _budget
+
+    selected = tmp_path / "selected"
+    recorded: list[tuple[object, str]] = []
+
+    async def resolve(signature, args, kwargs, *, fallback_to_default=True):
+        assert fallback_to_default is False
+        assert signature.bind_partial(*args, **kwargs).arguments["repo"] == "make"
+        return selected
+
+    def record(repo_root, tool, **kwargs):
+        recorded.append((repo_root, tool))
+        return True
+
+    monkeypatch.setattr(_budget, "resolve_response_budget_repo_root", resolve)
+    monkeypatch.setattr(wrapper, "record_mcp_call", record)
+
+    async def search_codebase(query: str, repo: str | None = None) -> dict:
+        return {"results": [], "confidence": "no_match"}
+
+    await wrapper.instrument(search_codebase)("atlas integration", repo="make")
+    assert recorded == [(selected, "search_codebase")]

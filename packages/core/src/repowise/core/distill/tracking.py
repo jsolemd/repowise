@@ -9,7 +9,217 @@ from __future__ import annotations
 
 import sqlite3
 import time
+from collections import defaultdict
+from datetime import UTC, datetime, timedelta
 from typing import Any
+
+#: MCP usage is operational telemetry, not an activity ledger. One row per
+#: tool/day is retained for this many inclusive UTC calendar days.
+MCP_USAGE_RETENTION_DAYS = 30
+
+
+def _usage_table_exists(conn: sqlite3.Connection) -> bool:
+    return (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='mcp_usage_daily'"
+        ).fetchone()
+        is not None
+    )
+
+
+def _usage_cutoff_day(now: float | None = None) -> str:
+    current = datetime.fromtimestamp(now if now is not None else time.time(), UTC).date()
+    return (current - timedelta(days=MCP_USAGE_RETENTION_DAYS - 1)).isoformat()
+
+
+def migrate_legacy_mcp_savings(conn: sqlite3.Connection) -> None:
+    """Collapse old per-call ``mcp:*`` savings rows, then delete them.
+
+    The insert and delete share one transaction, so concurrent server workers
+    can neither duplicate nor lose a legacy row. Reopening the store is
+    idempotent: after the first successful migration there is nothing to move.
+    """
+    if not _usage_table_exists(conn):
+        return
+    cutoff = _usage_cutoff_day()
+    has_legacy = conn.execute("SELECT 1 FROM savings WHERE source LIKE 'mcp:%' LIMIT 1").fetchone()
+    has_expired = conn.execute(
+        "SELECT 1 FROM mcp_usage_daily WHERE day < ? LIMIT 1", (cutoff,)
+    ).fetchone()
+    if has_legacy is None and has_expired is None:
+        return
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        rows = conn.execute(
+            """
+            SELECT created_at, source, raw_tokens, distilled_tokens
+            FROM savings WHERE source LIKE 'mcp:%'
+            ORDER BY id
+            """
+        ).fetchall()
+        grouped: dict[tuple[str, str], list[int]] = defaultdict(lambda: [0] * 6)
+        for created_at, source, raw_tokens, distilled_tokens in rows:
+            tool = str(source).removeprefix("mcp:").removesuffix(":dead_end")
+            if not tool:
+                continue
+            day = datetime.fromtimestamp(float(created_at), UTC).date().isoformat()
+            saved = int(raw_tokens) - int(distilled_tokens)
+            stats = grouped[(day, tool)]
+            stats[0] += 1  # calls represented by the legacy savings event
+            stats[1] += int(str(source).endswith(":dead_end"))
+            stats[2] += 1  # saving_calls
+            stats[3] += int(saved > 0)  # positive_saving_calls
+            stats[4] += int(raw_tokens)
+            stats[5] += int(distilled_tokens)
+
+        for (day, tool), stats in grouped.items():
+            conn.execute(
+                """
+                INSERT INTO mcp_usage_daily
+                    (day, tool, calls, error_calls, saving_calls,
+                     positive_saving_calls, replaced_tokens, delivered_tokens)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(day, tool) DO UPDATE SET
+                    calls = calls + excluded.calls,
+                    error_calls = error_calls + excluded.error_calls,
+                    saving_calls = saving_calls + excluded.saving_calls,
+                    positive_saving_calls = positive_saving_calls
+                        + excluded.positive_saving_calls,
+                    replaced_tokens = replaced_tokens + excluded.replaced_tokens,
+                    delivered_tokens = delivered_tokens + excluded.delivered_tokens
+                """,
+                (day, tool, stats[0], stats[1], stats[2], stats[3], stats[4], stats[5]),
+            )
+        conn.execute("DELETE FROM savings WHERE source LIKE 'mcp:%'")
+        conn.execute("DELETE FROM mcp_usage_daily WHERE day < ?", (cutoff,))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def record_mcp_usage(
+    conn: sqlite3.Connection,
+    *,
+    tool: str,
+    duration_ms: int,
+    error: bool,
+    no_match: bool,
+    degraded: bool,
+    replaced_tokens: int,
+    delivered_tokens: int,
+    occurred_at: float | None = None,
+) -> None:
+    """Fold one MCP call into a fixed-cardinality daily aggregate.
+
+    No query, target, repository path, session id, or individual event is
+    stored. The table can contain at most roughly ``days × tool names`` rows.
+    Calls without a defensible counterfactual still contribute usage/outcome
+    counts, while their token-saving fields remain zero.
+    """
+    stamped = occurred_at if occurred_at is not None else time.time()
+    day = datetime.fromtimestamp(stamped, UTC).date().isoformat()
+    duration = max(0, int(duration_ms))
+    replaced = max(0, int(replaced_tokens))
+    delivered = max(0, int(delivered_tokens))
+    saving = replaced > 0 or (error and delivered > 0)
+    positive = saving and replaced > delivered
+    counted_replaced = replaced if saving else 0
+    counted_delivered = delivered if saving else 0
+    with conn:
+        conn.execute(
+            """
+            INSERT INTO mcp_usage_daily
+                (day, tool, calls, error_calls, no_match_calls, degraded_calls,
+                 duration_ms_total, saving_calls, positive_saving_calls,
+                 replaced_tokens, delivered_tokens)
+            VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(day, tool) DO UPDATE SET
+                calls = calls + 1,
+                error_calls = error_calls + excluded.error_calls,
+                no_match_calls = no_match_calls + excluded.no_match_calls,
+                degraded_calls = degraded_calls + excluded.degraded_calls,
+                duration_ms_total = duration_ms_total + excluded.duration_ms_total,
+                saving_calls = saving_calls + excluded.saving_calls,
+                positive_saving_calls = positive_saving_calls
+                    + excluded.positive_saving_calls,
+                replaced_tokens = replaced_tokens + excluded.replaced_tokens,
+                delivered_tokens = delivered_tokens + excluded.delivered_tokens
+            """,
+            (
+                day,
+                tool,
+                int(error),
+                int(no_match),
+                int(degraded),
+                duration,
+                int(saving),
+                int(positive),
+                counted_replaced,
+                counted_delivered,
+            ),
+        )
+        conn.execute("DELETE FROM mcp_usage_daily WHERE day < ?", (_usage_cutoff_day(stamped),))
+
+
+def mcp_usage_summary(conn: sqlite3.Connection, *, since: float | None = None) -> dict[str, Any]:
+    """Return retained local MCP usage totals and a per-tool breakdown."""
+    empty = {
+        "calls": 0,
+        "error_calls": 0,
+        "no_match_calls": 0,
+        "degraded_calls": 0,
+        "duration_ms_total": 0,
+        "avg_duration_ms": 0.0,
+        "window_days": MCP_USAGE_RETENTION_DAYS,
+        "per_tool": [],
+    }
+    if not _usage_table_exists(conn):
+        return empty
+    where = ""
+    params: tuple[float, ...] = ()
+    if since is not None:
+        where = " WHERE day >= date(?, 'unixepoch')"
+        params = (since,)
+    rows = conn.execute(
+        """
+        SELECT tool, SUM(calls), SUM(error_calls), SUM(no_match_calls),
+               SUM(degraded_calls), SUM(duration_ms_total),
+               SUM(saving_calls), SUM(positive_saving_calls),
+               SUM(replaced_tokens - delivered_tokens)
+        FROM mcp_usage_daily
+        """
+        + where
+        + " GROUP BY tool ORDER BY SUM(calls) DESC, tool ASC",
+        params,
+    ).fetchall()
+    per_tool = [
+        {
+            "tool": row[0],
+            "calls": row[1],
+            "error_calls": row[2],
+            "no_match_calls": row[3],
+            "degraded_calls": row[4],
+            "duration_ms_total": row[5],
+            "avg_duration_ms": round(row[5] / row[1], 1) if row[1] else 0.0,
+            "saving_calls": row[6],
+            "positive_saving_calls": row[7],
+            "saved_tokens": row[8],
+        }
+        for row in rows
+    ]
+    calls = sum(row["calls"] for row in per_tool)
+    duration = sum(row["duration_ms_total"] for row in per_tool)
+    return {
+        "calls": calls,
+        "error_calls": sum(row["error_calls"] for row in per_tool),
+        "no_match_calls": sum(row["no_match_calls"] for row in per_tool),
+        "degraded_calls": sum(row["degraded_calls"] for row in per_tool),
+        "duration_ms_total": duration,
+        "avg_duration_ms": round(duration / calls, 1) if calls else 0.0,
+        "window_days": MCP_USAGE_RETENTION_DAYS,
+        "per_tool": per_tool,
+    }
 
 
 def record_saving(
@@ -33,33 +243,21 @@ def record_saving(
     conn.commit()
 
 
-def savings_summary(
-    conn: sqlite3.Connection, *, since: float | None = None
-) -> dict[str, Any]:
+def savings_summary(conn: sqlite3.Connection, *, since: float | None = None) -> dict[str, Any]:
     """Aggregate ledger totals, overall and per filter.
 
     *since* is a Unix timestamp; only events at or after it are counted.
     """
-    where = " WHERE created_at >= ?" if since is not None else ""
-    params: tuple[float, ...] = (since,) if since is not None else ()
-    total_raw, total_distilled, events = conn.execute(
-        "SELECT COALESCE(SUM(raw_tokens),0), COALESCE(SUM(distilled_tokens),0),"
-        f" COUNT(*) FROM savings{where}",
-        params,
-    ).fetchone()
+    rows = savings_rollup(conn, by="filter", since=since)
     per_filter = {
-        row[0]: {
-            "events": row[1],
-            "raw_tokens": row[2],
-            "distilled_tokens": row[3],
-            "saved_tokens": row[2] - row[3],
+        row["group"]: {
+            key: row[key] for key in ("events", "raw_tokens", "distilled_tokens", "saved_tokens")
         }
-        for row in conn.execute(
-            "SELECT filter, COUNT(*), SUM(raw_tokens), SUM(distilled_tokens)"
-            f" FROM savings{where} GROUP BY filter ORDER BY SUM(raw_tokens) DESC",
-            params,
-        )
+        for row in rows
     }
+    events = sum(row["events"] for row in rows)
+    total_raw = sum(row["raw_tokens"] for row in rows)
+    total_distilled = sum(row["distilled_tokens"] for row in rows)
     return {
         "events": events,
         "raw_tokens": total_raw,
@@ -69,9 +267,7 @@ def savings_summary(
     }
 
 
-def distill_summary(
-    conn: sqlite3.Connection, *, since: float | None = None
-) -> dict[str, Any]:
+def distill_summary(conn: sqlite3.Connection, *, since: float | None = None) -> dict[str, Any]:
     """Ledger totals for the **distill** surface only (excludes ``mcp:*``).
 
     Identical in shape to :func:`savings_summary` but scoped to non-MCP
@@ -113,9 +309,7 @@ def distill_summary(
     }
 
 
-def mcp_savings_summary(
-    conn: sqlite3.Connection, *, since: float | None = None
-) -> dict[str, Any]:
+def mcp_savings_summary(conn: sqlite3.Connection, *, since: float | None = None) -> dict[str, Any]:
     """Unified MCP savings view — counterfactual ledger, truncation as fallback.
 
     Two MCP signals live in the sidecar:
@@ -137,11 +331,14 @@ def mcp_savings_summary(
     saved, ``queries`` counts counterfactual tool calls (the "N MCP queries
     answered" headline), and ``events`` counts every contributing event.
     """
-    ledger = {
-        _strip_mcp_prefix(row["group"]): row
-        for row in savings_rollup(conn, by="source", since=since)
-        if row["group"].startswith("mcp:")
-    }
+    ledger: dict[str, dict[str, int]] = {}
+    for row in savings_rollup(conn, by="source", since=since):
+        if not row["group"].startswith("mcp:"):
+            continue
+        tool = _strip_mcp_prefix(row["group"])
+        bucket = ledger.setdefault(tool, {"events": 0, "saved_tokens": 0})
+        bucket["events"] += row["events"]
+        bucket["saved_tokens"] += row["saved_tokens"]
     drops = mcp_drops_summary(conn, since=since)["per_tool"]
 
     per_tool: list[dict[str, Any]] = []
@@ -177,9 +374,7 @@ def mcp_savings_summary(
     }
 
 
-def mcp_drops_summary(
-    conn: sqlite3.Connection, *, since: float | None = None
-) -> dict[str, Any]:
+def mcp_drops_summary(conn: sqlite3.Connection, *, since: float | None = None) -> dict[str, Any]:
     """Truncation savings the MCP server already wrote to the omissions store.
 
     MCP tools drop content past their response budget into the ``omissions``
@@ -215,7 +410,8 @@ def mcp_drops_summary(
 def _strip_mcp_prefix(source: str) -> str:
     """``mcp:get_risk`` → ``get_risk`` (passthrough for anything else)."""
     prefix = "mcp:"
-    return source[len(prefix):] if source.startswith(prefix) else source
+    stripped = source[len(prefix) :] if source.startswith(prefix) else source
+    return stripped.removesuffix(":dead_end")
 
 
 #: Grouping dimensions accepted by :func:`savings_rollup`. ``day`` buckets by
@@ -254,13 +450,58 @@ def savings_rollup(
         f" FROM savings{where} GROUP BY 1 ORDER BY {order}",
         params,
     ).fetchall()
-    return [
-        {
+    combined: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        combined[row[0]] = {
             "group": row[0],
             "events": row[1],
             "raw_tokens": row[2],
             "distilled_tokens": row[3],
             "saved_tokens": row[2] - row[3],
         }
-        for row in rows
-    ]
+
+    # MCP calls use bounded daily aggregates. Project their counterfactual
+    # columns back into the historical rollup shape so CLI/API consumers do
+    # not lose savings when legacy per-call rows are migrated away.
+    if _usage_table_exists(conn):
+        usage_where = " WHERE saving_calls > 0"
+        usage_params: tuple[float, ...] = ()
+        if since is not None:
+            usage_where += " AND day >= date(?, 'unixepoch')"
+            usage_params = (since,)
+        usage_rows = conn.execute(
+            """
+            SELECT day, tool, SUM(saving_calls), SUM(replaced_tokens),
+                   SUM(delivered_tokens)
+            FROM mcp_usage_daily
+            """
+            + usage_where
+            + " GROUP BY day, tool",
+            usage_params,
+        ).fetchall()
+        for day, tool, events, raw, distilled in usage_rows:
+            group = day if by == "day" else (f"mcp:{tool}" if by == "source" else tool)
+            bucket = combined.setdefault(
+                group,
+                {
+                    "group": group,
+                    "events": 0,
+                    "raw_tokens": 0,
+                    "distilled_tokens": 0,
+                    "saved_tokens": 0,
+                },
+            )
+            bucket["events"] += events
+            bucket["raw_tokens"] += raw
+            bucket["distilled_tokens"] += distilled
+            bucket["saved_tokens"] += raw - distilled
+
+    result = list(combined.values())
+    result.sort(
+        key=(
+            (lambda item: item["group"])
+            if by == "day"
+            else (lambda item: (-item["saved_tokens"], item["group"]))
+        )
+    )
+    return result

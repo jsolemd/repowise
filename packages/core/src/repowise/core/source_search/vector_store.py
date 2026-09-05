@@ -8,6 +8,7 @@ separate transactions.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from typing import Any
@@ -138,6 +139,7 @@ class SourceChunkVectorStore:
         self._table: Any = None
         self._generation_table: Any = None
         self._versioned: bool | None = None
+        self._connect_lock = asyncio.Lock()
 
     # -- connection ------------------------------------------------------
 
@@ -150,16 +152,26 @@ class SourceChunkVectorStore:
             raise RuntimeError(
                 "LanceDB is not installed. Install it with: pip install repowise-core[search]"
             ) from exc
-        self._db = await lancedb.connect_async(self._db_path)
-        self._table = await self._open_table_if_present(self._table_name)
-        self._generation_table = await self._open_table_if_present(SOURCE_GENERATIONS_TABLE)
-        if self._table is not None:
-            schema = await self._table.schema()
-            self._versioned = _VISIBILITY_COLUMNS.issubset(schema.names)
+        async with self._connect_lock:
+            if self._db is not None:
+                return
+            db = await lancedb.connect_async(self._db_path)
+            table = await self._open_table_if_present(db, self._table_name)
+            generations = await self._open_table_if_present(db, SOURCE_GENERATIONS_TABLE)
+            versioned = None
+            if table is not None:
+                schema = await table.schema()
+                versioned = _VISIBILITY_COLUMNS.issubset(schema.names)
+            # Publish readiness only after every awaited open succeeds.
+            self._table = table
+            self._generation_table = generations
+            self._versioned = versioned
+            self._db = db
 
-    async def _open_table_if_present(self, table_name: str) -> Any:
+    @staticmethod
+    async def _open_table_if_present(db: Any, table_name: str) -> Any:
         try:
-            return await self._db.open_table(table_name)
+            return await db.open_table(table_name)
         except ValueError:
             return None
 
@@ -502,8 +514,7 @@ class SourceChunkVectorStore:
             file_window_chunks=sum(1 for row in rows if row.get("source") == "file_window"),
             files_covered=len({str(row.get("file_path") or "") for row in rows}),
             entries=tuple(
-                (str(row.get("chunk_id") or ""), str(row.get("content_hash") or ""))
-                for row in rows
+                (str(row.get("chunk_id") or ""), str(row.get("content_hash") or "")) for row in rows
             ),
         )
 

@@ -35,6 +35,7 @@ from repowise.server.mcp_server._budget import OmissionCollector, cap_collection
 from repowise.server.mcp_server._helpers import (
     LIKE_ESCAPE,
     _decision_body,
+    _is_path,
     escape_like,
     filter_dicts_by_key,
     filter_path_list,
@@ -311,6 +312,14 @@ async def _resolve_one_target(
     repo_id = repository.id
     result_data: dict[str, Any] = {}
 
+    # A slash-bearing or extension-bearing target has already selected the
+    # path namespace.  Keep that choice for the whole ladder.  In particular,
+    # an extensionless config path such as ``infra/repowise/env`` must never
+    # fall through to a symbol called ``ENV`` merely because the path is
+    # excluded or absent from the index.  ``path::Symbol`` remains an explicit
+    # request to cross into the symbol namespace.
+    path_intent = _is_path(target) and "::" not in target
+
     # Reject excluded file / ``path::Name`` targets outright (bare symbol names
     # aren't path-matchable here and fall through to neighbor filtering).
     gate_path = target.split("::", 1)[0] if "::" in target else target
@@ -409,13 +418,14 @@ async def _resolve_one_target(
             # the other, in whichever separator style the caller wrote it, and
             # a name an agent read off a call site resolves without a path it
             # does not have yet.
-            sym_match = await resolve_symbol_match(
-                session,
-                repo_id,
-                target,
-                eligible=lambda row: not is_excluded(row.file_path, exclude_spec),
-            )
-            if not sym_match.rows and "::" not in target:
+            if not path_intent:
+                sym_match = await resolve_symbol_match(
+                    session,
+                    repo_id,
+                    target,
+                    eligible=lambda row: not is_excluded(row.file_path, exclude_spec),
+                )
+            if not path_intent and not sym_match.rows and "::" not in target:
                 # Exploratory substring rung, get_context only. The ladder
                 # above matches whole names; a caller browsing for "auth"
                 # wants AuthService, and get_context is the tool where that
@@ -446,7 +456,7 @@ async def _resolve_one_target(
                         rung="name_substring",
                         total_count=substring_total,
                     )
-            if sym_match.rows:
+            if not path_intent and sym_match.rows:
                 target_type = "symbol"
                 file_path_for_git = sym_match.rows[0].file_path
             else:
@@ -644,9 +654,7 @@ async def _resolve_one_target(
         result_data["verification_basis"] = "indexed_plus_live"
         result_data["exists_in_git"] = True
         result_data["last_commit_at"] = (
-            live_file_meta.last_commit_at.isoformat()
-            if live_file_meta.last_commit_at
-            else None
+            live_file_meta.last_commit_at.isoformat() if live_file_meta.last_commit_at else None
         )
         result_data["primary_owner"] = live_file_meta.primary_owner_name
         result_data["is_hotspot"] = live_file_meta.is_hotspot

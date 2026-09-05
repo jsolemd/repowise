@@ -52,13 +52,13 @@ from repowise.core.source_search.vector_store import SourceChunkVectorStore
 pytest.importorskip("lancedb")
 
 _IDENTITY = EmbedderIdentity(provider="mock", model="MockEmbedder", dims=8)
-_APP_V1 = '''def alpha():
+_APP_V1 = """def alpha():
     return "oldquasar"
 
 
 def stable():
     return "stablecomet"
-'''
+"""
 _APP_V2 = _APP_V1.replace("oldquasar", "newnebula")
 _APP_V3 = _APP_V1.replace("oldquasar", "finalpulsar")
 
@@ -292,9 +292,7 @@ async def test_incremental_edit_is_atomically_visible_and_idempotent(lifecycle_r
     (repo / "src" / "app.py").write_text(_APP_V2)
     await _capture(repo, path="src/app.py")
     counter = _CountingEmbedder()
-    result = await reconcile_source_index(
-        repo, embedder=counter, embedder_identity=_IDENTITY
-    )
+    result = await reconcile_source_index(repo, embedder=counter, embedder_identity=_IDENTITY)
     current = read_manifest(default_manifest_path(repo))
     assert current is not None
     assert current.generation_sequence > old.generation_sequence
@@ -308,9 +306,7 @@ async def test_incremental_edit_is_atomically_visible_and_idempotent(lifecycle_r
         assert current_fts.query("newnebula")
         assert not current_fts.query("oldquasar")
 
-    second = await reconcile_source_index(
-        repo, embedder=counter, embedder_identity=_IDENTITY
-    )
+    second = await reconcile_source_index(repo, embedder=counter, embedder_identity=_IDENTITY)
     assert second.status == "current"
     assert second.generation_id == current.generation_id
     assert counter.texts == 1
@@ -731,9 +727,7 @@ async def test_transient_parse_failure_keeps_last_good_chunks_and_marks_stale(li
         "after_publish",
     ],
 )
-async def test_every_interruption_boundary_recovers_without_torn_visibility(
-    lifecycle_repo, stage
-):
+async def test_every_interruption_boundary_recovers_without_torn_visibility(lifecycle_repo, stage):
     repo = lifecycle_repo
     old = read_manifest(default_manifest_path(repo))
     assert old is not None
@@ -811,9 +805,7 @@ async def test_changed_again_after_capture_defers_without_publishing(lifecycle_r
     (repo / "src" / "app.py").write_text(_APP_V3)
 
     with pytest.raises(SourceIndexDeferredError):
-        await reconcile_source_index(
-            repo, embedder=MockEmbedder(), embedder_identity=_IDENTITY
-        )
+        await reconcile_source_index(repo, embedder=MockEmbedder(), embedder_identity=_IDENTITY)
     assert read_manifest(default_manifest_path(repo)) == old
 
     await _capture(repo, path="src/app.py")
@@ -931,26 +923,30 @@ async def test_workspace_reader_reopens_on_manifest_flip_without_closing_the_old
         first_manifest = read_manifest(default_manifest_path(repo))
         assert first_manifest is not None
 
-        (repo / "src" / "app.py").write_text(_APP_V2)
-        await _capture(repo, path="src/app.py")
-        await reconcile_source_index(repo, embedder=MockEmbedder(), embedder_identity=_IDENTITY)
+        async with wiring.coordinator_lease(first):
+            (repo / "src" / "app.py").write_text(_APP_V2)
+            await _capture(repo, path="src/app.py")
+            await reconcile_source_index(repo, embedder=MockEmbedder(), embedder_identity=_IDENTITY)
 
-        second = await wiring.context_coordinator(ctx)
-        assert second is not None and second is not first
-        second_manifest = read_manifest(default_manifest_path(repo))
-        assert second_manifest is not None
-        assert second_manifest.generation_sequence > first_manifest.generation_sequence
+            second = await wiring.context_coordinator(ctx)
+            assert second is not None and second is not first
+            second_manifest = read_manifest(default_manifest_path(repo))
+            assert second_manifest is not None
+            assert second_manifest.generation_sequence > first_manifest.generation_sequence
 
-        response = await second.search("newnebula", limit=3)
-        assert any(result["file"] == "src/app.py" for result in response["results"])
-        assert (
-            response["_meta"]["source_search"]["generation_sequence"]
-            == second_manifest.generation_sequence
-        )
+            response = await second.search("newnebula", limit=3)
+            assert any(result["file"] == "src/app.py" for result in response["results"])
+            assert (
+                response["_meta"]["source_search"]["generation_sequence"]
+                == second_manifest.generation_sequence
+            )
 
-        # The replaced reader is retired, not closed: its stores still answer.
-        stale = await first.search("stablecomet", limit=3)
-        assert stale["_meta"]["source_search"]["generation_sequence"] is not None
+            # An active borrower keeps its reader, without claiming the new generation.
+            stale = await first.search("stablecomet", limit=3)
+            source = stale["_meta"]["source_search"]
+            assert source["generation_sequence"] == first_manifest.generation_sequence
+            assert source["published_generation_id"] == second_manifest.generation_id
+            assert source["status"] == "stale"
     finally:
         wiring.reset_for_tests()
 

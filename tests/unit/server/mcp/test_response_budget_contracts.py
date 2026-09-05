@@ -265,8 +265,7 @@ def test_health_budget_prunes_profiles_for_removed_plans(
     (tmp_path / ".repowise").mkdir()
     monkeypatch.setattr(mcp_mod, "_repo_path", str(tmp_path))
     plans = [
-        {"id": f"plan-{index}", "validation_profile_id": f"profile-{index}"}
-        for index in range(8)
+        {"id": f"plan-{index}", "validation_profile_id": f"profile-{index}"} for index in range(8)
     ]
     profiles = [
         {
@@ -397,3 +396,31 @@ async def test_budget_repo_root_follows_workspace_alias(
 
     signature = inspect.signature(call)
     assert await resolve_response_budget_repo_root(signature, (), {"repo": "other"}) == selected
+
+
+@pytest.mark.asyncio
+async def test_usage_repo_resolution_never_falls_back_from_an_invalid_alias(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import repowise.server.mcp_server as mcp_mod
+    import repowise.server.mcp_server._helpers as helpers
+
+    async def reject(repo: str | None = None) -> Any:
+        raise KeyError(repo)
+
+    monkeypatch.setattr(helpers, "_resolve_repo_context", reject)
+    monkeypatch.setattr(mcp_mod, "_repo_path", str(tmp_path / "default"))
+
+    def call(repo: str | None = None) -> None:
+        pass
+
+    signature = inspect.signature(call)
+    assert (
+        await resolve_response_budget_repo_root(
+            signature,
+            (),
+            {"repo": "does-not-exist"},
+            fallback_to_default=False,
+        )
+        is None
+    )

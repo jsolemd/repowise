@@ -6,6 +6,7 @@ test data, mirroring the conftest pattern from the REST API tests.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import UTC, datetime
 
@@ -564,7 +565,7 @@ async def populated_db(session: AsyncSession, repo_id: str) -> str:
 
 
 @pytest.fixture
-async def setup_mcp(factory, fts, vector_store, populated_db):
+async def setup_mcp(factory, fts, vector_store, populated_db, monkeypatch):
     """Configure the MCP module's global state for testing."""
     import repowise.server.mcp_server as mcp_mod
 
@@ -573,6 +574,11 @@ async def setup_mcp(factory, fts, vector_store, populated_db):
     mcp_mod._vector_store = vector_store
     mcp_mod._decision_store = InMemoryVectorStore(embedder=MockEmbedder())
     mcp_mod._repo_path = "/tmp/test-repo"
+    # These stores are already constructed; no background loader will signal
+    # readiness. Match the settled production context instead of timing out.
+    ready = asyncio.Event()
+    ready.set()
+    monkeypatch.setattr(mcp_mod, "_vector_store_ready", ready)
 
     yield populated_db
 

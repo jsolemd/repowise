@@ -33,6 +33,7 @@ from repowise.core.refsites.taxonomy import (
     ReferenceKind,
     ReferenceOrigin,
 )
+from repowise.core.source_search.generation import GenerationRef
 from repowise.core.source_search.vector_store import STORED_SNIPPET_CHARS
 from repowise.core.source_search.worktree import WorkingTreeDivergence
 from repowise.server import source_search_wiring as w
@@ -164,7 +165,9 @@ CLEAN = WorkingTreeDivergence(checked=True)
 
 
 def _coordinator(response: dict, session_factory, repo: Path):
-    return w._StatusCoordinator(_Inner(response), repo, object(), object(), session_factory)
+    # The naming gate compares the reader's generation with the live status.
+    fts = SimpleNamespace(generation=GenerationRef("g1", 1))
+    return w._StatusCoordinator(_Inner(response), repo, object(), fts, session_factory)
 
 
 @pytest.fixture
@@ -188,6 +191,23 @@ async def test_a_window_row_is_named_from_the_reference_sites(
         "mmr_diversify::_sim",
     ]
     assert response["results"][0]["containment"] == "definition_start_in_span"
+
+
+async def test_a_retired_reader_does_not_name_from_newer_reference_sites(
+    monkeypatch, extracted, session_factory, nested_repo
+):
+    _patch_status(monkeypatch, CLEAN)
+    coordinator = _coordinator(_window_response(), session_factory, nested_repo)
+    coordinator._source_fts.generation = GenerationRef("older", 0)
+
+    response = await coordinator.search("how are near duplicates dropped")
+
+    assert "contains_symbols" not in response["results"][0]
+    source = response["_meta"]["source_search"]
+    assert source["status"] == "stale"
+    assert source["generation_id"] == "older"
+    assert source["published_generation_id"] == "g1"
+    assert source["working_tree"]["checked"] is False
 
 
 async def test_an_enclosing_row_is_named_when_no_rival_survived(

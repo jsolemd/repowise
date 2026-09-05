@@ -177,6 +177,54 @@ async def test_a_path_resembling_nothing_says_that_rather_than_guessing(setup_mc
 
 
 @pytest.mark.asyncio
+async def test_extensionless_path_never_crosses_into_the_symbol_namespace(
+    setup_mcp, session, tmp_path, monkeypatch
+):
+    """A path miss must not become an unrelated same-tail symbol hit.
+
+    Extensionless config files are ordinary path targets.  The slash is the
+    caller's namespace choice; resolving ``infra/repowise/env`` as a symbol
+    named ``ENV`` is more dangerous than returning no result because the card
+    looks valid while describing unrelated code.
+    """
+    import repowise.server.mcp_server as mcp_mod
+    from repowise.server.mcp_server import get_context
+
+    session.add(
+        WikiSymbol(
+            id="unrelated-env-symbol",
+            repository_id="repo1",
+            file_path="src/settings.py",
+            symbol_id="src/settings.py::ENV",
+            name="ENV",
+            qualified_name="settings.ENV",
+            kind="constant",
+            signature="ENV = {}",
+            start_line=1,
+            end_line=1,
+            language="python",
+        )
+    )
+    await session.flush()
+
+    live = tmp_path / "infra" / "repowise" / "env"
+    live.parent.mkdir(parents=True)
+    live.write_text("REPOWISE_SOURCE_SEARCH=1\n", encoding="utf-8")
+    monkeypatch.setattr(mcp_mod, "_repo_path", str(tmp_path))
+
+    live_card = (await get_context(["infra/repowise/env"]))["targets"]["infra/repowise/env"]
+    missing_card = (await get_context(["infra/repowise/missing"]))["targets"][
+        "infra/repowise/missing"
+    ]
+
+    assert live_card["type"] == "file"
+    assert live_card["index_status"] == "live_file_without_index_record"
+    assert live_card.get("docs", {}).get("name") != "ENV"
+    assert missing_card["status"] == "not_found"
+    assert missing_card.get("type") != "symbol"
+
+
+@pytest.mark.asyncio
 async def test_module_targets_keep_their_opt_in_blocks(setup_mcp, session):
     """A module target has no file, and must not lose blocks to that.
 

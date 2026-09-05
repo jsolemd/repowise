@@ -170,16 +170,18 @@ async def expand_seeds(
 ) -> list[SliceMember]:
     """Turn entry candidates into seed members on both graph layers.
 
-    A symbol candidate also seeds the file that defines it; a file candidate
-    also seeds up to ``seed_symbol_fanout`` of the symbols it defines, taken
-    in pagerank order. This is the one place the walk crosses layers, and it
-    crosses through the containment edges (``defines`` / ``has_method``) that
-    :mod:`repowise.core.ingestion.models` names as the only bridge between
-    them. Bounded, because a file that defines two hundred symbols would
-    otherwise seed the walk with its whole contents instead of with the task.
+    A symbol candidate also starts the file layer from the file that defines
+    it.  That supporting file is *not* promoted into a semantic seed and does
+    not fan back out into sibling symbols: the caller named one exact call
+    path, not every declaration beside it. A caller-named file candidate does
+    seed up to ``seed_symbol_fanout`` of the symbols it defines, taken in
+    pagerank order. This is the one place the walk crosses layers, through the
+    containment edges (``defines`` / ``has_method``) that
+    :mod:`repowise.core.ingestion.models` names as the only bridge.
     """
     seeds: dict[str, SliceMember] = {}
     wanted_paths: list[str] = []
+    explicit_file_seeds: set[str] = set()
 
     for candidate in candidates:
         row = await session.execute(
@@ -199,6 +201,8 @@ async def expand_seeds(
         seeds[member.node_id] = member
         if node.node_type == "symbol":
             wanted_paths.append(member.file_path)
+        elif node.node_type == "file":
+            explicit_file_seeds.add(member.node_id)
 
     # A symbol seed drags in its own file, so the file layer has somewhere to
     # start. Without this a symbol-only query produces a slice with no file
@@ -216,12 +220,14 @@ async def expand_seeds(
         node = row.scalar_one_or_none()
         if node is None:
             continue
-        member = member_from_node(node, distance=0, is_seed=True, revision=revision)
-        member.reasons.append("defines a seed symbol")
+        member = member_from_node(node, distance=0, is_seed=False, revision=revision)
+        member.reasons.append("contains the exact seed symbol; starts the file dependency layer")
         seeds[member.node_id] = member
 
-    if policy.seed_symbol_fanout:
-        file_seed_ids = [m.node_id for m in seeds.values() if m.layer == "file"]
+    if policy.seed_symbol_fanout and explicit_file_seeds:
+        # Only files the caller/task actually selected fan out. A file added to
+        # support an exact symbol must not manufacture sibling seeds.
+        file_seed_ids = sorted(explicit_file_seeds)
         for chunk in _chunks(file_seed_ids):
             rows = await session.execute(
                 select(GraphEdge, GraphNode)

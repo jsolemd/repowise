@@ -720,7 +720,9 @@ async def _render_ambiguous(
     return response
 
 
-@mcp.tool(surface_order=30, artifact_type="source", presentation="source", evidence_basis="measured")
+@mcp.tool(
+    surface_order=30, artifact_type="source", presentation="source", evidence_basis="measured"
+)
 async def get_symbol(
     symbol_id: str | list[str] | None = None,
     context_lines: int = 0,
@@ -732,10 +734,11 @@ async def get_symbol(
 ) -> dict:
     """Follow-up read of symbols another response, or the source, already named.
 
-    **Not an entry point.** ``get_answer`` already ships ``symbol_bodies``, and
-    for a whole file ``get_context(include=["skeleton"])`` or a plain Read is
-    one call instead of many. Reach here for a body that was elided, or for a
-    ``continuation`` / omission ref. Never walk a file symbol by symbol.
+    **Not an entry point.** For a whole file,
+    ``get_context(include=["skeleton"])`` or a plain Read is one call instead
+    of many. Reach here for a symbol id another result named, a body that was
+    elided, or a ``continuation`` / omission ref. Never walk a file symbol by symbol.
+    This contract is self-contained even when optional synthesis tools are not served.
 
     Returns verified, line-numbered source for one indexed symbol, live range,
     or omission ref. Ambiguity returns every candidate; an index miss returns
@@ -760,11 +763,7 @@ async def get_symbol(
     if reference:
         if not symbol_id and not id and isinstance(reference.get("id"), str):
             symbol_id = reference["id"]
-        if (
-            repo is None
-            and _is_workspace_mode()
-            and isinstance(reference.get("repository"), str)
-        ):
+        if repo is None and _is_workspace_mode() and isinstance(reference.get("repository"), str):
             repo = reference["repository"]
     if repo == "all":
         return _unsupported_repo_all("get_symbol")
@@ -923,9 +922,7 @@ async def _serve_symbol(
     omission_ref = _extract_omission_ref(symbol_id)
     if omission_ref is not None:
         canonical_omission = omission_reference(symbol_id) or symbol_id
-        return _resolve_omission_ref(
-            canonical_omission, omission_ref, query, ctx.path, t0
-        )
+        return _resolve_omission_ref(canonical_omission, omission_ref, query, ctx.path, t0)
 
     # Range read: "path/to/file.py:140-180" (single colon + numeric range —
     # never collides with "{path}::{name}").

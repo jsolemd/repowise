@@ -290,6 +290,55 @@ async def test_the_query_is_embedded_once_for_both_dense_stores(tmp_path):
     assert embedder.calls == 1
 
 
+async def test_verbose_query_is_focused_into_visible_bounded_intent_slots(tmp_path, monkeypatch):
+    """Agent-written task prose must not make every noun one owner's burden."""
+    query = "dashboard telemetry usage analytics calls latency failures savings wrappers counters"
+    concepts = query.split()
+    owner = _hit(
+        "record_usage",
+        "src/usage.py",
+        0.62,
+        snippet=" ".join(concepts),
+    )
+    term_files = {term: {"src/usage.py"} for term in concepts}
+    active_paths = {f"src/dummy_{index}.py" for index in range(30)} | {"src/usage.py"}
+    embedder = _Embedder()
+    coordinator = _coordinator(
+        tmp_path,
+        source_dense=[owner],
+        source_lexical=[_FTSHit(owner.chunk_id, owner.file_path)],
+        records={owner.chunk_id: _record(owner)},
+        embedder=embedder,
+        source_term_files=term_files,
+        source_active_paths=active_paths,
+    )
+    embedded: list[str] = []
+    lexical: list[str] = []
+
+    async def capture_embed(texts: list[str]) -> list[list[float]]:
+        embedded.extend(texts)
+        return [[1.0, 0.0, 0.0, 0.0] for _ in texts]
+
+    original_query = coordinator._source_fts.query
+
+    def capture_lexical(match: str, limit: int = 20):
+        lexical.append(match)
+        return original_query(match, limit)
+
+    monkeypatch.setattr(embedder, "embed", capture_embed)
+    monkeypatch.setattr(coordinator._source_fts, "query", capture_lexical)
+
+    response = await coordinator.search(query)
+    plan = response["query_plan"]
+
+    assert plan["strategy"] == "automatic_focus"
+    assert len(plan["intent_slots"]["concepts"]) == 8
+    assert plan["omitted_concepts"] == ["wrappers", "counters"]
+    assert embedded == [plan["retrieval_query"]]
+    assert lexical == [plan["retrieval_query"]]
+    assert response["selected_owner"]["file"] == "src/usage.py"
+
+
 async def test_a_lexical_only_source_hit_arrives_with_its_metadata(tmp_path):
     """BM25 returns ids; the response still owes the caller lines and a body."""
     lexical_only = _hit("solo", "src/solo.py", 0.0, snippet="def solo(): ...")
@@ -1708,6 +1757,9 @@ async def test_the_host_meta_survives_and_the_generation_is_added(tmp_path):
         ),
     )
     coordinator = _coordinator(tmp_path, source_dense=[_hit("alpha", "src/a.py", 0.6)])
+    # Publication may move or disappear before even this reader's first query.
+    # Its provenance is the construction snapshot, never a lazy live read.
+    default_manifest_path(tmp_path).unlink()
     response = await coordinator.search(
         "how alpha works", limit=5, base_meta={"indexed_commit": "abc123", "cached": True}
     )
@@ -1715,6 +1767,8 @@ async def test_the_host_meta_survives_and_the_generation_is_added(tmp_path):
     assert response["_meta"]["cached"] is True
     assert response["_meta"]["source_search"] == {
         "generation": "c0ffee123456",
+        "generation_id": "legacy",
+        "generation_sequence": 0,
         "indexed_commit": "abc123",
         "symbol_chunks": 7,
         "file_window_chunks": 3,

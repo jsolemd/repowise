@@ -289,7 +289,7 @@ async def _run_mode(
         payload["error"] = f"{type(exc).__name__}: {exc}"
         return
 
-    from repowise.server.source_search_wiring import context_coordinator
+    from repowise.server.source_search_wiring import context_coordinator, coordinator_lease
 
     coordinator = await context_coordinator(ctx)
     if coordinator is None:
@@ -297,7 +297,8 @@ async def _run_mode(
         payload["next_action"] = "Build one with 'repowise source-index', then run again."
         return
     payload["suite_path"] = target.as_posix()
-    payload["run"] = (await run_suite(loaded, coordinator.search)).to_dict()
+    async with coordinator_lease(coordinator):
+        payload["run"] = (await run_suite(loaded, coordinator.search)).to_dict()
 
 
 __all__ = ["get_query_quality"]

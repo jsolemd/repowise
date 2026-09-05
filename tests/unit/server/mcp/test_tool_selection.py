@@ -185,6 +185,7 @@ def test_real_registry_phase_one_surfaces_are_exact():
         "get_overview",
         "get_health",
         "get_dead_code",
+        "get_index_status",
     }
     ensure_full_surface()
     entries = mcp_tool_registry.entries()

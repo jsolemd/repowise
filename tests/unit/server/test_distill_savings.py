@@ -111,6 +111,56 @@ async def test_savings_endpoint_adds_avoided_tool_call_output_credit(
     assert data["estimated_usd_saved"] > input_usd  # the credit actually applied
 
 
+async def test_savings_endpoint_surfaces_bounded_mcp_usage_counts(
+    client: AsyncClient, tmp_path: Path
+) -> None:
+    repo = await create_test_repo(client, tmp_path)
+    repo_dir = Path(repo["local_path"])
+    store = OmissionStore(repo_dir / ".repowise" / "omissions" / "omissions.db")
+    store.record_mcp_usage(
+        tool="search_codebase",
+        duration_ms=40,
+        error=False,
+        no_match=False,
+        degraded=False,
+        replaced_tokens=1000,
+        delivered_tokens=200,
+    )
+    store.record_mcp_usage(
+        tool="search_codebase",
+        duration_ms=60,
+        error=False,
+        no_match=True,
+        degraded=True,
+        replaced_tokens=0,
+        delivered_tokens=100,
+    )
+    store.record_mcp_usage(
+        tool="get_context",
+        duration_ms=20,
+        error=True,
+        no_match=False,
+        degraded=False,
+        replaced_tokens=0,
+        delivered_tokens=50,
+    )
+    store.close()
+
+    resp = await client.get(f"/api/repos/{repo['id']}/distill-savings")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["mcp_usage_calls"] == 3
+    assert data["mcp_usage_error_calls"] == 1
+    assert data["mcp_usage_no_match_calls"] == 1
+    assert data["mcp_usage_degraded_calls"] == 1
+    assert data["mcp_usage_avg_duration_ms"] == 40.0
+    assert data["mcp_usage_window_days"] == 30
+    by_tool = {row["tool"]: row for row in data["mcp_usage_per_tool"]}
+    assert by_tool["search_codebase"]["calls"] == 2
+    assert by_tool["search_codebase"]["saved_tokens"] == 800
+    assert by_tool["get_context"]["error_calls"] == 1
+
+
 async def test_savings_endpoint_no_store_is_unavailable(
     client: AsyncClient, tmp_path: Path
 ) -> None:
