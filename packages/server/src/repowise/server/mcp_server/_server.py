@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
+import sys
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -170,8 +171,30 @@ def _embedder_kwargs(name: str) -> dict[str, Any]:
     if model:
         kwargs["model"] = model
     if name == "gemini":
-        dims = os.environ.get("REPOWISE_EMBEDDING_DIMS")
-        kwargs["output_dimensionality"] = int(dims) if dims else 768
+        dims_raw = os.environ.get("REPOWISE_EMBEDDING_DIMS")
+        dims = 768
+        if dims_raw:
+            try:
+                parsed = int(dims_raw)
+            except (ValueError, OverflowError):
+                parsed = 0
+            if parsed > 0:
+                dims = parsed
+            else:
+                _log.warning(
+                    "embedding_dims_invalid",
+                    extra={
+                        "var": "REPOWISE_EMBEDDING_DIMS",
+                        "value": dims_raw,
+                        "using": dims,
+                    },
+                )
+                print(
+                    f"REPOWISE_EMBEDDING_DIMS={dims_raw!r} is not a positive integer;"
+                    f" using {dims}.",
+                    file=sys.stderr,
+                )
+        kwargs["output_dimensionality"] = dims
 
     env_vars = _EMBEDDER_KEY_ENV.get(name, ())
     if env_vars and not any(os.environ.get(var) for var in env_vars):
@@ -351,6 +374,7 @@ def _detect_workspace(repo_path: str | None):
         resolved = _Path(repo_path).resolve()
         repo_alias = None
         best_match_depth = -1
+        best_match_abs = None
         for entry in ws_config.repos:
             entry_abs = (ws_root / entry.path).resolve()
             try:
@@ -362,11 +386,19 @@ def _detect_workspace(repo_path: str | None):
             if match_depth > best_match_depth:
                 repo_alias = entry.alias
                 best_match_depth = match_depth
+                best_match_abs = entry_abs
 
         if repo_alias is None:
             # Path is inside workspace but doesn't match a repo — use default
             primary = ws_config.get_primary()
             repo_alias = primary.alias if primary else ws_config.repos[0].alias
+        elif resolved != best_match_abs and (resolved / ".repowise" / "state.json").exists():
+            # resolved is its own indexed repo, nested inside a matched
+            # member/primary's directory but not itself a registered member.
+            # Containment made it match the enclosing entry above; that's
+            # wrong for an indexed, non-member repo — drop to single-repo
+            # mode instead of silently serving the enclosing repo.
+            return None, None, None
 
         return ws_root, ws_config, repo_alias
     except Exception:
@@ -390,7 +422,10 @@ async def _lifespan(server: FastMCP):
     _warm_task = asyncio.create_task(_warm_lancedb(), name="lancedb-warmup")
 
     # --- Workspace detection ------------------------------------------------
-    ws_root, ws_config, ws_repo_alias = _detect_workspace(_state._repo_path)
+    if _state._force_single_repo:
+        ws_root, ws_config, ws_repo_alias = None, None, None
+    else:
+        ws_root, ws_config, ws_repo_alias = _detect_workspace(_state._repo_path)
 
     if ws_root is not None and ws_config is not None:
         # Workspace mode — use RepoRegistry for multi-repo serving
@@ -463,6 +498,10 @@ async def _lifespan(server: FastMCP):
         await _cancel_task(_warm_task)
         _state._lancedb_ready = None
         _state._cross_repo_enricher = None
+        # The test-impact join holds its own session per consumer repo.
+        from repowise.server.mcp_server._test_impact import close_test_impact_indexes
+
+        await close_test_impact_indexes()
         await registry.close()
         _state._registry = None
         _state._workspace_root = None
@@ -627,6 +666,7 @@ async def _healthz(request: Request) -> JSONResponse:
 def create_mcp_server(
     repo_path: str | None = None,
     tools: str | list[str] | None = None,
+    workspace_mode: bool = True,
 ) -> FastMCP:
     """Create and return the MCP server instance, optionally scoped to a repo.
 
@@ -634,6 +674,7 @@ def create_mcp_server(
     deltas, or ``"all"``); when omitted the ``mcp.tools`` config block is used.
     """
     _state._repo_path = repo_path
+    _state._force_single_repo = not workspace_mode
     from repowise.server.mcp_server import ensure_full_surface
     from repowise.server.mcp_server._tool_selection import apply_tool_selection
 
@@ -773,6 +814,7 @@ def run_mcp(
     host: str = "127.0.0.1",
     port: int = 7338,
     tools: str | list[str] | None = None,
+    workspace_mode: bool = True,
 ) -> None:
     """Run the MCP server with the specified transport.
 
@@ -790,6 +832,7 @@ def run_mcp(
     """
     try:
         _state._repo_path = repo_path
+        _state._force_single_repo = not workspace_mode
         from repowise.server.mcp_server import ensure_full_surface
         from repowise.server.mcp_server._tool_selection import apply_tool_selection
 

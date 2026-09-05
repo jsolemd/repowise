@@ -70,6 +70,7 @@ from repowise.server.mcp_server._helpers import (
     read_repo_file_text,
 )
 from repowise.server.mcp_server._meta import build_meta as _build_meta
+from repowise.server.mcp_server._meta import completeness_line as _completeness_line
 from repowise.server.mcp_server._meta import symbol_hint as _symbol_hint
 from repowise.server.mcp_server._references import (
     omission_reference,
@@ -455,6 +456,10 @@ async def _resolve_range_read(
             targets=[path],
         ),
     }
+    if s == 1 and e == total and not range_truncated:
+        # Only a range that covers the file end to end is a whole unit; any
+        # other slice leaves lines the caller still has to go and read.
+        response["_meta"]["complete"] = _completeness_line(files=1)
     remainder_end = min(requested_end, total)
     if range_truncated and e < remainder_end:
         # Same clean-continuation contract as a truncated symbol read: name the
@@ -623,6 +628,7 @@ async def _render_ambiguous(
     path_qualified = match.rung in _PATH_QUALIFIED_RUNGS
     listed = rows if path_qualified else rows[:MAX_AMBIGUITY_CANDIDATES]
     with_bodies = path_qualified or match.total_count <= _MAX_AMBIGUITY_BODIES
+    whole_bodies = 0
 
     for i, row in enumerate(listed):
         entry: dict[str, Any] = {
@@ -673,6 +679,10 @@ async def _render_ambiguous(
         remaining -= len(numbered)
         entry["source"] = numbered
         candidates.append(entry)
+        # A candidate is whole only when the served span reaches both ends of
+        # the verified bounds; a budget-clipped or relocated one does not count.
+        if check.verified and start <= check.start_line and end >= check.end_line:
+            whole_bodies += 1
 
     if with_bodies:
         note = (
@@ -705,6 +715,8 @@ async def _render_ambiguous(
         response["resolution"] = match.rung
     if match.total_count > len(listed):
         response["note"] += f" Only the first {len(listed)} of them are listed."
+    if whole_bodies:
+        response["_meta"]["complete"] = _completeness_line(bodies=whole_bodies)
     if not_rendered:
         response["not_rendered"] = not_rendered
         response["note"] += (
@@ -1128,6 +1140,10 @@ async def _serve_symbol(
         # ``resolved_from`` is what an agent quotes when it re-asks.
         response["resolution"] = match.rung
         response["resolved_from"] = symbol_id
+    if not truncated and check.verified:
+        # The whole body was served against live bytes, so nothing is left to
+        # fetch for this symbol.
+        response["_meta"]["complete"] = _completeness_line(bodies=1)
     if truncated and not check.approximate and end < check.end_line:
         # The body exceeds the serve cap. Hand back the exact range read that
         # fetches the remainder so the agent never has to guess the next span

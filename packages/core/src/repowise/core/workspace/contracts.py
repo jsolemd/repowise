@@ -46,10 +46,11 @@ CONTRACTS_FILENAME = "contracts.json"
 #: package surface became a ``code`` contract, and to 5 when ASP.NET minimal
 #: APIs gained ``MapGroup`` prefixes and a handler-bound ``symbol_id``, and to 6
 #: when a multi-line axum route became readable and go/axum providers gained a
-#: handler-bound ``symbol_id``.
+#: handler-bound ``symbol_id``, and to 7 when HTTP consumers gained Go, Ruby,
+#: Java, Kotlin and PHP client calls resolved from URL expressions.
 #: A store written under an older version is readable but not reusable: its
 #: rows carry no identity, and nothing short of re-extraction can give them one.
-CONTRACTS_VERSION = 6
+CONTRACTS_VERSION = 7
 
 
 # ---------------------------------------------------------------------------
@@ -814,6 +815,40 @@ def load_contract_store(workspace_root: Path) -> ContractStore | None:
 # ---------------------------------------------------------------------------
 
 
+def contract_repo_paths(ws_config: Any, workspace_root: Path) -> dict[str, Path]:
+    """The repos whose source contract extraction may read.
+
+    Two gates, and they are different questions. **Indexed** — a
+    ``.repowise/`` directory — is upstream's: a repo nobody has indexed has no
+    layer data to extract against. **Federated** is this fork's: a repo can be
+    worth indexing and reachable by its own alias without belonging in every
+    workspace-wide answer (``WorkspaceRepoEntry.federated``), and the engine's
+    own source tree is the case that exists for.
+
+    This gate is why the second one belongs here rather than at each consumer.
+    Everything cross-repo v0.49.0 added is downstream of the contract store:
+    the contracts page, ``build_system_graph``, ``cross_repo_blast_radius`` and
+    the cross-repo test impact on ``get_change_risk`` / ``get_blast_radius``
+    all read contracts or links, and none of them re-enumerates the workspace.
+    So a repo that never gets a contract extracted can never surface as a
+    provider or a consumer in any of them — which is exactly what opting out
+    of the fan-out is supposed to mean. Filtering at the four call sites
+    instead would put the same rule in four places and lose it on the fifth.
+
+    An opted-out repo keeps everything the opt-out does not name: it is still
+    indexed, still in ``list_repos``, still addressable by ``repo="<alias>"``,
+    and its own contracts page still answers for it.
+    """
+    repo_paths: dict[str, Path] = {}
+    for entry in ws_config.repos:
+        if not getattr(entry, "federated", True):
+            continue
+        resolved = (workspace_root / entry.path).resolve()
+        if resolved.is_dir() and (resolved / ".repowise").is_dir():
+            repo_paths[entry.alias] = resolved
+    return repo_paths
+
+
 async def run_contract_extraction(
     ws_config: WorkspaceConfig,
     workspace_root: Path,
@@ -901,14 +936,7 @@ async def run_contract_extraction(
     contract_config = ws_config.contracts
     exclude = make_exclude_predicate(tuple(contract_config.exclude_globs))
 
-    # Build repo_paths — only include repos that have been indexed
-    # (have a .repowise/ directory). Non-indexed repos must not participate
-    # in contract extraction.
-    repo_paths: dict[str, Path] = {}
-    for entry in ws_config.repos:
-        resolved = (workspace_root / entry.path).resolve()
-        if resolved.is_dir() and (resolved / ".repowise").is_dir():
-            repo_paths[entry.alias] = resolved
+    repo_paths = contract_repo_paths(ws_config, workspace_root)
 
     if len(repo_paths) < 2:
         return ContractStore()

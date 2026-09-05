@@ -58,7 +58,16 @@ STORE_FORMAT_VERSION: int = 2
 #: bump a cache sealed by a pre-F42 build stays acceptable and hands back
 #: ``ParsedFile``s whose symbols still carry ``~<hash>`` ids. Measured: same
 #: bytes, same fingerprint, two identity schemes in one index.
-PARSER_SCHEMA_VERSION: int = 3
+#:
+#: v4: a Python import that resolves to no repo file now becomes an
+#: ``external:`` node and edge instead of resolving to nothing. The fingerprint
+#: change makes ``persist_incremental_edges`` reconcile every file's edges once
+#: on the next update, so an existing index does not keep half its Python files
+#: without external edges. Upstream numbered this bump 3, but the fork had
+#: already spent 3 on F42 and sealed live indexes with it, so taking upstream's
+#: numeral verbatim would leave every fork parse cache acceptable and the
+#: external edges unbuilt. Two independent invalidations, two numbers.
+PARSER_SCHEMA_VERSION: int = 4
 
 #: state.json key holding the store format version that wrote the store.
 STORE_FORMAT_VERSION_KEY = "store_format_version"

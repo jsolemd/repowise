@@ -113,7 +113,23 @@ def _build_embedder():
     if name == "gemini":
         from repowise.core.providers.embedding.gemini import GeminiEmbedder
 
-        dims = int(os.environ.get("REPOWISE_EMBEDDING_DIMS", "768"))
+        dims_raw = os.environ.get("REPOWISE_EMBEDDING_DIMS")
+        dims = 768
+        if dims_raw:
+            try:
+                parsed = int(dims_raw)
+            except (ValueError, OverflowError):
+                parsed = 0
+            if parsed > 0:
+                dims = parsed
+            else:
+                import sys
+
+                print(
+                    f"REPOWISE_EMBEDDING_DIMS={dims_raw!r} is not a positive integer;"
+                    f" using {dims}.",
+                    file=sys.stderr,
+                )
         # Honour the indexed embedding model so serve doesn't silently rebuild
         # the embedder with a different default than init used (issue #426).
         model = os.environ.get("REPOWISE_EMBEDDING_MODEL")
@@ -448,6 +464,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                 await _repo_registry.close()
             # The enricher is only ever published alongside the registry.
             set_tool_workspace(registry=None, workspace_root=None, cross_repo_enricher=None)
+            # The test-impact join holds its own session per consumer repo.
+            from repowise.server.mcp_server._test_impact import close_test_impact_indexes
+
+            with suppress(Exception):
+                await close_test_impact_indexes()
         # Dispose workspace repo engines first
         for ws_engine in getattr(app.state, "workspace_engines", []):
             with suppress(Exception):

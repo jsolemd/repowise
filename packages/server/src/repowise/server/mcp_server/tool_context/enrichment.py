@@ -38,6 +38,7 @@ from repowise.core.persistence.models import (
     HealthFinding,
     Repository,
 )
+from repowise.server.mcp_server._basis import basis_cache_key, call_resolution_basis
 from repowise.server.mcp_server._budget import OmissionCollector, cap_collection
 from repowise.server.mcp_server._graph_files import keep_projected_edge, node_to_file
 from repowise.server.mcp_server._helpers import filter_dicts_by_key, filter_path_list
@@ -178,10 +179,13 @@ async def _resolve_call_graph(
         # pass for no reason; the graph has the answer at file granularity.
         if node is not None and node.node_type == "file" and want_callers:
             await _resolve_file_level_callers(
-                session, repo_id, node, result_data, exclude_spec, collector
+                session, repo_id, node, result_data, exclude_spec, collector, repository=repository
             )
             if want_callees:
                 result_data["callees"] = []
+                result_data["callees_basis"] = await call_resolution_basis(
+                    session, repo_id, node.language, cache_key=basis_cache_key(repository)
+                )
             return
         if want_callers:
             result_data["callers"] = []
@@ -357,6 +361,13 @@ async def _resolve_call_graph(
         result_data.setdefault("callers", [])
     if want_callees:
         result_data.setdefault("callees", [])
+    # A zero only earns a basis. A populated list is already its own evidence,
+    # and the basis would just repeat what the rows show.
+    for key in ("callers", "callees"):
+        if key in result_data and not result_data[key]:
+            result_data[f"{key}_basis"] = await call_resolution_basis(
+                session, repo_id, node.language, cache_key=basis_cache_key(repository)
+            )
 
     if relations:
         relations.sort(key=lambda r: (r["direction"], -r["total"], r["edge_type"]))
@@ -385,6 +396,8 @@ async def _resolve_file_level_callers(
     result_data: dict[str, Any],
     exclude_spec: Any = None,
     collector: OmissionCollector | None = None,
+    *,
+    repository: Repository | None = None,
 ) -> None:
     """File-target callers: importing files + inbound symbol-call rollup.
 
@@ -469,6 +482,10 @@ async def _resolve_file_level_callers(
         "File-level rollup: importing files plus inbound cross-file call "
         "counts. For symbol-precise callers pass 'file.py::Symbol'."
     )
+    if repository is not None and not result_data.get("callers"):
+        result_data["callers_basis"] = await call_resolution_basis(
+            session, repo_id, node.language, cache_key=basis_cache_key(repository)
+        )
 
 
 async def _resolve_metrics(

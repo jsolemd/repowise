@@ -69,6 +69,7 @@ export const DECISION_SOURCES = [
   "cli",
   "comment",
   "commit",
+  "conventions",
   "git_archaeology",
   "inline_marker",
   // Written by the canonical decision-journal projection when
@@ -112,6 +113,7 @@ export const DECISION_SOURCE_LABELS: Record<
   cli: "Manual",
   comment: "Comment",
   commit: "Commit",
+  conventions: "Convention",
   git_archaeology: "Git history",
   inline_marker: "Marker",
   llm_inferred: "Model",

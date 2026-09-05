@@ -158,7 +158,11 @@ async def get_execution_flows(
                 missing: dict[str, Any] = {
                     "entry_point": entry_point,
                     "error": f"Symbol not found: {entry_point!r}",
-                    "_meta": _build_meta(timing_ms=(time.perf_counter() - t0) * 1000),
+                    "_meta": _build_meta(
+                        timing_ms=(time.perf_counter() - t0) * 1000,
+                        repository=repository,
+                        targets=None,
+                    ),
                 }
                 if requested is not None:
                     # A handle that resolved to nothing is the one case where a
@@ -188,12 +192,20 @@ async def get_execution_flows(
             return {
                 "total_entry_points": 0,
                 "flows": [],
-                "_meta": _build_meta(timing_ms=(time.perf_counter() - t0) * 1000),
+                # No file content served, so freshness never warns here.
+                "_meta": _build_meta(
+                    timing_ms=(time.perf_counter() - t0) * 1000,
+                    repository=repository,
+                    targets=[],
+                ),
             }
 
         # BFS trace from each entry point
         node_cache: dict[str, GraphNode] = {}
         flows: list[dict[str, Any]] = []
+        # Files the published traces touch, so freshness warns only when one
+        # of them changed after indexing.
+        trace_paths: set[str] = set()
 
         for ep_node, ep_score in entry_nodes:
             hop_origins: dict[tuple[str, str], str] = {}
@@ -223,6 +235,13 @@ async def get_execution_flows(
             communities_visited, crosses = await resolve_trace_communities(
                 session, repo_id, trace, node_cache
             )
+
+            for nid in trace:
+                cached = node_cache.get(nid)
+                # A file node keeps its path in node_id; _meta reduces symbol ids.
+                path = (cached.file_path if cached is not None else None) or nid
+                if path:
+                    trace_paths.add(path)
 
             flow: dict[str, Any] = {
                 "flow_id": mint_flow_id(generation, ep_node.node_id),
@@ -270,6 +289,8 @@ async def get_execution_flows(
                 "Pass a flow_id back to drill it into a resolved step chain. "
                 "Use get_context(include=['callers','callees']) on any trace node for detail."
             ),
+            repository=repository,
+            targets=sorted(trace_paths),
         ),
     }
     if requested is not None:
