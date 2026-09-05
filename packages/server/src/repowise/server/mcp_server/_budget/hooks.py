@@ -7,6 +7,8 @@ pruned to the rows still emitted. Those steps know field names the shared layer
 must not, so a tool registers them here at import time instead of the budgeter
 importing back into a tool module.
 
+``pre_shed`` trims tool-owned excerpts before whole rows are dropped, with the
+same open collector and working character limit as the shared fitter.
 ``post_shed`` runs after shedding while the collector is still open, so a hook
 may route what it drops into recovery. Only the ``blocks`` strategy has that
 window; the ``targets`` strategy attaches inside :func:`truncate_to_budget`.
@@ -24,10 +26,17 @@ if TYPE_CHECKING:
     from repowise.server.mcp_server._budget.collector import OmissionCollector
 
 PostShedHook = Callable[[dict[str, Any], "OmissionCollector"], None]
+PreShedHook = Callable[[dict[str, Any], "OmissionCollector", int], None]
 PostEnforceHook = Callable[[dict[str, Any]], None]
 
 _POST_SHED: dict[str, list[PostShedHook]] = {}
+_PRE_SHED: dict[str, list[PreShedHook]] = {}
 _POST_ENFORCE: dict[str, list[PostEnforceHook]] = {}
+
+
+def register_pre_shed(tool: str, hook: PreShedHook) -> None:
+    """Register *hook* before row shedding, while excerpts can still be reduced."""
+    _register(_PRE_SHED, tool, hook)
 
 
 def register_post_shed(tool: str, hook: PostShedHook) -> None:
@@ -48,6 +57,14 @@ def _register(registry: dict[str, list[Any]], tool: str, hook: Any) -> None:
         hooks.append(hook)
 
 
+def run_pre_shed(
+    tool: str, result: dict[str, Any], collector: OmissionCollector, limit: int
+) -> None:
+    """Run excerpt reduction before the shared row fitter."""
+    for hook in _PRE_SHED.get(tool, ()):
+        hook(result, collector, limit)
+
+
 def run_post_shed(tool: str, result: dict[str, Any], collector: OmissionCollector) -> None:
     """Run *tool*'s post-shed hooks, in registration order."""
     for hook in _POST_SHED.get(tool, ()):
@@ -62,15 +79,18 @@ def run_post_enforce(tool: str, result: dict[str, Any]) -> None:
 
 def registered_hook_tools() -> frozenset[str]:
     """Tools with at least one hook, for coverage assertions."""
-    return frozenset(_POST_SHED) | frozenset(_POST_ENFORCE)
+    return frozenset(_PRE_SHED) | frozenset(_POST_SHED) | frozenset(_POST_ENFORCE)
 
 
 __all__ = [
     "PostEnforceHook",
     "PostShedHook",
+    "PreShedHook",
     "register_post_enforce",
     "register_post_shed",
+    "register_pre_shed",
     "registered_hook_tools",
     "run_post_enforce",
     "run_post_shed",
+    "run_pre_shed",
 ]

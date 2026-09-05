@@ -21,7 +21,7 @@ from repowise.server.mcp_server._budget.budgeter import (
     truncate_to_budget,
 )
 from repowise.server.mcp_server._budget.collector import OmissionCollector
-from repowise.server.mcp_server._budget.hooks import run_post_enforce, run_post_shed
+from repowise.server.mcp_server._budget.hooks import run_post_enforce, run_post_shed, run_pre_shed
 
 DEFAULT_RESPONSE_CHARS = 24_000
 EXPANDED_RESPONSE_CHARS = 32_000
@@ -556,6 +556,7 @@ def enforce_response_budget(
             record_counts=True,
         )
     else:
+        run_pre_shed(tool, result, collector, working_limit)
         fit_to_budget(
             result,
             contract.shed_order,

@@ -24,10 +24,12 @@ and protect everything a reader has to have in order to act on what survives**
 
 from __future__ import annotations
 
+from repowise.server.mcp_server._budget._search_snippets import trim_search_snippets
 from repowise.server.mcp_server._budget.contracts import (
     _CONTRACTS,
     ResponseBudgetContract,
 )
+from repowise.server.mcp_server._budget.hooks import register_pre_shed
 
 __all__ = ["FORK_CONTRACTS"]
 
@@ -270,3 +272,5 @@ FORK_CONTRACTS: dict[str, ResponseBudgetContract] = {
 # quiet rather than silently shadowing it.
 for _name, _contract in FORK_CONTRACTS.items():
     _CONTRACTS.setdefault(_name, _contract)
+
+register_pre_shed("search_codebase", trim_search_snippets)
