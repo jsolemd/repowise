@@ -23,7 +23,7 @@ from .persist import (
     persist_post_index_result,
     tombstone_absent_file_pages,
 )
-from .phase_timing import PhaseTimingRecorder
+from .phase_timing import PhaseTimingRecorder, PhaseTimings, timed
 from .progress import LoggingProgressCallback, ProgressCallback
 from .reparse import reparse_repo
 from .upgrade import rehydrate_graph_builder
@@ -31,6 +31,7 @@ from .upgrade import rehydrate_graph_builder
 __all__ = [
     "LoggingProgressCallback",
     "PhaseTimingRecorder",
+    "PhaseTimings",
     "PipelineResult",
     "ProgressCallback",
     "persist_analysis",
@@ -44,5 +45,6 @@ __all__ = [
     "run_generation",
     "run_pipeline",
     "sweep_stale_generated_pages",
+    "timed",
     "tombstone_absent_file_pages",
 ]

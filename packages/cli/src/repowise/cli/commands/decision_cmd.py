@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -18,7 +19,7 @@ from repowise.cli.helpers import (
     resolve_command_target,
     run_async,
 )
-from repowise.cli.output import emit_json, format_option, notice_console
+from repowise.cli.output import emit_json, emit_refusal, format_option, notice_console
 from repowise.core.analysis.decisions.provenance import LISTABLE_SOURCES
 from repowise.core.precedent.currency import describe_decision_currency
 
@@ -114,6 +115,47 @@ def decision_group() -> None:
     """Manage architectural decision records."""
 
 
+def _register_config_commands() -> None:
+    """Attach the capture-control commands.
+
+    They live in their own module (policy resolution, presets, per-source
+    switches) and are attached here so ``decision`` stays one group.
+    """
+    from repowise.cli.commands.decision_config_cmd import (
+        config_group,
+        llm_command,
+        source_group,
+    )
+
+    decision_group.add_command(config_group)
+    decision_group.add_command(source_group)
+    decision_group.add_command(llm_command)
+
+    from repowise.cli.commands.decision_review_cmd import (
+        candidates_command,
+        export_command,
+        import_command,
+        merge_command,
+        migrate_command,
+        split_command,
+        status_command,
+    )
+
+    for command in (
+        migrate_command,
+        candidates_command,
+        merge_command,
+        split_command,
+        export_command,
+        import_command,
+        status_command,
+    ):
+        decision_group.add_command(command)
+
+
+_register_config_commands()
+
+
 async def _resolve_decision_id(session, decision_id: str) -> str | None:
     """Expand a (possibly truncated) decision id to the full stored id.
 
@@ -136,7 +178,25 @@ async def _resolve_decision_id(session, decision_id: str) -> str | None:
         raise click.ClickException(
             f"Decision id prefix {decision_id!r} is ambiguous; use more characters."
         )
-    return ids[0] if ids else None
+    if ids:
+        return ids[0]
+
+    # Merging and superseding retire ids that are already written down
+    # somewhere. Resolving through the alias keeps those working instead of
+    # reporting the decision as gone.
+    from repowise.core.persistence.models import DecisionAlias
+
+    alias = await session.execute(
+        select(DecisionAlias.decision_id)
+        .where(DecisionAlias.alias_id.like(f"{escape_like(decision_id)}%", escape=LIKE_ESCAPE))
+        .limit(2)
+    )
+    alias_ids = [row[0] for row in alias.all()]
+    if len(alias_ids) > 1:
+        raise click.ClickException(
+            f"Decision id prefix {decision_id!r} is ambiguous; use more characters."
+        )
+    return alias_ids[0] if alias_ids else None
 
 
 # ---------------------------------------------------------------------------
@@ -237,7 +297,8 @@ def decision_add(
         consequences_list = [c.strip() for c in consequences_raw.split(",") if c.strip()]
 
         affected_raw = click.prompt(
-            "Affected files/modules (comma-separated, optional)", default=""
+            "Affected files/modules (comma-separated; required to make it govern)",
+            default="",
         )
         affected_files = [f.strip() for f in affected_raw.split(",") if f.strip()]
 
@@ -321,6 +382,28 @@ def decision_add(
                     source="cli",
                     confidence=1.0,
                 )
+                # A decision that names nothing cannot be checked against the
+                # code and cannot reach the agent editing a governed file, so
+                # it cannot be accepted. Keeping it as a candidate is better
+                # than discarding eight answered questions; ``confirm
+                # --scope`` finishes the job.
+                if status == "active" and affected_files:
+                    # Answering the prompts is the acceptance; recording it as
+                    # one is what makes this record indistinguishable from any
+                    # other accepted decision to every reader. The journal
+                    # branch above records its own acceptance in the JSONL.
+                    from repowise.core.analysis.decisions.accepter import resolve_accepter
+                    from repowise.core.persistence.crud.authority import (
+                        AcceptanceRefusedError,
+                        accept_decision,
+                    )
+
+                    try:
+                        await accept_decision(session, rec, accepter=resolve_accepter(repo_path))
+                    except AcceptanceRefusedError as exc:
+                        raise click.ClickException(
+                            f"Cannot accept this decision: {exc}."
+                        ) from exc
             # The stored status, not the one asked for: in journal mode it is
             # the projection that decides, from whether ``confirmed_at`` is set.
             decision_id, stored_status = rec.id, rec.status
@@ -330,6 +413,12 @@ def decision_add(
 
     decision_id, status = run_async(_persist())
 
+    if status != "active" and not non_interactive:
+        console.print(
+            "[yellow]Stored as a candidate: it names no files, so it cannot be "
+            "checked against the code.[/yellow]\n"
+            f"[dim]repowise decision confirm {decision_id[:8]} --scope <path>[/dim]"
+        )
     if not journal_mode:
         # The derived store is rebuilt from scratch by any reindex and is not
         # tracked by git, so a row written here reaches nobody else. Said out
@@ -544,7 +633,9 @@ def decision_show(decision_id: str, path: str | None, repo_alias: str | None, fm
         notice_console(fmt).print(f"[red]Decision not found: {decision_id}[/red]")
         if fmt == "json":
             emit_json({"query": decision_id, "decision": None})
-        return
+        # Non-zero for the same reason the lifecycle commands are: a caller
+        # scripting `show` cannot tell a missing id from an empty record.
+        raise click.exceptions.Exit(1)
 
     if fmt == "json":
         emit_json(
@@ -633,77 +724,328 @@ def decision_show(decision_id: str, path: str | None, repo_alias: str | None, fm
     console.print(Panel("\n".join(lines), title=f"Decision {rec.id[:8]}"))
 
 
+
+def _emit_lifecycle(rec, decision_id: str, action: str, fmt: str, note: str = "") -> None:
+    """Report one status transition to a person or to a machine.
+
+    Not found exits non-zero: an agent driving the lifecycle could not tell a
+    typo'd id from a successful confirm when both returned 0.
+    """
+    if rec is None:
+        if fmt == "json":
+            emit_json({"error": "decision_not_found", "decision_id": decision_id})
+        else:
+            console.print(f"[red]Decision not found: {decision_id}[/red]")
+        raise click.exceptions.Exit(1)
+    if fmt == "json":
+        emit_json({"id": rec.id, "status": rec.status, "action": action})
+        return
+    console.print(f"[green]Decision {rec.id[:8]} {action}[/green]" + (f" {note}" if note else ""))
+
+
 # ---------------------------------------------------------------------------
-# decision confirm
+# decision confirm / dismiss
 # ---------------------------------------------------------------------------
+
+
+#: The remedy printed beside a refused acceptance, naming the flags that
+#: supply what the contract found missing.
+_ACCEPT_REMEDY = "Supply the missing parts with --reason, --scope or --evidence."
+
+
+class _PreviewRollbackError(Exception):
+    """Signals a preview to roll its savepoint back."""
+
+
+#: A decision id, or a prefix of one, as ``_resolve_decision_id`` accepts it.
+_ID_SHAPED = re.compile(r"[0-9a-fA-F]{4,64}\Z")
+
+
+def _split_ids_and_path(tokens: tuple[str, ...]) -> tuple[list[str], str | None]:
+    """Separate decision ids from the optional trailing repo path.
+
+    ``confirm ID [PATH]`` shipped before batch arity, so the path is still a
+    positional. An id-shaped last token stays an id even when a directory of
+    that name happens to exist, because reading one as a path would drop it
+    from the batch and still exit 0.
+    """
+    last = tokens[-1] if tokens else ""
+    if len(tokens) > 1 and last and not _ID_SHAPED.match(last) and Path(last).is_dir():
+        return list(tokens[:-1]), last
+    return list(tokens), None
+
+
+async def _resolve_one(session, token: str):
+    """The record *token* names, or the failure to report for it."""
+    from repowise.core.persistence.models import DecisionRecord
+
+    try:
+        full_id = await _resolve_decision_id(session, token)
+    except click.ClickException as exc:
+        return None, {"given": token, "ok": False, "error": "ambiguous_id", "message": str(exc)}
+    rec = await session.get(DecisionRecord, full_id) if full_id else None
+    if rec is None:
+        return None, {
+            "given": token,
+            "ok": False,
+            "error": "decision_not_found",
+            "message": f"Decision not found: {token}",
+        }
+    return rec, None
+
+
+async def _project_decision_journal(session, repo_path: Path) -> str | None:
+    """Project the canonical decision journal into the derived store.
+
+    A no-op outside journal mode. Returns the repository id when it ran, so a
+    caller that needs to address the journal by repo does not have to upsert
+    the repository a second time.
+    """
+    if not _journal_mode_enabled():
+        return None
+    from repowise.core.analysis.decisions.journal_projection import refresh_decision_journal
+    from repowise.core.persistence import upsert_repository
+
+    repo = await upsert_repository(session, name=repo_path.name, local_path=str(repo_path))
+    await refresh_decision_journal(session, repo.id, repo_root=repo_path)
+    return repo.id
+
+
+async def _review_batch(repo_path, tokens, *, action: str, verb: str, preview: bool, apply_one):
+    """Apply *apply_one* to every id, keeping one refusal from ending the run.
+
+    Each id runs inside its own savepoint. ``accept_decision`` edits the
+    record's rationale and scope before the contract can refuse it, so without
+    one a refused id would leave that edit in the transaction the accepted ids
+    commit. A preview runs the real write and then rolls the whole session
+    back, so what it reports is what the contract actually said; the schema
+    reconcile every subcommand opens the store with still runs.
+    """
+    from repowise.core.persistence import (
+        create_engine,
+        create_session_factory,
+        get_session,
+        init_db,
+    )
+    from repowise.core.persistence.crud.authority import AcceptanceRefusedError
+
+    engine = create_engine(get_db_url_for_repo(repo_path))
+    try:
+        await init_db(engine)
+    except BaseException:
+        await engine.dispose()
+        raise
+    results: list[dict] = []
+    try:
+        async with get_session(create_session_factory(engine)) as session:
+            # Journal mode keeps the authority in a git-tracked JSONL and the
+            # SQL rows are its projection, so a review that skipped this would
+            # resolve ids against whatever the last index happened to write.
+            await _project_decision_journal(session, repo_path)
+            for token in tokens:
+                rec, failure = await _resolve_one(session, token)
+                if failure is not None:
+                    results.append(failure)
+                    continue
+                entry = {"given": token, "id": rec.id, "title": rec.title}
+                try:
+                    async with session.begin_nested():
+                        await apply_one(session, rec)
+                        if preview:
+                            raise _PreviewRollbackError
+                except _PreviewRollbackError:
+                    results.append({**entry, "ok": True, "action": f"would_{verb}"})
+                except AcceptanceRefusedError as exc:
+                    results.append(
+                        {
+                            **entry,
+                            "ok": False,
+                            "error": "acceptance_refused",
+                            "message": str(exc),
+                            "blockers": list(exc.blockers),
+                        }
+                    )
+                else:
+                    results.append({**entry, "ok": True, "action": action, "status": rec.status})
+            if preview:
+                await session.rollback()
+    finally:
+        await engine.dispose()
+    return results
+
+
+def _emit_batch(results: list[dict], action: str, verb: str, preview: bool, fmt: str) -> None:
+    """Report a multi-id run, exiting non-zero when any id was refused."""
+    failed = [r for r in results if not r["ok"]]
+    if fmt == "json":
+        emit_json(
+            {
+                "action": action,
+                "preview": preview,
+                "results": results,
+                "succeeded": len(results) - len(failed),
+                "failed": len(failed),
+            }
+        )
+        if failed:
+            raise click.exceptions.Exit(1)
+        return
+
+    headline = f"Would {verb}" if preview else action.capitalize()
+    table = Table(title=f"{headline} {len(results) - len(failed)} of {len(results)}")
+    for column in ("ID", "Title", "Outcome"):
+        table.add_column(column)
+    for result in results:
+        outcome = "[green]ok[/green]" if result["ok"] else f"[red]{result['message']}[/red]"
+        table.add_row(result.get("id", result["given"])[:8], result.get("title", "")[:50], outcome)
+    console.print(table)
+    if preview:
+        console.print("[dim]Nothing was written. Re-run without --preview.[/dim]")
+    if failed:
+        raise click.exceptions.Exit(1)
+
+
+def _emit_single(result: dict, token: str, verb: str, fmt: str, note: str, remedy: str) -> None:
+    """The one-id document, unchanged from before these verbs took many."""
+    if result["ok"]:
+        if fmt == "json":
+            emit_json({"id": result["id"], "status": result["status"], "action": result["action"]})
+            return
+        console.print(
+            f"[green]Decision {result['id'][:8]} {result['action']}[/green]"
+            + (f" {note}" if note else "")
+        )
+        return
+    if result["error"] == "decision_not_found":
+        _emit_lifecycle(None, token, "", fmt)
+        return
+    if "id" not in result:
+        # An ambiguous prefix never resolved to a record, so there is nothing
+        # to name but the token the caller gave.
+        emit_refusal(result["error"], result["message"], fmt)
+        return
+    extra: dict = {"decision_id": result["id"]}
+    if "blockers" in result:
+        extra["blockers"] = result["blockers"]
+        if remedy:
+            extra["remedy"] = remedy
+    emit_refusal(
+        result["error"], f"Cannot {verb} {result['id'][:8]}: {result['message']}", fmt, **extra
+    )
 
 
 @decision_group.command("confirm")
-@click.argument("decision_id")
-@click.argument("path", required=False, default=None)
+@click.argument("decision_ids", nargs=-1, required=True)
+@click.option("--reason", default="", help="Rationale, or why the constraint needs none.")
+@click.option(
+    "--scope",
+    multiple=True,
+    help="File or module this governs. Repeatable; replaces the proposed scope.",
+)
+@click.option(
+    "--evidence",
+    multiple=True,
+    help="Commit, file or link the decision rests on. Repeatable.",
+)
+@click.option("--as", "accepter", default="", help="Record a different accepter identity.")
+@click.option(
+    "--preview", is_flag=True, default=False, help="Report what each id would do, and write nothing."
+)
 @repo_option()
-def decision_confirm(decision_id: str, path: str | None, repo_alias: str | None) -> None:
-    """Confirm a proposed decision (set status to active)."""
-    repo_path = _resolve_decision_repo(path, repo_alias=repo_alias)
+@format_option()
+def decision_confirm(
+    decision_ids: tuple[str, ...],
+    reason: str,
+    scope: tuple[str, ...],
+    evidence: tuple[str, ...],
+    accepter: str,
+    preview: bool,
+    fmt: str,
+    repo_alias: str | None,
+) -> None:
+    """Accept candidates, making them decisions that govern.
+
+    Takes one id or many, and an optional repository path after them. This is
+    the acceptance event, and it is the only thing that produces one:
+    extraction, recurrence and confidence all stop at a candidate. Acceptance
+    is refused rather than stored blank when the candidate carries no reason,
+    no scope or no evidence; ``--reason``, ``--scope`` and ``--evidence``
+    supply what is missing, and correcting them here corrects the record too.
+    A refused id does not stop the others, and the run exits non-zero if any
+    were refused.
+    """
+    ids, path = _split_ids_and_path(decision_ids)
+    repo_path = _resolve_decision_repo(path, fmt, repo_alias=repo_alias)
     journal_mode = _journal_mode_enabled()
 
-    async def _update():
-        from repowise.core.persistence import (
-            create_engine,
-            create_session_factory,
-            get_session,
-            init_db,
-            update_decision_status,
+    # ``--preview`` rolls a savepoint back. The canonical journal is a file
+    # write outside that transaction, so in journal mode a preview would leave
+    # the acceptance in the JSONL and undo only its projection — the one state
+    # the whole mode exists to keep from happening.
+    if journal_mode and preview:
+        raise click.ClickException(
+            "--preview is unavailable in decision journal mode: the canonical "
+            "journal write is not covered by the rollback a preview relies on"
         )
 
-        url = get_db_url_for_repo(repo_path)
-        engine = create_engine(url)
-        await init_db(engine)
-        sf = create_session_factory(engine)
+    async def _accept(session, rec) -> None:
+        if journal_mode:
+            # The JSONL is the authority; confirming there and re-projecting is
+            # what makes the derived status true, so the acceptance row the
+            # SQLite path writes would be a second, divergent authority.
+            from repowise.core.analysis.decisions.journal_projection import (
+                confirm_journal_decision,
+            )
 
-        async with get_session(sf) as session:
-            journal_repo_id: str | None = None
-            if journal_mode:
-                from repowise.core.analysis.decisions.journal_projection import (
-                    confirm_journal_decision,
-                    refresh_decision_journal,
-                )
-                from repowise.core.persistence import upsert_repository
+            await confirm_journal_decision(session, rec.repository_id, rec.id)
+            return
 
-                repo = await upsert_repository(
-                    session, name=repo_path.name, local_path=str(repo_path)
-                )
-                journal_repo_id = repo.id
-                await refresh_decision_journal(session, repo.id, repo_root=repo_path)
-            full_id = await _resolve_decision_id(session, decision_id)
-            if full_id and journal_mode:
-                assert journal_repo_id is not None
-                rec = await confirm_journal_decision(session, journal_repo_id, full_id)
-            else:
-                rec = await update_decision_status(session, full_id, "active") if full_id else None
+        from repowise.core.analysis.decisions.accepter import resolve_accepter
+        from repowise.core.persistence.crud.authority import accept_decision
 
-        await engine.dispose()
-        return rec
+        await accept_decision(
+            session,
+            rec,
+            accepter=resolve_accepter(repo_path, override=accepter),
+            reason=reason,
+            scope=list(scope) or None,
+            evidence=list(evidence) or None,
+        )
 
-    rec = run_async(_update())
-    if rec is None:
-        console.print(f"[red]Decision not found: {decision_id}[/red]")
-    else:
-        console.print(f"[green]Decision {rec.id[:8]} confirmed (active)[/green]")
-
-
-# ---------------------------------------------------------------------------
-# decision dismiss
-# ---------------------------------------------------------------------------
+    results = run_async(
+        _review_batch(
+            repo_path, ids, action="accepted", verb="accept", preview=preview, apply_one=_accept
+        )
+    )
+    if len(ids) > 1 or preview:
+        _emit_batch(results, "accepted", "accept", preview, fmt)
+        return
+    _emit_single(results[0], ids[0], "accept", fmt, "(governing)", _ACCEPT_REMEDY)
 
 
 @decision_group.command("dismiss")
-@click.argument("decision_id")
-@click.argument("path", required=False, default=None)
+@click.argument("decision_ids", nargs=-1, required=True)
+@click.option("--yes", "-y", is_flag=True, default=False, help="Skip the confirmation prompt.")
+@click.option("--reason", default="", help="Why it was tombstoned.")
+@click.option(
+    "--preview", is_flag=True, default=False, help="Report what each id would do, and write nothing."
+)
 @repo_option()
-def decision_dismiss(decision_id: str, path: str | None, repo_alias: str | None) -> None:
-    """Dismiss a proposed decision (kept as a tombstone; never re-proposed)."""
-    repo_path = _resolve_decision_repo(path, repo_alias=repo_alias)
+@format_option()
+def decision_dismiss(
+    decision_ids: tuple[str, ...],
+    yes: bool,
+    reason: str,
+    preview: bool,
+    fmt: str,
+    repo_alias: str | None,
+) -> None:
+    """Dismiss proposed decisions (kept as tombstones; never re-proposed).
+
+    Takes one id or many, and an optional repository path after them.
+    """
+    ids, path = _split_ids_and_path(decision_ids)
+    repo_path = _resolve_decision_repo(path, fmt, repo_alias=repo_alias)
 
     if _journal_mode_enabled():
         raise click.ClickException(
@@ -711,39 +1053,35 @@ def decision_dismiss(decision_id: str, path: str | None, repo_alias: str | None)
             "format has no dismissed status"
         )
 
-    if not click.confirm(f"Dismiss decision {decision_id[:8]}?"):
+    # A machine-readable invocation is non-interactive by construction: the
+    # prompt read EOF and aborted every scripted dismissal.
+    subject = ids[0][:8] if len(ids) == 1 else f"{len(ids)} decisions"
+    if not yes and not preview and fmt != "json" and not click.confirm(f"Dismiss {subject}?"):
         console.print("[yellow]Cancelled.[/yellow]")
         return
 
-    async def _dismiss():
-        from repowise.core.persistence import (
-            create_engine,
-            create_session_factory,
-            get_session,
-            init_db,
-            update_decision_status,
+    async def _dismiss(session, rec) -> None:
+        from repowise.core.analysis.decisions.accepter import resolve_accepter
+        from repowise.core.persistence.crud.authority import dismiss_candidate
+
+        await dismiss_candidate(session, rec, reason=reason, accepter=resolve_accepter(repo_path))
+
+    results = run_async(
+        _review_batch(
+            repo_path, ids, action="dismissed", verb="dismiss", preview=preview, apply_one=_dismiss
         )
-
-        url = get_db_url_for_repo(repo_path)
-        engine = create_engine(url)
-        await init_db(engine)
-        sf = create_session_factory(engine)
-
-        async with get_session(sf) as session:
-            full_id = await _resolve_decision_id(session, decision_id)
-            rec = await update_decision_status(session, full_id, "dismissed") if full_id else None
-
-        await engine.dispose()
-        return rec
-
-    rec = run_async(_dismiss())
-    if rec is not None:
-        console.print(
-            f"[green]Decision {rec.id[:8]} dismissed[/green] "
-            "[dim](kept as a tombstone; reindexing will not re-propose it)[/dim]"
-        )
-    else:
-        console.print(f"[red]Decision not found: {decision_id}[/red]")
+    )
+    if len(ids) > 1 or preview:
+        _emit_batch(results, "dismissed", "dismiss", preview, fmt)
+        return
+    _emit_single(
+        results[0],
+        ids[0],
+        "dismiss",
+        fmt,
+        "[dim](kept as a tombstone; reindexing will not re-propose it)[/dim]",
+        "",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -756,11 +1094,21 @@ def decision_dismiss(decision_id: str, path: str | None, repo_alias: str | None)
 @click.argument("path", required=False, default=None)
 @click.option("--superseded-by", default=None, help="ID of the decision that replaces this one.")
 @repo_option()
+@format_option()
 def decision_deprecate(
-    decision_id: str, path: str | None, superseded_by: str | None, repo_alias: str | None
+    decision_id: str,
+    path: str | None,
+    superseded_by: str | None,
+    fmt: str,
+    repo_alias: str | None,
 ) -> None:
-    """Deprecate an active decision."""
-    repo_path = _resolve_decision_repo(path, repo_alias=repo_alias)
+    """Retire a decision, optionally naming the one that replaces it.
+
+    With ``--superseded-by`` this writes an explicit lineage edge and keeps the
+    retired id resolving to its successor. Similarity never does either: an edge
+    exists because somebody named the successor.
+    """
+    repo_path = _resolve_decision_repo(path, fmt, repo_alias=repo_alias)
 
     if _journal_mode_enabled():
         raise click.ClickException(
@@ -769,6 +1117,7 @@ def decision_deprecate(
         )
 
     async def _update():
+        from repowise.core.analysis.decisions.accepter import resolve_accepter
         from repowise.core.persistence import (
             create_engine,
             create_session_factory,
@@ -776,30 +1125,57 @@ def decision_deprecate(
             init_db,
             update_decision_status,
         )
+        from repowise.core.persistence.crud.authority import (
+            AcceptanceRefusedError,
+            is_accepted,
+            supersede_decision,
+        )
+        from repowise.core.persistence.models import DecisionRecord
 
         url = get_db_url_for_repo(repo_path)
         engine = create_engine(url)
         await init_db(engine)
         sf = create_session_factory(engine)
 
-        async with get_session(sf) as session:
-            full_id = await _resolve_decision_id(session, decision_id)
-            rec = (
-                await update_decision_status(
-                    session, full_id, "deprecated", superseded_by=superseded_by
+        try:
+            async with get_session(sf) as session:
+                full_id = await _resolve_decision_id(session, decision_id)
+                rec = await session.get(DecisionRecord, full_id) if full_id else None
+                if rec is None:
+                    return None
+                successor = (
+                    await _resolve_decision_id(session, superseded_by)
+                    if superseded_by
+                    else None
                 )
-                if full_id
-                else None
-            )
+                if superseded_by and successor is None:
+                    emit_refusal(
+                        "decision_not_found",
+                        f"Unknown successor: {superseded_by}",
+                        fmt,
+                        decision_id=superseded_by,
+                    )
+                if successor and await is_accepted(session, rec.id):
+                    try:
+                        await supersede_decision(
+                            session,
+                            rec,
+                            successor_id=successor,
+                            accepter=resolve_accepter(repo_path),
+                        )
+                    except (AcceptanceRefusedError, ValueError) as exc:
+                        emit_refusal("supersede_refused", str(exc), fmt, decision_id=rec.id)
+                else:
+                    # A candidate has no authority to retire, so this stays the
+                    # plain status change it always was.
+                    await update_decision_status(
+                        session, rec.id, "deprecated", superseded_by=successor
+                    )
+                return rec
+        finally:
+            await engine.dispose()
 
-        await engine.dispose()
-        return rec
-
-    rec = run_async(_update())
-    if rec is None:
-        console.print(f"[red]Decision not found: {decision_id}[/red]")
-    else:
-        console.print(f"[yellow]Decision {rec.id[:8]} deprecated.[/yellow]")
+    _emit_lifecycle(run_async(_update()), decision_id, "deprecated", fmt)
 
 
 # ---------------------------------------------------------------------------

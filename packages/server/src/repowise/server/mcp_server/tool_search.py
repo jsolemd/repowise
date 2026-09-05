@@ -30,7 +30,11 @@ from repowise.server.mcp_server._answer_pipeline import (
     degraded_legs,
     retrieval_legs,
 )
-from repowise.server.mcp_server._budget import OmissionCollector, fit_to_budget
+from repowise.server.mcp_server._budget import (
+    OmissionCollector,
+    register_post_enforce,
+    register_post_shed,
+)
 from repowise.server.mcp_server._helpers import (
     _VECTOR_TIMEOUT_ENV,
     _get_exclude_spec,
@@ -1116,22 +1120,27 @@ async def _federated_search(
     # Last, so nothing above has to know the fields are on their way out.
     _strip_ranking_internals(output)
     _drop_derivable_page_ids(output)
-    return _fit_search_response(response, contexts[0].path if contexts else None)
+    return response
 
 
-# A search response is one ranked list, so past the derived ``candidates`` there
-# is nothing to shed but the weakest hits.
-_SHED_ORDER: tuple[str, ...] = ("candidates", "results[]")
+def _refresh_served_targets(response: dict, _collector: OmissionCollector | None) -> None:
+    """Re-derive target-scoped freshness from the hits that survived shedding.
 
-
-def _fit_search_response(response: dict, repo_root: Any) -> dict:
-    """Bring a search response under the transport ceiling, recoverably."""
-    collector = OmissionCollector("search_codebase", repo_root=repo_root)
-    fit_to_budget(response, _SHED_ORDER, collector)
+    ``_meta.targets`` claims which files the response served. Shedding decides
+    that, so this has to run after it or the claim names rows the caller never
+    received.
+    """
     if response.get("truncated") and isinstance(response.get("_meta"), dict):
         response["_meta"]["targets"] = _result_paths(response.get("results") or [])
-    collector.attach(response)
-    return response
+
+
+def _refresh_served_targets_final(response: dict) -> None:
+    """Same claim, re-derived after the final size guard may have cut again."""
+    _refresh_served_targets(response, None)
+
+
+register_post_shed("search_codebase", _refresh_served_targets)
+register_post_enforce("search_codebase", _refresh_served_targets_final)
 
 
 def _result_paths(results: list[dict]) -> list[str]:
@@ -1356,7 +1365,7 @@ async def _structured_search(
     # Last, so nothing above has to know the fields are on their way out.
     _strip_ranking_internals(results)
     _drop_derivable_page_ids(results)
-    return _fit_search_response(response, contexts[0].path if contexts else None)
+    return response
 
 
 @mcp.tool(
@@ -1574,4 +1583,4 @@ async def search_codebase(
     # Last, so nothing above has to know the fields are on their way out.
     _strip_ranking_internals(output)
     _drop_derivable_page_ids(output)
-    return _fit_search_response(response, ctx.path)
+    return response

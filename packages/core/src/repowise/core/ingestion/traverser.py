@@ -1279,7 +1279,13 @@ def _scan_package_dir(
         pass
     language: LanguageTag = "unknown"
     if counts:
-        language = max(counts, key=lambda k: counts[k])  # type: ignore[assignment]
+        # Tie-break by name, not by insertion order. counts is populated in
+        # walk order and walk_repo does not sort dirnames, so a bare
+        # max handed an exact tie returned whichever language the filesystem
+        # happened to yield first — a different answer on different machines,
+        # and on the same machine after an unrelated file was added. Highest
+        # count wins; equal counts resolve to the alphabetically first name.
+        language = min(counts, key=lambda k: (-counts[k], k))  # type: ignore[assignment]
     return language, sorted(entry_points)
 
 

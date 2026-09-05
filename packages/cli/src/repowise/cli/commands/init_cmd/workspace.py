@@ -101,6 +101,7 @@ def _run_workspace_generation(
     skip_tests: bool,
     skip_infra: bool,
     test_run: bool,
+    timings: Any | None = None,
     reasoning: str = "auto",
     onboarding: bool = True,
     wiki_style: str = DEFAULT_STYLE,
@@ -173,6 +174,7 @@ def _run_workspace_generation(
         resume=resume,
         verbose=False,
         test_run=test_run,
+        timings=timings,
     )
 
 
@@ -187,6 +189,7 @@ def _run_workspace_deterministic_generation(
     onboarding: bool,
     wiki_style: str,
     language: str,
+    timings: Any | None = None,
 ) -> tuple[list[Any], str]:
     """Render one workspace repo's wiki from templates (no model, no cost).
 
@@ -238,6 +241,7 @@ def _run_workspace_deterministic_generation(
         embedder_name_resolved=embedder,
         resume=resume,
         verbose=False,
+        timings=timings,
     )
     return generated_pages, embedder
 
@@ -351,8 +355,7 @@ def _ingest_and_generate_repo(repo: Any, idx: int, total: int, ctx: _WorkspaceCt
                     derive_environment_facts=True,
                 )
             )
-        repo_phase_timings: dict[str, float] = callback.timings
-        console.print(
+            console.print(
             f"    [{OK}]✓[/] {result.file_count:,} files, {result.symbol_count:,} symbols"
         )
     except Exception as exc:
@@ -380,6 +383,7 @@ def _ingest_and_generate_repo(repo: Any, idx: int, total: int, ctx: _WorkspaceCt
             result=result,
             embedder_name_resolved=ctx.embedder_name_resolved,
             embedder_was_requested=ctx.embedder_was_requested,
+            timings=callback.table,
             concurrency=ctx.concurrency,
             resume=ctx.resume,
             onboarding=ctx.onboarding,
@@ -412,6 +416,7 @@ def _ingest_and_generate_repo(repo: Any, idx: int, total: int, ctx: _WorkspaceCt
                 result=result,
                 provider=repo_provider,
                 embedder_name_resolved=ctx.embedder_name_resolved,
+                timings=callback.table,
                 concurrency=ctx.concurrency,
                 yes=ctx.yes,
                 resume=ctx.resume,
@@ -469,7 +474,7 @@ def _ingest_and_generate_repo(repo: Any, idx: int, total: int, ctx: _WorkspaceCt
         )
 
     # Persist to repo-local DB
-    run_async(persist_result(result, repo.path))
+    run_async(persist_result(result, repo.path, timings=callback.table))
 
     # Write state.json so `repowise update` knows the base commit
     head = get_head_commit(repo.path)
@@ -485,6 +490,9 @@ def _ingest_and_generate_repo(repo: Any, idx: int, total: int, ctx: _WorkspaceCt
     if docs_mode == "llm" and provider is not None:
         state["provider"] = provider.provider_name
         state["model"] = provider.model_name
+    # Read after generation and persistence, not straight off the pipeline:
+    # both write into the same table.
+    repo_phase_timings: dict[str, float] = callback.timings
     if repo_phase_timings:
         state["phase_timings"] = repo_phase_timings
     kg = getattr(result, "knowledge_graph_result", None)

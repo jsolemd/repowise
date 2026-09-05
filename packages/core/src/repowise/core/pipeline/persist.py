@@ -239,7 +239,7 @@ async def tombstone_absent_file_pages(
     return marked
 
 
-async def mark_stale_pages(session: Any, repo_id: str, paths: list[str]) -> int:
+async def mark_stale_pages(session: Any, repo_id: str, paths: Iterable[str]) -> int:
     """Decay weakly-affected file pages to ``freshness_status='stale'``.
 
     ``ChangeDetector.get_affected_pages`` returns ``decay_only`` — pages hit
@@ -251,28 +251,21 @@ async def mark_stale_pages(session: Any, repo_id: str, paths: list[str]) -> int:
     already-stale pages keep their stronger status, and pages regenerated in
     this run are never in ``decay_only`` by construction.
 
+    Maps each path to its ``file_page:<path>`` id and hands off to
+    :func:`mark_page_ids_stale`, so both entry points share one UPDATE.
+
+    The two were separate copies of the same statement, and only the sibling
+    was chunked against ``SQLITE_MAX_VARIABLE_NUMBER``. That is not a crash
+    anyone is hitting today: SQLite has defaulted to 32766 bind variables since
+    3.32, and a ``decay_only`` set that large would take an enormous cascade.
+    It is reachable on the 999-variable builds older interpreters still ship,
+    but the reason to collapse the two is narrower than that. They answered the
+    same question differently, in the file with the most bug fixes in this repo,
+    and now there is one place to answer it.
+
     Returns the number of pages marked.
     """
-    if not paths:
-        return 0
-    from sqlalchemy import update
-
-    from repowise.core.persistence.models import Page
-
-    page_ids = [f"file_page:{path}" for path in paths]
-    res = await session.execute(
-        update(Page)
-        .where(
-            Page.repository_id == repo_id,
-            Page.id.in_(page_ids),
-            Page.freshness_status == "fresh",
-        )
-        .values(freshness_status="stale")
-    )
-    marked = int(res.rowcount or 0)
-    if marked:
-        logger.info("pages_decayed_stale", repo_id=repo_id, count=marked)
-    return marked
+    return await mark_page_ids_stale(session, repo_id, (f"file_page:{path}" for path in paths))
 
 
 async def mark_page_ids_stale(session: Any, repo_id: str, page_ids: Iterable[str]) -> int:
@@ -339,6 +332,23 @@ def _derive_entry_point_scores(graph_builder: Any) -> dict[str, float]:
     }
 
 
+def _betweenness_commits(graph_builder: Any) -> dict[str, str | None]:
+    """Per kind, the commit its betweenness was last exactly computed at.
+
+    ``None`` means the builder cannot say, which is not "never scored" and must
+    not be written as one: a builder rehydrated from SQL serves real values it
+    did not compute, and stamping those NULL would report an entire indexed
+    repository as unscored.
+    """
+    scoring = getattr(graph_builder, "betweenness_scoring", None)
+    if scoring is None:
+        return {"file": None, "symbol": None}
+    try:
+        return {k: getattr(scoring(k), "scored_commit", None) for k in ("file", "symbol")}
+    except Exception:  # pragma: no cover - a builder without the accessor
+        return {"file": None, "symbol": None}
+
+
 async def persist_graph_nodes(
     session: Any,
     repo_id: str,
@@ -373,6 +383,8 @@ async def persist_graph_nodes(
     if ep_scores is None:
         ep_scores = _derive_entry_point_scores(graph_builder)
 
+    bt_commits = _betweenness_commits(graph_builder)
+
     nodes = []
     for node_id in graph.nodes:
         data = graph.nodes[node_id]
@@ -393,6 +405,17 @@ async def persist_graph_nodes(
             "betweenness": bc.get(node_id, sym_bc.get(node_id, 0.0)),
             "community_id": cd.get(node_id, 0),
         }
+
+        # Scored → its commit; in no scoring → NULL, the unscored marker;
+        # provenance unknown → key omitted, so the stored stamp survives.
+        if node_id in bc:
+            kind, scored = "file", True
+        elif node_id in sym_bc:
+            kind, scored = "symbol", True
+        else:
+            kind, scored = ("file" if node_type == "file" else "symbol"), False
+        if bt_commits[kind] is not None:
+            node_dict["betweenness_commit"] = bt_commits[kind] if scored else None
 
         community_meta: dict[str, Any] = {}
         if node_type == "file":
@@ -1998,6 +2021,32 @@ async def persist_analysis(result: Any, session: Any, repo_id: str) -> None:
         await reconcile_source_ranks(session)
     except Exception as _rank_err:
         logger.debug("decision_rank_reconcile_skipped", error=str(_rank_err))
+
+    # Move legacy records onto ids derived from their own identity, before
+    # anything else reads or writes one. A random id is re-minted whenever a
+    # store is rebuilt rather than updated, which strands every reference held
+    # outside the row. Idempotent, and it never deletes a record.
+    try:
+        from repowise.core.persistence.decision_id_migration import apply_id_migration
+
+        await apply_id_migration(
+            session, repo_id, vector_store=getattr(result, "vector_store", None)
+        )
+    except Exception as _id_err:
+        logger.debug("decision_id_migration_skipped", error=str(_id_err))
+
+    # Classify legacy rows against the entity split. A record promoted by
+    # recurrence rather than by a person becomes a candidate, which visibly
+    # shrinks what governs; leaving it to an explicit command would instead
+    # leave the status column and the acceptance log permanently disagreeing,
+    # with half the surfaces reading each. Idempotent, and it never reopens a
+    # review action somebody already performed.
+    try:
+        from repowise.core.persistence.decision_migration import apply_migration
+
+        await apply_migration(session, repo_id)
+    except Exception as _migrate_err:
+        logger.debug("decision_entity_migration_skipped", error=str(_migrate_err))
 
     if decision_dicts:
         # Reuse the run's shared vector store for semantic (paraphrase) dedup

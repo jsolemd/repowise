@@ -145,6 +145,12 @@ Truncated skeleton blocks are replaced in place by a `[repowise#<ref>: ...]`
 marker; everything else is captured into one combined document per response.
 A response that would still oversize sheds whole blocks, in an order each tool
 declares cheapest-loss-first, and reports `truncated: true` alongside the refs.
+
+Every tool is budgeted. Most declare their own shed order; the rest meet a
+final size guard that trims the largest blocks and records what it took. Either
+way no response is returned unbounded and unflagged, and
+`_meta.response_budget` reports the ceiling that applied and the size delivered
+under it.
 Resolve refs with `repowise expand <ref>` from a shell, or
 `get_symbol("repowise#<ref>")` from any MCP client. See
 [DISTILL.md](DISTILL.md) for the full reversibility model.
@@ -175,6 +181,8 @@ promotion happens in the served MCP wrapper and nowhere else.
 | `semantic_search` | Only when `false`, meaning these results are full-text only — either the index is keyless, or the semantic leg did not run for this request |
 | `retrieval_degraded` | Only when a retrieval leg fell over on **this** request (`["vector"]`). The results are still served, and a miss in them is not evidence of absence. Nothing to restart: the leg is retried per request, and the key disappears on the next whole one |
 | `retrieval_degraded_reason` | Alongside `retrieval_degraded`: what failed, and the cause it reported |
+| `response_budget` | Always: `limit_chars` (the ceiling that applied), `tier` (`default` or `expanded`, chosen by whether the call passed an expansion argument), `serialized_chars` (the size delivered) |
+| `state` | Only when something fired: `degraded` plus `degraded_reasons` mapping each contributing key to its reason (a synthesis reason string, the retrieval legs that broke), `partial`, `truncated`. A coarse roll-up of the response's own flags |
 
 Silence on `stale_warning` means the index is current; don't infer staleness from its absence. `list_repos`, `get_architecture`, `get_blast_radius`, and `get_conformance` don't carry a freshness envelope at all.
 
@@ -265,6 +273,12 @@ One-call RAG: retrieves over the wiki, gates synthesis on confidence, and return
 | `repo` | string | No | *(workspace only)* Target repo alias |
 
 **Returns:** A synthesized answer with file/symbol citations and a confidence label (`high`, `medium`, `low`). High-confidence answers can be cited directly. Low-confidence answers return ranked wiki candidates instead, with the page excerpt served on the highest-scoring few; the rest carry path, title and summary, and one follow-up call opens any of them.
+
+When synthesis cannot run at all — no provider resolvable, or the call failed —
+the response carries a top-level `degraded` naming the reason, and is built from
+retrieval and mined rationale with no LLM involved. `confidence` is `low` there
+for a different reason than usual, so read `degraded` first. It also raises
+`_meta.state.degraded`.
 
 Two path-bearing blocks, with different jobs:
 
@@ -780,13 +794,21 @@ Architectural decision intelligence. Falls back to git archaeology when no decis
 **Modes:**
 
 1. **NL search**: pass a question, optionally anchored to `targets`: `get_why(query="why JWT over sessions?")` -> searches decision records.
-2. **Path-based**: pass a file path as `query`: `get_why(query="src/auth/service.ts")` -> returns decisions governing that file plus its origin story.
+2. **Path-based**: pass a file path as `query`: `get_why(query="src/auth/service.ts")` -> returns three lanes, `decisions` (accepted, governing), `candidates` (nobody accepted them) and `history` (accepted and since replaced), plus the file's origin story.
 3. **Health dashboard**: no `query`: `get_why()` -> stale decisions, conflicts, ungoverned hotspots.
 4. **Reference lookup**: pass `id`: `get_why(id="ev_...")` -> the exact evidence and supporting decision in one call.
 
 **Returns:** Matching decision records with title, rationale, alternatives considered, affected files, staleness score. Health mode returns stale decisions, conflicts, and ungoverned hotspots.
 
 `answer_basis` names the strongest lane the response rests on: `decision`, `episode`, `rationale`, `archaeology`, or `documentation`. Only `decision` is a ruling; the rest are evidence to weigh. Absent when no lane was served, and on the health dashboard.
+
+**The lane a record is in decides whether it binds you, and path mode puts it in one.** `decisions` holds accepted records: somebody accepted each in a recorded event naming the reason, the scope, the evidence and the accepter, so treat them as constraints. `candidates` holds records something inferred and nobody has agreed to; read them as hints and never as rules, and note the `candidates_note` beside them says so too. Nothing produces an acceptance except an explicit `repowise decision confirm` or a committed ADR that says it is accepted, so a candidate that has recurred across fifty sessions is still a candidate.
+
+Do not read the lane off `status`. That column is a projection kept in step for readers that predate the split, and a record can carry `status: "active"` with no acceptance behind it at all. An accepted record instead carries a `currency`: `active` (still describes its code), `needs_review` (its files have moved, and it still binds), `uncheckable` (it names nothing, so nothing can check it), `superseded` or `dismissed`. A candidate carries `review_state: "open"` and no `currency`.
+
+Path mode's `alignment` counts the lanes separately and they sum to `governing_count`, which is every record naming the file: `active_count` is what governs it, `deprecated_count` what was accepted and withdrawn, `uncheckable_count` what was accepted but names nothing, `candidate_count` what is merely awaiting review. `score` is derived from `active_count` alone, so a file with `active_count: 0` is ungoverned however many candidates name it.
+
+The `candidates` and `history` lanes are capped at three rows each and shed first under response-budget pressure, so an absent lane means the budget was tight, not that it was empty. `get_overview`, `get_risk` directives and `get_answer` serve accepted records only; a candidate reaches none of them as an instruction.
 
 **When to use:** Before architectural changes, understand existing intent and constraints. After changes, record new decisions.
 
@@ -920,7 +942,10 @@ does not have an error report.
 `_meta.health_analysis` explicitly labels the result as stored analysis,
 states that the call did not recompute it, distinguishes index/live-Git facts
 from source-byte verification, and gives the exact commit-then-update refresh
-precondition. `_meta.health_analyzed_at` dates the health pass, which is separate from
+precondition. Its `status` is `available`, `provenance_unknown` (metrics exist
+but no row recorded the commit they were computed against, with `reason:
+"analysis_commit_not_recorded"`), or `unavailable` (no stored analysis at all).
+`provenance_unknown` is a gap in attribution, not a failed analysis. `_meta.health_analyzed_at` dates the health pass, which is separate from
 indexing and can lag it, and `_meta.health_analyzed_commit` says which commit
 those scores were computed against. The incremental update path rescores only
 the files that changed, so the metrics table can hold rows from several passes
@@ -933,10 +958,11 @@ five ranked lists compose: `include=['refactoring']` on a mid-size repo lands
 near the host's tool-result cap, past which the host rejects the whole result
 and you get nothing. Pair `include` with `only` —
 `get_health(include=['refactoring'], only=['refactoring_plans'])` is the call
-`directive.plan_via` names. Anything that would still overflow is trimmed
-longest-ranked-list-first and reported in `_meta.truncated_to_fit`
-(`{block: rows_dropped}`), never silently; the `*_total` siblings still describe
-what was there, and re-requesting one block with `only` recovers it.
+`directive.plan_via` names. Anything that would still overflow is shed in the order this tool declares,
+never silently: the response carries `truncated: true`, the `*_total` /
+`*_emitted` / `*_reduced_reason` siblings describe what was there, and
+`_meta.omitted` names refs that restore the dropped rows. Re-requesting one
+block with `only` also recovers it.
 
 **Test material is bucketed, not hidden.** Every metric row carries `is_test`
 (distinct from `has_test_file`: "is this file a test" vs "is this file tested").
