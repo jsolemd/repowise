@@ -251,7 +251,25 @@ _CONTRACTS: dict[str, ResponseBudgetContract] = {
         "blocks",
         ("candidates", "results[]"),
         expansion_argument=None,
-        protected=("results", "mode", "exact_match"),
+        # The fork's source lane returns its own response shape, and #2051 is
+        # the first release in which the shared budget runs over it. The scalar
+        # keys below are the answer: an owner claim with nothing to say who was
+        # chosen, how sure the engine is, or what it read is worse than a
+        # shorter list of rows, and the emergency guard removes whole
+        # unprotected top-level keys before it trims a protected list.
+        protected=(
+            "results",
+            "mode",
+            "exact_match",
+            "confidence",
+            "selected_owner",
+            "competing_owners",
+            "note",
+            "query_plan",
+            "status",
+            "error",
+            "trust",
+        ),
     ),
     "get_dead_code": ResponseBudgetContract(
         "blocks",

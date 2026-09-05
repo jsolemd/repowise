@@ -432,30 +432,12 @@ async def test_usage_repo_resolution_never_falls_back_from_an_invalid_alias(
     )
 
 
-#: Tools this fork registers that upstream does not, and that carry no tuned
-#: response-budget contract. They are still bounded — an undeclared name lands
-#: on the budgeter's floor, which
-#: :func:`test_an_undeclared_tool_is_still_bounded_and_says_so` pins — but they
-#: shed by that floor rather than by an owner-written order. Listed by name so a
-#: *new* uncontracted tool still fails the check below instead of joining a
-#: silently growing gap. Tracked for the lead as a follow-up, not an absorption
-#: change: writing twelve shed orders is design work, not merge work.
-_FORK_TOOLS_WITHOUT_A_TUNED_CONTRACT = frozenset(
-    {
-        "build_task_slice",
-        "extend_task_slice",
-        "find_clones",
-        "find_patterns",
-        "get_dependents",
-        "get_index_status",
-        "get_query_quality",
-        "get_reference_sites",
-        "get_task_slice",
-        "manage_decision",
-        "preview_symbol_rename",
-        "reindex_repository",
-    }
-)
+#: The one registered tool with no tuned response-budget contract, and it is
+#: not served: ``reindex_repository`` is a mutation whose reply is three scalars.
+#: Every other fork tool declares one in ``_budget/_fork_contracts.py``. Named
+#: rather than subtracted, so a *second* uncontracted tool fails this check
+#: instead of joining a silently growing gap.
+_FORK_TOOLS_WITHOUT_A_TUNED_CONTRACT = frozenset({"reindex_repository"})
 
 
 def test_every_registered_tool_declares_a_contract() -> None:
@@ -598,6 +580,174 @@ def _resolve_shed_path(shape: dict[str, Any], key: str) -> str | None:
     if tail and not isinstance(node[name], (list, dict)):
         return f"{leaf} is not a collection, so a tail trim cannot apply"
     return None
+
+
+def test_an_oversized_source_lane_answer_keeps_its_owner_claim() -> None:
+    """#2051 runs the shared budget over the fork's source lane for the first time.
+
+    The source coordinator returns its own shape, and until this release that
+    shape never met ``enforce_response_budget``. With only
+    ``results``/``mode``/``exact_match`` protected, the emergency guard removes
+    whole unprotected top-level keys before it trims a protected list — so an
+    oversized answer would have shed exactly the keys that make it an answer:
+    who was chosen, how sure the engine is, what it read, and what it could not.
+    """
+    payload = {
+        "mode": "hybrid",
+        "exact_match": False,
+        "confidence": "confident",
+        "status": "ok",
+        "note": "one owner, two near-ties",
+        "selected_owner": {"file": "src/pack.py", "reason": "exact_name"},
+        "competing_owners": [{"file": "src/other.py", "margin": 0.02}],
+        "query_plan": {"strategy": "automatic_focus", "retrieval_query": "pack budget"},
+        "trust": {"index_behind": False, "source_search": {"status": "ok"}},
+        "results": [
+            {
+                "target_path": f"src/mod_{index}.py",
+                "snippet": "S" * 900,
+                "evidence": {"dense_cosine": 0.5, "lane": "source"},
+            }
+            for index in range(32)
+        ],
+        "_meta": {"contract_version": 1},
+    }
+    assert len(json.dumps(payload, default=str)) > 30_000
+
+    result = _enforce("search_codebase", payload)
+
+    assert len(json.dumps(result, separators=(",", ":"), default=str)) <= (
+        result["_meta"]["response_budget"]["limit_chars"]
+    )
+    assert result["truncated"] is True
+    assert len(result["results"]) < 32
+    for key in (
+        "mode",
+        "exact_match",
+        "confidence",
+        "status",
+        "note",
+        "selected_owner",
+        "competing_owners",
+        "query_plan",
+        "trust",
+    ):
+        assert key in result, key
+    assert result["selected_owner"] == {"file": "src/pack.py", "reason": "exact_name"}
+    assert result["confidence"] == "confident"
+
+
+#: One oversized response per fork tool: the lists that must shrink, and the
+#: keys that must survive because a reader cannot act on what is left without
+#: them. Kept beside the contracts rather than inside them so a contract that
+#: quietly loses a protected key fails here.
+_FORK_TOOL_CASES = [
+    (
+        "build_task_slice",
+        {"members": 40, "history": 12, "externals": 30, "edges": 40},
+        ("status", "slice_id", "task", "view", "summary", "seeds", "ranking", "budget"),
+    ),
+    (
+        "get_task_slice",
+        {"members": 40, "history": 12},
+        ("status", "slice_id", "task", "view", "summary", "seeds"),
+    ),
+    (
+        "extend_task_slice",
+        {"members": 40, "externals": 30},
+        ("status", "slice_id", "task", "seeds", "summary"),
+    ),
+    (
+        "find_clones",
+        {"findings": 40, "degradations": 10},
+        ("status", "summary", "scope", "near_clones", "definition"),
+    ),
+    (
+        "find_patterns",
+        {"matches": 40, "available_patterns": 12},
+        ("pattern", "definition", "summary"),
+    ),
+    (
+        "get_dependents",
+        {"dependents": 60},
+        (
+            "status",
+            "target",
+            "total",
+            "returned",
+            "has_more",
+            "counts_by_depth",
+            "matched_by",
+            "explanation",
+        ),
+    ),
+    (
+        "get_reference_sites",
+        {"sites": 60, "candidates": 12, "counts_by_kind": 10, "counts_by_language": 10},
+        ("status", "symbol_id", "total", "returned", "has_more", "coverage", "working_tree"),
+    ),
+    (
+        "preview_symbol_rename",
+        {"sites": 60, "candidates": 12},
+        (
+            "status",
+            "old_name",
+            "new_name",
+            "total",
+            "summary",
+            "mechanically_safe",
+            "needs_review",
+            "caveats",
+        ),
+    ),
+    (
+        "get_query_quality",
+        {"cases": 60},
+        ("status", "mode", "repo", "report", "case_count"),
+    ),
+    (
+        "manage_decision",
+        {"decisions": 50, "chain": 20},
+        (
+            "action",
+            "repo",
+            "total",
+            "returned",
+            "journal",
+            "journal_exists",
+            "journal_available",
+        ),
+    ),
+]
+
+
+@pytest.mark.parametrize("tool,lists,protected", _FORK_TOOL_CASES, ids=lambda v: v if isinstance(v, str) else "")
+def test_a_fork_tool_sheds_its_lists_and_keeps_its_answer(
+    tool: str, lists: dict[str, int], protected: tuple[str, ...]
+) -> None:
+    from repowise.server.mcp_server._budget.contracts import _CONTRACTS
+
+    contract = _CONTRACTS[tool]
+    payload: dict[str, Any] = {"_meta": {"contract_version": 1}}
+    for key in protected:
+        payload[key] = {"kept": key}
+    for key, count in lists.items():
+        payload[key] = [{"i": index, "blob": "X" * 700} for index in range(count)]
+    assert len(json.dumps(payload, default=str)) > 30_000
+
+    result = _enforce(tool, payload)
+
+    assert len(json.dumps(result, separators=(",", ":"), default=str)) <= (
+        result["_meta"]["response_budget"]["limit_chars"]
+    )
+    for key in protected:
+        assert key in result, f"{tool} shed protected key {key}"
+        assert result[key] == {"kept": key}, f"{tool} mangled protected key {key}"
+    shrunk = [k for k, n in lists.items() if len(result.get(k) or []) < n]
+    assert shrunk, f"{tool} fitted without shedding any of {sorted(lists)}"
+    # Only declared lists may shrink: anything else was collateral.
+    declared = {k[:-2] if k.endswith("[]") else k for k in contract.shed_order}
+    assert set(shrunk) <= declared, f"{tool} shed undeclared {set(shrunk) - declared}"
 
 
 def test_every_shed_path_names_a_real_block() -> None:

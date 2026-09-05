@@ -24,6 +24,13 @@ tools needing a step of their own once shedding has settled register it through
 
 from __future__ import annotations
 
+# Imported for its import-time side effect: the fork's eleven served tools
+# insert their contracts into ``_CONTRACTS``. Order-independent — this module
+# imports ``contracts`` itself, so upstream's table is fully built before a
+# single ``setdefault`` runs against it, and an upstream contract of the same
+# name always wins. One line, on purpose: it is the whole conflict surface this
+# arrangement costs the next absorption.
+from repowise.server.mcp_server._budget import _fork_contracts  # noqa: F401
 from repowise.server.mcp_server._budget.budgeter import (
     CHAR_BUDGET,
     CHARS_PER_TOKEN,

@@ -1,4 +1,195 @@
 {
+  "build_task_slice": {
+    "_meta": {
+      "contract_version": null,
+      "embedder_degraded": null,
+      "index_age_days": null,
+      "indexed_commit": null
+    },
+    "budget": {
+      "dropped": null,
+      "spent": null,
+      "tokens": null
+    },
+    "edges": [
+      {
+        "confidence": null,
+        "edge_type": null,
+        "source": null,
+        "target": null
+      }
+    ],
+    "externals": [
+      null
+    ],
+    "history": [
+      {
+        "at": null,
+        "event": null
+      }
+    ],
+    "members": [
+      {
+        "file": null,
+        "source": null,
+        "symbol_id": null,
+        "view": null
+      }
+    ],
+    "next": null,
+    "ranking": {
+      "policy": null
+    },
+    "seeds": [
+      null
+    ],
+    "slice_id": null,
+    "status": null,
+    "summary": {
+      "files": null,
+      "members": null,
+      "tokens": null
+    },
+    "task": null,
+    "view": null
+  },
+  "extend_task_slice": {
+    "_meta": {
+      "contract_version": null,
+      "embedder_degraded": null,
+      "index_age_days": null,
+      "indexed_commit": null
+    },
+    "budget": {
+      "dropped": null,
+      "spent": null,
+      "tokens": null
+    },
+    "edges": [
+      {
+        "confidence": null,
+        "edge_type": null,
+        "source": null,
+        "target": null
+      }
+    ],
+    "extension": {
+      "added": null
+    },
+    "externals": [
+      null
+    ],
+    "history": [
+      {
+        "at": null,
+        "event": null
+      }
+    ],
+    "members": [
+      {
+        "file": null,
+        "source": null,
+        "symbol_id": null,
+        "view": null
+      }
+    ],
+    "next": null,
+    "ranking": {
+      "policy": null
+    },
+    "seeds": [
+      null
+    ],
+    "slice_id": null,
+    "status": null,
+    "summary": {
+      "files": null,
+      "members": null,
+      "tokens": null
+    },
+    "task": null,
+    "view": null
+  },
+  "find_clones": {
+    "_meta": {
+      "contract_version": null,
+      "embedder_degraded": null,
+      "index_age_days": null,
+      "indexed_commit": null
+    },
+    "definition": {
+      "exact": null
+    },
+    "degradations": [
+      {
+        "code": null,
+        "detail": null,
+        "impact": null,
+        "scope": null
+      }
+    ],
+    "findings": [
+      {
+        "id": null,
+        "intra_file": null,
+        "kind": null,
+        "lines": null,
+        "similarity": null,
+        "sites": [
+          {
+            "end_line": null,
+            "file": null,
+            "lines": null,
+            "start_line": null
+          }
+        ]
+      }
+    ],
+    "near_clones": {
+      "enabled": null,
+      "threshold": null
+    },
+    "scope": {
+      "files": null
+    },
+    "status": null,
+    "summary": {
+      "duplicated_lines": null,
+      "exact": null,
+      "near": null,
+      "returned": null,
+      "scanned_files": null,
+      "total_findings": null,
+      "truncated": null
+    }
+  },
+  "find_patterns": {
+    "_meta": {
+      "contract_version": null,
+      "embedder_degraded": null,
+      "index_age_days": null,
+      "indexed_commit": null
+    },
+    "available_patterns": [
+      null
+    ],
+    "definition": {
+      "name": null,
+      "params": null
+    },
+    "matches": [
+      {
+        "key": null
+      }
+    ],
+    "pattern": null,
+    "summary": {
+      "returned": null,
+      "scanned_symbols": null,
+      "total_matches": null,
+      "truncated": null
+    }
+  },
   "get_answer": {
     "_meta": {
       "cached": null,
@@ -527,6 +718,47 @@
       ],
       "suggestion": null
     }
+  },
+  "get_dependents": {
+    "_meta": {
+      "contract_version": null,
+      "embedder_degraded": null,
+      "index_age_days": null,
+      "indexed_commit": null
+    },
+    "counts_by_depth": {
+      "1": null
+    },
+    "dependents": [
+      {
+        "distance": null,
+        "edge_type": null,
+        "file": null,
+        "node": null
+      }
+    ],
+    "depth": null,
+    "edge_types": [
+      null
+    ],
+    "explanation": null,
+    "has_more": null,
+    "include_tests": null,
+    "limit": null,
+    "matched_by": null,
+    "next_offset": null,
+    "offset": null,
+    "ranking": null,
+    "reference_count_unit": null,
+    "returned": null,
+    "status": null,
+    "target": {
+      "file": null,
+      "node": null,
+      "node_type": null,
+      "query": null
+    },
+    "total": null
   },
   "get_execution_flows": {
     "_meta": {
@@ -1249,6 +1481,82 @@
     "validation_profiles_emitted": null,
     "validation_profiles_total": null
   },
+  "get_index_status": {
+    "_meta": {
+      "contract_version": null,
+      "embedder_degraded": null,
+      "index_age_days": null,
+      "indexed_commit": null
+    },
+    "degradation_findings": [
+      {
+        "code": null,
+        "detail": null
+      }
+    ],
+    "degraded": null,
+    "degraded_reason": null,
+    "generation": {
+      "built_at": null,
+      "commit_matches": null,
+      "head_commit": null,
+      "id": null,
+      "indexed_commit": null,
+      "published_at": null,
+      "sequence": null,
+      "stale_file_count": null,
+      "stale_files": [
+        null
+      ],
+      "uncommitted_indexed_path_count": null,
+      "uncommitted_indexed_paths": [
+        null
+      ],
+      "working_tree": {
+        "checked": null
+      }
+    },
+    "last_update": null,
+    "mode": null,
+    "queue": {
+      "blocked": null,
+      "building": null,
+      "pending": null,
+      "ready": null,
+      "total": null
+    },
+    "recipe": {
+      "embedder_matches": null,
+      "fingerprint": null,
+      "indexed_embedder": null,
+      "indexed_parser_fingerprint": null,
+      "parser_matches": null,
+      "runtime_embedder": null,
+      "runtime_parser_fingerprint": null
+    },
+    "repo": {
+      "alias": null,
+      "path": null
+    },
+    "status": null,
+    "stores": {
+      "fts_chunks": null,
+      "manifest": {
+        "state": null
+      },
+      "parity": {
+        "fts": null,
+        "vector": null
+      },
+      "vector_chunks": null
+    },
+    "trust": {
+      "reasons": [
+        null
+      ],
+      "search_results": null
+    }
+  },
   "get_overview": {
     "_meta": {
       "contract_version": null,
@@ -1368,6 +1676,94 @@
       ]
     }
   },
+  "get_query_quality": {
+    "_meta": {
+      "contract_version": null,
+      "embedder_degraded": null,
+      "index_age_days": null,
+      "indexed_commit": null
+    },
+    "case_count": null,
+    "cases": [
+      {
+        "expect": null,
+        "id": null,
+        "name": null
+      }
+    ],
+    "cases_listed": null,
+    "mode": null,
+    "pending_cases": null,
+    "repo": null,
+    "report": {
+      "cases": null,
+      "passed": null
+    },
+    "status": null
+  },
+  "get_reference_sites": {
+    "_meta": {
+      "contract_version": null,
+      "embedder_degraded": null,
+      "index_age_days": null,
+      "indexed_commit": null
+    },
+    "candidates": [
+      {
+        "file": null,
+        "symbol_id": null
+      }
+    ],
+    "confidence_scale": {
+      "high": null
+    },
+    "counts_by_kind": [
+      {
+        "count": null,
+        "kind": null
+      }
+    ],
+    "counts_by_language": [
+      {
+        "count": null,
+        "language": null
+      }
+    ],
+    "coverage": {
+      "bound": null,
+      "unbound": null
+    },
+    "explanation": null,
+    "has_more": null,
+    "limit": null,
+    "matched_by": null,
+    "next_offset": null,
+    "offset": null,
+    "pagination": {
+      "offset": null
+    },
+    "query": null,
+    "returned": null,
+    "sites": [
+      {
+        "confidence": null,
+        "file": null,
+        "kind": null,
+        "language": null,
+        "line": null
+      }
+    ],
+    "status": null,
+    "symbol_id": null,
+    "target": {
+      "query": null
+    },
+    "total": null,
+    "unbound": null,
+    "working_tree": {
+      "checked": null
+    }
+  },
   "get_risk": {
     "_meta": {
       "contract_version": null,
@@ -1483,6 +1879,60 @@
     "symbol_start_line": null,
     "truncated": null,
     "verified": null
+  },
+  "get_task_slice": {
+    "_meta": {
+      "contract_version": null,
+      "embedder_degraded": null,
+      "index_age_days": null,
+      "indexed_commit": null
+    },
+    "budget": {
+      "dropped": null,
+      "spent": null,
+      "tokens": null
+    },
+    "edges": [
+      {
+        "confidence": null,
+        "edge_type": null,
+        "source": null,
+        "target": null
+      }
+    ],
+    "externals": [
+      null
+    ],
+    "history": [
+      {
+        "at": null,
+        "event": null
+      }
+    ],
+    "members": [
+      {
+        "file": null,
+        "source": null,
+        "symbol_id": null,
+        "view": null
+      }
+    ],
+    "next": null,
+    "ranking": {
+      "policy": null
+    },
+    "seeds": [
+      null
+    ],
+    "slice_id": null,
+    "status": null,
+    "summary": {
+      "files": null,
+      "members": null,
+      "tokens": null
+    },
+    "task": null,
+    "view": null
   },
   "get_why": {
     "_meta": {
@@ -1676,6 +2126,99 @@
     ],
     "workspace": null,
     "workspace_root": null
+  },
+  "manage_decision": {
+    "_meta": {
+      "contract_version": null,
+      "embedder_degraded": null,
+      "index_age_days": null,
+      "indexed_commit": null
+    },
+    "action": null,
+    "chain": [
+      {
+        "id": null,
+        "title": null
+      }
+    ],
+    "decision": {
+      "id": null,
+      "status": null,
+      "title": null
+    },
+    "decisions": [
+      {
+        "id": null,
+        "status": null,
+        "title": null
+      }
+    ],
+    "journal": null,
+    "journal_available": null,
+    "journal_created": null,
+    "journal_exists": null,
+    "offset": null,
+    "paging": null,
+    "per_repo": {
+      "infra": null
+    },
+    "repo": null,
+    "returned": null,
+    "total": null
+  },
+  "preview_symbol_rename": {
+    "_meta": {
+      "contract_version": null,
+      "embedder_degraded": null,
+      "index_age_days": null,
+      "indexed_commit": null
+    },
+    "applies_changes": null,
+    "candidates": [
+      {
+        "file": null,
+        "symbol_id": null
+      }
+    ],
+    "caveats": [
+      null
+    ],
+    "confidence_scale": {
+      "high": null
+    },
+    "coverage": {
+      "bound": null
+    },
+    "explanation": null,
+    "files_touched": [
+      null
+    ],
+    "matched_by": null,
+    "mechanically_safe": null,
+    "needs_review": null,
+    "new_name": null,
+    "old_name": null,
+    "query": null,
+    "returned": null,
+    "safe_threshold": null,
+    "sites": [
+      {
+        "confidence": null,
+        "file": null,
+        "line": null
+      }
+    ],
+    "status": null,
+    "summary": {
+      "files": null,
+      "sites": null
+    },
+    "symbol": null,
+    "symbol_id": null,
+    "total": null,
+    "working_tree": {
+      "checked": null
+    }
   },
   "search_codebase": {
     "_meta": {
