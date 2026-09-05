@@ -190,9 +190,43 @@ module Writer =
         member this.Go() = 2
 """
         result = parser.parse_file(_fs(), src)
-        parents = {s.parent_name for s in result.symbols if s.name == "Go"}
-        assert parents == {"Reader.Dup", "Writer.Dup"}
-        assert len({s.id for s in result.symbols if s.name == "Go"}) == 2
+        gos = [s for s in result.symbols if s.name == "Go"]
+        assert len(gos) == 2
+
+        # Upstream's guarantee, unchanged and still the point of the test.
+        assert len({s.id for s in gos}) == 2
+
+        # How the two are told apart differs on this fork, so the assertion
+        # below is the fork's contract rather than upstream's.
+        #
+        # Upstream has no ``parent_symbol_id`` column, so it carries the
+        # disambiguator in ``parent_name`` as the string "Reader.Dup", and mints
+        # the member id "a.fs::Reader.Dup::Go" — which does not nest under the
+        # type's own id, "a.fs::Reader::Dup", because the two use different
+        # separators for the same containment.
+        #
+        # This fork resolves parentage from AST ancestry in
+        # ``_finalize_symbol_parentage``, which rewrites ``parent_name`` to the
+        # immediate parent's own name and puts exact identity in the lexical id
+        # and in ``parent_symbol_id``. So ``parent_name`` is "Dup" for both, and
+        # the pair is distinguished by two things upstream cannot offer: ids
+        # that nest under their type, and a resolvable link to it.
+        assert {s.parent_name for s in gos} == {"Dup"}
+        assert {s.id for s in gos} == {
+            "src/Sample.fs::Reader::Dup::Go",
+            "src/Sample.fs::Writer::Dup::Go",
+        }
+        assert {s.parent_symbol_id for s in gos} == {
+            "src/Sample.fs::Reader::Dup",
+            "src/Sample.fs::Writer::Dup",
+        }
+        # Every member id nests under its own type's id, which is the
+        # containment upstream's mixed "::"/"." separators do not express.
+        assert all(s.id.startswith(f"{s.parent_symbol_id}::") for s in gos)
+        # And each parent id is a real symbol in this file, which is the
+        # property that makes the fork's form strictly stronger here.
+        by_id = {s.id: s for s in result.symbols}
+        assert all(s.parent_symbol_id in by_id for s in gos)
 
     def test_type_extension_does_not_mint_a_second_type_symbol(
         self, parser: ASTParser
