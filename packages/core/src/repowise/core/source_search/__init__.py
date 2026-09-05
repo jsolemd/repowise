@@ -26,10 +26,19 @@ from __future__ import annotations
 
 import os
 
-__all__ = ["SOURCE_SEARCH_ENV", "TRUTHY", "source_search_enabled"]
+__all__ = [
+    "QUERY_FOCUS_ENV",
+    "SOURCE_SEARCH_ENV",
+    "TRUTHY",
+    "query_focus_enabled",
+    "source_search_enabled",
+]
 
 #: Environment variable that gates every source-search code path.
 SOURCE_SEARCH_ENV = "REPOWISE_SOURCE_SEARCH"
+
+#: Environment variable that gates verbose-query focusing. Off by default.
+QUERY_FOCUS_ENV = "REPOWISE_SOURCE_QUERY_FOCUS"
 
 #: Values that count as "on", case-insensitively.
 TRUTHY = frozenset({"1", "true", "yes", "on"})
@@ -48,3 +57,24 @@ def source_search_enabled() -> bool:
     variable and a already-imported module still sees it.
     """
     return os.environ.get(SOURCE_SEARCH_ENV, "").strip().lower() in TRUTHY
+
+
+def query_focus_enabled() -> bool:
+    """Whether a verbose prose query is focused before retrieval.
+
+    Defaults to **off**, and for the reason
+    :func:`source_search_enabled` gives: the feature has no acceptance gate
+    behind it yet, so an unset variable must leave retrieval exactly as it was.
+
+    Measured on the landing corpus, the heuristic loses real subjects. It drops
+    any concept whose exact token has zero document frequency — which is every
+    morphological variant the dense leg would have matched (``committing`` when
+    the corpus says ``commit``, ``sentence`` when it says ``sentences``) — while
+    keeping corpus-common function words like ``an``, then embeds the mangled
+    string. Symbol-surfacing verdicts went 10 exact / 1 enclosing / 1 wrong_file
+    to 5 / 3 / 4. The code and its tests stay; the default does not.
+
+    Resolved at the call site, so a test can set the variable and an
+    already-imported module still sees it.
+    """
+    return os.environ.get(QUERY_FOCUS_ENV, "").strip().lower() in TRUTHY

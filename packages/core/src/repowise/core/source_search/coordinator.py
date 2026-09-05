@@ -54,6 +54,7 @@ from typing import Any, Protocol
 
 from repowise.core.providers.embedding.base import Embedder
 
+from . import query_focus_enabled
 from .chunks import SOURCE_FILE_WINDOW, SOURCE_SYMBOL, language_for_path, window_eligible
 from .fts import SourceFTSIndex, tokenize
 from .manifest import SourceIndexManifest, default_manifest_path, read_manifest
@@ -1184,6 +1185,12 @@ class SourceSearchCoordinator:
     def _plan_query(self, query: str, intent: QueryIntent) -> _QueryPlan:
         """Focus verbose prose into bounded, evidence-backed intent slots.
 
+        **Off unless** ``REPOWISE_SOURCE_QUERY_FOCUS`` is set — see
+        :func:`repowise.core.source_search.query_focus_enabled` for the measured
+        reason. With it unset this returns the unfocused plan for every query,
+        so ``retrieval_query`` is the query, ``concepts`` are its raw tokens,
+        ``focused`` is ``False`` and no ``query_plan`` reaches the response.
+
         Frequency comes from the active source generation, not a global stop
         list: a term common in one repository can be the rare subject in
         another. Unseen terms cannot locate a file and corpus-common terms
@@ -1193,7 +1200,7 @@ class SourceSearchCoordinator:
         """
         raw = _concept_tokens(query)
         identifiers = (intent.identifier,) if intent.identifier else intent.embedded_identifiers
-        if len(raw) <= MAX_QUERY_CONCEPTS:
+        if not query_focus_enabled() or len(raw) <= MAX_QUERY_CONCEPTS:
             return _QueryPlan(
                 retrieval_query=query,
                 concepts=raw,

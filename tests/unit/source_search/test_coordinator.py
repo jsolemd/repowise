@@ -14,11 +14,14 @@ from typing import Any
 
 import pytest
 
+from repowise.core.source_search import QUERY_FOCUS_ENV
 from repowise.core.source_search.coordinator import (
     AGREEMENT_DENSE_COSINE,
     CONFIDENT_DENSE_COSINE,
+    MAX_QUERY_CONCEPTS,
     NO_MATCH_DENSE_COSINE,
     SourceSearchCoordinator,
+    _concept_tokens,
     _Item,
     _query_intent,
 )
@@ -291,7 +294,12 @@ async def test_the_query_is_embedded_once_for_both_dense_stores(tmp_path):
 
 
 async def test_verbose_query_is_focused_into_visible_bounded_intent_slots(tmp_path, monkeypatch):
-    """Agent-written task prose must not make every noun one owner's burden."""
+    """Agent-written task prose must not make every noun one owner's burden.
+
+    Focusing is off by default, so this sets the flag: the behaviour is real
+    and tested, it is simply not what an unset install does.
+    """
+    monkeypatch.setenv(QUERY_FOCUS_ENV, "1")
     query = "dashboard telemetry usage analytics calls latency failures savings wrappers counters"
     concepts = query.split()
     owner = _hit(
@@ -337,6 +345,41 @@ async def test_verbose_query_is_focused_into_visible_bounded_intent_slots(tmp_pa
     assert embedded == [plan["retrieval_query"]]
     assert lexical == [plan["retrieval_query"]]
     assert response["selected_owner"]["file"] == "src/usage.py"
+
+
+async def test_a_verbose_query_is_not_focused_unless_the_flag_is_set(tmp_path):
+    """The default: fourteen tokens of prose reach retrieval as written.
+
+    The heuristic drops any concept whose exact token has no document
+    frequency — every morphological variant the dense leg would have matched —
+    and keeps corpus-common function words, so on the landing corpus it moved
+    owners to the wrong file. Until it has an evaluation set behind it, an
+    unset install must retrieve on what the caller actually asked.
+    """
+    query = (
+        "how does the sentence packer decide an omission budget when "
+        "committing and toggling a folder index guard"
+    )
+    concepts = query.split()
+    assert len(concepts) > MAX_QUERY_CONCEPTS
+    owner = _hit("pack_sentences", "src/pack.py", 0.62, snippet=" ".join(concepts))
+    coordinator = _coordinator(
+        tmp_path,
+        source_dense=[owner],
+        source_lexical=[_FTSHit(owner.chunk_id, owner.file_path)],
+        records={owner.chunk_id: _record(owner)},
+        source_term_files={term: {"src/pack.py"} for term in concepts},
+        source_active_paths={f"src/dummy_{index}.py" for index in range(30)},
+    )
+
+    response = await coordinator.search(query)
+
+    assert "query_plan" not in response
+    plan = coordinator._plan_query(query, _query_intent(query))
+    assert plan.focused is False
+    assert plan.retrieval_query == query
+    assert plan.concepts == tuple(_concept_tokens(query))
+    assert plan.omitted_concepts == ()
 
 
 async def test_a_lexical_only_source_hit_arrives_with_its_metadata(tmp_path):
