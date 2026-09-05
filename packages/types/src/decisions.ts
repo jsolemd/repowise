@@ -116,6 +116,7 @@ export const DECISION_SOURCE_LABELS: Record<
   conventions: "Convention",
   git_archaeology: "Git history",
   inline_marker: "Marker",
+  journal: "Journal",
   llm_inferred: "Model",
   pr: "Pull request",
   session: "Session",

@@ -162,8 +162,10 @@ export function registerLmTools(ctx: RepowiseContext): vscode.Disposable {
       const raw = typeof input.limit === "number" ? Math.floor(input.limit) : DEFAULT_SEARCH_RESULTS;
       const limit = Math.min(Math.max(raw, 1), MAX_SEARCH_RESULTS);
       // Queries form an unbounded space, so results are never cached.
-      const results = await search(input.query, { limit, repo_id: repoId });
-      const payload = results.map((r) => ({
+      // The fork's api-client normalizes either wire shape into one envelope;
+      // the ranked hits are its `results`.
+      const envelope = await search(input.query, { limit, repo_id: repoId });
+      const payload = envelope.results.map((r) => ({
         title: r.title,
         page_type: r.page_type,
         target_path: r.target_path,
