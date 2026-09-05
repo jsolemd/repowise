@@ -41,6 +41,18 @@ def _infer_dimensions(model: str) -> int:
     return 768
 
 
+def _resolve_num_thread(num_thread: int | None) -> int:
+    """Validate explicit configuration; tolerate an unusable environment pin."""
+    if num_thread is not None:
+        if type(num_thread) is not int or num_thread < 0:
+            raise ValueError("num_thread must be a non-negative integer")
+        return num_thread
+    try:
+        return max(0, int(os.environ.get("OLLAMA_EMBEDDING_NUM_THREAD", "0")))
+    except (ValueError, OverflowError):
+        return 0
+
+
 class OllamaEmbedder:
     """Ollama embedding adapter implementing the repowise Embedder protocol.
 
@@ -53,6 +65,9 @@ class OllamaEmbedder:
             ``OLLAMA_EMBEDDING_TIMEOUT`` / ``REPOWISE_EMBEDDING_TIMEOUT`` env
             vars, then ``30.0``. Raise it when embedding long pages on a slow
             local model that would otherwise exceed the default and be dropped.
+        num_thread: CPU runner threads, or ``OLLAMA_EMBEDDING_NUM_THREAD``.
+            Zero or unset keeps Ollama's native default. A runtime scheduling
+            option, not a model, dimension or embedding-recipe change.
     """
 
     def __init__(
@@ -61,6 +76,7 @@ class OllamaEmbedder:
         base_url: str | None = None,
         dimensions: int | None = None,
         timeout: float | None = None,
+        num_thread: int | None = None,
     ) -> None:
         self._model = (
             model
@@ -92,6 +108,7 @@ class OllamaEmbedder:
         self._timeout = resolve_embedding_timeout(
             timeout, _DEFAULT_TIMEOUT, provider_env="OLLAMA_EMBEDDING_TIMEOUT"
         )
+        self._num_thread = _resolve_num_thread(num_thread)
 
     @property
     def dimensions(self) -> int:
@@ -108,6 +125,8 @@ class OllamaEmbedder:
         }
         if self._requested_dimensions is not None:
             payload["dimensions"] = self._requested_dimensions
+        if self._num_thread:
+            payload["options"] = {"num_thread": self._num_thread}
 
         async with httpx.AsyncClient(timeout=self._timeout) as client:
             response = await client.post(f"{self._base_url}/api/embed", json=payload)

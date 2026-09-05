@@ -56,6 +56,7 @@ class _FakeAsyncClient:
 
 @pytest.fixture(autouse=True)
 def _reset_fake_client(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("OLLAMA_EMBEDDING_NUM_THREAD", raising=False)
     _FakeAsyncClient.calls = []
     _FakeAsyncClient.response_data = {"embeddings": [[1.0, 0.0]]}
     monkeypatch.setattr(
@@ -67,6 +68,31 @@ def _reset_fake_client(monkeypatch: pytest.MonkeyPatch):
 async def test_embed_empty_returns_empty() -> None:
     embedder = OllamaEmbedder(model="embeddinggemma")
     assert await embedder.embed([]) == []
+
+
+@pytest.mark.parametrize(
+    "explicit,env,expected",
+    [(None, "8", 8), (4, "8", 4), (0, "8", 0), (None, "bad", 0), (None, "-1", 0)],
+)
+async def test_runner_threads_use_native_options_without_changing_identity(
+    monkeypatch, explicit, env, expected
+):
+    monkeypatch.setenv("OLLAMA_EMBEDDING_NUM_THREAD", env)
+    embedder = OllamaEmbedder(model="embeddinggemma", dimensions=2, num_thread=explicit)
+    await embedder.embed(["text"])
+    payload = _FakeAsyncClient.calls[0]["json"]
+    assert payload["model"] == "embeddinggemma" and payload["dimensions"] == 2
+    assert embedder.dimensions == 2
+    if expected:
+        assert payload["options"] == {"num_thread": expected}
+    else:
+        assert "options" not in payload
+
+
+@pytest.mark.parametrize("value", [-1, 1.5, True, "8"])
+def test_invalid_explicit_thread_count_is_rejected(value):
+    with pytest.raises(ValueError, match="num_thread"):
+        OllamaEmbedder(num_thread=value)
 
 
 async def test_embed_posts_batch_to_native_endpoint() -> None:
@@ -176,8 +202,8 @@ async def test_embed_raises_when_server_returns_wrong_width_inferred() -> None:
         await embedder.embed(["hello"])
 
     msg = str(exc_info.value)
-    assert "3" in msg                       # actual width named
-    assert "OLLAMA_EMBEDDING_DIMS" in msg   # points at the env var fix
+    assert "3" in msg  # actual width named
+    assert "OLLAMA_EMBEDDING_DIMS" in msg  # points at the env var fix
 
 
 async def test_embed_raises_when_server_returns_wrong_width_explicit() -> None:
@@ -199,4 +225,3 @@ async def test_embed_width_check_not_triggered_on_empty() -> None:
     # embed([]) short-circuits and returns [] without calling the server.
     embedder = OllamaEmbedder(model="embeddinggemma")
     assert await embedder.embed([]) == []
-
