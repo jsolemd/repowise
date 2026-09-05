@@ -1189,6 +1189,19 @@ def _grep_hint_for(query: str) -> str | None:
 _VALID_MODES = {"auto", "concept", "symbol", "path", "hybrid"}
 
 
+def _caller_mode(mode: str | None) -> str:
+    """The mode the caller actually asked for: a valid name, or ``"auto"``.
+
+    Split out of :func:`_resolve_mode` because two different questions were
+    being answered by one value. "Which branch runs" is the resolved mode.
+    "Did the caller ask for the native resolver's argument semantics" is this
+    one, and only an explicit spelling can answer it — ``auto`` resolving to
+    ``symbol`` is the router's inference, not the caller's request.
+    """
+    m = (mode or "auto").lower()
+    return m if m in _VALID_MODES else "auto"
+
+
 def _resolve_mode(query: str, mode: str | None) -> str:
     """Resolve ``mode="auto"`` to a concrete branch from the query shape.
 
@@ -1198,9 +1211,7 @@ def _resolve_mode(query: str, mode: str | None) -> str:
     else stays concept (the original wiki-semantic path). The routing reuses
     the exact heuristics that previously only emitted a grep_hint.
     """
-    m = (mode or "auto").lower()
-    if m not in _VALID_MODES:
-        m = "auto"
+    m = _caller_mode(mode)
     if m != "auto":
         return m
     if _canonical_symbol_query(query):
@@ -1415,6 +1426,7 @@ async def search_codebase(
     # into this record, and the response it builds reads it back.
     _begin_retrieval_record()
     grep_hint = _grep_hint_for(query)
+    caller_mode = _caller_mode(mode)
     resolved_mode = _resolve_mode(query, mode)
 
     # ``repo`` is a workspace argument: without a registry there is one repo,
@@ -1438,9 +1450,23 @@ async def search_codebase(
     # Exact symbol/path lookup and filtered searches already have native
     # resolvers. Preserve their argument semantics; the source coordinator
     # owns unfiltered concept/hybrid retrieval, not an alternate filter API.
+    #
+    # The mode test is on what the CALLER passed, not on what ``auto``
+    # resolved to. An explicit ``mode="symbol"`` is a request for the native
+    # exact resolver and its argument semantics; an ``auto`` query that merely
+    # *looks* like an identifier is not — it is the ordinary way an agent asks
+    # "who owns this name", and the source lane's exact-identifier router is
+    # what answers it with an owner, its evidence and a symbol_path. Testing
+    # the resolved mode instead silently routed every auto identifier to the
+    # native rows, which carry ``exact_match`` but no ``selected_owner``.
+    #
+    # ``path`` is different and keeps testing the resolved mode: a path is a
+    # filename lookup rather than a retrieval, and fusing it against a corpus
+    # can only blur it. That rule predates the split and is unchanged.
     if (
         source_search_enabled()
-        and resolved_mode not in {"path", "symbol"}
+        and caller_mode not in {"path", "symbol"}
+        and resolved_mode != "path"
         and not any((kind, symbol_kind, page_type))
     ):
         if _is_workspace_mode():

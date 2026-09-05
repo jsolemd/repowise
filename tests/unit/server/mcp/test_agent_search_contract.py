@@ -33,6 +33,66 @@ async def test_explicit_lookup_contract_uses_native_resolver(monkeypatch, argume
     assert received[4] == arguments.get("symbol_kind")
 
 
+@pytest.mark.parametrize("query", ["as_list_raw", "SourceSearchCoordinator"])
+async def test_an_auto_mode_identifier_still_reaches_the_source_lane(monkeypatch, query):
+    """The owner claim an identifier lookup exists to produce.
+
+    ``auto`` resolves a bare identifier to ``symbol``, and a guard that tested
+    the *resolved* mode sent it to the native rows — which carry
+    ``exact_match`` but no ``selected_owner``, no ``confidence`` and no
+    per-row ``evidence``. The caller never asked for the native resolver's
+    argument semantics; they asked who owns a name, and the source lane's
+    exact-identifier router is what answers that.
+    """
+    monkeypatch.setenv("REPOWISE_SOURCE_SEARCH", "1")
+    monkeypatch.setattr(tool_search, "_is_workspace_mode", lambda: False)
+    native = AsyncMock(return_value={"results": [], "mode": "symbol"})
+    owned = {
+        "results": [
+            {
+                "target_path": "conceptatlas/atlas/content.py",
+                "symbol_path": "conceptatlas/atlas/content.py::as_list_raw",
+                "evidence": {"exact_name": True, "lane": "source"},
+            }
+        ],
+        "mode": "symbol",
+        "confidence": "confident",
+        "selected_owner": {
+            "file": "conceptatlas/atlas/content.py",
+            "reason": "exact_name",
+        },
+    }
+    coordinator = AsyncMock()
+    coordinator.search = AsyncMock(return_value=owned)
+    monkeypatch.setattr(tool_search, "_structured_search", native)
+    monkeypatch.setattr(tool_search, "mcp_coordinator", AsyncMock(return_value=coordinator))
+
+    result = await tool_search.search_codebase(query)
+
+    native.assert_not_awaited()
+    coordinator.search.assert_awaited_once()
+    # The resolved mode still travels: the source lane routes on it too.
+    assert coordinator.search.call_args.kwargs["mode"] == "symbol"
+    assert result["selected_owner"]["file"] == "conceptatlas/atlas/content.py"
+    assert result["confidence"] == "confident"
+    assert result["results"][0]["evidence"]
+
+
+async def test_an_auto_resolved_path_stays_on_the_native_resolver(monkeypatch):
+    """A path is a filename lookup, not a retrieval — the rule that predates the split."""
+    monkeypatch.setenv("REPOWISE_SOURCE_SEARCH", "1")
+    monkeypatch.setattr(tool_search, "_is_workspace_mode", lambda: False)
+    native = AsyncMock(return_value={"results": [], "mode": "path"})
+    source = AsyncMock()
+    monkeypatch.setattr(tool_search, "_structured_search", native)
+    monkeypatch.setattr(tool_search, "mcp_coordinator", source)
+
+    await tool_search.search_codebase("src/repowise/core/foo.py")
+
+    native.assert_awaited_once()
+    source.assert_not_awaited()
+
+
 def test_trust_survives_a_client_that_only_forwards_tool_content():
     import json
 

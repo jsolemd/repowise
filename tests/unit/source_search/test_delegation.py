@@ -77,9 +77,9 @@ async def test_mcp_flag_on_delegates(mcp_guard, monkeypatch):
     slot.append(coordinator)
     monkeypatch.setenv(SOURCE_SEARCH_ENV, "1")
 
-    assert await search_codebase("how retrieval works", limit=7, mode="hybrid") == COORDINATED
+    assert await search_codebase("MyClass.method", limit=7) == COORDINATED
     assert asked == [1]
-    assert coordinator.queries == [("how retrieval works", 7)]
+    assert coordinator.queries == [("MyClass.method", 7)]
 
 
 async def test_mcp_falls_back_when_the_repo_has_no_source_index(mcp_guard, monkeypatch):
@@ -89,20 +89,44 @@ async def test_mcp_falls_back_when_the_repo_has_no_source_index(mcp_guard, monke
     asked, _ = mcp_guard
     monkeypatch.setenv(SOURCE_SEARCH_ENV, "1")
 
-    assert await search_codebase("how retrieval works", mode="hybrid") == STOCK
+    assert await search_codebase("MyClass.method") == STOCK
     assert asked == [1]
 
 
-@pytest.mark.parametrize("query", ["src/pkg/module.py", "MyClass.method"])
-async def test_mcp_exact_queries_stay_on_the_stock_resolver(mcp_guard, monkeypatch, query):
-    """Exact file and symbol intent must not become a semantic guess."""
+async def test_mcp_path_queries_stay_on_the_stock_resolver(mcp_guard, monkeypatch):
+    """A path is a filename lookup; fusing it against a corpus only blurs it."""
     from repowise.server.mcp_server.tool_search import search_codebase
 
     asked, slot = mcp_guard
     slot.append(_Coordinator())
     monkeypatch.setenv(SOURCE_SEARCH_ENV, "1")
 
-    assert await search_codebase(query) == STOCK
+    assert await search_codebase("src/pkg/module.py") == STOCK
+    assert asked == []
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [{"mode": "symbol"}, {"mode": "path"}, {"kind": "test"}, {"symbol_kind": "class"}],
+)
+async def test_mcp_caller_explicit_lookups_stay_on_the_stock_resolver(
+    mcp_guard, monkeypatch, arguments
+):
+    """What the caller spells, not what ``auto`` infers.
+
+    An explicit ``mode="symbol"`` or a filter is a request for the native
+    resolver's argument semantics, and the source coordinator is not an
+    alternate filter API. A bare identifier under ``auto`` is neither: it is
+    the ordinary "who owns this name" question, and it keeps delegating —
+    see :func:`test_mcp_flag_on_delegates`.
+    """
+    from repowise.server.mcp_server.tool_search import search_codebase
+
+    asked, slot = mcp_guard
+    slot.append(_Coordinator())
+    monkeypatch.setenv(SOURCE_SEARCH_ENV, "1")
+
+    assert await search_codebase("MyClass.method", **arguments) == STOCK
     assert asked == []
 
 
