@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import UTC, datetime
 from pathlib import Path
 
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -49,6 +50,7 @@ async def _build_wiki_db(repo_root: Path, decisions: list[dict], extras=None) ->
                     rationale=spec.get("rationale", ""),
                     status=spec.get("status", "active"),
                     source=spec.get("source", "cli"),
+                    confirmed_at=spec.get("confirmed_at"),
                     confidence=spec.get("confidence", 0.9),
                     staleness_score=spec.get("staleness", 0.0),
                     evidence_file=spec["id"],  # keeps the unique constraint happy
@@ -93,6 +95,38 @@ async def _build_wiki_db(repo_root: Path, decisions: list[dict], extras=None) ->
             session.add(extra)
         await session.commit()
     await engine.dispose()
+
+
+async def test_journal_confirmations_reach_hooks_without_sqlite_acceptance(tmp_path):
+    await _build_wiki_db(
+        tmp_path,
+        [
+            {
+                "id": "journal-confirmed",
+                "title": "A rule",
+                "source": "journal",
+                "accepted": False,
+                "confirmed_at": datetime(2026, 9, 5, tzinfo=UTC),
+            },
+            {
+                "id": "journal-proposed",
+                "title": "A proposal",
+                "source": "journal",
+                "accepted": False,
+            },
+            {
+                "id": "native-unaccepted",
+                "title": "Not journal authority",
+                "accepted": False,
+                "confirmed_at": datetime(2026, 9, 5, tzinfo=UTC),
+            },
+        ],
+    )
+    with sqlite3.connect(tmp_path / ".repowise" / "wiki.db") as conn:
+        assert [row["id"] for row in decision_inject._load_active_decisions(conn)] == [
+            "journal-confirmed"
+        ]
+        assert conn.execute("SELECT COUNT(*) FROM decision_acceptances").fetchone()[0] == 0
 
 
 def _quiet_git(monkeypatch, *, dirty=None, branch="main", branch_files=None) -> None:

@@ -19,6 +19,7 @@ from typing import Any
 from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import load_only
 
 from repowise.core.analysis.decisions.lifecycle import (
     ACCEPTANCE_ACTIONS,
@@ -97,9 +98,13 @@ def accepted_predicate() -> Any:
     ``status == "active"`` — is how the same question came to have four
     different answers across the CLI, the MCP tools and two web surfaces.
     """
-    return select(DecisionAcceptance.id).where(
-        DecisionAcceptance.decision_id == DecisionRecord.id
-    ).exists()
+    return or_(
+        select(DecisionAcceptance.id)
+        .where(DecisionAcceptance.decision_id == DecisionRecord.id)
+        .exists(),
+        (DecisionRecord.source == _DECISION_JOURNAL_SOURCE)
+        & DecisionRecord.confirmed_at.is_not(None),
+    )
 
 
 def candidate_predicate() -> Any:
@@ -117,18 +122,18 @@ def candidate_predicate() -> Any:
 #: sqlite3 and cannot import the ORM. Correlated on ``decision_records.id``, so
 #: it drops into an existing ``WHERE`` unchanged.
 ACCEPTED_SQL_PREDICATE = (
-    "EXISTS (SELECT 1 FROM decision_acceptances a "
-    "WHERE a.decision_id = decision_records.id)"
+    "(EXISTS (SELECT 1 FROM decision_acceptances a "
+    "WHERE a.decision_id = decision_records.id) "
+    "OR (decision_records.source = 'journal' "
+    "AND decision_records.confirmed_at IS NOT NULL))"
 )
 
 
-async def latest_acceptance(
-    session: AsyncSession, decision_id: str
-) -> DecisionAcceptance | None:
+async def latest_acceptance(session: AsyncSession, decision_id: str) -> DecisionAcceptance | None:
     """The acceptance row that currently governs *decision_id*, if any.
 
-    ``None`` means the record is a candidate. This is the one predicate that
-    separates the two entities; every governance read is a join onto it.
+    Journal confirmations live in the journal projection, not this table.
+    Use :func:`is_accepted` or :func:`current_currency` for an authority read.
     """
     result = await session.execute(
         select(DecisionAcceptance)
@@ -141,7 +146,11 @@ async def latest_acceptance(
 
 async def is_accepted(session: AsyncSession, decision_id: str) -> bool:
     """Whether *decision_id* has ever been accepted."""
-    return await latest_acceptance(session, decision_id) is not None
+    return bool(
+        await session.scalar(
+            select(DecisionRecord.id).where(DecisionRecord.id == decision_id, accepted_predicate())
+        )
+    )
 
 
 async def accepted_decision_ids(
@@ -154,9 +163,35 @@ async def accepted_decision_ids(
 
     With *governing_only*, drops the ones whose authority has been withdrawn
     (``superseded``, ``dismissed``) so the caller is left with what still binds.
-    The subquery picks the highest ``seq`` per decision, which is the append-only
-    log's way of saying "current".
+    Journal confirmations and native acceptance events share the same rule.
     """
+    stored = await _stored_acceptance_currencies(session, repository_id)
+    records = (
+        await session.scalars(
+            select(DecisionRecord)
+            .where(
+                DecisionRecord.repository_id == repository_id,
+                DecisionRecord.source == _DECISION_JOURNAL_SOURCE,
+                DecisionRecord.confirmed_at.is_not(None),
+            )
+            .options(
+                load_only(DecisionRecord.source, DecisionRecord.status, DecisionRecord.confirmed_at)
+            )
+        )
+    ).all()
+    for record in records:
+        currency = journal_stored_currency(record)
+        if currency is not None:
+            stored.setdefault(record.id, currency)
+    if not governing_only:
+        return set(stored)
+    return {did for did, currency in stored.items() if currency not in ("superseded", "dismissed")}
+
+
+async def _stored_acceptance_currencies(
+    session: AsyncSession, repository_id: str
+) -> dict[str, str]:
+    """Latest native event per id; shared by bulk authority reads."""
     latest_seq = (
         select(
             DecisionAcceptance.decision_id.label("did"),
@@ -171,10 +206,7 @@ async def accepted_decision_ids(
         (DecisionAcceptance.decision_id == latest_seq.c.did)
         & (DecisionAcceptance.seq == latest_seq.c.seq),
     )
-    rows = (await session.execute(q)).all()
-    if not governing_only:
-        return {did for did, _ in rows}
-    return {did for did, currency in rows if currency not in ("superseded", "dismissed")}
+    return dict((await session.execute(q)).all())
 
 
 #: ``DecisionRecord.source`` for a row projected from the canonical decision
@@ -229,21 +261,7 @@ async def decision_currencies(
     different answer: the column is a projection every writer keeps in step, so
     it agrees right up until something writes it without an acceptance.
     """
-    latest_seq = (
-        select(
-            DecisionAcceptance.decision_id.label("did"),
-            func.max(DecisionAcceptance.seq).label("seq"),
-        )
-        .where(DecisionAcceptance.repository_id == repository_id)
-        .group_by(DecisionAcceptance.decision_id)
-        .subquery()
-    )
-    q = select(DecisionAcceptance.decision_id, DecisionAcceptance.currency).join(
-        latest_seq,
-        (DecisionAcceptance.decision_id == latest_seq.c.did)
-        & (DecisionAcceptance.seq == latest_seq.c.seq),
-    )
-    stored = {did: currency for did, currency in (await session.execute(q)).all()}
+    stored = await _stored_acceptance_currencies(session, repository_id)
 
     out: dict[str, str] = {}
     for record in records:
@@ -258,9 +276,7 @@ async def decision_currencies(
     return out
 
 
-async def count_decisions_by_lane(
-    session: AsyncSession, repository_id: str
-) -> dict[str, int]:
+async def count_decisions_by_lane(session: AsyncSession, repository_id: str) -> dict[str, int]:
     """Records per review lane, as counts a surface can put on a tab.
 
     ``candidates`` plus the four currencies (``active``, ``needs_review``,
@@ -270,20 +286,15 @@ async def count_decisions_by_lane(
     peer lane: a tab row of overlapping datasets is a tab row a reader cannot
     add up.
 
-    Loads the id, scope and staleness of every record rather than grouping in
+    Loads authority, scope and staleness rather than grouping in
     SQL: two of the currencies are derived from the record's scope and
     staleness by :func:`effective_currency`, so no ``GROUP BY`` over the
-    acceptance table can produce them. Three columns per row, which is less
-    than ``get_decision_health_summary`` already pays for whole rows.
+    acceptance table can produce them. Decision bodies stay unloaded.
     """
     rows = (
-        await session.execute(
-            select(
-                DecisionRecord.id,
-                DecisionRecord.affected_files_json,
-                DecisionRecord.affected_modules_json,
-                DecisionRecord.staleness_score,
-            ).where(
+        await session.scalars(
+            select(DecisionRecord)
+            .where(
                 DecisionRecord.repository_id == repository_id,
                 # Tombstoned candidates are excluded; a decision that was
                 # accepted and then withdrawn is not, because it is history
@@ -295,31 +306,19 @@ async def count_decisions_by_lane(
                     accepted_predicate(),
                 ),
             )
-        )
-    ).all()
-
-    latest_seq = (
-        select(
-            DecisionAcceptance.decision_id.label("did"),
-            func.max(DecisionAcceptance.seq).label("seq"),
-        )
-        .where(DecisionAcceptance.repository_id == repository_id)
-        .group_by(DecisionAcceptance.decision_id)
-        .subquery()
-    )
-    stored = dict(
-        (
-            await session.execute(
-                select(
-                    DecisionAcceptance.decision_id, DecisionAcceptance.currency
-                ).join(
-                    latest_seq,
-                    (DecisionAcceptance.decision_id == latest_seq.c.did)
-                    & (DecisionAcceptance.seq == latest_seq.c.seq),
+            .options(
+                load_only(
+                    DecisionRecord.source,
+                    DecisionRecord.status,
+                    DecisionRecord.confirmed_at,
+                    DecisionRecord.affected_files_json,
+                    DecisionRecord.affected_modules_json,
+                    DecisionRecord.staleness_score,
                 )
             )
-        ).all()
-    )
+        )
+    ).all()
+    currencies = await decision_currencies(session, repository_id, rows)
 
     counts = {
         "candidates": 0,
@@ -330,17 +329,11 @@ async def count_decisions_by_lane(
         "governing": 0,
         "total": len(rows),
     }
-    for did, files_json, modules_json, staleness in rows:
-        acceptance = stored.get(did)
-        if acceptance is None:
+    for record in rows:
+        currency = currencies.get(record.id)
+        if currency is None:
             counts["candidates"] += 1
             continue
-        has_scope = bool(json.loads(files_json or "[]")) or bool(
-            json.loads(modules_json or "[]")
-        )
-        currency = effective_currency(
-            acceptance, has_scope=has_scope, staleness=staleness or 0.0
-        )
         counts["history" if currency in ("superseded", "dismissed") else currency] += 1
         if is_governing(currency):
             counts["governing"] += 1
@@ -859,12 +852,9 @@ async def list_candidates(
 ) -> list[tuple[DecisionRecord, DecisionCandidateMeta | None]]:
     """Records with no acceptance, newest and highest-priority first.
 
-    The left join keeps candidates that predate the review table visible; the
-    ``NOT IN`` is what makes this a candidate read rather than a status read.
+    The left join keeps candidates that predate the review table visible;
+    the shared predicate also excludes confirmed journal decisions.
     """
-    accepted = select(DecisionAcceptance.decision_id).where(
-        DecisionAcceptance.repository_id == repository_id
-    )
     q = (
         select(DecisionRecord, DecisionCandidateMeta)
         .outerjoin(
@@ -873,7 +863,7 @@ async def list_candidates(
         )
         .where(
             DecisionRecord.repository_id == repository_id,
-            DecisionRecord.id.notin_(accepted),
+            ~accepted_predicate(),
         )
     )
     if review_state is not None:
@@ -888,13 +878,17 @@ async def list_candidates(
             q = q.where(DecisionCandidateMeta.review_state == review_state)
     if lane is not None:
         q = q.where(DecisionCandidateMeta.lane == lane)
-    q = q.order_by(
-        # A candidate with no review row yet is unjudged, not lowest: it ranks
-        # with the ones the contract refused and confidence orders within.
-        func.coalesce(DecisionCandidateMeta.review_priority, 0.0).desc(),
-        DecisionRecord.confidence.desc(),
-        DecisionRecord.created_at.desc(),
-    ).limit(limit).offset(offset)
+    q = (
+        q.order_by(
+            # A candidate with no review row yet is unjudged, not lowest: it ranks
+            # with the ones the contract refused and confidence orders within.
+            func.coalesce(DecisionCandidateMeta.review_priority, 0.0).desc(),
+            DecisionRecord.confidence.desc(),
+            DecisionRecord.created_at.desc(),
+        )
+        .limit(limit)
+        .offset(offset)
+    )
     return [(rec, meta) for rec, meta in (await session.execute(q)).all()]
 
 
@@ -912,9 +906,7 @@ async def _set_review_state(
 ) -> DecisionCandidateMeta:
     meta = await session.get(DecisionCandidateMeta, record.id)
     if meta is None:
-        meta = DecisionCandidateMeta(
-            decision_id=record.id, repository_id=record.repository_id
-        )
+        meta = DecisionCandidateMeta(decision_id=record.id, repository_id=record.repository_id)
         session.add(meta)
     meta.review_state = state
     if merged_into is not None:
@@ -932,11 +924,7 @@ async def _add_alias(
     # for the update branch as much as the insert one, or A -> B followed by
     # B -> C strands A at an id that no longer resolves.
     stale = (
-        (
-            await session.execute(
-                select(DecisionAlias).where(DecisionAlias.decision_id == alias_id)
-            )
-        )
+        (await session.execute(select(DecisionAlias).where(DecisionAlias.decision_id == alias_id)))
         .scalars()
         .all()
     )

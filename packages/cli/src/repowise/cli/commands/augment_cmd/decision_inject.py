@@ -293,7 +293,10 @@ def _expand_one_hop(conn: sqlite3.Connection, seeds: list[str]) -> set[str]:
 #: Governance is acceptance, not a status string. Spelled out here rather than
 #: imported because this path opens the store with stdlib sqlite3 and never
 #: imports ``repowise.core``; it mirrors ``crud.authority.ACCEPTED_SQL_PREDICATE``.
-_ACCEPTED = "EXISTS (SELECT 1 FROM decision_acceptances a WHERE a.decision_id = {ref}.id)"
+_ACCEPTED = (
+    "(EXISTS (SELECT 1 FROM decision_acceptances a WHERE a.decision_id = {ref}.id) "
+    "OR ({ref}.source = 'journal' AND {ref}.confirmed_at IS NOT NULL))"
+)
 
 #: What to add to a governance query on a store that predates the entity split.
 #: Nothing, deliberately. This path opens the store read-only and never runs the

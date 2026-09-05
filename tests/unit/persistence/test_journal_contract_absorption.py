@@ -23,7 +23,7 @@ import shutil
 from pathlib import Path
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from repowise.core.analysis.decisions.journal import (
     DECISIONS_JOURNAL_ENV,
@@ -37,7 +37,7 @@ from repowise.core.analysis.decisions.journal_projection import (
     supersede_journal_decision,
 )
 from repowise.core.persistence import crud
-from repowise.core.persistence.models import DecisionRecord
+from repowise.core.persistence.models import DecisionAcceptance, DecisionRecord, _now_utc
 from tests.unit.persistence.helpers import insert_repo
 
 _FIXTURE = Path(__file__).resolve().parents[2] / "fixtures" / "decisions" / "journal_contract.jsonl"
@@ -195,6 +195,97 @@ async def test_record_confirm_supersede_round_trips(
     assert retired.status == "superseded"
     assert retired.superseded_by == successor.id
     assert before <= {row["id"] for row in _rows(root)}
+
+
+async def test_journal_authority_agrees_across_ids_predicates_lists_and_tabs(
+    async_session, journal_repo, in_memory_vector_store
+) -> None:
+    from repowise.core.persistence.crud.authority import (
+        ACCEPTED_SQL_PREDICATE,
+        accepted_decision_ids,
+        accepted_predicate,
+        candidate_predicate,
+        count_decisions_by_lane,
+        is_accepted,
+        list_candidates,
+    )
+
+    repo, root = journal_repo
+    await refresh_decision_journal(
+        async_session, repo.id, repo_root=root, vector_store=in_memory_vector_store
+    )
+    rows = _rows(root)
+    confirmed = {row["id"] for row in rows if row.get("confirmed_at")}
+    candidates = {row["id"] for row in rows} - confirmed
+    assert await accepted_decision_ids(async_session, repo.id) == confirmed
+    assert await accepted_decision_ids(async_session, repo.id, governing_only=True) == {
+        row["id"] for row in rows if row.get("confirmed_at") and row["status"] == "active"
+    }
+    assert await accepted_decision_ids(async_session, "absent-repo") == set()
+    for row in rows:
+        assert await is_accepted(async_session, row["id"]) == (row["id"] in confirmed)
+    assert not await is_accepted(async_session, "absent-decision")
+
+    for predicate, expected in [
+        (accepted_predicate(), confirmed),
+        (candidate_predicate(), candidates),
+    ]:
+        actual = await async_session.scalars(
+            select(DecisionRecord.id).where(DecisionRecord.repository_id == repo.id, predicate)
+        )
+        assert set(actual) == expected
+    sql_ids = await async_session.scalars(
+        text("SELECT id FROM decision_records WHERE " + ACCEPTED_SQL_PREDICATE)
+    )
+    assert set(sql_ids) == confirmed
+    assert {rec.id for rec, _ in await list_candidates(async_session, repo.id)} == candidates
+    counts = await count_decisions_by_lane(async_session, repo.id)
+    assert counts == {
+        "candidates": 2,
+        "active": 1,
+        "needs_review": 0,
+        "uncheckable": 0,
+        "history": 1,
+        "governing": 1,
+        "total": 4,
+    }
+    assert not (await async_session.scalars(select(DecisionAcceptance))).all()
+
+
+@pytest.mark.parametrize("status", ["active", "superseded", "dismissed"])
+@pytest.mark.parametrize("source,confirmed", [("journal", True), ("journal", False), ("cli", True)])
+async def test_confirmation_is_journal_specific_and_history_never_governs(
+    async_session, status, source, confirmed
+) -> None:
+    from repowise.core.persistence.crud.authority import (
+        accepted_decision_ids,
+        count_decisions_by_lane,
+        is_accepted,
+    )
+
+    repo = await insert_repo(async_session)
+    rec = DecisionRecord(
+        repository_id=repo.id,
+        title="Authority probe",
+        decision="Scoped rule",
+        source=source,
+        status=status,
+        confirmed_at=_now_utc() if confirmed else None,
+        affected_files_json='["src/app.py"]',
+    )
+    async_session.add(rec)
+    await async_session.flush()
+    accepted = source == "journal" and confirmed
+    assert await is_accepted(async_session, rec.id) == accepted
+    assert await accepted_decision_ids(async_session, repo.id) == ({rec.id} if accepted else set())
+    assert await accepted_decision_ids(async_session, repo.id, governing_only=True) == (
+        {rec.id} if accepted and status == "active" else set()
+    )
+    counts = await count_decisions_by_lane(async_session, repo.id)
+    assert counts["governing"] == int(accepted and status == "active")
+    assert counts["history"] == int(accepted and status != "active")
+    assert counts["candidates"] == int(not accepted and status != "dismissed")
+    assert counts["total"] == int(accepted or status != "dismissed")
 
 
 async def test_machine_writes_stay_disabled_under_the_flag(async_session, journal_repo) -> None:
