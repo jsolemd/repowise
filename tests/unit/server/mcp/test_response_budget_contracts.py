@@ -791,3 +791,36 @@ def test_recorded_shapes_cover_the_tools_that_can_be_exercised() -> None:
         - {"generate_refactoring_code"}
         - _FORK_TOOLS_WITHOUT_A_TUNED_CONTRACT
     )
+
+
+def test_search_candidates_survive_a_budget_cut() -> None:
+    """A tight budget trims result rows tail-first; the openable list is kept whole.
+
+    Measured at the v0.48.0 landing: with ``candidates`` first in the shed order,
+    31 of 43 federated cases returned zero candidates while still carrying nine
+    result rows. The doctrine names ``candidates`` as what to open, so it is
+    protected and ``results[]`` is the only shed path.
+    """
+    row = {
+        "file": "pkg/module.py",
+        "target_path": "pkg/module.py",
+        "name": "handler",
+        "kind": "function",
+        "snippet": "x" * 3_000,
+        "evidence": {"dense_cosine": 0.51, "lexical_rank": 1, "lane": "source"},
+        "repo": "infra",
+    }
+    payload = {
+        "mode": "hybrid",
+        "confidence": "caution",
+        "results": [dict(row, file=f"pkg/m{i}.py", target_path=f"pkg/m{i}.py") for i in range(30)],
+        "candidates": [{"path": f"pkg/m{i}.py", "repo": "infra"} for i in range(10)],
+        "selected_owner": {"file": "pkg/m0.py", "reason": "dense+lexical agreement", "repo": "infra"},
+        "_meta": {},
+    }
+    result = _enforce("search_codebase", payload)
+    assert len(result["candidates"]) == 10
+    assert result.get("candidates_emitted") in (None, 10)
+    assert result["results_emitted"] < 30
+    assert result["results_reduced_reason"] == "response_budget"
+    assert result["selected_owner"]["file"] == "pkg/m0.py"

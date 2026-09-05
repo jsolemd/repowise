@@ -247,9 +247,14 @@ _CONTRACTS: dict[str, ResponseBudgetContract] = {
     # Same order the tool used, enforced where the size is rechecked after the
     # trust envelope: its own pass reserved 400 chars for a collector and the
     # metadata that followed added roughly 2.6k.
+    # ``candidates`` is NOT shed. Upstream drops it first because for the wiki
+    # lane it is derivable from ``results``; on this fork it is the doctrine's
+    # "what to open" list, ten small dicts, and the only complete list of files
+    # once ``results[]`` has been cut. Measured at the v0.48.0 landing: with it
+    # first in the shed order 31 of 43 federated cases returned zero candidates.
     "search_codebase": ResponseBudgetContract(
         "blocks",
-        ("candidates", "results[]"),
+        ("results[]",),
         expansion_argument=None,
         # The fork's source lane returns its own response shape, and #2051 is
         # the first release in which the shared budget runs over it. The scalar
@@ -259,6 +264,7 @@ _CONTRACTS: dict[str, ResponseBudgetContract] = {
         # unprotected top-level keys before it trims a protected list.
         protected=(
             "results",
+            "candidates",
             "mode",
             "exact_match",
             "confidence",
