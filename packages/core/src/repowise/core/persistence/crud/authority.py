@@ -177,6 +177,40 @@ async def accepted_decision_ids(
     return {did for did, currency in rows if currency not in ("superseded", "dismissed")}
 
 
+#: ``DecisionRecord.source`` for a row projected from the canonical decision
+#: journal. Spelled here rather than imported from
+#: ``analysis.decisions.journal_projection``, which imports this package.
+_DECISION_JOURNAL_SOURCE = "journal"
+
+
+def journal_stored_currency(record: DecisionRecord) -> str | None:
+    """The stored currency a *journal* record carries, or ``None``.
+
+    Journal mode moves the acceptance authority out of the database: the
+    git-tracked JSONL is what a person ratifies, and ``decision_acceptances``
+    is never written for those records. Upstream's lane derivation reads only
+    that table, so without this every journal decision — including one Jon has
+    confirmed and committed — resolves to ``currency=None`` and is reported as
+    an unreviewed candidate by ``get_why``, ``get_risk`` and the decisions
+    dashboard.
+
+    ``confirmed_at`` is the projection of the journal's own confirmation, and
+    the projector is the only writer of it, so it is the acceptance row's
+    equivalent and nothing else can set it. A journal row with no
+    ``confirmed_at`` really is a candidate: that is an agent's unratified
+    proposal, which is exactly what the fork's journal mode means by
+    ``proposed``.
+
+    Returns a *stored* currency, so :func:`effective_currency` still derives
+    ``needs_review`` and ``uncheckable`` from the record's scope and staleness
+    the same way it does for an accepted decision.
+    """
+    if record.source != _DECISION_JOURNAL_SOURCE or record.confirmed_at is None:
+        return None
+    stored = record.status if record.status in STORED_CURRENCIES else "active"
+    return stored
+
+
 async def decision_currencies(
     session: AsyncSession,
     repository_id: str,
@@ -213,7 +247,7 @@ async def decision_currencies(
 
     out: dict[str, str] = {}
     for record in records:
-        currency = stored.get(record.id)
+        currency = stored.get(record.id) or journal_stored_currency(record)
         if currency is None:
             continue
         out[record.id] = effective_currency(
@@ -316,11 +350,12 @@ async def count_decisions_by_lane(
 async def current_currency(session: AsyncSession, record: DecisionRecord) -> str | None:
     """Effective currency for *record*, or ``None`` if it is a candidate."""
     acceptance = await latest_acceptance(session, record.id)
-    if acceptance is None:
+    stored = acceptance.currency if acceptance is not None else journal_stored_currency(record)
+    if stored is None:
         return None
     has_scope = bool(_record_scope(record))
     return effective_currency(
-        acceptance.currency,
+        stored,
         has_scope=has_scope,
         staleness=record.staleness_score,
     )

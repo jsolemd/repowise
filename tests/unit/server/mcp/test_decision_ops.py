@@ -735,7 +735,12 @@ async def test_a_proposal_never_reaches_answer_context_until_confirmed(journal_r
 
     injected = await fetch_relevant_decisions(ctx, repo_id, ["src/service.py"])
     assert [d["title"] for d in injected] == ["Route reads through the projection"]
-    assert injected[0]["status"] == "active"
+    # v0.48.0 replaced the injected ``status`` with a lane, because the row is
+    # rendered verbatim into a model prompt. A confirmed journal decision must
+    # land in the accepted lane: the mirror of the trap upstream wrote the lane
+    # for — a ratified decision that reads to the model as an open candidate.
+    assert injected[0]["lane"] == "accepted"
+    assert injected[0]["currency"] is not None
 
 
 # ---------------------------------------------------------------------------

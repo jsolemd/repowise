@@ -269,6 +269,24 @@ class DecisionGraphResponse(BaseModel):
     code_edges: list[DecisionCodeEdge]
 
 
+class DecisionJournalHealthResponse(BaseModel):
+    """State of the canonical decision journal behind a projected store.
+
+    ``null`` on the health rollup when journal mode is off, which is how a
+    caller tells "the derived store is the authority here" from "the journal is
+    the authority and this is its state".
+    """
+
+    #: Absolute path to the JSONL the projection was rebuilt from.
+    path: str
+    #: SHA-256 of that file's bytes, so a caller can tell an unchanged read.
+    content_hash: str
+    projected_count: int
+    last_refresh: str
+    #: False while another process holds the single-writer lock.
+    lock_acquirable: bool
+
+
 class DecisionHealthResponse(BaseModel):
     """Governance rollup: what is stale, awaiting review, and ungoverned."""
 
@@ -278,6 +296,10 @@ class DecisionHealthResponse(BaseModel):
     proposed_awaiting_review: list[DecisionRecordResponse] = []
     #: Hotspot paths no active decision names, worst-ranked first.
     ungoverned_hotspots: list[str] = []
+    #: Journal state, or ``None`` outside journal mode. Declared here because
+    #: upstream v0.48.0 gave this route a ``response_model`` (#2035) and FastAPI
+    #: drops any key the model does not name — which silently removed this one.
+    journal: DecisionJournalHealthResponse | None = None
 
 
 class DecisionEvidenceListResponse(BaseModel):
