@@ -1070,19 +1070,15 @@ async def run_cross_repo_analysis(
 
     Called from :func:`run_cross_repo_hooks` after workspace update.
     """
-    # Build repo_paths dict — only include repos that have been indexed
-    # (have a .repowise/ directory). Non-indexed repos must not leak into
-    # cross-repo signals.
-    repo_paths: dict[str, Path] = {}
+    # Only indexed AND federated repos feed cross-repo signals. A non-indexed
+    # repo has nothing to contribute; an opted-out one (``federated: false``)
+    # must not surface as a co-change partner — measured at the v0.49.0
+    # landing, the engine's own checkout otherwise ranked as the top impacted
+    # repo for every product target on co-change edges alone.
+    repo_paths = ws_config.federated_indexed_repo_paths(workspace_root)
     for entry in ws_config.repos:
-        abs_path = (workspace_root / entry.path).resolve()
-        if abs_path.is_dir() and (abs_path / ".repowise").is_dir():
-            repo_paths[entry.alias] = abs_path
-        elif abs_path.is_dir():
-            _log.debug(
-                "Skipping non-indexed repo %r in cross-repo analysis",
-                entry.alias,
-            )
+        if entry.alias not in repo_paths:
+            _log.debug("Skipping non-indexed or non-federated repo %r in cross-repo analysis", entry.alias)
 
     if len(repo_paths) < 2:
         _log.debug("Skipping cross-repo analysis — fewer than 2 indexed repos")

@@ -839,14 +839,7 @@ def contract_repo_paths(ws_config: Any, workspace_root: Path) -> dict[str, Path]
     indexed, still in ``list_repos``, still addressable by ``repo="<alias>"``,
     and its own contracts page still answers for it.
     """
-    repo_paths: dict[str, Path] = {}
-    for entry in ws_config.repos:
-        if not getattr(entry, "federated", True):
-            continue
-        resolved = (workspace_root / entry.path).resolve()
-        if resolved.is_dir() and (resolved / ".repowise").is_dir():
-            repo_paths[entry.alias] = resolved
-    return repo_paths
+    return ws_config.federated_indexed_repo_paths(workspace_root)
 
 
 async def run_contract_extraction(

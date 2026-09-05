@@ -15,6 +15,7 @@ from pathlib import Path
 
 from repowise.core.workspace.config import RepoEntry, WorkspaceConfig
 from repowise.core.workspace.contracts import contract_repo_paths
+from repowise.core.workspace.system_graph import _detect_boundaries_by_repo
 
 
 def _indexed(root: Path, name: str) -> None:
@@ -74,3 +75,34 @@ def test_opting_out_does_not_remove_the_repo_from_the_workspace(tmp_path: Path) 
     assert "engine" not in registry.get_federated_aliases()
     assert registry.resolve_repo_param("engine") == "engine"
     assert "engine" not in registry.resolve_repo_param("all")
+
+
+def test_every_cross_repo_producer_reads_one_gate(tmp_path: Path) -> None:
+    """Contracts, co-change detection and the system graph share the set.
+
+    Measured at the v0.49.0 landing: the contract store was gated but the
+    co-change detector and the boundary walk were not, so the opted-out repo
+    ranked as the top impacted repo in ``get_blast_radius`` on every product
+    target through ``co_change`` edges alone.
+    """
+    for name in ("web", "api", "engine"):
+        _indexed(tmp_path, name)
+    config = _config(
+        RepoEntry(path="web", alias="web"),
+        RepoEntry(path="api", alias="api"),
+        RepoEntry(path="engine", alias="engine", federated=False),
+    )
+
+    gate = config.federated_indexed_repo_paths(tmp_path)
+
+    assert set(gate) == {"web", "api"}
+    assert contract_repo_paths(config, tmp_path) == gate
+    assert set(_detect_boundaries_by_repo(config, tmp_path)) == {"web", "api"}
+
+
+def test_the_gate_keeps_upstreams_indexed_rule(tmp_path: Path) -> None:
+    _indexed(tmp_path, "web")
+    (tmp_path / "api").mkdir()  # present, never indexed, federated by default
+    config = _config(RepoEntry(path="web", alias="web"), RepoEntry(path="api", alias="api"))
+
+    assert set(config.federated_indexed_repo_paths(tmp_path)) == {"web"}

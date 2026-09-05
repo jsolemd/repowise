@@ -468,13 +468,15 @@ def load_system_graph(workspace_root: Path) -> SystemGraph | None:
 def _detect_boundaries_by_repo(
     ws_config: WorkspaceConfig, workspace_root: Path
 ) -> dict[str, list[ServiceBoundary]]:
-    """Detect service boundaries for every indexed repo in the workspace."""
-    boundaries: dict[str, list[ServiceBoundary]] = {}
-    for entry in ws_config.repos:
-        resolved = (workspace_root / entry.path).resolve()
-        if resolved.is_dir() and (resolved / ".repowise").is_dir():
-            boundaries[entry.alias] = detect_service_boundaries(resolved)
-    return boundaries
+    """Detect service boundaries for every indexed, federated repo in the workspace.
+
+    An opted-out repo (``federated: false``) gets no node in the system graph,
+    so it cannot be a blast-radius target or an impacted repo.
+    """
+    return {
+        alias: detect_service_boundaries(resolved)
+        for alias, resolved in ws_config.federated_indexed_repo_paths(workspace_root).items()
+    }
 
 
 async def run_system_graph_build(

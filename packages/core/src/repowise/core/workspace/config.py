@@ -378,6 +378,35 @@ class WorkspaceConfig:
         root = Path(workspace_root).resolve()
         return [(root / entry.path).resolve() for entry in self.repos]
 
+    def federated_indexed_repo_paths(self, workspace_root: Path) -> dict[str, Path]:
+        """Alias -> resolved path for every repo that may join a workspace-wide answer.
+
+        Two gates, two questions. **Indexed** (a ``.repowise/`` directory) is
+        upstream's: a repo nobody has indexed has nothing to contribute.
+        **Federated** is this fork's (``RepoEntry.federated``): a repo can be
+        worth indexing and reachable by its own alias without competing for
+        rank in answers about the other repositories. The engine's own source
+        tree is the case that exists for.
+
+        This is the one place both questions are asked, so every cross-repo
+        producer reads the same set: contract extraction, git co-change
+        detection, and the service-boundary walk behind the system graph. The
+        v0.49.0 landing measured what one missed gate costs: the opted-out repo
+        ranked as the top impacted repo in ``get_blast_radius`` on every product
+        target, through co-change edges alone.
+
+        Discovery and per-repo indexing keep using ``repos`` directly: opting out
+        never removes a repo from the workspace.
+        """
+        paths: dict[str, Path] = {}
+        for entry in self.repos:
+            if not entry.federated:
+                continue
+            resolved = (workspace_root / entry.path).resolve()
+            if resolved.is_dir() and (resolved / ".repowise").is_dir():
+                paths[entry.alias] = resolved
+        return paths
+
     def repo_aliases(self) -> list[str]:
         """Return all repo aliases in order."""
         return [r.alias for r in self.repos]
