@@ -1106,6 +1106,11 @@ async def _federated_search(
     for item in output:
         item.pop("_merged_position_score", None)
 
+    # Upstream serves no freshness on this path, reasoning that several repos
+    # have no single indexed commit to compare a live HEAD against. This fork
+    # answers that per repo instead of skipping it: ``_federated_freshness``
+    # keys the verdict by the repo each hit came from, which is the fact the
+    # single-commit framing says cannot exist.
     response: dict = {
         "results": output,
         "_meta": _build_meta(

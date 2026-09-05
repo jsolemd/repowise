@@ -271,8 +271,9 @@ async def test_context_used_by_and_relations_recover_in_one_bounded_query_shape(
     relation_recovered = await _recover_one(relation_result, "Type025")
     assert "Type025" in relation_recovered
     assert "Type000" not in relation_recovered
-    # Upstream pins 20 for both. Two fork additions sit on top, both measured
-    # and both ticketed:
+    # Upstream pinned 20 for both at v0.48.0 and raised the relation leg to 22
+    # at v0.49.0. Two fork additions sit on top of upstream's number, both
+    # measured and both ticketed:
     #
     #   +4  get_context target resolution (tool_context/targets.py: the
     #       near-miss path pool over GitMetadata / Page / GraphNode plus the
@@ -290,7 +291,13 @@ async def test_context_used_by_and_relations_recover_in_one_bounded_query_shape(
     # The +2 buys the recall this rung was swapped for: upstream measures the
     # 1-hop import relation this replaced at 19.5% of provably-executed files
     # against the call walk's 27.7%, at higher precision (72.1% -> 91.7%).
-    assert relation_statements <= 26 and used_by_statements <= 20
+    #
+    # And v0.49.0's own +2, upstream's words: the first call also pays the one
+    # aggregate behind the empty-callers basis and the one layer read behind
+    # the scope hint. Both are cached per repo per index commit, so the second
+    # call pays neither. 20 + 6 + 2 = 28; MEASURED at 28 on the merged tree,
+    # not derived from the arithmetic.
+    assert relation_statements <= 28 and used_by_statements <= 20
 
 
 @pytest.mark.asyncio
