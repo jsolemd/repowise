@@ -7,6 +7,7 @@
     "commit",
     "git_archaeology",
     "inline_marker",
+    "journal",
     "llm_inferred",
     "pr",
     "session"

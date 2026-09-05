@@ -696,6 +696,13 @@ export interface DeadCodeSummaryResponse {
   by_kind: Record<string, unknown>;
 }
 
+/** One file/symbol anchor retained from a canonical decision journal. */
+export interface DecisionAnchorResponse {
+  file: string;
+  symbol?: string | null;
+  file_sha?: string | null;
+}
+
 /** A link from a decision to a governed file or module. */
 export interface DecisionCodeEdge {
   decision_id: string;
@@ -799,6 +806,22 @@ export interface DecisionHealthResponse {
   stale_decisions?: DecisionRecordResponse[];
   proposed_awaiting_review?: DecisionRecordResponse[];
   ungoverned_hotspots?: string[];
+  journal?: DecisionJournalHealthResponse | null;
+}
+
+/**
+ * State of the canonical decision journal behind a projected store.
+ *
+ * ``null`` on the health rollup when journal mode is off, which is how a
+ * caller tells "the derived store is the authority here" from "the journal is
+ * the authority and this is its state".
+ */
+export interface DecisionJournalHealthResponse {
+  path: string;
+  content_hash: string;
+  projected_count: number;
+  last_refresh: string;
+  lock_acquirable: boolean;
 }
 
 /**
@@ -849,11 +872,14 @@ export interface DecisionRecordResponse {
   evidence_commits: string[];
   evidence_file: string | null;
   evidence_line: number | null;
+  anchors?: DecisionAnchorResponse[];
   confidence: number;
   staleness_score: number;
   verification?: string;
   scope?: string | null;
+  supersedes?: string | null;
   superseded_by: string | null;
+  confirmed_at?: string | null;
   last_code_change: string | null;
   created_at: string;
   updated_at: string;
@@ -940,6 +966,18 @@ export interface DependencyPathResponse {
   visual_context?: Record<string, unknown> | null;
 }
 
+/**
+ * What this deployment forbids, so the UI never offers a refused action.
+ *
+ * Deliberately cheap and free of index or provider work: the dashboard's root
+ * layout fetches it server-side on every render, and an affordance that
+ * appears and then disappears is worse than one that was never drawn.
+ */
+export interface DeploymentPolicyResponse {
+  generative_disabled: boolean;
+  generative_policy_source: string;
+}
+
 export interface DirectRiskEntry {
   path: string;
   structural_score: number;
@@ -983,6 +1021,13 @@ export interface DistillSavingsResponse {
   mcp_tokens?: number;
   mcp_queries?: number;
   mcp_per_tool?: McpDropGroup[];
+  mcp_usage_calls?: number;
+  mcp_usage_error_calls?: number;
+  mcp_usage_no_match_calls?: number;
+  mcp_usage_degraded_calls?: number;
+  mcp_usage_avg_duration_ms?: number;
+  mcp_usage_window_days?: number;
+  mcp_usage_per_tool?: McpUsageGroup[];
   missed_events?: number;
   missed_tokens_est?: number;
   missed_window_days?: number;
@@ -1516,6 +1561,7 @@ export interface HealthResponse {
   status: string;
   db: string;
   version: string;
+  source_search?: Record<string, unknown> | null;
 }
 
 export interface HealthTrendAlert {
@@ -1740,6 +1786,19 @@ export interface McpToolSurfaceResponse {
   is_workspace: boolean;
   override?: string[] | string | null;
   tools: McpToolInfo[];
+}
+
+/** Bounded local usage/outcome totals for one MCP tool. */
+export interface McpUsageGroup {
+  tool: string;
+  calls: number;
+  error_calls: number;
+  no_match_calls: number;
+  degraded_calls: number;
+  avg_duration_ms: number;
+  saving_calls: number;
+  positive_saving_calls: number;
+  saved_tokens: number;
 }
 
 export interface ModuleEdgeResponse {

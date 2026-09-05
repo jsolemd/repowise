@@ -71,6 +71,10 @@ export const DECISION_SOURCES = [
   "commit",
   "git_archaeology",
   "inline_marker",
+  // Written by the canonical decision-journal projection when
+  // REPOWISE_DECISIONS_JOURNAL names a JSONL. Stored provenance with no capture
+  // toggle, like `commit`: the journal is the authority, not a harvest lane.
+  "journal",
   "llm_inferred",
   "pr",
   "session",
