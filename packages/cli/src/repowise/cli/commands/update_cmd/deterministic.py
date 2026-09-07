@@ -17,12 +17,15 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from repowise.cli.helpers import console, run_async
 from repowise.core.persistence import (
     load_stale_structural_file_paths as load_stale_structural_file_paths,
 )
+
+if TYPE_CHECKING:
+    from .module_reconcile import ModuleReconcilePlan
 
 
 def deterministic_embedder_name(cfg: dict) -> str:
@@ -120,26 +123,6 @@ def regenerate_deterministic_pages(
     )
 
 
-MODULE_RECONCILE_ENV = "REPOWISE_MODULE_RECONCILE"
-
-#: ``on`` retires module pages outside the derived set; ``report`` derives and
-#: logs but retires nothing; ``off`` skips the derivation entirely. Report mode
-#: exists so the first run against a real wiki can prove the derivation
-#: reproduces the pages that are already there before anything is deleted.
-_MODULE_RECONCILE_MODES = ("on", "report", "off")
-
-
-def module_reconcile_mode() -> str:
-    """The configured reconcile mode, defaulting to ``on``.
-
-    An unrecognised value reads as ``on`` rather than as an error: this runs
-    inside the post-commit hook's hot path, where refusing to update because a
-    variable is misspelled costs more than doing the safe default.
-    """
-    raw = os.environ.get(MODULE_RECONCILE_ENV, "").strip().lower()
-    return raw if raw in _MODULE_RECONCILE_MODES else "on"
-
-
 def deterministic_generation_config(
     cfg: dict,
     *,
@@ -165,105 +148,6 @@ def deterministic_generation_config(
     )
 
 
-def load_module_page_keys(repo_path: Path) -> dict[str, str]:
-    """``page_id -> structural_key`` for every ``module_page`` in the wiki.
-
-    An unkeyed row yields an empty string, which is what a page written before
-    the structural stamp looks like. Read for two things: what report mode
-    would retire, and which stored pages have drifted from the key the current
-    parse would give them.
-    """
-    return run_async(_load_module_page_keys(repo_path))
-
-
-async def _load_module_page_keys(repo_path: Path) -> dict[str, str]:
-    from repowise.cli.helpers import get_db_url_for_repo
-    from repowise.core.persistence import create_engine, create_session_factory, get_session
-
-    engine = create_engine(get_db_url_for_repo(repo_path))
-    try:
-        from sqlalchemy import select as sa_select
-
-        from repowise.core.persistence.models import Page
-
-        async with get_session(create_session_factory(engine)) as session:
-            rows = await session.execute(
-                sa_select(Page.id, Page.structural_key).where(Page.page_type == "module_page")
-            )
-            return {pid: str(key or "") for pid, key in rows}
-    except Exception:
-        # Never block an update on this. An empty map means report mode has
-        # nothing to compare against and the drift gate stays shut, which is
-        # the same thing this path did before the reconcile existed.
-        return {}
-    finally:
-        await engine.dispose()
-
-
-def reconcile_module_page_ids(
-    *,
-    repo_path: Path,
-    parsed_files: list,
-    graph_builder: Any,
-    git_meta_map: dict,
-    kg_modules: list | None,
-    cfg: dict,
-    concurrency: int,
-    degraded: list[str],
-) -> tuple[dict[str, str], set[str] | None]:
-    """Derive the module pages this commit should have. Never raises.
-
-    Returns ``(page_id -> structural_key, ids to enforce)``. The second element
-    is what persistence is allowed to act on, and it is ``None`` in every case
-    where retiring would be a guess: ``off``, ``report``, and any failure. An
-    empty dict with ``None`` beside it is therefore the safe answer, and the
-    one this returns whenever the derivation did not complete.
-
-    *parsed_files* is the whole current parse, which is what the index-only
-    path already holds — the changed-file slice is taken later, by the render.
-    """
-    mode = module_reconcile_mode()
-    if mode == "off":
-        return {}, None
-
-    try:
-        from repowise.core.generation.selection.module_reconcile import (
-            authoritative_module_pages,
-        )
-
-        module_ids = authoritative_module_pages(
-            parsed_files=parsed_files,
-            graph_builder=graph_builder,
-            config=deterministic_generation_config(cfg, concurrency=concurrency),
-            repo_path=repo_path,
-            kg_modules=kg_modules or None,
-            git_meta_map=git_meta_map,
-        )
-    except Exception as exc:
-        degraded.append(f"Module page reconcile: {exc}")
-        console.print(f"[yellow]module_reconcile skipped: {exc}[/yellow]")
-        return {}, None
-
-    if not module_ids:
-        # No production code, or a derivation that produced nothing while
-        # raising nothing. Indistinguishable from here, and the second reading
-        # would empty the type, so this refuses to act on either.
-        console.print("[yellow]module_reconcile derived no module pages; retiring nothing[/yellow]")
-        return {}, None
-
-    stored = load_module_page_keys(repo_path)
-    would_retire = sorted(set(stored) - set(module_ids))
-    console.print(
-        f"  module_reconcile mode={mode} authoritative={len(module_ids)} "
-        f"stored={len(stored)} would_retire={len(would_retire)}"
-    )
-    if mode == "report":
-        for page_id in would_retire:
-            console.print(f"    module_reconcile would retire {page_id}")
-        return module_ids, None
-    return module_ids, set(module_ids)
-
-
 def _render_pages(
     *,
     repo_path: Path,
@@ -281,6 +165,7 @@ def _render_pages(
     degrade_label: str,
     file_pages_only: bool = True,
     only_page_ids: set[str] | None = None,
+    kg_modules: list[dict] | None = None,
 ) -> list:
     """Render the changed files' pages from structure (free, no LLM).
 
@@ -354,6 +239,7 @@ def _render_pages(
                     repo_path=repo_path,
                     dead_code_report=dead_code_report,
                     only_page_ids=only_page_ids,
+                    kg_modules=kg_modules,
                 )
             )
     except Exception as exc:
@@ -369,7 +255,7 @@ def render_missing_module_pages(
     graph_builder: Any,
     repo_structure: Any,
     git_meta_map: dict,
-    module_ids: dict[str, str],
+    plan: ModuleReconcilePlan,
     cfg: dict,
     concurrency: int,
     degraded: list[str],
@@ -392,26 +278,13 @@ def render_missing_module_pages(
     Returns ``(pages rendered, repository page total)``; the total is ``None``
     when nothing was rendered and the caller's existing count still stands.
     """
-    if not module_ids:
-        return 0, None
-
-    stored = load_module_page_keys(repo_path)
-    missing = set(module_ids) - set(stored)
-    # A stored page with no key predates the structural stamp. That is not
-    # drift and re-rendering it would fire on every update forever, so an
-    # empty stored key is left alone.
-    drifted = {
-        page_id
-        for page_id, key in module_ids.items()
-        if page_id in stored and stored[page_id] and key and stored[page_id] != key
-    }
-    targets = missing | drifted
+    targets = plan.render_page_ids
     if not targets:
         return 0, None
 
     console.print(
         f"  module_reconcile rendering {len(targets)} module page(s) "
-        f"(missing={len(missing)} drifted={len(drifted)})"
+        f"(missing={len(plan.missing_page_ids)} drifted={len(plan.drifted_page_ids)})"
     )
     pages = _render_pages(
         repo_path=repo_path,
@@ -431,24 +304,32 @@ def render_missing_module_pages(
         degrade_label="Module page render",
         file_pages_only=False,
         only_page_ids=targets,
+        kg_modules=plan.kg_modules,
     )
     # Persist only what was asked for. The level gate already emits nothing
     # else, and keeping the filter here means a future level that starts
     # emitting on this path cannot quietly overwrite a page this run had no
     # opinion about.
     wanted = [page for page in pages if page.page_id in targets]
-    if not wanted:
+    missing = targets - {page.page_id for page in wanted}
+    if missing:
         degraded.append(
-            f"Module page render: {len(targets)} page(s) were requested and none came back"
+            f"Module page render: {len(missing)} of {len(targets)} requested page(s) "
+            f"were not rendered: {', '.join(sorted(missing))}"
         )
+    if not wanted:
         return 0, None
 
-    total = persist_deterministic_pages(
-        repo_path=repo_path,
-        generated_pages=wanted,
-        decay_paths=[],
-        degraded=degraded,
-    )
+    try:
+        total = persist_deterministic_pages(
+            repo_path=repo_path,
+            generated_pages=wanted,
+            decay_paths=[],
+            degraded=degraded,
+        )
+    except Exception as exc:
+        degraded.append(f"Module page persistence: {exc}")
+        return 0, None
     return len(wanted), total
 
 

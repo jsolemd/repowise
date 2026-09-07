@@ -25,27 +25,16 @@ import {
 } from "@/lib/api/docs-libraries";
 import {
   classifyLibrary,
+  compareLibraries,
+  LIBRARY_SORT_KEYS,
   DOCS_STATUS_UI,
   earliestNextCheck,
   formatNextCheck,
   remoteHasMoved,
-  type LibraryFreshness,
+  type LibrarySortKey,
 } from "@/lib/docs/library-status";
 
 const SWR_OPTS = { revalidateOnFocus: false, revalidateOnReconnect: false };
-
-/** Sort keys the header offers. Anything else is ignored, so a stray click on
- *  a non-sortable header cannot silently reorder the table. */
-const SORT_KEYS = ["freshness", "indexed_at", "freshness_checked_at"] as const;
-type SortKey = (typeof SORT_KEYS)[number];
-
-/** Worst first when sorting descending, so the rows that need attention lead. */
-const FRESHNESS_RANK: Record<LibraryFreshness, number> = {
-  outdated: 3,
-  stale: 2,
-  unknown: 1,
-  fresh: 0,
-};
 
 /** Indexer status → an existing badge variant. `indexing` borrows `accent`
  *  because it is work in progress, not a verdict about the copy on disk. */
@@ -59,15 +48,6 @@ const STATUS_BADGE: Record<string, "fresh" | "stale" | "outdated" | "accent" | "
 
 function shortSha(sha: string | null): string | null {
   return sha ? sha.slice(0, 8) : null;
-}
-
-/** Milliseconds for sorting. Missing sorts last in either direction. */
-function timeValue(iso: string | null): number {
-  if (!iso) return Number.NEGATIVE_INFINITY;
-  const trimmed = iso.trim();
-  const stamped = /[zZ]|[+-]\d\d?:\d\d$/.test(trimmed) ? trimmed : `${trimmed}Z`;
-  const at = new Date(stamped).getTime();
-  return Number.isNaN(at) ? Number.NEGATIVE_INFINITY : at;
 }
 
 /** What went wrong with this library, in one line, or null when nothing did. */
@@ -209,23 +189,15 @@ export function DocsLibrariesSection() {
     getDocsLibraries,
     SWR_OPTS,
   );
-  const [sort, setSort] = useState<SortKey>("freshness");
+  const [sort, setSort] = useState<LibrarySortKey>("freshness");
   const [order, setOrder] = useState<"asc" | "desc">("desc");
 
   const libraries = useMemo(() => data?.libraries ?? [], [data]);
 
-  const rows = useMemo(() => {
-    const direction = order === "asc" ? 1 : -1;
-    return [...libraries].sort((a, b) => {
-      if (sort === "freshness") {
-        const delta =
-          FRESHNESS_RANK[classifyLibrary(a)] - FRESHNESS_RANK[classifyLibrary(b)];
-        return delta !== 0 ? delta * direction : a.name.localeCompare(b.name);
-      }
-      const delta = timeValue(a[sort]) - timeValue(b[sort]);
-      return delta !== 0 ? delta * direction : a.name.localeCompare(b.name);
-    });
-  }, [libraries, sort, order]);
+  const rows = useMemo(
+    () => [...libraries].sort((a, b) => compareLibraries(a, b, sort, order)),
+    [libraries, sort, order],
+  );
 
   const unknownCount = useMemo(
     () => libraries.filter((lib) => classifyLibrary(lib) === "unknown").length,
@@ -249,13 +221,13 @@ export function DocsLibrariesSection() {
     return (
       <OverviewSection title="Libraries" flush>
         <ApiError
-          title={unreachable ? "Documentation service not running" : "Failed to load"}
+          title={unreachable ? "Documentation inventory unavailable" : "Failed to load"}
           message={
             // No backticks: ApiError takes a plain string, so markdown fences
             // would render as literal characters. The docs lane is on-demand,
             // so "down" is a normal state with a one-command fix.
             unreachable
-              ? "The documentation service is not running. Start it with: solemd infra up"
+              ? "The documentation service could not provide its inventory. Retry, or start the service with: solemd infra up"
               : "The library inventory could not be read from the server."
           }
           onRetry={() => void mutate()}
@@ -324,10 +296,10 @@ export function DocsLibrariesSection() {
             sortField={sort}
             sortOrder={order}
             onSort={(key) => {
-              if (!SORT_KEYS.includes(key as SortKey)) return;
+              if (!LIBRARY_SORT_KEYS.includes(key as LibrarySortKey)) return;
               if (key === sort) setOrder((o) => (o === "asc" ? "desc" : "asc"));
               else {
-                setSort(key as SortKey);
+                setSort(key as LibrarySortKey);
                 setOrder("desc");
               }
             }}

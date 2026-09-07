@@ -1,4 +1,5 @@
 import { AlertTriangle, CheckCircle2, Clock, HelpCircle } from "lucide-react";
+import { parseDate } from "@repowise-dev/ui/lib/format";
 import type { DocsLibrary } from "@/lib/api/docs-libraries";
 
 /**
@@ -45,8 +46,8 @@ export function classifyLibrary(lib: DocsLibrary): LibraryFreshness {
  * test. A git library stores the bare commit in both. A snapshot stores a
  * composite in ``current_sha`` — the remote identity followed by a content
  * hash — because its source has no commit and only the content proves the
- * copy. What holds in every case is that ``last_remote_sha`` is a *prefix* of
- * ``current_sha`` while the copy is current.
+ * copy. A current copy either matches the remote identity exactly or carries
+ * that complete identity followed by the content-hash delimiter.
  *
  * Measured against the live corpus on 2026-09-07 (84 libraries, all of which
  * the service itself reports fresh): the prefix rule agrees on all 84. Plain
@@ -56,15 +57,15 @@ export function classifyLibrary(lib: DocsLibrary): LibraryFreshness {
  * Both would have put a red badge on a current library, on the one column this
  * page exists for.
  *
- * A remote that genuinely moves writes a different hash, which will not be a
- * prefix of a composite built from the old one, so the signal survives.
+ * Requiring the delimiter also distinguishes identities such as v2 and v20;
+ * a partial string prefix is not evidence that two sources match.
  */
 export function remoteHasMoved(
   lib: Pick<DocsLibrary, "current_sha" | "last_remote_sha">,
 ): boolean {
   const { current_sha: current, last_remote_sha: remote } = lib;
   if (!current || !remote) return false;
-  return !current.startsWith(remote);
+  return current !== remote && !current.startsWith(`${remote}:`);
 }
 
 /**
@@ -148,15 +149,35 @@ export function formatNextCheck(iso: string | null | undefined, fallback = "—"
 /**
  * Milliseconds for an API timestamp, or null when it is unparseable.
  *
- * The docs service returns UTC wall-clock strings, some without a `Z`. Same
- * rule as `parseDate` in the shared formatters, restated here so this module
- * stays pure and importable from a test with no UI dependencies.
+ * The docs service returns UTC wall-clock strings, some without a `Z`. Delegates
+ * to the shared, pure timestamp parser so sorting and display agree on UTC.
  */
 function parseUtc(iso: string): number | null {
-  const trimmed = iso.trim();
-  const stamped = /[zZ]|[+-]\d\d?:\d\d$/.test(trimmed) ? trimmed : `${trimmed}Z`;
-  const at = new Date(stamped).getTime();
+  const at = parseDate(iso).getTime();
   return Number.isNaN(at) ? null : at;
+}
+
+export const LIBRARY_SORT_KEYS = ["freshness", "indexed_at", "freshness_checked_at"] as const;
+export type LibrarySortKey = (typeof LIBRARY_SORT_KEYS)[number];
+
+/** Missing timestamps stay last in either direction; ties sort by name. */
+export function compareLibraries(
+  a: DocsLibrary,
+  b: DocsLibrary,
+  sort: LibrarySortKey,
+  order: "asc" | "desc",
+): number {
+  const direction = order === "asc" ? 1 : -1;
+  if (sort === "freshness") {
+    const delta = LIBRARY_FRESHNESS_ORDER.indexOf(classifyLibrary(b)) -
+      LIBRARY_FRESHNESS_ORDER.indexOf(classifyLibrary(a));
+    return delta * direction || a.name.localeCompare(b.name);
+  }
+  const left = a[sort] ? parseUtc(a[sort]) : null;
+  const right = b[sort] ? parseUtc(b[sort]) : null;
+  if (left === null && right !== null) return 1;
+  if (right === null && left !== null) return -1;
+  return ((left ?? 0) - (right ?? 0)) * direction || a.name.localeCompare(b.name);
 }
 
 /** The soonest check still ahead of us, or null when nothing is scheduled. */

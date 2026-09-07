@@ -393,7 +393,7 @@ def _persist_index_only_update(
 
     ``module_page_ids`` is the module-page set the caller's parse says should
     exist, or ``None`` to leave every module page alone. Only the deterministic
-    docs mode derives one; see ``deterministic.reconcile_module_page_ids``.
+    docs mode derives one; see ``module_reconcile.plan_module_reconcile``.
 
     ``force_full_rescore`` runs the full health re-score regardless of the
     periodic gate. Set by the config-changed caller, which relies on this path

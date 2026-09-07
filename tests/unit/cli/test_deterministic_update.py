@@ -24,8 +24,10 @@ from sqlalchemy import select
 
 from repowise.cli.commands.update_cmd.deterministic import (
     deterministic_embedder_name,
+)
+from repowise.cli.commands.update_cmd.module_reconcile import (
     module_reconcile_mode,
-    reconcile_module_page_ids,
+    plan_module_reconcile,
 )
 from repowise.core.persistence import (
     create_engine,
@@ -136,7 +138,7 @@ async def _persist(repo: Path, module_page_ids: set[str] | None, **kwargs):
     """
     return await persist_incremental_index(
         repo,
-        object(),
+        kwargs.pop("graph_builder", object()),
         {},
         None,
         None,
@@ -159,11 +161,11 @@ class TestModuleReconcileMode:
         monkeypatch.setenv("REPOWISE_MODULE_RECONCILE", "off")
         assert module_reconcile_mode() == "off"
 
-    def test_nonsense_reads_as_on(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        # This runs inside the post-commit hook. Refusing to update because a
-        # variable is misspelled costs more than doing the safe default.
+    def test_nonsense_only_reports(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("REPOWISE_MODULE_RECONCILE", "yes-please")
-        assert module_reconcile_mode() == "on"
+        degraded: list[str] = []
+        assert module_reconcile_mode(degraded=degraded) == "report"
+        assert "invalid REPOWISE_MODULE_RECONCILE" in degraded[0]
 
 
 async def test_index_only_update_retires_module_pages_for_deleted_directories(repo):
@@ -191,7 +193,8 @@ async def test_index_only_update_without_module_ids_retires_nothing(repo):
     assert outcome.swept_page_ids == ()
 
 
-async def test_reconcile_refusal_reaches_prune_refusals_state(repo):
+@pytest.mark.parametrize("file_prune_succeeds", [False, True])
+async def test_reconcile_refusal_reaches_prune_refusals_state(repo, file_prune_succeeds):
     """A refused reconcile has to survive into ``state.json``.
 
     That is the whole reporting chain: the refusal rides the prune outcome,
@@ -203,7 +206,15 @@ async def test_reconcile_refusal_reaches_prune_refusals_state(repo):
     await _seed_module_pages(repo, *targets)
     degraded: list[str] = []
 
-    outcome = await _persist(repo, {f"module_page:src/m{i}" for i in range(5)}, degraded=degraded)
+    import networkx as nx
+
+    builder = SimpleNamespace(graph=lambda: nx.DiGraph()) if file_prune_succeeds else object()
+    outcome = await _persist(
+        repo,
+        {f"module_page:src/m{i}" for i in range(5)},
+        degraded=degraded,
+        graph_builder=builder,
+    )
 
     assert len(outcome.refusals) == 1
     assert outcome.refusals[0].table == "wiki_module_pages"
@@ -221,9 +232,7 @@ class TestReconcileGate:
     """What the CLI helper hands persistence, per mode."""
 
     def _args(self, repo: Path, monkeypatch: pytest.MonkeyPatch, derived: dict[str, str]):
-        from repowise.cli.commands.update_cmd import deterministic as det
-
-        monkeypatch.setattr(det, "authoritative_module_pages", lambda **_kw: derived, raising=False)
+        _seed_sync(repo, "mcp")
         monkeypatch.setattr(
             "repowise.core.generation.selection.module_reconcile.authoritative_module_pages",
             lambda **_kw: derived,
@@ -242,16 +251,16 @@ class TestReconcileGate:
     def test_on_mode_enforces_the_derived_set(self, repo, monkeypatch):
         monkeypatch.setenv("REPOWISE_MODULE_RECONCILE", "on")
         args = self._args(repo, monkeypatch, {"module_page:mcp": "concept-mcp"})
-        derived, enforced = reconcile_module_page_ids(**args)
-        assert derived == {"module_page:mcp": "concept-mcp"}
-        assert enforced == {"module_page:mcp"}
+        plan = plan_module_reconcile(**args)
+        assert plan is not None
+        assert plan.authoritative_page_ids == {"module_page:mcp"}
+        assert plan.render_page_ids == set()
 
     def test_report_mode_derives_but_enforces_nothing(self, repo, monkeypatch):
         monkeypatch.setenv("REPOWISE_MODULE_RECONCILE", "report")
         args = self._args(repo, monkeypatch, {"module_page:mcp": "concept-mcp"})
-        derived, enforced = reconcile_module_page_ids(**args)
-        assert derived == {"module_page:mcp": "concept-mcp"}
-        assert enforced is None
+        assert plan_module_reconcile(**args) is None
+        assert args["degraded"] == []
 
     def test_off_mode_does_not_even_derive(self, repo, monkeypatch):
         monkeypatch.setenv("REPOWISE_MODULE_RECONCILE", "off")
@@ -263,7 +272,7 @@ class TestReconcileGate:
             "repowise.core.generation.selection.module_reconcile.authoritative_module_pages",
             _boom,
         )
-        derived, enforced = reconcile_module_page_ids(
+        plan = plan_module_reconcile(
             repo_path=repo,
             parsed_files=[],
             graph_builder=object(),
@@ -273,7 +282,7 @@ class TestReconcileGate:
             concurrency=2,
             degraded=[],
         )
-        assert (derived, enforced) == ({}, None)
+        assert plan is None
 
     def test_a_failed_derivation_enforces_nothing_and_degrades(self, repo, monkeypatch):
         monkeypatch.setenv("REPOWISE_MODULE_RECONCILE", "on")
@@ -286,7 +295,7 @@ class TestReconcileGate:
             _boom,
         )
         degraded: list[str] = []
-        derived, enforced = reconcile_module_page_ids(
+        plan = plan_module_reconcile(
             repo_path=repo,
             parsed_files=[],
             graph_builder=object(),
@@ -296,15 +305,44 @@ class TestReconcileGate:
             concurrency=2,
             degraded=degraded,
         )
-        assert (derived, enforced) == ({}, None)
+        assert plan is None
         assert degraded == ["Module page reconcile: grouping exploded"]
 
     def test_an_empty_derivation_enforces_nothing(self, repo, monkeypatch):
         """Empty is a legal answer and an under-derivation. Refuse to act on it."""
         monkeypatch.setenv("REPOWISE_MODULE_RECONCILE", "on")
         args = self._args(repo, monkeypatch, {})
-        derived, enforced = reconcile_module_page_ids(**args)
-        assert (derived, enforced) == ({}, None)
+        plan = plan_module_reconcile(**args)
+        assert plan is None
+        assert "preserving stored pages" in args["degraded"][0]
+
+    def test_failed_inventory_read_preserves_pages_and_reports_degradation(self, repo, monkeypatch):
+        from repowise.cli.commands.update_cmd import module_reconcile as reconcile
+
+        args = self._args(repo, monkeypatch, {"module_page:mcp": "concept-mcp"})
+
+        async def unreadable(_repo):
+            raise RuntimeError("database is locked")
+
+        monkeypatch.setattr(reconcile, "_load_module_page_keys", unreadable)
+        assert plan_module_reconcile(**args) is None
+        assert args["degraded"] == ["Module page reconcile: database is locked"]
+
+    def test_plan_and_render_read_the_inventory_once(self, repo, monkeypatch):
+        from unittest.mock import AsyncMock
+
+        from repowise.cli.commands.update_cmd import deterministic as det
+        from repowise.cli.commands.update_cmd import module_reconcile as reconcile
+
+        args = self._args(repo, monkeypatch, {"module_page:mcp": "concept-mcp"})
+        read = AsyncMock(wraps=reconcile._load_module_page_keys)
+        monkeypatch.setattr(reconcile, "_load_module_page_keys", read)
+        plan = plan_module_reconcile(**args)
+        render_args = dict(args)
+        render_args.pop("kg_modules")
+        render_args.update(source_map={}, repo_structure=object(), plan=plan)
+        assert det.render_missing_module_pages(**render_args) == (0, None)
+        assert read.await_count == 1
 
 
 # ---------------------------------------------------------------------------
@@ -332,18 +370,33 @@ def _seed_sync(repo: Path, *targets: str) -> None:
 
 
 def _render_args(repo: Path, module_ids: dict[str, str], degraded: list[str]) -> dict:
-    return dict(
-        repo_path=repo,
-        parsed_files=[_FakeParsed("a.py"), _FakeParsed("pkg/b.py")],
-        source_map={},
-        graph_builder=object(),
-        repo_structure=object(),
-        git_meta_map={},
-        module_ids=module_ids,
-        cfg={},
-        concurrency=2,
-        degraded=degraded,
-    )
+    from unittest.mock import patch
+
+    with patch(
+        "repowise.core.generation.selection.module_reconcile.authoritative_module_pages",
+        return_value=module_ids,
+    ):
+        return dict(
+            repo_path=repo,
+            parsed_files=[_FakeParsed("a.py"), _FakeParsed("pkg/b.py")],
+            source_map={},
+            graph_builder=object(),
+            repo_structure=object(),
+            git_meta_map={},
+            plan=plan_module_reconcile(
+                repo_path=repo,
+                parsed_files=[],
+                graph_builder=object(),
+                git_meta_map={},
+                kg_modules=None,
+                cfg={},
+                concurrency=2,
+                degraded=degraded,
+            ),
+            cfg={},
+            concurrency=2,
+            degraded=degraded,
+        )
 
 
 def test_missing_module_page_is_rendered_and_persisted(repo, monkeypatch):
@@ -454,3 +507,59 @@ def test_an_unkeyed_stored_page_is_not_drift(repo, monkeypatch):
     assert det.render_missing_module_pages(
         **_render_args(repo, {"module_page:mcp": "concept-mcp"}, [])
     ) == (0, None)
+
+
+@pytest.mark.parametrize("rendered_ids", [[], ["module_page:new1"]])
+def test_partial_module_render_reports_missing_replacements(repo, monkeypatch, rendered_ids):
+    from repowise.cli.commands.update_cmd import deterministic as det
+
+    _seed_sync(repo, "mcp")
+    degraded: list[str] = []
+    monkeypatch.setattr(det, "_render_pages", lambda **_: [_FakePage(pid) for pid in rendered_ids])
+    monkeypatch.setattr(det, "persist_deterministic_pages", lambda **_: 3)
+    args = _render_args(repo, {"module_page:new1": "k1", "module_page:new2": "k2"}, degraded)
+    rendered, _ = det.render_missing_module_pages(**args)
+    assert rendered == len(rendered_ids)
+    assert rendered < len(args["plan"].render_page_ids)
+    assert "module_page:new2" in degraded[0]
+    assert "were not rendered" in degraded[0]
+
+
+def test_failed_module_persistence_reports_no_committed_replacements(repo, monkeypatch):
+    from repowise.cli.commands.update_cmd import deterministic as det
+
+    _seed_sync(repo, "mcp")
+    degraded: list[str] = []
+    monkeypatch.setattr(det, "_render_pages", lambda **_: [_FakePage("module_page:new")])
+
+    def failed_write(**_):
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(det, "persist_deterministic_pages", failed_write)
+    assert det.render_missing_module_pages(
+        **_render_args(repo, {"module_page:new": "k"}, degraded)
+    ) == (0, None)
+    assert degraded == ["Module page persistence: disk full"]
+
+
+def test_module_render_passes_current_grouping_to_the_generator(repo, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from repowise.cli.commands.update_cmd import deterministic as det
+
+    _seed_sync(repo, "mcp")
+    groups = [{"id": "new-group", "filePaths": ["a.py"]}]
+    args = _render_args(repo, {"module_page:new": "k"}, [])
+    from dataclasses import replace
+
+    args["plan"] = replace(args["plan"], kg_modules=groups)
+    generate = AsyncMock(return_value=[_FakePage("module_page:new")])
+    monkeypatch.setattr(
+        "repowise.core.generation.PageGenerator",
+        lambda *_, **__: SimpleNamespace(generate_all=generate),
+    )
+    monkeypatch.setattr("repowise.core.generation.ContextAssembler", lambda *_, **__: object())
+    monkeypatch.setattr(det, "persist_deterministic_pages", lambda **_: 2)
+    assert det.render_missing_module_pages(**args) == (1, 2)
+    assert generate.await_args.kwargs["kg_modules"] is groups
+    assert generate.await_args.kwargs["only_page_ids"] == {"module_page:new"}

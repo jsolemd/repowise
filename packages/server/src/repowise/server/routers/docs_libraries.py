@@ -53,12 +53,15 @@ async def get_docs_libraries() -> dict:
     own for it, and re-modelling it here would mean a second place to update
     every time the docs service adds a field.
     """
-    url = f"{_docs_url()}/docs/libraries"
+    url = f"{_docs_url().rstrip('/')}/docs/libraries"
     try:
         async with httpx.AsyncClient(timeout=_TIMEOUT_SECONDS) as client:
             resp = await client.get(url)
         resp.raise_for_status()
-        return resp.json()
+        payload = resp.json()
+        if not isinstance(payload, dict):
+            raise ValueError("inventory must be a JSON object")
+        return payload
     except httpx.HTTPError as exc:
         # Covers connect/read errors and non-2xx alike: to the dashboard both
         # mean "the inventory is not available right now".
@@ -66,4 +69,10 @@ async def get_docs_libraries() -> dict:
         raise HTTPException(
             status_code=502,
             detail="Couldn't reach the documentation service.",
+        ) from exc
+    except ValueError as exc:
+        logger.warning("docs_libraries_invalid_response url=%s error=%s", url, exc)
+        raise HTTPException(
+            status_code=502,
+            detail="The documentation service returned an invalid inventory.",
         ) from exc

@@ -1,6 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   classifyLibrary,
+  compareLibraries,
+  formatNextCheck,
   DOCS_STATUS_UI,
   LIBRARY_FRESHNESS_ORDER,
   remoteHasMoved,
@@ -110,7 +112,7 @@ describe("classifyLibrary", () => {
     // Absent evidence is not evidence of divergence; the state word decides.
     expect(remoteHasMoved({ current_sha: null, last_remote_sha: "abc" })).toBe(false);
     expect(remoteHasMoved({ current_sha: "abc", last_remote_sha: null })).toBe(false);
-    expect(remoteHasMoved({ current_sha: "abcdef", last_remote_sha: "abc" })).toBe(false);
+    expect(remoteHasMoved({ current_sha: "abcdef", last_remote_sha: "abc" })).toBe(true);
     expect(remoteHasMoved({ current_sha: "abcdef", last_remote_sha: "zzz" })).toBe(true);
   });
 
@@ -165,5 +167,47 @@ describe("DOCS_STATUS_UI", () => {
   it("orders the verdicts worst-first and names each one once", () => {
     expect([...LIBRARY_FRESHNESS_ORDER].sort()).toEqual([...verdicts].sort());
     expect(LIBRARY_FRESHNESS_ORDER[0]).toBe("outdated");
+  });
+});
+
+
+describe("inventory ordering and timestamps", () => {
+  it.each(["asc", "desc"] as const)("keeps missing dates last when %s", (order) => {
+    const rows = [
+      library({ name: "Z missing", indexed_at: null }),
+      library({ name: "Recent", indexed_at: "2026-09-07T08:00:00" }),
+      library({ name: "A invalid", indexed_at: "invalid" }),
+      library({ name: "Older", indexed_at: "2026-09-01T08:00:00Z" }),
+    ].sort((a, b) => compareLibraries(a, b, "indexed_at", order));
+    expect(rows.map((row) => row.name)).toEqual([
+      ...(order === "asc" ? ["Older", "Recent"] : ["Recent", "Older"]),
+      "A invalid", "Z missing",
+    ]);
+  });
+
+  it("puts the most concerning freshness first by default", () => {
+    const rows = [
+      library({ name: "fresh" }),
+      library({ name: "unknown", last_freshness_state: null }),
+      library({ name: "stale", last_freshness_state: "stale" }),
+      library({ name: "outdated", status: "error" }),
+    ].sort((a, b) => compareLibraries(a, b, "freshness", "desc"));
+    expect(rows.map((row) => row.name)).toEqual(["outdated", "stale", "unknown", "fresh"]);
+  });
+
+  it("treats bare API timestamps as UTC for future check times", () => {
+    const now = vi.spyOn(Date, "now").mockReturnValue(Date.parse("2026-09-07T08:00:00Z"));
+    try {
+      expect(formatNextCheck("2026-09-07T12:00:00")).toBe("in 4h");
+      expect(formatNextCheck("2026-09-07T07:00:00Z")).toBe("due now");
+      expect(formatNextCheck("invalid")).toBe("—");
+    } finally {
+      now.mockRestore();
+    }
+  });
+
+  it("requires the complete remote identity before a snapshot content hash", () => {
+    expect(remoteHasMoved({ current_sha: "curated:v20:content", last_remote_sha: "curated:v2" })).toBe(true);
+    expect(remoteHasMoved({ current_sha: "curated:v2:content", last_remote_sha: "curated:v2" })).toBe(false);
   });
 });

@@ -354,7 +354,7 @@ function RowOverflow({
         onClick={() => setOpen((v) => !v)}
         className="rounded-md px-1.5 py-1 leading-none text-[var(--color-text-tertiary)] transition-colors hover:bg-[var(--color-bg-inset)] hover:text-[var(--color-text-primary)]"
       >
-        <span aria-hidden>&#183;&#183;&#183;</span>
+        <span aria-hidden>···</span>
       </button>
       {open ? (
         <div

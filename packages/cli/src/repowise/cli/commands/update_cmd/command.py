@@ -1561,10 +1561,10 @@ def run_update(
             from .deterministic import (
                 load_prior_page_ids,
                 persist_deterministic_pages,
-                reconcile_module_page_ids,
                 regenerate_deterministic_pages,
                 render_missing_module_pages,
             )
+            from .module_reconcile import plan_module_reconcile
 
             if emitter is not None:
                 emitter.stage("generate")
@@ -1616,7 +1616,7 @@ def run_update(
             # current parse would produce is the only thing on this path that
             # can tell persistence which of them are dead.
             with timed(timings, "module_reconcile"):
-                module_ids, module_page_ids = reconcile_module_page_ids(
+                module_plan = plan_module_reconcile(
                     repo_path=repo_path,
                     parsed_files=parsed_files,
                     graph_builder=graph_builder,
@@ -1633,7 +1633,7 @@ def run_update(
             # only when the derived set and the store actually disagree — the
             # render needs a full-repo context pass, which a quiet commit must
             # not pay for.
-            if module_page_ids is not None:
+            if module_plan is not None:
                 with timed(timings, "module_render"):
                     rendered, page_total = render_missing_module_pages(
                         repo_path=repo_path,
@@ -1642,13 +1642,17 @@ def run_update(
                         graph_builder=graph_builder,
                         repo_structure=repo_structure,
                         git_meta_map=git_meta_map,
-                        module_ids=module_ids,
+                        plan=module_plan,
                         cfg=cfg,
                         concurrency=concurrency,
                         degraded=degraded,
                         dead_code_report=dead_code_report,
                         prior_page_ids=prior_ids,
                     )
+                # Keep the last usable pages if any replacement failed. The
+                # next changed-file update can retry from the current parse.
+                if rendered == len(module_plan.render_page_ids):
+                    module_page_ids = set(module_plan.authoritative_page_ids)
                 if rendered:
                     module_pages_rendered = rendered
                     if page_total is not None:

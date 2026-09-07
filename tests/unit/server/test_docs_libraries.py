@@ -118,6 +118,48 @@ async def test_returns_payload_from_docs_service(
     assert requested == [f"{docs_url}/docs/libraries"]
 
 
+async def test_docs_url_accepts_a_trailing_slash(monkeypatch, docs_url):
+    monkeypatch.setenv("REPOWISE_DOCS_URL", f"{docs_url}/")
+
+    def handler(url: str) -> httpx.Response:
+        assert url == f"{docs_url}/docs/libraries"
+        return httpx.Response(200, json=_PAYLOAD, request=httpx.Request("GET", url))
+
+    monkeypatch.setattr(docs_libraries.httpx, "AsyncClient", lambda **_: _StubClient(handler))
+    assert (await _get(_app())).status_code == 200
+
+
+@pytest.mark.parametrize("body", ["<html>Unavailable</html>", "null", "[]"])
+async def test_invalid_inventory_returns_502(monkeypatch, body):
+    def handler(url: str) -> httpx.Response:
+        return httpx.Response(200, text=body, request=httpx.Request("GET", url))
+
+    monkeypatch.setattr(docs_libraries.httpx, "AsyncClient", lambda **_: _StubClient(handler))
+    response = await _get(_app())
+    assert response.status_code == 502
+    assert response.json()["detail"] == "The documentation service returned an invalid inventory."
+
+
+async def test_timeout_returns_502_and_closes_client(monkeypatch):
+    closed = []
+
+    class TimeoutClient(_StubClient):
+        async def __aexit__(self, *exc_info):
+            closed.append(True)
+            return False
+
+    def handler(url: str) -> httpx.Response:
+        raise httpx.ReadTimeout("timed out", request=httpx.Request("GET", url))
+
+    def client(**kwargs):
+        assert kwargs["timeout"] == 10.0
+        return TimeoutClient(handler)
+
+    monkeypatch.setattr(docs_libraries.httpx, "AsyncClient", client)
+    assert (await _get(_app())).status_code == 502
+    assert closed == [True]
+
+
 async def test_returns_502_when_docs_service_unreachable(
     monkeypatch: pytest.MonkeyPatch, docs_url: str
 ) -> None:
