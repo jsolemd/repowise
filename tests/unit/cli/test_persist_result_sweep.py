@@ -279,3 +279,95 @@ async def test_persist_result_keeps_pages_a_resume_skipped(tmp_path):
         await engine.dispose()
 
     assert kept_id in await store.list_page_ids()
+
+
+# ---------------------------------------------------------------------------
+# Retired pages must lose their vectors too (update path)
+#
+# Vector deletes used to ride only on ``tombstoned_page_ids``. A swept page is
+# the worse case of the two: a tombstone still has a row, while a swept page is
+# deleted outright, and retrieval hydrates title and snippet from the vector
+# store itself — so the orphan answers in full for a page that 404s.
+# ---------------------------------------------------------------------------
+
+
+class _RecordingStore:
+    def __init__(self) -> None:
+        self.deleted: list[list[str]] = []
+
+    async def delete_many(self, page_ids: list[str]) -> None:
+        self.deleted.append(list(page_ids))
+
+
+def test_update_persist_deletes_vectors_for_tombstoned_and_swept_pages(tmp_path, monkeypatch):
+    """The single-repo index-only path deletes the union, not just tombstones."""
+    from repowise.cli.commands.update_cmd import incremental as update_incremental
+    from repowise.cli.commands.update_cmd import persistence as update_persistence
+    from repowise.core.pipeline import incremental as core_incremental
+    from repowise.core.pipeline.prune_state import DeletedFilePruneOutcome
+
+    repo_path = tmp_path / "repo"
+    (repo_path / ".repowise").mkdir(parents=True)
+
+    outcome = DeletedFilePruneOutcome(
+        attempted=True,
+        pruned_paths=0,
+        tombstoned_page_ids=("file_page:src/gone.py",),
+        swept_page_ids=("module_page:codeatlas/chunking", "file_page:src/gone.py"),
+    )
+
+    async def _fake_persist(*_args, **_kwargs):
+        return outcome
+
+    store = _RecordingStore()
+    monkeypatch.setattr(core_incremental, "persist_incremental_index", _fake_persist)
+    monkeypatch.setattr(update_incremental, "_build_update_vector_store", lambda *_a, **_kw: store)
+    monkeypatch.setattr(update_persistence, "run_decay_health_rescore", lambda *_a, **_kw: False)
+
+    import networkx as nx
+
+    class _Builder:
+        def graph(self):
+            return nx.DiGraph()
+
+    update_persistence._persist_index_only_update(
+        repo_path,
+        _Builder(),
+        {},
+        None,
+        None,
+        {},
+        "head1234",
+        0.0,
+        [],
+    )
+
+    assert store.deleted == [["file_page:src/gone.py", "module_page:codeatlas/chunking"]], (
+        "the swept page kept its vector"
+    )
+
+
+def test_workspace_vector_delete_covers_swept_pages(tmp_path, monkeypatch):
+    """The workspace pass takes the same union, for repos on the core path."""
+    from repowise.cli.commands.update_cmd import incremental as update_incremental
+    from repowise.cli.commands.update_cmd.workspace import _remove_tombstoned_page_vectors
+    from repowise.core.pipeline.prune_state import DeletedFilePruneOutcome
+
+    (tmp_path / "a").mkdir()
+    store = _RecordingStore()
+    monkeypatch.setattr(update_incremental, "_build_update_vector_store", lambda *_a, **_kw: store)
+
+    result = SimpleNamespace(
+        alias="a",
+        updated=True,
+        prune_outcome=DeletedFilePruneOutcome(
+            attempted=True,
+            tombstoned_page_ids=("file_page:a.py",),
+            swept_page_ids=("scc_page:cycle-1",),
+        ),
+    )
+    ws_config = SimpleNamespace(repos=[SimpleNamespace(alias="a", path="a")])
+
+    _remove_tombstoned_page_vectors(tmp_path, ws_config, [result])
+
+    assert store.deleted == [["file_page:a.py", "scc_page:cycle-1"]]

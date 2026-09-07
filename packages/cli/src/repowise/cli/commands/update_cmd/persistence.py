@@ -385,10 +385,15 @@ def _persist_index_only_update(
     force_full_rescore: bool = False,
     accept_mass_deletion: bool = False,
     repair_from_commit: str | None = None,
+    module_page_ids: set[str] | None = None,
     timings: PhaseTimings | None = None,
 ) -> None:
     """Persist the index-only update (graph + symbols + git + dead-code + health + KG),
     save state, and print the completion line. No LLM regeneration.
+
+    ``module_page_ids`` is the module-page set the caller's parse says should
+    exist, or ``None`` to leave every module page alone. Only the deterministic
+    docs mode derives one; see ``deterministic.reconcile_module_page_ids``.
 
     ``force_full_rescore`` runs the full health re-score regardless of the
     periodic gate. Set by the config-changed caller, which relies on this path
@@ -426,10 +431,19 @@ def _persist_index_only_update(
             degraded=degraded,
             failed_steps=failed_steps,
             accept_mass_deletion=accept_mass_deletion,
+            module_page_ids=module_page_ids,
             timings=timings,
         )
     )
-    if isinstance(prune_outcome, DeletedFilePruneOutcome) and prune_outcome.tombstoned_page_ids:
+    # Tombstoned and swept ids both leave a vector behind, and a swept one is
+    # the worse of the two: retrieval hydrates title and snippet from the store
+    # itself, so an orphan answers in full while the page it names is gone.
+    retired_vector_ids: list[str] = []
+    if isinstance(prune_outcome, DeletedFilePruneOutcome):
+        retired_vector_ids = list(
+            dict.fromkeys([*prune_outcome.tombstoned_page_ids, *prune_outcome.swept_page_ids])
+        )
+    if retired_vector_ids:
         try:
             from repowise.cli.helpers import load_config
 
@@ -437,10 +451,10 @@ def _persist_index_only_update(
 
             page_store = _build_update_vector_store(repo_path, load_config(Path(repo_path)))
             if page_store is not None:
-                run_async(page_store.delete_many(list(prune_outcome.tombstoned_page_ids)))
+                run_async(page_store.delete_many(retired_vector_ids))
         except Exception as exc:
-            degraded.append(f"Tombstone vector removal: {exc}")
-            console.print(f"[yellow]Tombstone vector removal deferred: {exc}[/yellow]")
+            degraded.append(f"Retired page vector removal: {exc}")
+            console.print(f"[yellow]Retired page vector removal deferred: {exc}[/yellow]")
     try:
         from repowise.cli.source_search_runtime import reconcile_configured_source_index
 

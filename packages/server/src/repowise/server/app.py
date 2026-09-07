@@ -47,6 +47,7 @@ from repowise.server.routers import (
     coupling,
     dead_code,
     decisions,
+    docs_libraries,
     episodes,
     external_systems,
     feedback,
@@ -538,5 +539,6 @@ def create_app() -> FastAPI:
     app.include_router(files.router)
     app.include_router(external_systems.router)
     app.include_router(feedback.router)
+    app.include_router(docs_libraries.router)
 
     return app

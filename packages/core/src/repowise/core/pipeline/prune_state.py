@@ -62,6 +62,12 @@ class DeletedFilePruneOutcome:
     pruned_paths: int = 0
     refusals: tuple[PruneRefusal, ...] = ()
     tombstoned_page_ids: tuple[str, ...] = ()
+    #: Pages this run deleted outright rather than tombstoned. They ride here
+    #: for one reason: the core persist path deliberately never builds the
+    #: host-owned page vector store, so only the CLI host can drop their
+    #: embeddings. Tombstoned ids already travelled this way and swept ids did
+    #: not, which is what left orphan vectors answering for pages that 404.
+    swept_page_ids: tuple[str, ...] = ()
 
 
 def state_prune_refusals(state: dict[str, Any]) -> tuple[PruneRefusal, ...]:

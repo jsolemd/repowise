@@ -1550,12 +1550,20 @@ def run_update(
         # skip this and stay a pure index.
         det_pages: list = []
         index_only_cost = 0.0
+        # The module pages this commit's parse says should exist. ``None`` all
+        # the way through means "no opinion", which is what every path but the
+        # deterministic one has: only this one holds a full current parse and
+        # renders its own pages, so only it can say a module page is dead.
+        module_page_ids: set[str] | None = None
+        module_pages_rendered = 0
         docs_mode = resolve_docs_mode(state)
         if docs_mode == "deterministic":
             from .deterministic import (
                 load_prior_page_ids,
                 persist_deterministic_pages,
+                reconcile_module_page_ids,
                 regenerate_deterministic_pages,
+                render_missing_module_pages,
             )
 
             if emitter is not None:
@@ -1601,6 +1609,58 @@ def run_update(
                     f"  [green]✓[/green] Re-rendered [bold]{len(det_pages)}[/bold] "
                     "wiki pages from structure"
                 )
+
+            # Module pages are repo-wide, so the render above never touches
+            # one: a page for a directory deleted three commits ago is still
+            # ``fresh`` and still answering searches. Deriving the set the
+            # current parse would produce is the only thing on this path that
+            # can tell persistence which of them are dead.
+            with timed(timings, "module_reconcile"):
+                module_ids, module_page_ids = reconcile_module_page_ids(
+                    repo_path=repo_path,
+                    parsed_files=parsed_files,
+                    graph_builder=graph_builder,
+                    git_meta_map=git_meta_map,
+                    kg_modules=getattr(knowledge_graph_result, "modules", None),
+                    cfg=cfg,
+                    concurrency=concurrency,
+                    degraded=degraded,
+                )
+
+            # The other half of the reconcile: retiring a drifted page without
+            # rendering its replacement would leave the subsystem undocumented
+            # until someone ran a full init. Only ``on`` mode does this, and
+            # only when the derived set and the store actually disagree — the
+            # render needs a full-repo context pass, which a quiet commit must
+            # not pay for.
+            if module_page_ids is not None:
+                with timed(timings, "module_render"):
+                    rendered, page_total = render_missing_module_pages(
+                        repo_path=repo_path,
+                        parsed_files=parsed_files,
+                        source_map=source_map,
+                        graph_builder=graph_builder,
+                        repo_structure=repo_structure,
+                        git_meta_map=git_meta_map,
+                        module_ids=module_ids,
+                        cfg=cfg,
+                        concurrency=concurrency,
+                        degraded=degraded,
+                        dead_code_report=dead_code_report,
+                        prior_page_ids=prior_ids,
+                    )
+                if rendered:
+                    module_pages_rendered = rendered
+                    if page_total is not None:
+                        state["total_pages"] = page_total
+                    # ``last_docs_commit`` deliberately not advanced here. It
+                    # says the whole wiki was rendered at this commit, and this
+                    # step only claims the module pages; the file-page render
+                    # above is what earns that stamp, including when it failed.
+                    console.print(
+                        f"  [green]✓[/green] Rendered [bold]{rendered}[/bold] "
+                        "missing or drifted module page(s)"
+                    )
         if emitter is not None:
             emitter.stage("persist")
         try:
@@ -1622,13 +1682,14 @@ def run_update(
                 # that touched no source file re-renders nothing, and that is
                 # not the same as having no wiki.
                 template_wiki=docs_mode == "deterministic",
-                pages_rendered=len(det_pages),
+                pages_rendered=len(det_pages) + module_pages_rendered,
                 git_decay_map=git_decay_map,
                 exclude_patterns=exclude_patterns,
                 head_ts=head_ts,
                 force_full_rescore=config_changed,
                 accept_mass_deletion=accept_mass_deletion,
                 repair_from_commit=base_ref,
+                module_page_ids=module_page_ids,
                 timings=timings,
             )
         except Exception as exc:
