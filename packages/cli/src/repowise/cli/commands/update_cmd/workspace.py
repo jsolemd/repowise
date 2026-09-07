@@ -62,10 +62,20 @@ def _remove_tombstoned_page_vectors(ws_root: Path, ws_config: Any, results: list
     by_alias = {result.alias: result for result in results}
     for entry in ws_config.repos:
         result = by_alias.get(entry.alias)
+        # A swept page is deleted outright, so its vector orphans harder than a
+        # tombstone's: search hydrates its title and snippet from the store and
+        # serves an answer for a page that no longer exists.
         page_ids = (
-            result.prune_outcome.tombstoned_page_ids
+            list(
+                dict.fromkeys(
+                    [
+                        *result.prune_outcome.tombstoned_page_ids,
+                        *result.prune_outcome.swept_page_ids,
+                    ]
+                )
+            )
             if result is not None and result.updated
-            else ()
+            else []
         )
         if not page_ids:
             continue
@@ -73,10 +83,10 @@ def _remove_tombstoned_page_vectors(ws_root: Path, ws_config: Any, results: list
         try:
             store = _build_update_vector_store(repo_path, load_config(repo_path))
             if store is not None:
-                run_async(store.delete_many(list(page_ids)))
+                run_async(store.delete_many(page_ids))
         except Exception as exc:
             console.print(
-                f"  [yellow]{entry.alias}: tombstone vector removal deferred: {exc}[/yellow]"
+                f"  [yellow]{entry.alias}: retired page vector removal deferred: {exc}[/yellow]"
             )
 
 

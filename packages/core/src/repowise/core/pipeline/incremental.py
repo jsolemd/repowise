@@ -27,7 +27,7 @@ from typing import Any
 import structlog
 
 from repowise.core.pipeline.phase_timing import PhaseTimings, timed
-from repowise.core.pipeline.prune_state import DeletedFilePruneOutcome
+from repowise.core.pipeline.prune_state import DeletedFilePruneOutcome, PruneRefusal
 
 logger = structlog.get_logger(__name__)
 
@@ -1479,6 +1479,7 @@ async def persist_incremental_index(
     degraded: list[str] | None = None,
     failed_steps: list[str] | None = None,
     accept_mass_deletion: bool = False,
+    module_page_ids: set[str] | None = None,
     timings: PhaseTimings | None = None,
 ) -> DeletedFilePruneOutcome:
     """Persist an incremental index refresh (graph + symbols + git + dead-code + health).
@@ -1506,6 +1507,15 @@ async def persist_incremental_index(
     looks range-scoped and is not: it bounds its walk by the newest
     ``committed_at`` already in the table, so a run it skipped is re-walked by
     the next one whatever the diff base says.
+
+    ``module_page_ids`` is the set of ``module_page`` ids the caller's current
+    parse says should exist. ``None`` — every caller but the deterministic CLI
+    update — means "no opinion", and no module page is reconciled. Passing a
+    set is a claim of authority over the whole type: everything outside it is
+    retired, subject to the same mass-deletion floor the file prune uses. A
+    caller whose derivation failed must pass ``None`` rather than an empty or
+    partial set, because an under-derived set and a repo that really lost its
+    code are indistinguishable here.
 
     ``timings`` records the whole write as ``persist`` and each step as a
     ``persist.*`` row. A step that did not run records nothing, so an absent
@@ -1536,8 +1546,15 @@ async def persist_incremental_index(
     tombstoned_page_ids: list[str] = []
     # Same contract, for rows of a page that has been retired outright.
     swept_page_ids: list[str] = []
+    # Refusals raised by the module reconcile. Merged into the outcome beside
+    # the file prune's own so ``apply_prune_outcome`` records them in
+    # ``state.json`` and ``get_index_status`` can report the run as degraded.
+    module_refusals: list[PruneRefusal] = []
     source_symbol_error: str | None = None
     prune_outcome = DeletedFilePruneOutcome()
+    # False until the prune step builds the real outcome. The tail below fills
+    # in from the loose accumulators only when it never got there.
+    prune_outcome_recorded = False
     if timings is not None:
         timings.start("persist")
     try:
@@ -1583,6 +1600,32 @@ async def persist_incremental_index(
                     )
             except Exception as exc:
                 _skip("Retired page sweep", exc)
+
+            # Module pages are repo-wide, so the re-render on this path never
+            # touches one and neither sweep above can tell that a directory is
+            # gone. The caller derives the set the current parse would produce
+            # and this retires the rest; ``None`` keeps the historical
+            # behaviour of leaving every module page alone.
+            if module_page_ids is not None:
+                try:
+                    from repowise.core.pipeline.persist import reconcile_module_pages
+
+                    with timed(timings, "persist.module_reconcile"):
+                        swept, module_refusals = await reconcile_module_pages(
+                            session,
+                            repo_id,
+                            module_page_ids,
+                            accept_mass_deletion=accept_mass_deletion,
+                        )
+                    swept_page_ids += swept
+                    if swept:
+                        log(f"Retired [cyan]{len(swept)}[/cyan] module page(s) for removed code")
+                    for refusal in module_refusals:
+                        log(f"[yellow]{refusal.message}[/yellow]")
+                        if degraded is not None:
+                            degraded.append(refusal.message)
+                except Exception as exc:
+                    _skip("Module page reconcile", exc)
 
             # Tombstone pages for deleted/renamed files FIRST — a fresh page
             # for a file that no longer exists misleads every retrieval
@@ -1853,9 +1896,11 @@ async def persist_incremental_index(
                 prune_outcome = DeletedFilePruneOutcome(
                     attempted=True,
                     pruned_paths=pruned,
-                    refusals=tuple(refusals),
+                    refusals=tuple([*refusals, *module_refusals]),
                     tombstoned_page_ids=tuple(dict.fromkeys(tombstoned_page_ids)),
+                    swept_page_ids=tuple(dict.fromkeys(swept_page_ids)),
                 )
+                prune_outcome_recorded = True
                 if pruned:
                     log(f"Pruned rows for [cyan]{pruned}[/cyan] deleted or excluded file(s)")
                 for refusal in refusals:
@@ -1962,11 +2007,22 @@ async def persist_incremental_index(
         await engine.dispose()
         if timings is not None:
             timings.stop("persist")
-    if tombstoned_page_ids and not prune_outcome.tombstoned_page_ids:
+    if not prune_outcome_recorded:
+        # The prune step raised before it could build the outcome. Everything
+        # the steps *before* it established still has to reach the CLI host:
+        # a page whose row is gone but whose vector and refusal never surface
+        # is the failure this path exists to avoid.
         prune_outcome = DeletedFilePruneOutcome(
-            attempted=prune_outcome.attempted,
+            # A module refusal counts as an attempt on its own. Without that,
+            # a run whose file prune raised would carry the refusal home and
+            # ``apply_prune_outcome`` would drop it on the floor, which is the
+            # one outcome a refusal exists to prevent. It can only ever turn
+            # the flag on alongside a non-empty refusal list, so it cannot
+            # clear an earlier refusal the way a bare ``True`` would.
+            attempted=prune_outcome.attempted or bool(module_refusals),
             pruned_paths=prune_outcome.pruned_paths,
-            refusals=prune_outcome.refusals,
+            refusals=tuple([*prune_outcome.refusals, *module_refusals]),
             tombstoned_page_ids=tuple(dict.fromkeys(tombstoned_page_ids)),
+            swept_page_ids=tuple(dict.fromkeys(swept_page_ids)),
         )
     return prune_outcome

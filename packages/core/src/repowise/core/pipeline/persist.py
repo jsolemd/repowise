@@ -1485,6 +1485,93 @@ async def _sweep_stale_generated_pages(
     return swept
 
 
+async def reconcile_module_pages(
+    session: Any,
+    repo_id: str,
+    authoritative_page_ids: set[str],
+    *,
+    accept_mass_deletion: bool = False,
+) -> tuple[list[str], list[PruneRefusal]]:
+    """Retire ``module_page`` rows outside *authoritative_page_ids*.
+
+    The deterministic ``update --index-only`` path re-renders file pages and
+    leaves every repo-wide page frozen, so a module page whose directory was
+    deleted stays ``fresh`` and keeps answering searches. Nothing else on that
+    path ever visits a module page to notice it should be gone.
+
+    *authoritative_page_ids* is what the current parse would produce (see
+    ``generation.selection.module_reconcile.authoritative_module_pages``). An
+    empty set is a legitimate answer — a repo with no production code has no
+    module pages — but it is also what a broken derivation looks like, which
+    is why the caller must not call this at all when the derivation failed,
+    and why the floor below stands between a wrong set and a deleted wiki.
+
+    Returns ``(retired ids, refusals)``. A refusal deletes nothing: the same
+    asymmetry the deleted-file prune is built on, since stale rows are visible
+    and repairable by a re-index while deleted live ones are invisible until
+    someone notices the page is missing.
+    """
+    from sqlalchemy import select
+
+    from repowise.core.persistence.models import Page
+
+    stored = set(
+        (
+            await session.execute(
+                select(Page.id).where(
+                    Page.repository_id == repo_id, Page.page_type == "module_page"
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    stale = stored - set(authoritative_page_ids)
+    if not stale:
+        return [], []
+
+    # The same floor the deleted-file prune uses, and the same constants: a
+    # module reconcile that wants most of the table is a derivation that went
+    # wrong far more often than it is a repo that lost most of its code.
+    if (
+        not accept_mass_deletion
+        and len(stale) > _PRUNE_FLOOR_MIN_ROWS
+        and stored
+        and len(stale) > _PRUNE_MAX_FRACTION * len(stored)
+    ):
+        refusal = PruneRefusal(
+            table="wiki_module_pages",
+            candidate_paths=len(stale),
+            persisted_paths=len(stored),
+        )
+        logger.info(
+            "module_pages_reconciled",
+            repo_id=repo_id,
+            stored=len(stored),
+            authoritative=len(authoritative_page_ids),
+            retired=0,
+            refused=True,
+        )
+        return [], [refusal]
+
+    swept = await _sweep_stale_generated_pages(
+        session,
+        repo_id,
+        [],
+        authoritative_page_types={"module_page"},
+        preserved_page_ids=set(authoritative_page_ids),
+    )
+    logger.info(
+        "module_pages_reconciled",
+        repo_id=repo_id,
+        stored=len(stored),
+        authoritative=len(authoritative_page_ids),
+        retired=len(swept),
+        retired_ids=sorted(swept),
+    )
+    return swept, []
+
+
 async def sweep_absent_cycle_pages(session: Any, repo_id: str, graph_builder: Any) -> list[str]:
     """Delete ``scc_page`` rows whose cycle no longer exists in the graph.
 
