@@ -593,3 +593,69 @@ async def test_ambiguous_overview_is_refused_not_guessed(client: AsyncClient, ap
             )
     resp = await client.get("/api/pages/layer_page:layer:analysis")
     assert resp.status_code == 404
+
+
+async def _create_tombstoned_page(client: AsyncClient, session_factory) -> tuple[str, str]:
+    """A live page plus a retired one whose file was deleted and replaced."""
+    repo_id, _ = await _create_page(client, session_factory)
+
+    async with get_session(session_factory) as session:
+        await crud.upsert_page(
+            session,
+            page_id="file_page:src/gone.py",
+            repository_id=repo_id,
+            page_type="file_page",
+            title="gone.py",
+            content="# Deleted module",
+            target_path="src/gone.py",
+            source_hash="def456",
+            model_name="mock",
+            provider_name="mock",
+            freshness_status="tombstone",
+            metadata={"successor_paths": ["src/main.py"]},
+        )
+
+    return repo_id, "file_page:src/gone.py"
+
+
+@pytest.mark.asyncio
+async def test_list_pages_excludes_tombstones_by_default(client: AsyncClient, app) -> None:
+    """A reader's listing must not count pages whose file is gone."""
+    repo_id, tombstone_id = await _create_tombstoned_page(client, app.state.session_factory)
+
+    resp = await client.get("/api/pages", params={"repo_id": repo_id})
+
+    assert resp.status_code == 200
+    ids = [page["id"] for page in resp.json()]
+    assert ids == ["file_page:src/main.py"]
+    assert tombstone_id not in ids
+
+
+@pytest.mark.asyncio
+async def test_list_pages_includes_tombstones_when_asked(client: AsyncClient, app) -> None:
+    """Reconcilers still need the raw row set, and ask for it explicitly."""
+    repo_id, tombstone_id = await _create_tombstoned_page(client, app.state.session_factory)
+
+    resp = await client.get("/api/pages", params={"repo_id": repo_id, "include_tombstones": "true"})
+
+    assert resp.status_code == 200
+    ids = {page["id"] for page in resp.json()}
+    assert ids == {"file_page:src/main.py", tombstone_id}
+
+
+@pytest.mark.asyncio
+async def test_get_page_returns_tombstone_with_freshness_status(client: AsyncClient, app) -> None:
+    """A retired id keeps resolving: 200, marked retired, successor intact.
+
+    Serving 404 here would discard ``successor_paths``, which is the only thing
+    that can tell a reader where the content moved.
+    """
+    _, tombstone_id = await _create_tombstoned_page(client, app.state.session_factory)
+
+    resp = await client.get(f"/api/pages/{tombstone_id}")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["id"] == tombstone_id
+    assert body["freshness_status"] == "tombstone"
+    assert body["metadata"]["successor_paths"] == ["src/main.py"]

@@ -30,6 +30,7 @@ import {
   SidebarToggle,
 } from "./docs-page-actions";
 import { PageGenerateButton } from "./page-generate-button";
+import { RetiredPageBanner, isRetiredPage } from "./retired-page-banner";
 import { BulkGenerateButton } from "./bulk-generate-button";
 import { isModelWrittenType, isStubPage } from "@repowise-dev/ui/lib/page-types";
 import { search as searchPages } from "@/lib/api/search";
@@ -300,27 +301,40 @@ export function DocsExplorer({ repoId }: DocsExplorerProps) {
       </div>
     );
   } else {
+    // A retired page keeps rendering — its prose is the only record of a file
+    // that is gone — but it is history, so it is labelled and dimmed rather
+    // than presented as current documentation.
+    const retired = selectedPage !== null && isRetiredPage(selectedPage);
     body = (
-      <div className="h-full min-w-0">
-        <DocsViewer
-          page={selectedPage}
-          pages={pages}
-          repoId={repoId}
-          // Reading-column skeleton while its own page is in flight, and while
-          // the list is still deciding which page to open on.
-          isLoading={pageLoading || (!selectedPageId && isLoading)}
-          // The id resolved to nothing. Guarded on `!pageLoading` so the
-          // "no page for this one" line cannot flash over a request still in
-          // flight, and on `!selectedPage` so it never shows over a page that
-          // did land.
-          missingPageId={
-            selectedPageId && !pageLoading && !selectedPage ? selectedPageId : undefined
-          }
-          onSelectPage={handleSelectPage}
-          persona={persona}
-          sidebarOpen={sidebarOpen}
-          onGenerated={handleGenerated}
-        />
+      <div className="flex h-full min-w-0 flex-col">
+        {retired && selectedPage && (
+          <RetiredPageBanner
+            page={selectedPage}
+            pages={pages}
+            onSelectPage={handleSelectPage}
+          />
+        )}
+        <div className={cn("min-h-0 flex-1", retired && "opacity-60")}>
+          <DocsViewer
+            page={selectedPage}
+            pages={pages}
+            repoId={repoId}
+            // Reading-column skeleton while its own page is in flight, and while
+            // the list is still deciding which page to open on.
+            isLoading={pageLoading || (!selectedPageId && isLoading)}
+            // The id resolved to nothing. Guarded on `!pageLoading` so the
+            // "no page for this one" line cannot flash over a request still in
+            // flight, and on `!selectedPage` so it never shows over a page that
+            // did land.
+            missingPageId={
+              selectedPageId && !pageLoading && !selectedPage ? selectedPageId : undefined
+            }
+            onSelectPage={handleSelectPage}
+            persona={persona}
+            sidebarOpen={sidebarOpen}
+            onGenerated={handleGenerated}
+          />
+        </div>
       </div>
     );
   }

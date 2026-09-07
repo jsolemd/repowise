@@ -143,6 +143,13 @@ async def list_pages(
         "of a listing's bytes, and read by nothing that renders a list of "
         "pages — and adds 'content_chars' in their place.",
     ),
+    include_tombstones: bool = Query(
+        False,
+        description="Include retired (tombstoned) pages, whose source file is "
+        "gone. Off by default: this route feeds readers, and a listing that "
+        "counts retired pages overstates what the repo actually has. A caller "
+        "reconciling against deleted files asks for them explicitly.",
+    ),
     session: AsyncSession = Depends(get_db_session),
 ) -> list[PageResponse] | list[PageSummaryResponse]:
     """List wiki pages for a repository."""
@@ -156,6 +163,7 @@ async def list_pages(
         repo_id,
         page_type=page_type,
         has_prose=has_prose,
+        include_tombstones=include_tombstones,
         limit=limit,
         offset=offset,
         sort_by=sort_by,

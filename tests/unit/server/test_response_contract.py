@@ -36,6 +36,11 @@ WAIVED: dict[tuple[str, str], str] = {
         "returns full or summary rows by ``fields``; the models serialize "
         "themselves and FastAPI cannot coerce one shape into the other"
     ),
+    ("GET", "/api/docs-libraries"): (
+        "verbatim proxy of the documentation service's payload; that service "
+        "owns the schema, and re-declaring it here would be a second copy to "
+        "keep in step with a body this server never reads"
+    ),
 }
 
 #: Routes still serving an anonymous object. Delete a line when you model one.

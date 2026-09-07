@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { repoNavGroups, repoNavItems } from "./nav-items";
+import { GLOBAL_NAV, repoNavGroups, repoNavItems } from "./nav-items";
 
 /**
  * Navigation must not offer a destination the server refuses.
@@ -39,5 +39,24 @@ describe("repo navigation under the deployment policy", () => {
     for (const item of repoNavItems("r1", { generativeDisabled: true })) {
       expect(item.href.startsWith("/repos/r1")).toBe(true);
     }
+  });
+});
+
+/**
+ * The documentation corpus is workspace-wide, not per-repo, so its only
+ * possible entry point is the global nav. Without an entry the page exists at
+ * a URL nobody can reach by navigating.
+ */
+describe("global navigation", () => {
+  it("offers the docs library index", () => {
+    const entry = GLOBAL_NAV.find((i) => i.href === "/docs-libraries");
+    expect(entry).toBeDefined();
+    expect(entry?.label).toBe("Docs Libraries");
+    expect(entry?.icon).toBeTruthy();
+  });
+
+  it("keeps Settings pinned last", () => {
+    // The IA's one ordering rule: everything new lands above Settings.
+    expect(GLOBAL_NAV.at(-1)?.href).toBe("/settings");
   });
 });
