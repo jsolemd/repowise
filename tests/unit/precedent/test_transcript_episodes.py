@@ -9,7 +9,6 @@ run that read nothing is allowed to delete.
 from __future__ import annotations
 
 import json
-import time
 from datetime import UTC, datetime
 
 import pytest
