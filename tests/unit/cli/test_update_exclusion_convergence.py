@@ -31,6 +31,9 @@ async def test_update_sweeps_newly_excluded_file_from_all_derived_stores(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
+    # This assertion includes the opt-in source outbox; do not inherit whether
+    # the deployment or a previously collected test enabled that lane.
+    monkeypatch.setenv("REPOWISE_SOURCE_SEARCH", "1")
     repo_path = tmp_path / "repo"
     repo_path.mkdir()
     for path in ("src/keep.py", "generated/drop.py"):
