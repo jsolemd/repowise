@@ -64,6 +64,7 @@ from repowise.server.mcp_server._helpers import (
     _get_exclude_spec,
     _get_repo,
     _resolve_repo_context,
+    _unsupported_repo_all,
     filter_rows_by_attr,
 )
 from repowise.server.mcp_server._meta import build_meta as _build_meta
@@ -1280,6 +1281,8 @@ def _gap_analysis(metrics: list[HealthFileMetric]) -> dict[str, Any]:
         }
 
     def _files_for(points: float) -> int:
+        if points <= 0:
+            return 0
         acc = 0.0
         for i, d in enumerate(below, 1):
             acc += d
@@ -1497,9 +1500,9 @@ async def get_health(
 ) -> dict:
     """Code-health scores and findings from stored analysis.
 
-    No ``targets`` returns a dashboard; targets return ranked files and findings.
-    Never recomputes health: commit changes, then run ``repowise update``.
-    Every block and accepted value: docs/agent/MCP_TOOLS.md.
+    No targets returns a dashboard; targets return ranked files and findings.
+    Stored analysis: refresh with ``repowise update``.
+    Reference: docs/agent/MCP_TOOLS.md.
 
     Args:
         targets: file paths or ``module:<name>``. Empty means dashboard;
@@ -1511,7 +1514,7 @@ async def get_health(
             ``biomarkers``, ``accuracy`` and ``refactoring`` alias their block
             key. ``performance``, ``defect`` and ``maintainability`` do not:
             they filter rows and land in ``unknown_only_keys``.
-        repo: usually omitted.
+        repo: one repository alias, name or path; ``"all"`` is unsupported.
         limit: max rows per ranked list, ``0`` for none.
         cursor: zero-based offset into a ranked list.
         finding_id: stable ``id`` from a health finding.
@@ -1526,6 +1529,8 @@ async def get_health(
 
     """
     started = perf_counter()
+    if repo == "all":
+        return _unsupported_repo_all("get_health")
     conflict = _selector_conflict(
         finding_id=finding_id, plan_id=plan_id, opportunity_id=opportunity_id
     )

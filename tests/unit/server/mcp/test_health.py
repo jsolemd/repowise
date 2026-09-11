@@ -796,6 +796,8 @@ async def test_high_leverage_rows_sum_to_100_with_negative_net_gap(session, setu
     assert gap["weighted_gross_gap_points"] == 1050
     # Net gap is negative: 8*1900 - (6*400+7*200+7.5*100+9*1200) = 15200 - 15350.
     assert gap["weighted_gap_points"] == 0
+    assert gap["files_to_reach_target"] == 0
+    assert gap["files_for_half_gap"] == 0
     # Rows are distinct (ranking survives) and bounded, summing to 100%.
     shares = {r["file_path"]: r["share_of_repo_gap_pct"] for r in rows}
     assert shares == pytest.approx(
@@ -2311,3 +2313,37 @@ async def test_the_ranked_findings_leave_performance_out_but_asking_returns_it(
 
     asked = await get_health(include=["performance"], only=["top_findings"])
     assert any(f["dimension"] == "performance" for f in asked["top_findings"])
+
+
+@pytest.mark.parametrize("scores", [(6.0, 10.0), (7.0, 10.0)])
+def test_healthy_average_needs_no_files_even_with_gross_deficit(scores):
+    from types import SimpleNamespace
+
+    from repowise.server.mcp_server.tool_health import _gap_analysis
+
+    result = _gap_analysis([SimpleNamespace(nloc=100, score=score) for score in scores])
+
+    assert result["weighted_gap_points"] == 0
+    assert result["weighted_gross_gap_points"] > 0
+    assert result["files_to_reach_target"] == 0
+    assert result["files_for_half_gap"] == 0
+
+
+@pytest.mark.asyncio
+async def test_health_all_returns_supported_aliases_without_resolving_context(monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from repowise.server.mcp_server import _state, tool_health
+
+    resolver = AsyncMock(side_effect=AssertionError("Unsupported scope reached the database"))
+    monkeypatch.setattr(tool_health, "_resolve_repo_context", resolver)
+    monkeypatch.setattr(
+        _state, "_registry", SimpleNamespace(get_all_aliases=lambda: ["infra", "graph"])
+    )
+
+    result = await tool_health.get_health(repo="all")
+
+    assert "not supported for get_health" in result["error"]
+    assert "infra" in result["error"] and "graph" in result["error"]
+    resolver.assert_not_awaited()
