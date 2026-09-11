@@ -342,11 +342,16 @@ def _build_window_chunks(repo: Path, symbol_chunks: Sequence[SourceChunk]) -> li
     deliberately: the formats this lane exists for are usually in the repo's
     ``exclude_patterns`` and so were never ingested at all.
     """
+    from repowise.core.ingestion.traverser import _load_extra_ignore_spec
+
+    explicit_ignore = _load_extra_ignore_spec(repo, ".repowiseIgnore")
     covered: Counter[str] = Counter(chunk.file_path for chunk in symbol_chunks)
     chunks: list[SourceChunk] = []
     skipped_large = 0
     skipped_binary = 0
     for rel in _tracked_paths(repo):
+        if explicit_ignore.match_file(rel):
+            continue
         if not window_eligible(rel, indexed_symbols=covered.get(rel, 0)):
             continue
         try:

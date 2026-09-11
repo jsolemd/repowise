@@ -112,6 +112,9 @@ async def capture_source_changes(
     if not paths:
         return FastSourceCaptureResult((), 0, 0, 0)
 
+    from repowise.core.ingestion.traverser import _load_extra_ignore_spec
+
+    explicit_ignore = _load_extra_ignore_spec(repo, ".repowiseIgnore")
     config = load_repo_config(repo)
     include_submodules, include_nested_repos = _state_flags(repo)
     traverser = FileTraverser(
@@ -146,7 +149,7 @@ async def capture_source_changes(
         info = traverser.file_info_for_path(path, resolve_entry_point=False)
         if info is None:
             is_tracked_window = False
-            if window_eligible(path, indexed_symbols=0):
+            if window_eligible(path, indexed_symbols=0) and not explicit_ignore.match_file(path):
                 if tracked_paths is None:
                     # The full source corpus deliberately owns operational
                     # files through git rather than FileTraverser: shell/YAML

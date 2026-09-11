@@ -206,6 +206,15 @@ async def test_tracked_parser_code_excluded_by_config_becomes_a_fresh_window(
     assert change["content_hash"] == compute_content_hash(absolute.read_bytes())
 
 
+async def test_explicit_ignore_does_not_reintroduce_a_saved_window(excluded_repo: Path) -> None:
+    path = "infra/up.sh"
+    (excluded_repo / ".repowiseIgnore").write_text("infra/up.sh\n")
+    await capture_source_changes(excluded_repo, [path])
+    _symbols, updates = await _stored(excluded_repo)
+    change = json.loads(updates[0].change_set_json)[0]
+    assert change["parse_state"] == "unindexed"
+
+
 @pytest.mark.parametrize("gitignored", [False, True])
 async def test_untracked_excluded_windows_remain_unindexed(
     excluded_repo: Path,

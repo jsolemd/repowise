@@ -71,10 +71,9 @@ _COMPONENT_LABELS = {
 # ``exclude_patterns`` plus .gitignore/.repowiseIgnore. It is NOT the
 # query-time read-path exclusion spec, which the source index never consults.
 _PARSER_LANE_SURFACE = "wiki ingestion traversal (FileTraverser + repo exclude_patterns)"
-# The window lane is driven by ``git ls-files`` and ``window_eligible`` alone
-# (source_search/indexer.py::_build_window_chunks). It evaluates no exclusion
-# spec at all, deliberately: the formats it exists for are usually excluded.
-_WINDOW_LANE_SURFACE = "git ls-files + window_eligible (no exclusion spec)"
+# Parser-format exclusions do not disable operational windows, but explicit
+# root corpus exclusions apply to this lane as well as the parser lane.
+_WINDOW_LANE_SURFACE = "git ls-files + window_eligible + root .repowiseIgnore"
 
 # Bounds for the payload's variable-length arrays. Every cap is disclosed:
 # the exact total stays beside the listed slice, and the dropped tail goes to
@@ -697,6 +696,11 @@ def _path_mode_payload(
         window_policy = None
     else:
         window_policy = window_eligible(normalized, indexed_symbols=0)
+
+    from repowise.core.ingestion.traverser import _load_extra_ignore_spec
+
+    if _load_extra_ignore_spec(repo_path, ".repowiseIgnore").match_file(normalized):
+        window_policy = False
 
     working_tree_indexed = normalized in set(_recorded_working_tree_paths(status, repo_state))
     parser_lane = parser_policy and traversal_eligible is True
