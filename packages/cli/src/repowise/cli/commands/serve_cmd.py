@@ -592,10 +592,13 @@ def serve_command(
 
     _setup_embedder()
 
-    # Auto-detect local .repowise/ directory if REPOWISE_DB_URL is not set.
-    # repowise init writes to <repo>/.repowise/wiki.db, so honour it when
-    # the user runs `repowise serve` from the same directory.
-    if not os.environ.get("REPOWISE_DB_URL"):
+    # Respect both explicit database settings. At a workspace root, leave
+    # selection to the app's primary-repository resolver: an old .repowise/
+    # directory there is not the workspace's active source index.
+    from repowise.core.persistence.database import get_configured_db_url
+    from repowise.core.workspace.config import find_workspace_root
+
+    if get_configured_db_url() is None and find_workspace_root() != Path.cwd().resolve():
         local_repowise = Path.cwd() / ".repowise"
         if local_repowise.exists():
             local_db = local_repowise / "wiki.db"

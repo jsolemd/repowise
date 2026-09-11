@@ -91,3 +91,24 @@ def test_the_previous_test_did_not_leak_its_db_url() -> None:
     What restores the variable is the autouse guard in ``tests/conftest.py``.
     """
     assert "REPOWISE_DB_URL" not in os.environ
+
+
+@pytest.mark.parametrize("context", ["workspace", "legacy_override"])
+def test_local_directory_does_not_override_workspace_or_explicit_legacy_database(
+    stub_serve, monkeypatch, tmp_path, context
+):
+    (tmp_path / ".repowise").mkdir()
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("REPOWISE_DB_URL", raising=False)
+    monkeypatch.delenv("REPOWISE_DATABASE_URL", raising=False)
+    if context == "workspace":
+        (tmp_path / ".repowise-workspace.yaml").write_text(
+            "repos:\n  - path: primary\n    alias: primary\n    is_primary: true\n"
+        )
+    else:
+        monkeypatch.setenv("REPOWISE_DATABASE_URL", SENTINEL)
+
+    result = CliRunner().invoke(serve_cmd.serve_command, ["--no-ui"])
+
+    assert result.exit_code == 0, result.output
+    assert "REPOWISE_DB_URL" not in os.environ
