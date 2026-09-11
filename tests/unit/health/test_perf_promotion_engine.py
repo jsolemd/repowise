@@ -55,7 +55,7 @@ def _line_of(src: str, marker: str) -> int:
     return next(i for i, ln in enumerate(body.splitlines(), start=1) if marker in ln)
 
 
-def test_independent_hit_is_promoted_in_place(tmp_path: Path):
+def test_await_without_local_carry_stays_advisory(tmp_path: Path):
     _require_python()
     src = """
     async def f(items):
@@ -71,11 +71,11 @@ def test_independent_hit_is_promoted_in_place(tmp_path: Path):
 
     apply_perf_promotions([(pf, fcx)])
 
-    assert fcx.perf_hits[0].promoted is True
-    # The biomarker now asserts rather than hedges, and flags verification.
+    assert fcx.perf_hits[0].promoted is False
+    # Local independence does not prove resource ownership or effect ordering.
     results = SERIAL.detect(_ctx(fcx))
-    assert results and results[0].details.get("dataflow_verified") is True
-    assert "carry no data dependence" in results[0].reason
+    assert results and "dataflow_verified" not in results[0].details
+    assert "validate resource concurrency" in results[0].reason
 
 
 def test_carried_hit_is_not_promoted(tmp_path: Path):
@@ -114,12 +114,10 @@ def test_budget_no_dataflow_without_advisory_hit(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(analyze_mod, "analyze_function", _counting)
 
     indep = """
-    async def f(items):
-        out = []
+    def f(items, others):
         for item in items:
-            r = await fetch(item.id)  # HIT
-            out.append(r)
-        return out
+            for other in others:
+                compare(item, other)  # HIT
     """
     # A file with a non-promotable perf hit (io_in_loop) and no advisory marker
     # must never be analyzed.
@@ -133,7 +131,7 @@ def test_budget_no_dataflow_without_advisory_hit(tmp_path: Path, monkeypatch):
         tmp_path,
         "indep.py",
         indep,
-        [PerfHit(kind="serial_await_in_loop", line=line, function="f", detail="network")],
+        [PerfHit(kind="nested_loop_quadratic", line=line, function="f", detail="scan")],
     )
     e2 = _walked_entry(
         tmp_path,
@@ -151,10 +149,8 @@ def test_budget_no_dataflow_without_advisory_hit(tmp_path: Path, monkeypatch):
     assert e2[1].perf_hits[0].promoted is False
 
 
-def test_rust_independent_await_loop_is_promoted(tmp_path: Path):
-    # The promotion pass activates for a language the moment its def/use
-    # dialect exists. A ``?`` on the awaited value is an early *exit*, not a
-    # data carry -- the same contract as a Python ``await`` that may raise.
+def test_rust_await_without_local_carry_stays_advisory(tmp_path: Path):
+    # The effect/ownership limitation applies independently of language.
     src = """
     async fn f(items: &[Item]) -> Result<Vec<R>, E> {
         let mut out = Vec::new();
@@ -171,9 +167,7 @@ def test_rust_independent_await_loop_is_promoted(tmp_path: Path):
 
     apply_perf_promotions([(pf, fcx)])
 
-    if fcx.perf_hits[0].promoted is False:  # pack missing -> silence, not a wrong answer
-        pytest.skip("tree-sitter language pack missing for rust")
-    assert fcx.perf_hits[0].promoted is True
+    assert fcx.perf_hits[0].promoted is False
 
 
 def test_rust_carried_cursor_is_not_promoted(tmp_path: Path):

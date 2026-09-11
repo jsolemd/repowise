@@ -107,15 +107,23 @@ def assess_fix(
     of markers, and it is the one place a wrong answer ships a wrong edit.
     """
     if marker == "serial_await_in_loop":
-        if not all(detail.get("dataflow_verified") for detail in details):
-            return FixAssessment(None, ("loop_carried_dependence_proof",))
+        # Stored findings may carry the old local-dataflow proof. It says
+        # nothing about shared sessions, ordering, cancellation or capacity.
+        prerequisites = (
+            "resource_concurrency_contract",
+            "effect_and_failure_ordering",
+            "bounded_concurrency",
+        )
+        if not details or not all(detail.get("dataflow_verified") for detail in details):
+            return FixAssessment(None, ("loop_carried_dependence_proof", *prerequisites))
         return FixAssessment(
             PerformanceFix(
                 "parallelize_independent_awaits",
-                "proven",
-                "Dataflow proves that every observed loop carries no cross-iteration dependence.",
+                "advisory",
+                "Local dataflow cannot prove resource concurrency or transaction and "
+                "failure ordering; validate those contracts before bounded fan-out.",
             ),
-            (),
+            prerequisites,
         )
     if marker == "membership_test_against_list_in_loop":
         return FixAssessment(
@@ -147,9 +155,10 @@ def assess_fix(
                 "batch_or_prefetch_io",
                 "advisory",
                 "The shared I/O sink is proven; no concrete batch API or "
-                "result-equivalence proof is available.",
+                "result-equivalence proof is available. Check bounds and preserve "
+                "retry, early-exit and ordered failover behavior.",
             ),
-            ("batch_api_contract", "result_equivalence"),
+            ("batch_api_contract", "result_equivalence", "retry_and_failover_ordering"),
         )
     if marker == "blocking_io_under_lock":
         owners = {

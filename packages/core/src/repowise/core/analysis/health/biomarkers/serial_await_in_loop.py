@@ -38,20 +38,14 @@ class SerialAwaitInLoopDetector:
             if hit.kind != _KIND:
                 continue
             phrasing = _BOUNDARY_PHRASING.get(hit.detail, "an awaited I/O call")
-            if hit.promoted:
-                # Dataflow proved the loop carries no data dependence between
-                # iterations: assert the fan-out instead of hedging on it.
-                details = {"boundary_kind": hit.detail, "dataflow_verified": True}
-                reason = (
-                    f"{phrasing} is awaited serially in a loop whose iterations "
-                    "carry no data dependence; fan out with gather / Promise.all"
-                )
-            else:
-                details = {"boundary_kind": hit.detail}
-                reason = (
-                    f"{phrasing} is awaited serially in a loop; if the "
-                    "iterations are independent, fan out with gather / Promise.all"
-                )
+            # A cached promoted flag establishes at most local-variable flow.
+            # It cannot establish the safety of shared connections or I/O effects.
+            details = {"boundary_kind": hit.detail}
+            reason = (
+                f"{phrasing} is awaited serially in a loop; if the iterations are "
+                "independent, validate resource concurrency, transaction and failure "
+                "ordering before bounded fan-out with gather / Promise.all"
+            )
             out.append(
                 BiomarkerResult(
                     biomarker_type=self.name,

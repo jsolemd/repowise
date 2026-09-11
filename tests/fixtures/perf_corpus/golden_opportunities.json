@@ -5,81 +5,6 @@
       "actionability_state": "plan_ready",
       "affected_call_sites_total": 1,
       "affected_files_total": 1,
-      "biomarker_type": "serial_await_in_loop",
-      "biomarker_types": [
-        "serial_await_in_loop"
-      ],
-      "boundary_kind": "network",
-      "confidence": "high",
-      "evidence": [
-        {
-          "biomarker_type": "serial_await_in_loop",
-          "file_path": "src/app/fanout.py",
-          "finding_id": "finding_28eb6a8735fdf18585c6",
-          "function_name": "gather_all",
-          "line_end": 92,
-          "line_start": 90,
-          "path": [],
-          "provenance": "direct",
-          "reason": "async_serial_awaits: serial_await_in_loop at src/app/fanout.py:90 repeats work per iteration."
-        }
-      ],
-      "evidence_truncated": false,
-      "execution_context": "production",
-      "facets": {
-        "actionability_confidence": "high",
-        "amplification": "per_iteration",
-        "change_risk": "contained",
-        "exposure": "unknown",
-        "leverage": "isolated"
-      },
-      "fix": {
-        "rationale": "Dataflow proves that every observed loop carries no cross-iteration dependence.",
-        "safety": "proven",
-        "strategy": "parallelize_independent_awaits"
-      },
-      "intervention_symbol": null,
-      "observations_total": 1,
-      "opportunity_id": "perf2_182b2a7c053167959285",
-      "performance_model_version": 2,
-      "prerequisites": [],
-      "provenance": "direct",
-      "rank_factors": {
-        "affected_call_sites": 2,
-        "boundary_kind": 4,
-        "entry_reachability": 0,
-        "execution_context": 3,
-        "multiplier_shape": 4,
-        "provenance": 3
-      },
-      "rank_score": 16,
-      "reliable_entry_reachability": null,
-      "resource_fingerprints": [],
-      "shared_path_suffix": [],
-      "terminal_sink": null,
-      "why_ranked": [
-        {
-          "factor": "boundary_kind",
-          "points": 4,
-          "value": "network"
-        },
-        {
-          "factor": "multiplier_shape",
-          "points": 4,
-          "value": "serial_await_in_loop"
-        },
-        {
-          "factor": "execution_context",
-          "points": 3,
-          "value": "production"
-        }
-      ]
-    },
-    {
-      "actionability_reason": "proven_strategy",
-      "actionability_state": "plan_ready",
-      "affected_call_sites_total": 1,
-      "affected_files_total": 1,
       "biomarker_type": "resource_construction_in_loop",
       "biomarker_types": [
         "resource_construction_in_loop"
@@ -203,7 +128,7 @@
         "leverage": "local"
       },
       "fix": {
-        "rationale": "The shared I/O sink is proven; no concrete batch API or result-equivalence proof is available.",
+        "rationale": "The shared I/O sink is proven; no concrete batch API or result-equivalence proof is available. Check bounds and preserve retry, early-exit and ordered failover behavior.",
         "safety": "advisory",
         "strategy": "batch_or_prefetch_io"
       },
@@ -213,7 +138,8 @@
       "performance_model_version": 2,
       "prerequisites": [
         "batch_api_contract",
-        "result_equivalence"
+        "result_equivalence",
+        "retry_and_failover_ordering"
       ],
       "provenance": "call-site",
       "rank_factors": {
@@ -303,7 +229,7 @@
         "leverage": "local"
       },
       "fix": {
-        "rationale": "The shared I/O sink is proven; no concrete batch API or result-equivalence proof is available.",
+        "rationale": "The shared I/O sink is proven; no concrete batch API or result-equivalence proof is available. Check bounds and preserve retry, early-exit and ordered failover behavior.",
         "safety": "advisory",
         "strategy": "batch_or_prefetch_io"
       },
@@ -313,7 +239,8 @@
       "performance_model_version": 2,
       "prerequisites": [
         "batch_api_contract",
-        "result_equivalence"
+        "result_equivalence",
+        "retry_and_failover_ordering"
       ],
       "provenance": "call-site",
       "rank_factors": {
@@ -404,7 +331,7 @@
         "leverage": "local"
       },
       "fix": {
-        "rationale": "The shared I/O sink is proven; no concrete batch API or result-equivalence proof is available.",
+        "rationale": "The shared I/O sink is proven; no concrete batch API or result-equivalence proof is available. Check bounds and preserve retry, early-exit and ordered failover behavior.",
         "safety": "advisory",
         "strategy": "batch_or_prefetch_io"
       },
@@ -414,7 +341,8 @@
       "performance_model_version": 2,
       "prerequisites": [
         "batch_api_contract",
-        "result_equivalence"
+        "result_equivalence",
+        "retry_and_failover_ordering"
       ],
       "provenance": "call-site",
       "rank_factors": {
@@ -504,7 +432,7 @@
         "leverage": "local"
       },
       "fix": {
-        "rationale": "The shared I/O sink is proven; no concrete batch API or result-equivalence proof is available.",
+        "rationale": "The shared I/O sink is proven; no concrete batch API or result-equivalence proof is available. Check bounds and preserve retry, early-exit and ordered failover behavior.",
         "safety": "advisory",
         "strategy": "batch_or_prefetch_io"
       },
@@ -514,7 +442,8 @@
       "performance_model_version": 2,
       "prerequisites": [
         "batch_api_contract",
-        "result_equivalence"
+        "result_equivalence",
+        "retry_and_failover_ordering"
       ],
       "provenance": "call-site",
       "rank_factors": {
@@ -639,6 +568,85 @@
       "actionability_state": "advisory",
       "affected_call_sites_total": 1,
       "affected_files_total": 1,
+      "biomarker_type": "serial_await_in_loop",
+      "biomarker_types": [
+        "serial_await_in_loop"
+      ],
+      "boundary_kind": "network",
+      "confidence": "high",
+      "evidence": [
+        {
+          "biomarker_type": "serial_await_in_loop",
+          "file_path": "src/app/fanout.py",
+          "finding_id": "finding_28eb6a8735fdf18585c6",
+          "function_name": "gather_all",
+          "line_end": 92,
+          "line_start": 90,
+          "path": [],
+          "provenance": "direct",
+          "reason": "async_serial_awaits: serial_await_in_loop at src/app/fanout.py:90 repeats work per iteration."
+        }
+      ],
+      "evidence_truncated": false,
+      "execution_context": "production",
+      "facets": {
+        "actionability_confidence": "medium",
+        "amplification": "per_iteration",
+        "change_risk": "contained",
+        "exposure": "unknown",
+        "leverage": "isolated"
+      },
+      "fix": {
+        "rationale": "Local dataflow cannot prove resource concurrency or transaction and failure ordering; validate those contracts before bounded fan-out.",
+        "safety": "advisory",
+        "strategy": "parallelize_independent_awaits"
+      },
+      "intervention_symbol": null,
+      "observations_total": 1,
+      "opportunity_id": "perf2_182b2a7c053167959285",
+      "performance_model_version": 2,
+      "prerequisites": [
+        "resource_concurrency_contract",
+        "effect_and_failure_ordering",
+        "bounded_concurrency"
+      ],
+      "provenance": "direct",
+      "rank_factors": {
+        "affected_call_sites": 2,
+        "boundary_kind": 4,
+        "entry_reachability": 0,
+        "execution_context": 3,
+        "multiplier_shape": 4,
+        "provenance": 3
+      },
+      "rank_score": 16,
+      "reliable_entry_reachability": null,
+      "resource_fingerprints": [],
+      "shared_path_suffix": [],
+      "terminal_sink": null,
+      "why_ranked": [
+        {
+          "factor": "boundary_kind",
+          "points": 4,
+          "value": "network"
+        },
+        {
+          "factor": "multiplier_shape",
+          "points": 4,
+          "value": "serial_await_in_loop"
+        },
+        {
+          "factor": "execution_context",
+          "points": 3,
+          "value": "production"
+        }
+      ]
+    },
+    {
+      "actionability_reason": "strategy_requires_validation",
+      "actionability_state": "advisory",
+      "affected_call_sites_total": 1,
+      "affected_files_total": 1,
       "biomarker_type": "io_in_loop",
       "biomarker_types": [
         "io_in_loop"
@@ -671,7 +679,7 @@
         "leverage": "isolated"
       },
       "fix": {
-        "rationale": "The shared I/O sink is proven; no concrete batch API or result-equivalence proof is available.",
+        "rationale": "The shared I/O sink is proven; no concrete batch API or result-equivalence proof is available. Check bounds and preserve retry, early-exit and ordered failover behavior.",
         "safety": "advisory",
         "strategy": "batch_or_prefetch_io"
       },
@@ -681,7 +689,8 @@
       "performance_model_version": 2,
       "prerequisites": [
         "batch_api_contract",
-        "result_equivalence"
+        "result_equivalence",
+        "retry_and_failover_ordering"
       ],
       "provenance": "call-site",
       "rank_factors": {
@@ -755,7 +764,7 @@
         "leverage": "isolated"
       },
       "fix": {
-        "rationale": "The shared I/O sink is proven; no concrete batch API or result-equivalence proof is available.",
+        "rationale": "The shared I/O sink is proven; no concrete batch API or result-equivalence proof is available. Check bounds and preserve retry, early-exit and ordered failover behavior.",
         "safety": "advisory",
         "strategy": "batch_or_prefetch_io"
       },
@@ -765,7 +774,8 @@
       "performance_model_version": 2,
       "prerequisites": [
         "batch_api_contract",
-        "result_equivalence"
+        "result_equivalence",
+        "retry_and_failover_ordering"
       ],
       "provenance": "call-site",
       "rank_factors": {
@@ -839,7 +849,7 @@
         "leverage": "isolated"
       },
       "fix": {
-        "rationale": "The shared I/O sink is proven; no concrete batch API or result-equivalence proof is available.",
+        "rationale": "The shared I/O sink is proven; no concrete batch API or result-equivalence proof is available. Check bounds and preserve retry, early-exit and ordered failover behavior.",
         "safety": "advisory",
         "strategy": "batch_or_prefetch_io"
       },
@@ -849,7 +859,8 @@
       "performance_model_version": 2,
       "prerequisites": [
         "batch_api_contract",
-        "result_equivalence"
+        "result_equivalence",
+        "retry_and_failover_ordering"
       ],
       "provenance": "call-site",
       "rank_factors": {
@@ -923,7 +934,7 @@
         "leverage": "isolated"
       },
       "fix": {
-        "rationale": "The shared I/O sink is proven; no concrete batch API or result-equivalence proof is available.",
+        "rationale": "The shared I/O sink is proven; no concrete batch API or result-equivalence proof is available. Check bounds and preserve retry, early-exit and ordered failover behavior.",
         "safety": "advisory",
         "strategy": "batch_or_prefetch_io"
       },
@@ -933,7 +944,8 @@
       "performance_model_version": 2,
       "prerequisites": [
         "batch_api_contract",
-        "result_equivalence"
+        "result_equivalence",
+        "retry_and_failover_ordering"
       ],
       "provenance": "call-site",
       "rank_factors": {
@@ -1006,7 +1018,7 @@
         "leverage": "isolated"
       },
       "fix": {
-        "rationale": "The shared I/O sink is proven; no concrete batch API or result-equivalence proof is available.",
+        "rationale": "The shared I/O sink is proven; no concrete batch API or result-equivalence proof is available. Check bounds and preserve retry, early-exit and ordered failover behavior.",
         "safety": "advisory",
         "strategy": "batch_or_prefetch_io"
       },
@@ -1016,7 +1028,8 @@
       "performance_model_version": 2,
       "prerequisites": [
         "batch_api_contract",
-        "result_equivalence"
+        "result_equivalence",
+        "retry_and_failover_ordering"
       ],
       "provenance": "call-site",
       "rank_factors": {
@@ -1089,7 +1102,7 @@
         "leverage": "isolated"
       },
       "fix": {
-        "rationale": "The shared I/O sink is proven; no concrete batch API or result-equivalence proof is available.",
+        "rationale": "The shared I/O sink is proven; no concrete batch API or result-equivalence proof is available. Check bounds and preserve retry, early-exit and ordered failover behavior.",
         "safety": "advisory",
         "strategy": "batch_or_prefetch_io"
       },
@@ -1099,7 +1112,8 @@
       "performance_model_version": 2,
       "prerequisites": [
         "batch_api_contract",
-        "result_equivalence"
+        "result_equivalence",
+        "retry_and_failover_ordering"
       ],
       "provenance": "call-site",
       "rank_factors": {
@@ -1173,7 +1187,7 @@
         "leverage": "isolated"
       },
       "fix": {
-        "rationale": "The shared I/O sink is proven; no concrete batch API or result-equivalence proof is available.",
+        "rationale": "The shared I/O sink is proven; no concrete batch API or result-equivalence proof is available. Check bounds and preserve retry, early-exit and ordered failover behavior.",
         "safety": "advisory",
         "strategy": "batch_or_prefetch_io"
       },
@@ -1183,7 +1197,8 @@
       "performance_model_version": 2,
       "prerequisites": [
         "batch_api_contract",
-        "result_equivalence"
+        "result_equivalence",
+        "retry_and_failover_ordering"
       ],
       "provenance": "reliable-edge",
       "rank_factors": {
@@ -1257,7 +1272,7 @@
         "leverage": "isolated"
       },
       "fix": {
-        "rationale": "The shared I/O sink is proven; no concrete batch API or result-equivalence proof is available.",
+        "rationale": "The shared I/O sink is proven; no concrete batch API or result-equivalence proof is available. Check bounds and preserve retry, early-exit and ordered failover behavior.",
         "safety": "advisory",
         "strategy": "batch_or_prefetch_io"
       },
@@ -1267,7 +1282,8 @@
       "performance_model_version": 2,
       "prerequisites": [
         "batch_api_contract",
-        "result_equivalence"
+        "result_equivalence",
+        "retry_and_failover_ordering"
       ],
       "provenance": "call-site",
       "rank_factors": {
@@ -1341,7 +1357,7 @@
         "leverage": "isolated"
       },
       "fix": {
-        "rationale": "The shared I/O sink is proven; no concrete batch API or result-equivalence proof is available.",
+        "rationale": "The shared I/O sink is proven; no concrete batch API or result-equivalence proof is available. Check bounds and preserve retry, early-exit and ordered failover behavior.",
         "safety": "advisory",
         "strategy": "batch_or_prefetch_io"
       },
@@ -1352,6 +1368,7 @@
       "prerequisites": [
         "batch_api_contract",
         "result_equivalence",
+        "retry_and_failover_ordering",
         "reliable_call_path"
       ],
       "provenance": "name-fallback",
@@ -1876,7 +1893,10 @@
       "opportunity_id": "perf2_64fbd03504c61c115894",
       "performance_model_version": 2,
       "prerequisites": [
-        "loop_carried_dependence_proof"
+        "loop_carried_dependence_proof",
+        "resource_concurrency_contract",
+        "effect_and_failure_ordering",
+        "bounded_concurrency"
       ],
       "provenance": "direct",
       "rank_factors": {

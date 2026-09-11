@@ -90,7 +90,8 @@ async def test_a_bare_dashboard_leads_with_something_to_do(setup_mcp, materializ
 
     result = await get_health()
     directive = result["performance_directive"]
-    assert directive["status"] == "plan_ready"
+    # Local def/use evidence does not establish shared database concurrency.
+    assert directive["status"] == "advisory"
     assert directive["opportunity_id"].startswith("perf")
     assert directive["plan_state"] == "available"
     assert directive["next_action"] == {
@@ -146,7 +147,7 @@ async def test_the_summary_rolls_up_and_names_the_next_call(setup_mcp, materiali
     result = await get_health(include=["performance"], only=["performance_summary"])
     summary = result["performance_summary"]
     assert summary["status"] == "current"
-    assert summary["actionability"]["plan_ready"] == 1
+    assert summary["actionability"]["advisory"] == 2
     assert summary["with_plan_total"] == 2
     assert summary["analyzed_commit"] == "c" * 40
     assert "get_health" in summary["next_call"]
@@ -235,7 +236,8 @@ async def test_one_id_returns_the_cause_its_plan_and_its_rank_rationale(
     # The plan address space is the refactoring layer's content identity.
     assert result["plan_reference"].startswith("refac2_")
     assert result["confidence"] == "high"
-    assert result["fix"]["safety"] == "proven"
+    assert result["fix"]["safety"] == "advisory"
+    assert "resource_concurrency_contract" in result["prerequisites"]
     assert result["facets"]["leverage"] == "shared"
     assert result["why_ranked"]
     assert len(json.dumps(result)) <= 20_000

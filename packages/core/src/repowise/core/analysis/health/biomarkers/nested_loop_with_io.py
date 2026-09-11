@@ -46,8 +46,9 @@ class NestedLoopWithIoDetector:
                     line_end=hit.line,
                     details={"boundary_kind": hit.detail},
                     reason=(
-                        f"{phrasing} runs inside a nested loop (O(n·m) round-trips); "
-                        "batch the inner query or restructure the loops"
+                        f"{phrasing} runs inside nested loops; inspect iteration bounds "
+                        "and early exits before estimating round-trips. Preserve bounded "
+                        "retry and ordered failover; batch only independent repeated work."
                     ),
                 )
             )

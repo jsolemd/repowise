@@ -129,8 +129,10 @@ def test_strategy_preconditions_distinguish_proven_advisory_and_no_plan():
     )[0]
 
     assert verified.fix and verified.fix.strategy == "parallelize_independent_awaits"
-    assert verified.fix.safety == "proven"
+    assert verified.fix.safety == "advisory"
+    assert "resource_concurrency_contract" in verified.prerequisites
     assert ambiguous.fix is None
+    assert "loop_carried_dependence_proof" in ambiguous.prerequisites
     assert batching.fix and batching.fix.strategy == "batch_or_prefetch_io"
     assert batching.fix.safety == "advisory"
     assert filesystem.fix is None
@@ -251,12 +253,10 @@ def test_performance_fix_plan_carries_closed_strategy_and_true_totals():
 def test_a_proven_strategy_on_an_unreliable_path_is_not_offered_as_proven():
     """The demotion has to reach the plan, not just the label.
 
-    Dataflow can prove a loop carries no cross-iteration dependence and still
-    be proving it about the wrong loop, if the call path that grouped the
-    evidence was guessed. A plan stamped high confidence on that basis is the
-    wrong plan, which costs more than no plan at all.
+    Dataflow can prove resource construction invariant and still be proving
+    it about the wrong loop if the grouping call path was guessed.
 
-    No detector emits this shape today: the two markers carrying a proven
+    No detector emits this shape today: the marker carrying a proven
     strategy never travel with a call path, so their provenance is always
     direct. The guard is pinned here rather than in the corpus because the
     corpus records shapes the analyzer produces.
@@ -266,10 +266,10 @@ def test_a_proven_strategy_on_an_unreliable_path_is_not_offered_as_proven():
             _finding(
                 "async.py",
                 5,
-                marker="serial_await_in_loop",
+                marker="resource_construction_in_loop",
                 boundary="network",
                 call_path=("async.py::run", "http.py::send", "http.py::_write"),
-                dataflow_verified=True,
+                resource_invariant=True,
                 resolution_basis="name-fallback",
             )
         ]
@@ -283,7 +283,7 @@ def test_a_proven_strategy_on_an_unreliable_path_is_not_offered_as_proven():
     assert performance_fix_suggestions([opportunity])[0].confidence == "medium"
 
 
-def test_a_reliable_path_keeps_the_proven_strategy_and_its_plan_confidence():
+def test_a_reliable_path_does_not_prove_io_effect_safety():
     opportunity = build_performance_opportunities(
         [
             _finding(
@@ -296,9 +296,9 @@ def test_a_reliable_path_keeps_the_proven_strategy_and_its_plan_confidence():
         ]
     )[0]
 
-    assert opportunity.actionability_state == "plan_ready"
-    assert opportunity.fix and opportunity.fix.safety == "proven"
-    assert performance_fix_suggestions([opportunity])[0].confidence == "high"
+    assert opportunity.actionability_state == "advisory"
+    assert opportunity.fix and opportunity.fix.safety == "advisory"
+    assert performance_fix_suggestions([opportunity])[0].confidence == "medium"
 
 
 def test_a_cross_function_group_always_shares_its_last_two_path_nodes():

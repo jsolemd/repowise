@@ -237,9 +237,10 @@ def test_one_parse_when_promotion_and_extract_method_hit_same_file(tmp_path: Pat
         perf_hits=[PerfHit(kind="serial_await_in_loop", line=hit_line, function="f")],
     )
 
-    # Consumer 1: the promotion pass.
+    # Unsupported I/O promotion needs no local-dataflow parse.
     apply_perf_promotions([(pf, fcx)], dataflow=cache)
-    assert fcx.perf_hits[0].promoted is True
+    assert fcx.perf_hits[0].promoted is False
+    assert calls["n"] == 0
 
     # Consumer 2: the Extract Method view, through the same cache.
     flagged = cache.get(str(p), "python").flagged_analyses()

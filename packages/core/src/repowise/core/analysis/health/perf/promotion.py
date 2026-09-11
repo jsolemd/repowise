@@ -1,28 +1,15 @@
 """Advisory -> asserted promotion of perf findings via intra-procedural dataflow.
 
-Two perf markers are advisory *by construction* because a file-local pass cannot
-prove the one thing that would make them certain - that the loop's iterations do
-not depend on each other:
+The nested-loop marker can use local dataflow to reject a rewrite when the
+loop carries values between iterations. A hit without such a local dependence
+may be marked ``promoted``; this is not a proof of arbitrary rewrite safety.
 
-  * ``serial_await_in_loop`` - an awaited I/O call run once per iteration. The fix
-    (fan out with ``gather`` / ``Promise.all``) is only valid when iteration i+1
-    does not consume a value iteration i produced.
-  * ``nested_loop_quadratic`` - a data-dependent loop nested in another. The
-    "use a set/map lookup" advice presumes the inner loop is a genuine full scan,
-    not an accumulation that carries state.
+Serial I/O awaits remain advisory. Resource ownership, transaction ordering,
+aliasing and failure semantics require an effect proof outside this module.
+No absence of local assignments establishes that I/O can run concurrently.
 
-This module supplies exactly that missing proof, and only that. For a function
-already carrying one of those advisory hits it runs the dataflow layer
-(:func:`dataflow.analyze_function` - CFG + reaching definitions) over the *one*
-loop the hit sits in and checks for a **loop-carried true dependence**: a use of
-some variable, inside the loop, that can read a value a previous iteration wrote.
-When none exists the iterations are provably independent and the hit is marked
-``promoted`` (the biomarker then asserts rather than hedges). When the proof is
-unavailable - no def/use dialect for the language, the CFG guard trips, the
-fixpoint does not converge, no enclosing loop is found, or a genuine carried
-dependence *is* present - the hit is left advisory. Precision over recall: a
-false promotion is the one way to burn the perf pillar's trust, so every
-uncertain case degrades to silence.
+Unsupported dialects, guarded CFGs, unconverged analysis and unresolved loops
+leave the hit advisory. The pass runs only for functions with eligible hits.
 
 **Soundness of the carried-dependence check.** Using reaching definitions plus a
 per-iteration must-def analysis, a loop use of ``v`` is *upward-exposed* (can see
@@ -67,9 +54,9 @@ log = structlog.get_logger(__name__)
 # and the dataflow layer imports the biomarker detectors, so an eager import here
 # would close an import cycle. The same lazy discipline ``perf.crossfn`` uses.
 
-# The advisory markers this pass can turn into asserted findings. Both hedge on
-# iteration independence, which the loop-carried-dependence proof settles.
-PROMOTABLE_KINDS: frozenset[str] = frozenset({"serial_await_in_loop", "nested_loop_quadratic"})
+# Local dataflow supplies no proof of I/O resource ownership or effect ordering.
+# Serial awaits therefore remain advisory until a separate effect proof exists.
+PROMOTABLE_KINDS: frozenset[str] = frozenset({"nested_loop_quadratic"})
 
 
 def apply_perf_promotions(
