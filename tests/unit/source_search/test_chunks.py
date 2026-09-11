@@ -346,6 +346,8 @@ def test_a_file_shorter_than_one_window_yields_exactly_one():
         "pom.xml",
         "nginx.conf",
         "units/atlas.service",
+        "units/atlas.service.in",
+        "units/refresh.timer.in",
         "units/atlas.timer",
         "scripts/setup.ps1",
         "lib/task.rb",
@@ -373,6 +375,8 @@ def test_a_code_file_with_no_persisted_symbols_is_windowed():
 
 def test_a_file_with_no_grammar_and_no_listed_suffix_is_skipped():
     assert not window_eligible("docs/README.md", indexed_symbols=0)
+    assert not window_eligible("secrets.env.in", indexed_symbols=0)
+    assert not window_eligible("data/model.bin.in", indexed_symbols=0)
     assert not window_eligible("assets/logo.png", indexed_symbols=0)
 
 

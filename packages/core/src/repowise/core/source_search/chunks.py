@@ -340,6 +340,10 @@ def parser_eligible(rel_path: str) -> bool:
 def _is_window_text_format(rel_path: str) -> bool:
     """Whether *rel_path* is one of the text formats the symbol lane never sees."""
     name = PurePosixPath(rel_path).name
+    # These systemd templates keep unit syntax until installation substitutes
+    # their variables. Arbitrary .in files remain outside the allowlist.
+    if name.lower().endswith((".service.in", ".timer.in")):
+        return True
     if name in _WINDOW_BASENAMES:
         return True
     if any(name.startswith(f"{stem}.") for stem in _WINDOW_BASENAMES):

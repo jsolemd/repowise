@@ -897,10 +897,11 @@ async def _prune_stale_file_rows(
             )
             if (node_id if node_type == "file" else file_path) not in protected_paths
         ]
+        stale_node_id_set = set(stale_node_ids)
         pruned_paths.update(
             node_id if node_type == "file" else file_path
             for node_id, node_type, file_path in node_rows
-            if node_id in stale_node_ids
+            if node_id in stale_node_id_set
         )
         for i in range(0, len(stale_node_ids), _PRUNE_CHUNK):
             batch = stale_node_ids[i : i + _PRUNE_CHUNK]
