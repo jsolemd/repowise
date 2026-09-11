@@ -58,6 +58,30 @@ function pageRow(overrides: Record<string, unknown> = {}) {
 }
 
 describe("normalizeSearchResponse", () => {
+  it("retains repository identity through grouping and file/document navigation", () => {
+    const envelope = normalizeSearchResponse(envelopeBody({ results: [
+      { file: "src/config.py", name: "config", kind: "function", source: "symbol", repo: "infra" },
+      { file: "src/config.py", name: "config", kind: "function", source: "symbol", repo: "make" },
+      { page_id: "module_page:config", name: "Config", kind: "module_page", source: "wiki_page", repo: "make" },
+    ] }));
+    const grouped = groupSearchResults({
+      envelope, linkPrefix: PREFIX,
+      repoLinkPrefixes: { infra: "/repos/infra-id", make: "/repos/make-id" },
+    });
+    const entries = grouped.groups.flatMap((group) => group.entries);
+    expect(entries).toHaveLength(3);
+    expect(entries.filter((entry) => entry.href.startsWith("/repos/infra-id/"))).toHaveLength(1);
+    expect(entries.filter((entry) => entry.href.startsWith("/repos/make-id/"))).toHaveLength(2);
+    expect(entries.every((entry) => !entry.href.startsWith(PREFIX + "/"))).toBe(true);
+  });
+
+  it("does not route an unknown repository's result into the active repository", () => {
+    const envelope = normalizeSearchResponse(envelopeBody({ results: [
+      { file: "src/config.py", name: "config", kind: "function", source: "symbol", repo: "unloaded" },
+    ] }));
+    expect(groupSearchResults({ envelope, linkPrefix: PREFIX }).groups).toEqual([]);
+  });
+
   it("reads the hybrid host's envelope", () => {
     const envelope = normalizeSearchResponse(envelopeBody());
 

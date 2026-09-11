@@ -49,6 +49,8 @@ export interface SearchEvidence {
  * backed by a file — only a title.
  */
 export interface SearchHit {
+  /** Workspace repository alias, when the server scopes or federates a hit. */
+  repo?: string;
   /** Repo-relative path, or "" when nothing on disk backs this hit. */
   file: string;
   /** The wiki page's primary key, when this hit is a page. */
@@ -187,9 +189,11 @@ function hitFromEnvelopeRow(raw: Record<string, unknown>): SearchHit {
   const start = asPositiveInt(raw.start_line);
   const end = asPositiveInt(raw.end_line);
   const pageId = asString(raw.page_id);
+  const repo = asString(raw.repo);
 
   return {
     file,
+    ...(repo ? { repo } : {}),
     ...(pageId ? { page_id: pageId } : {}),
     name: asString(raw.name),
     kind: asString(raw.kind),

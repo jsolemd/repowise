@@ -223,6 +223,8 @@ export interface GroupSearchResultsInput {
   decisions?: readonly DecisionRecordResponse[];
   /** `/repos/{id}`. */
   linkPrefix: string;
+  /** Repository aliases mapped to canonical dashboard routes. */
+  repoLinkPrefixes?: Readonly<Record<string, string>>;
 }
 
 /** Search results as the palette's sections, in reading order. */
@@ -230,6 +232,7 @@ export function groupSearchResults({
   envelope,
   decisions = [],
   linkPrefix,
+  repoLinkPrefixes = {},
 }: GroupSearchResultsInput): GroupedSearchResults {
   const buckets: Record<SearchGroupId, SearchResultEntry[]> = {
     code: [],
@@ -250,7 +253,9 @@ export function groupSearchResults({
 
   if (!isNoMatch && !broke) {
     for (const hit of envelope.results) {
-      const entry = entryOf(hit, linkPrefix);
+      const prefix = hit.repo ? repoLinkPrefixes[hit.repo] : linkPrefix;
+      if (!prefix) continue;
+      const entry = entryOf(hit, prefix);
       if (entry) buckets[groupOf(hit)].push(entry);
     }
   }

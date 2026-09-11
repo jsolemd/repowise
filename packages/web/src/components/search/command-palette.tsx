@@ -103,8 +103,12 @@ export function CommandPalette({ repos, workspace }: CommandPaletteProps) {
         envelope,
         decisions: rankDecisions(decisionsData ?? [], query),
         linkPrefix: `/repos/${activeRepo?.id ?? repos[0]?.id ?? ""}`,
+        repoLinkPrefixes: Object.fromEntries(
+          (workspace?.repos ?? []).filter((repo) => repo.repo_id)
+            .map((repo) => [repo.alias, `/repos/${repo.repo_id}`]),
+        ),
       }),
-    [envelope, decisionsData, query, activeRepo, repos],
+    [envelope, decisionsData, query, activeRepo, repos, workspace],
   );
 
   // Only when the server said so. The stock search host classifies nothing,
