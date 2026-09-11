@@ -657,6 +657,8 @@ async def test_tools_list_and_selection_keep_read_default_mutation_opt_in(
     tmp_path,
     monkeypatch,
 ) -> None:
+    from mcp.server.fastmcp import FastMCP
+
     from repowise.core.registry import mcp_tool_registry
     from repowise.server.mcp_server import ensure_full_surface
     from repowise.server.mcp_server._tool_selection import (
@@ -665,7 +667,15 @@ async def test_tools_list_and_selection_keep_read_default_mutation_opt_in(
         resolve_enabled_tools,
     )
 
-    mcp = ensure_full_surface()
+    # Exercise registry defaults independently of the deployment's read-only
+    # and explicitly selected tool surface.
+    monkeypatch.delenv(NO_GENERATIVE_ENV, raising=False)
+    monkeypatch.delenv("REPOWISE_TOOLS", raising=False)
+    ensure_full_surface()
+    # Prior tests may have selected a subset on the process-wide server.
+    # A fresh server exercises registration without inheriting that selection.
+    mcp = FastMCP("index-status-registry-test")
+    mcp_tool_registry.apply(mcp)
     entries = {entry.name: entry for entry in mcp_tool_registry.entries()}
     listed = {tool.name for tool in await mcp.list_tools()}
 

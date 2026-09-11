@@ -4,7 +4,7 @@ By default a single-repo server exposes eleven tools (get_answer, get_context,
 get_symbol, search_codebase, get_overview, get_risk, get_change_risk, get_why,
 get_dead_code, get_health, get_index_status). Workspace mode also exposes the
 ``list_repos`` discovery utility, ``get_blast_radius`` and ``get_architecture``
-by default. Fifteen further tools (get_dependents, get_dependency_path,
+by default. Seventeen further tools (get_dependents, get_dependency_path,
 get_execution_flows, generate_refactoring_code, get_conformance,
 reindex_repository, build_task_slice, get_task_slice, extend_task_slice,
 get_query_quality, find_clones, find_patterns, manage_decision,

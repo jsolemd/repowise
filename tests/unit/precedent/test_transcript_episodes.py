@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import time
+from datetime import UTC, datetime
 
 import pytest
 
@@ -502,8 +503,7 @@ def test_the_episode_is_dated_from_the_session_not_the_index(tmp_path):
     (row,) = _rows(root, tier=TIER_TRANSCRIPT)
 
     assert row["birth_at"] == pytest.approx(
-        time.mktime(time.strptime("2026-08-06 10:00:00", "%Y-%m-%d %H:%M:%S"))
-        - time.timezone,
+        datetime(2026, 8, 6, 10, tzinfo=UTC).timestamp(),
         abs=2,
     )
     assert row["tier"] == TIER_TRANSCRIPT

@@ -153,8 +153,8 @@ def mcp_command(
     """Start the MCP server for editor integration.
 
     Exposes a curated set of tools for querying the repowise wiki via the MCP
-    protocol: eleven by default in single-repo mode, plus three more by default
-    in workspace mode. Fifteen more are opt-in via ``--tools`` or the
+    protocol: eleven by default in single-repo mode, plus one more by default
+    in workspace mode. Seventeen more are opt-in via ``--tools`` or the
     ``mcp.tools`` config block. Supports stdio
     (for Claude Code, Codex, Cursor), streamable HTTP, and legacy SSE
     transports.
