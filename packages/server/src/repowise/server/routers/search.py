@@ -74,9 +74,33 @@ async def search(
     # Returned as a Response so the richer envelope (owner, confidence,
     # evidence) reaches the caller instead of being trimmed to the page schema.
     if source_search_enabled() and search_type != "fulltext":
-        coordinator = await rest_coordinator(request.app.state)
-        if coordinator is not None:
-            return JSONResponse(await coordinator.search(query, limit=limit, mode="hybrid"))
+        registry = getattr(request.app.state, "repo_registry", None)
+        if registry is not None:
+            from repowise.core.persistence.crud import get_repository
+            from repowise.core.persistence.database import get_session
+            from repowise.server.deps import resolve_session_factory
+            from repowise.server.mcp_server._source_federation import workspace_source_search
+
+            scope = "all"
+            if repo_id is not None:
+                if repo_id.startswith("ws:"):
+                    return []
+                factory = resolve_session_factory(request.app.state, repo_id)
+                async with get_session(factory) as session:
+                    repository = await get_repository(session, repo_id)
+                    if repository is None:
+                        return []
+                    scope = registry.resolve_repo_param(repository.local_path)
+            response = await workspace_source_search(
+                query, limit=limit, mode="hybrid", repo=scope, registry=registry,
+                build_meta=lambda: {},
+            )
+            if response is not None:
+                return JSONResponse(response)
+        else:
+            coordinator = await rest_coordinator(request.app.state)
+            if coordinator is not None:
+                return JSONResponse(await coordinator.search(query, limit=limit, mode="hybrid"))
 
     # A keyless index has no semantic vectors, so a semantic request is served
     # lexically rather than refused. Returning nothing would read as "not in the
