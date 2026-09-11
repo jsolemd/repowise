@@ -146,7 +146,7 @@ function entryOf(hit: SearchHit, linkPrefix: string): SearchResultEntry | undefi
   return {
     key: href,
     label,
-    detail: hit.file || hit.kind,
+    detail: hit.repo ? `${hit.repo}: ${hit.file || hit.kind}` : hit.file || hit.kind,
     href,
     ...(hit.start_line !== undefined ? { startLine: hit.start_line } : {}),
     ...(hit.end_line !== undefined ? { endLine: hit.end_line } : {}),

@@ -70,6 +70,9 @@ describe("normalizeSearchResponse", () => {
     });
     const entries = grouped.groups.flatMap((group) => group.entries);
     expect(entries).toHaveLength(3);
+    expect(entries.map((entry) => entry.detail)).toEqual([
+      "infra: src/config.py", "make: src/config.py", "make: module_page",
+    ]);
     expect(entries.filter((entry) => entry.href.startsWith("/repos/infra-id/"))).toHaveLength(1);
     expect(entries.filter((entry) => entry.href.startsWith("/repos/make-id/"))).toHaveLength(2);
     expect(entries.every((entry) => !entry.href.startsWith(PREFIX + "/"))).toBe(true);
