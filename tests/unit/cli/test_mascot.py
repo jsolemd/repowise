@@ -105,7 +105,8 @@ def test_long_tagline_appears_at_eighty_columns() -> None:
 
 
 def test_short_tagline_below_the_banner_width() -> None:
-    console = Console(width=40, record=True, force_terminal=True)
+    # Rich 13's TERM=dumb fallback ignores width unless both dimensions are set.
+    console = Console(width=40, height=25, record=True, force_terminal=True)
     print_banner(console, repo_name="my-cool-repo")
     out = console.export_text()
     assert "codebase intelligence ·" in out
