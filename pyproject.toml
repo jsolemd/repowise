@@ -33,6 +33,8 @@ classifiers = [
 dependencies = [
     # HTTP client
     "httpx>=0.27,<1",
+    # Shield async resource cleanup during HTTP cancellation.
+    "anyio>=4,<5",
     # AST parsing
     "tree-sitter>=0.23,<1",
     "tree-sitter-python>=0.23,<1",

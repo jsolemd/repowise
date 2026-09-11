@@ -23,6 +23,8 @@ import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+import anyio
+
 if TYPE_CHECKING:
     from collections.abc import Collection
     from pathlib import Path
@@ -257,8 +259,7 @@ class RepoIndex:
         return [s for syms in self._by_file.values() for s in syms if s.visibility == "public"]
 
     async def close(self) -> None:
-        await self._session.close()
-        await self._engine.dispose()
+        await _close_index_db(self._session, self._engine)
 
 
 class WorkspaceIndex:
@@ -277,6 +278,16 @@ class WorkspaceIndex:
             except Exception:
                 _log.warning("Error closing index for '%s'", repo.alias, exc_info=True)
         self._repos.clear()
+
+
+async def _close_index_db(session: AsyncSession, engine: Any) -> None:
+    # HTTP cancellation remains active at every await. Finish returning the
+    # checked-out connection before the session or engine can lose its owner.
+    with anyio.CancelScope(shield=True):
+        try:
+            await session.close()
+        finally:
+            await engine.dispose()
 
 
 async def open_repo_index(alias: str, repo_path: Path) -> RepoIndex | None:
@@ -315,8 +326,7 @@ async def open_repo_index(alias: str, repo_path: Path) -> RepoIndex | None:
         # BaseException too: a cancellation landing in _load would otherwise
         # leak the engine and its connection.
         if not ok:
-            await session.close()
-            await engine.dispose()
+            await _close_index_db(session, engine)
     return index
 
 
@@ -331,13 +341,28 @@ async def open_workspace_index(
     *aliases*, when given, restricts the open to those repos.
     """
     entries = [e for e in ws_config.repos if aliases is None or e.alias in aliases]
-    opened = await asyncio.gather(
-        *(
-            open_repo_index(e.alias, (workspace_root / e.path).resolve())
-            for e in entries
-        ),
-        return_exceptions=True,
-    )
+    tasks = [
+        asyncio.create_task(open_repo_index(e.alias, (workspace_root / e.path).resolve()))
+        for e in entries
+    ]
+    try:
+        opened = await asyncio.gather(*tasks, return_exceptions=True)
+    except BaseException:
+        # gather cancellation discards results from children that already
+        # succeeded. Keep their owners until every child settles, then close.
+        with anyio.CancelScope(shield=True):
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            settled = await asyncio.gather(*tasks, return_exceptions=True)
+            await WorkspaceIndex(
+                {
+                    entry.alias: index
+                    for entry, index in zip(entries, settled, strict=True)
+                    if index is not None and not isinstance(index, BaseException)
+                }
+            ).close()
+        raise
     repos: dict[str, RepoIndex] = {}
     for entry, index in zip(entries, opened, strict=True):
         if isinstance(index, BaseException):
