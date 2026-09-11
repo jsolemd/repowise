@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import anyio
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 _log = logging.getLogger("repowise.workspace.registry")
@@ -45,6 +46,12 @@ def repo_db_path(repo_path: Path) -> Path:
     return repo_path / ".repowise" / "wiki.db"
 
 
+async def _dispose_engine(engine: Any) -> None:
+    # MCP cancels with AnyIO scopes, which also cancel unshielded cleanup awaits.
+    with anyio.CancelScope(shield=True):
+        await engine.dispose()
+
+
 async def open_repo_db(repo_path: Path) -> tuple[Any, async_sessionmaker[AsyncSession]]:
     """Open a repo's ``wiki.db``, returning ``(engine, session_factory)``.
 
@@ -56,7 +63,12 @@ async def open_repo_db(repo_path: Path) -> tuple[Any, async_sessionmaker[AsyncSe
     from repowise.core.persistence.database import create_engine, get_db_url, init_db
 
     engine = create_engine(get_db_url(f"sqlite:///{repo_db_path(repo_path).as_posix()}"))
-    await init_db(engine)
+    try:
+        await init_db(engine)
+    except BaseException:
+        # Ownership has not transferred to a context yet, including cancellation.
+        await _dispose_engine(engine)
+        raise
     return engine, async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 
 
@@ -250,36 +262,39 @@ class RepoRegistry:
             _log.warning("No wiki.db for repo '%s' at %s", alias, db_path)
         engine, session_factory = await open_repo_db(repo_path)
 
-        fts = FullTextSearch(engine)
-        await fts.ensure_index()
+        async with contextlib.AsyncExitStack() as resources:
+            resources.push_async_callback(_dispose_engine, engine)
+            fts = FullTextSearch(engine)
+            await fts.ensure_index()
 
-        # Seed placeholder vector stores.
-        # decision_store is repointed to the shared page store — decisions are
-        # embedded under the "decision:" namespace, no separate LanceDB table.
-        embedder = self._embedder_factory() if self._embedder_factory else KeylessEmbedder()
-        vector_store: Any = InMemoryVectorStore(embedder=embedder)
+            # Seed placeholder vector stores.
+            # decision_store is repointed to the shared page store — decisions are
+            # embedded under the "decision:" namespace, no separate LanceDB table.
+            embedder = self._embedder_factory() if self._embedder_factory else KeylessEmbedder()
+            vector_store: Any = InMemoryVectorStore(embedder=embedder)
 
-        vs_ready = asyncio.Event()
+            vs_ready = asyncio.Event()
 
-        ctx = RepoContext(
-            alias=alias,
-            path=repo_path,
-            session_factory=session_factory,
-            fts=fts,
-            vector_store=vector_store,
-            decision_store=vector_store,  # same store, decision: namespace
-            vector_store_ready=vs_ready,
-            _engine=engine,
-        )
+            ctx = RepoContext(
+                alias=alias,
+                path=repo_path,
+                session_factory=session_factory,
+                fts=fts,
+                vector_store=vector_store,
+                decision_store=vector_store,  # same store, decision: namespace
+                vector_store_ready=vs_ready,
+                _engine=engine,
+            )
 
-        # Load real vector stores in background; track task for cancellation on eviction
-        task = asyncio.create_task(
-            self._load_vector_stores(ctx, repo_path, embedder),
-            name=f"vs-load-{alias}",
-        )
-        self._vs_tasks[alias] = task
+            # Load real vector stores in background; track task for cancellation on eviction
+            task = asyncio.create_task(
+                self._load_vector_stores(ctx, repo_path, embedder),
+                name=f"vs-load-{alias}",
+            )
+            self._vs_tasks[alias] = task
 
-        return ctx
+            resources.pop_all()  # the registry now owns the context
+            return ctx
 
     async def _load_vector_stores(
         self,

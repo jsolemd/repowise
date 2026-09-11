@@ -6,9 +6,10 @@ import asyncio
 import contextlib
 import os
 import sys
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from typing import Any
 
+import anyio
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -408,6 +409,63 @@ def _detect_workspace(repo_path: str | None):
 
 @asynccontextmanager
 async def _lifespan(server: FastMCP):
+    """Lease process resources across the SDK's per-client lifespans."""
+    loop = asyncio.get_running_loop()
+    held = _state._runtime_lock
+    if held is None or held[0] is not loop:
+        if _state._runtime_users:
+            raise RuntimeError("MCP runtime is already active on another event loop")
+        held = (loop, asyncio.Lock())
+        _state._runtime_lock = held
+    lock = held[1]
+    async with lock:
+        if _state._runtime_users == 0:
+            context = _runtime_lifespan(server)
+            await context.__aenter__()
+            _state._runtime_context = context
+        _state._runtime_users += 1
+    try:
+        yield
+    finally:
+        # HTTP disconnects and idle expiry cancel the SDK's AnyIO scope.
+        # Resource return must finish before another client can initialize.
+        with anyio.CancelScope(shield=True):
+            async with lock:
+                _state._runtime_users -= 1
+                if _state._runtime_users == 0:
+                    context = _state._runtime_context
+                    _state._runtime_context = None
+                    await context.__aexit__(None, None, None)
+
+
+@asynccontextmanager
+async def _runtime_lifespan(server: FastMCP):
+    resources = AsyncExitStack()
+    try:
+        await _initialize_runtime(server, resources)
+        yield
+    finally:
+        # A later client may release the final lease from a different task.
+        # Never keep a task-bound AnyIO cancel scope open across the yield.
+        with anyio.CancelScope(shield=True):
+            await resources.aclose()
+
+
+def _clear_runtime_state() -> None:
+    for field in (
+        "_session_factory", "_fts", "_vector_store", "_decision_store",
+        "_vector_store_ready", "_lancedb_ready", "_registry",
+        "_workspace_root", "_cross_repo_enricher",
+    ):
+        setattr(_state, field, None)
+
+
+async def _close_runtime_vector_store() -> None:
+    if _state._vector_store is not None:
+        await _state._vector_store.close()
+
+
+async def _initialize_runtime(server: FastMCP, resources: AsyncExitStack) -> None:
     """Initialize DB engine, session factory, and FTS synchronously on startup.
 
     Vector store / LanceDB loading is deferred to a background asyncio task so
@@ -415,11 +473,13 @@ async def _lifespan(server: FastMCP):
     _state._vector_store_ready before querying the vector store.
     """
 
+    resources.callback(_clear_runtime_state)
     # Start the lancedb import immediately and gate tool dispatch on it. Both
     # modes load vector stores in the background, and in both the first tool
     # call can otherwise land mid-import and wedge the loop.
     _state._lancedb_ready = asyncio.Event()
     _warm_task = asyncio.create_task(_warm_lancedb(), name="lancedb-warmup")
+    resources.push_async_callback(_cancel_task, _warm_task)
 
     # --- Workspace detection ------------------------------------------------
     if _state._force_single_repo:
@@ -441,6 +501,10 @@ async def _lifespan(server: FastMCP):
             ws_config=ws_config,
             embedder_factory=lambda: _resolve_embedder(),
         )
+        resources.push_async_callback(registry.close)
+        from repowise.server.mcp_server._test_impact import close_test_impact_indexes
+
+        resources.push_async_callback(close_test_impact_indexes)
 
         # Eagerly load the default repo so tools work immediately
         default_ctx = await registry.get_default()
@@ -493,18 +557,6 @@ async def _lifespan(server: FastMCP):
             registry.get_default_alias(),
         )
 
-        yield
-
-        await _cancel_task(_warm_task)
-        _state._lancedb_ready = None
-        _state._cross_repo_enricher = None
-        # The test-impact join holds its own session per consumer repo.
-        from repowise.server.mcp_server._test_impact import close_test_impact_indexes
-
-        await close_test_impact_indexes()
-        await registry.close()
-        _state._registry = None
-        _state._workspace_root = None
         return
 
     # --- Single-repo mode (existing behavior) --------------------------------
@@ -530,6 +582,7 @@ async def _lifespan(server: FastMCP):
 
     _log.info("repowise MCP: initialising database…")
     engine = create_engine(db_url)
+    resources.push_async_callback(engine.dispose)
     await init_db(engine)
 
     _state._session_factory = async_sessionmaker(
@@ -552,22 +605,14 @@ async def _lifespan(server: FastMCP):
     _placeholder = InMemoryVectorStore(embedder=KeylessEmbedder())
     _state._vector_store = _placeholder
     _state._decision_store = _placeholder
+    resources.push_async_callback(_close_runtime_vector_store)
 
     # Defer embedder resolution + LanceDB open to a background task so
     # the server starts accepting connections without blocking on disk I/O.
     _state._vector_store_ready = asyncio.Event()
     _bg_task = asyncio.create_task(_load_vector_stores(_state._repo_path))
+    resources.push_async_callback(_cancel_task, _bg_task)
     _log.info("repowise MCP: ready (vector stores loading in background)")
-
-    yield
-
-    await _cancel_task(_bg_task)
-    await _cancel_task(_warm_task)
-    _state._lancedb_ready = None
-
-    await engine.dispose()
-    # _decision_store is an alias for _vector_store — close only once.
-    await _state._vector_store.close()
 
 
 # ---------------------------------------------------------------------------
