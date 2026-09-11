@@ -3,12 +3,13 @@
 By default a single-repo server exposes eleven tools (get_answer, get_context,
 get_symbol, search_codebase, get_overview, get_risk, get_change_risk, get_why,
 get_dead_code, get_health, get_index_status). Workspace mode also exposes the
-``list_repos`` discovery utility, ``get_blast_radius`` and ``get_architecture``
-by default. Seventeen further tools (get_dependents, get_dependency_path,
+``list_repos`` discovery utility by default. Seventeen further tools
+(get_dependents, get_dependency_path,
 get_execution_flows, generate_refactoring_code, get_conformance,
 reindex_repository, build_task_slice, get_task_slice, extend_task_slice,
 get_query_quality, find_clones, find_patterns, manage_decision,
-get_reference_sites, preview_symbol_rename) are registered but off by default
+get_reference_sites, preview_symbol_rename, get_architecture, get_blast_radius)
+are registered but off by default
 and can be opted in via the ``mcp.tools`` config block or the
 ``repowise mcp --tools`` flag; architecture, blast radius and conformance are
 workspace-only, and manage_decision only does useful work where a decision
@@ -31,6 +32,7 @@ from __future__ import annotations
 
 import importlib
 import sys
+from types import ModuleType
 from typing import Any
 
 # ``_state`` is the one submodule that stays eager: every other module in this
@@ -119,6 +121,8 @@ def tool_middleware(fn: Any) -> Any:
     4. ``budget`` — caps the delivered shape before savings are measured.
     5. ``instrument`` — records the bounded result and adds savings metadata.
     6. ``budget`` — accounts for those final middleware fields and rechecks.
+    7. ``finish_on_cancel`` — cancels the complete invocation once and waits
+       for cleanup, including the database reads in the budget middleware.
 
     Every layer here is about the *payload* — what the answer contains, how
     precise its numbers are, how large it may get, what it cost. The transport
@@ -135,7 +139,7 @@ def tool_middleware(fn: Any) -> Any:
         enforce_response_budget,
         resolve_response_budget_repo_root,
     )
-    from repowise.server.mcp_server._failure_shield import shield
+    from repowise.server.mcp_server._failure_shield import finish_on_cancel, shield
     from repowise.server.mcp_server._meta import finalize_trust_envelope
     from repowise.server.mcp_server._rounding import quantize
     from repowise.server.mcp_server._savings import instrument
@@ -176,7 +180,7 @@ def tool_middleware(fn: Any) -> Any:
 
         return wrapped
 
-    return budget(instrument(budget(quantize(trust(shield(fn))))))
+    return finish_on_cancel(budget(instrument(budget(quantize(trust(shield(fn)))))))
 
 
 def served_tool(fn: Any) -> Any:
@@ -300,10 +304,7 @@ def __dir__() -> list[str]:
     )
 
 
-_Module = type(sys.modules[__name__])
-
-
-class _WritableModule(_Module):
+class _WritableModule(ModuleType):
     def __setattr__(self, name: str, value: Any) -> None:
         if name in _STATE_NAMES:
             setattr(_state, name, value)

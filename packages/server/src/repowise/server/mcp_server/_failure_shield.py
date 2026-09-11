@@ -22,6 +22,8 @@ import logging
 from collections.abc import Callable
 from typing import Any
 
+import anyio
+
 from repowise.server.mcp_server import _state
 from repowise.server.mcp_server._signature import preserve
 
@@ -190,6 +192,34 @@ async def _await_import_warmup(tool: str) -> None:
             tool,
             _WARMUP_TIMEOUT_S,
         )
+
+
+def finish_on_cancel(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """Own an asyncio invocation until its cancellation cleanup completes."""
+    if not inspect.iscoroutinefunction(fn):
+        return fn
+    tool = getattr(fn, "__name__", "tool")
+
+    @functools.wraps(fn)
+    async def _wrapped(*args: Any, **kwargs: Any) -> Any:
+        # The HTTP SDK uses level cancellation; SQLAlchemy and other asyncio
+        # clients need one cancellation followed by time to unwind. Include
+        # middleware database reads, and preserve the request ContextVars.
+        task = asyncio.create_task(fn(*args, **kwargs), name=f"repowise-tool:{tool}")
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            task.cancel()
+            with anyio.CancelScope(shield=True):
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    logger.warning("mcp tool %s cleanup failed", tool, exc_info=True)
+            raise
+
+    return preserve(_wrapped, fn)
 
 
 def shield(fn: Callable[..., Any]) -> Callable[..., Any]:
