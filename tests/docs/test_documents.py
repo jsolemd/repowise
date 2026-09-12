@@ -80,3 +80,29 @@ async def test_page_uses_one_readonly_snapshot_and_literal_parameter_filter(monk
     assert "%_' OR 1=1" not in sql
     assert params == ["/a/b", "%_' OR 1=1", 10, 50]
     assert conn.fetchval.call_args.args[1:] == ("/a/b", "%_' OR 1=1")
+
+
+async def test_file_page_serializes_real_database_timestamps():
+    import json
+    from datetime import UTC, datetime
+
+    indexed = datetime(2026, 9, 12, 0, 0, tzinfo=UTC)
+    library = SimpleNamespace(
+        name="Docs",
+        repo="a/b",
+        branch="main",
+        source_type="git",
+        status="ready",
+        current_sha="abc",
+        indexed_at=indexed,
+    )
+    result = await documents.handle_list_documents(
+        {"library_id": "/a/b"},
+        get_library_fn=AsyncMock(return_value=library),
+        list_page_fn=AsyncMock(
+            return_value=([{"file_path": "guide.md", "chunk_count": 2, "indexed_at": indexed}], 1)
+        ),
+    )
+    encoded = json.loads(json.dumps(result))
+    assert encoded["library"]["indexed_at"] == "2026-09-12T00:00:00+00:00"
+    assert encoded["files"][0]["indexed_at"] == encoded["library"]["indexed_at"]

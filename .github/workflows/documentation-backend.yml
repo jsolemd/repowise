@@ -34,11 +34,13 @@ jobs:
           docker run --rm -i --network docs-test -e DOC_SEARCH_POSTGRES_DSN=postgresql://doc_search:doc_search@docs-test-db:5432/doc_search repowise-docs:test python - <<'PYTHON'
           import asyncio
           from repowise.docs.db_runtime import init_pool, close_pool
+          from repowise.docs.tools.documents import list_document_page
           async def verify():
               for _ in range(2):
                   pool = await init_pool()
                   async with pool.acquire() as conn:
                       assert await conn.fetchval("SELECT count(*) FROM doc_search.libraries") == 0
+                  assert await list_document_page("/missing/library", "", 0, 50) == ([], 0)
                   await close_pool()
           asyncio.run(verify())
           PYTHON

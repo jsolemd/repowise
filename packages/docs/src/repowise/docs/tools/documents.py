@@ -46,6 +46,9 @@ async def handle_list_documents(
     rows, total = await (list_page_fn or list_document_page)(
         library_id, arguments.get("query", ""), offset, limit
     )
+    for row in rows:
+        timestamp = row.get("indexed_at")
+        row["indexed_at"] = timestamp.isoformat() if timestamp is not None else None
     return {
         "library_id": library_id,
         "library": {
@@ -55,7 +58,7 @@ async def handle_list_documents(
             "source_type": library.source_type,
             "status": library.status,
             "indexed_ref": library.current_sha,
-            "indexed_at": library.indexed_at,
+            "indexed_at": library.indexed_at.isoformat() if library.indexed_at else None,
         },
         "files": rows,
         "pagination": {
