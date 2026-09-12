@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Semantic Scholar API docs scraper for CodeAtlas snapshot publishing.
+Semantic Scholar API docs scraper for RepoWise snapshot publishing.
 
 Scrapes:
   1. https://www.semanticscholar.org/product/api (overview, tutorial, gallery)
@@ -19,7 +19,7 @@ Usage:
     # Post-process already-fetched JSON swagger specs
     python semantic_scholar.py --process
 
-    # Publish updated docs into CodeAtlas
+    # Publish updated docs into RepoWise
     python semantic_scholar.py --publish
 
     # Full pipeline: fetch + process + publish
@@ -241,7 +241,7 @@ def publish_to_repowise(
     *,
     cleanup_output: bool = False,
 ) -> None:
-    """Publish updated docs into CodeAtlas current-state storage."""
+    """Publish updated docs into RepoWise current-state storage."""
     target_dir = output_dir or OUTPUT_DIR
     # Remove swagger JSON dir before pushing (only push markdown)
     swagger_dir = target_dir / "swagger-json"
@@ -275,7 +275,7 @@ if __name__ == "__main__":
         print("\nUsage:")
         print("  python semantic_scholar.py --fetch    # Download swagger JSON specs")
         print("  python semantic_scholar.py --process  # Convert JSON -> markdown")
-        print("  python semantic_scholar.py --publish  # Publish to CodeAtlas")
+        print("  python semantic_scholar.py --publish  # Publish to RepoWise")
         print("  python semantic_scholar.py --all      # Full pipeline")
         print("  python semantic_scholar.py --stats    # Show output summary")
         sys.exit(0)

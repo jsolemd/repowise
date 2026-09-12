@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PubTator3 docs scraper for CodeAtlas snapshot publishing.
+PubTator3 docs scraper for RepoWise snapshot publishing.
 
 This scraper builds a current-state docs bundle from the directly accessible
 PubTator3 sources rather than mirroring a synthetic GitHub repo.

@@ -54,7 +54,7 @@ def output_mode(
     tool_name: str,
     arguments: dict | None,
 ) -> str:
-    """Resolve a call's output mode from the same schema contract as :8100."""
+    """Resolve a call's output mode from the canonical documentation schema."""
     schema = tool_schema_by_name.get(tool_name) or {}
     properties = schema.get("properties") if isinstance(schema, dict) else {}
     output_property = properties.get("output") if isinstance(properties, dict) else {}

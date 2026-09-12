@@ -6,6 +6,7 @@ and serve while the docs worker and its dependencies are unavailable.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from typing import Any
@@ -30,20 +31,27 @@ class DocsClient:
         headers = {"X-Doc-Search-Token": self.token} if self.token else {}
         timeout = httpx.Timeout(35.0, connect=3.0, write=10.0, pool=3.0)
         try:
-            async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:  # noqa: SIM117
-                async with client.stream(
+            # HTTPX bounds inactivity within each I/O operation. The outer
+            # deadline also bounds a response that keeps delivering small parts.
+            async with (
+                asyncio.timeout(40.0),
+                httpx.AsyncClient(timeout=timeout, trust_env=False) as client,
+                client.stream(
                     method, self.base_url + path, json=arguments, headers=headers
-                ) as response:
-                    response.raise_for_status()
-                    body = bytearray()
-                    async for part in response.aiter_bytes():
-                        body.extend(part)
-                        if len(body) > 4 * 1024 * 1024:
-                            raise DocsUnavailable("Documentation response exceeded its size limit.")
-                    payload = json.loads(body)
-                    if not isinstance(payload, dict):
-                        raise DocsUnavailable("Documentation worker returned an invalid response.")
-                    return payload
+                ) as response,
+            ):
+                response.raise_for_status()
+                body = bytearray()
+                async for part in response.aiter_bytes(chunk_size=64 * 1024):
+                    if len(body) + len(part) > 4 * 1024 * 1024:
+                        raise DocsUnavailable("Documentation response exceeded its size limit.")
+                    body.extend(part)
+                payload = json.loads(body)
+                if not isinstance(payload, dict):
+                    raise DocsUnavailable("Documentation worker returned an invalid response.")
+                return payload
+        except TimeoutError as exc:
+            raise DocsUnavailable("Documentation request exceeded its 40-second deadline.") from exc
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code in {401, 403}:
                 raise DocsUnavailable(
@@ -65,4 +73,19 @@ class DocsClient:
 
         if name not in {tool.name for tool in get_doc_tool_definitions()}:
             raise ValueError(f"Unknown documentation tool: {name}")
-        return await self.request("POST", f"/docs/tools/{name}", arguments=arguments)
+        result = await self.request("POST", f"/docs/tools/{name}", arguments=arguments)
+        if (
+            arguments.get("output") == "markdown"
+            and result.get("output") == "markdown"
+            and isinstance(result.get("content"), str)
+        ):
+            return result
+        payload = result.get("payload")
+        if (
+            result.get("status") not in ("success", "error")
+            or not isinstance(payload, dict)
+            or not isinstance(result.get("trust", {}), dict)
+            or (result["status"] == "error" and not isinstance(payload.get("error"), str))
+        ):
+            raise DocsUnavailable("Documentation worker returned an invalid tool response.")
+        return result

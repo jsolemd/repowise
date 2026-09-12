@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-1Password Developer docs scraper for CodeAtlas snapshot publishing.
+1Password Developer docs scraper for RepoWise snapshot publishing.
 
 Scrapes the official 1Password developer docs from:
   https://developer.1password.com/docs/*
 
 This uses the public sitemap, fetches every docs page, converts the main
 documentation content to markdown, and publishes the latest current-state
-snapshot into CodeAtlas.
+snapshot into RepoWise.
 
 Library ID: /codeatlas/1password-developer
 
@@ -135,7 +135,7 @@ def _build_library_readme(urls: list[str], *, output_dir: Path = OUTPUT_DIR) -> 
         "",
         "# 1Password Developer Docs",
         "",
-        "Snapshot of the official 1Password developer documentation indexed by CodeAtlas.",
+        "Snapshot of the official 1Password developer documentation indexed by RepoWise.",
         "",
         "## Included sections",
         "",

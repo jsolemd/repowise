@@ -23,7 +23,7 @@ HIDDEN_DOC_TOOL_NAMES = frozenset({"search_docs_multi"})
 
 
 def get_public_doc_tool_definitions() -> list[Tool]:
-    """Return the ten advertised tools; deprecated aliases remain callable."""
+    """Return advertised tools; deprecated aliases remain callable internally."""
     return [
         tool for tool in get_doc_tool_definitions() if str(tool.name) not in HIDDEN_DOC_TOOL_NAMES
     ]

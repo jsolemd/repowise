@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Cosmograph docs scraper for CodeAtlas snapshot publishing.
+Cosmograph docs scraper for RepoWise snapshot publishing.
 
 Scrapes https://cosmograph.app documentation (docs-lib, docs-general,
 docs-widget, docs-app) into current-state markdown snapshots.
@@ -369,7 +369,7 @@ def publish_to_repowise(
     *,
     cleanup_output: bool = False,
 ) -> None:
-    """Publish updated docs into CodeAtlas current-state storage."""
+    """Publish updated docs into RepoWise current-state storage."""
     target_dir = output_dir or OUTPUT_DIR
     if not target_dir.exists():
         raise SystemExit("Run --fetch or --process first so there is scraped output to publish.")

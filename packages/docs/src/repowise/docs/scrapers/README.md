@@ -1,8 +1,8 @@
-# CodeAtlas Docs Scrapers
+# RepoWise documentation scrapers
 
 Reusable scrapers for documentation sources that do not fit the normal
 git-clone indexing path. These scripts produce markdown files in `/tmp`, then
-publish the latest current-state snapshot directly into CodeAtlas's Postgres
+publish the latest current-state snapshot directly into RepoWise's Postgres
 docs store. No GitHub mirror repos are involved.
 
 ## Architecture
@@ -17,10 +17,10 @@ Closed-source or irregular docs source
   /tmp/<library>-docs/  (generated markdown files)
         │
         ▼
-  publish current-state snapshot into CodeAtlas Postgres
+  publish current-state snapshot into RepoWise Postgres
         │
         ▼
-  queue incremental/full reindex in CodeAtlas
+  queue incremental/full reindex in RepoWise
 ```
 
 Current model:
@@ -29,7 +29,7 @@ Current model:
   current-state file set.
 - Scratch outputs belong in `/tmp`. Runtime git caches belong under
   `/var/cache/code-search/doc-search/repos`. They do not belong inside the
-  `codeatlas/` source tree.
+  `packages/docs/` source tree.
 
 ## Available Scrapers
 
@@ -44,26 +44,23 @@ Current model:
 
 ### Running a scraper
 
+Run the full flow inside the configured RepoWise worker. Fetching and publishing
+then share scratch paths and the worker's database configuration:
+
 ```bash
-cd /workspaces/SoleMD.Infra/codeatlas
-
-# Build /tmp/<library>-docs from the upstream source
-uv run python -m repowise.docs.scrapers.cosmograph --fetch
-uv run python -m repowise.docs.scrapers.semantic_scholar --fetch
-uv run python -m repowise.docs.scrapers.semantic_scholar --process
-
-# Publish the latest current-state snapshot into CodeAtlas
-docker cp /tmp/cosmograph-docs/. codeatlas:/tmp/cosmograph-docs
-docker exec codeatlas bash -lc 'cd /workspaces/SoleMD.Infra/codeatlas && /app/.venv/bin/python -m repowise.docs.scrapers.cosmograph --publish'
-docker cp /tmp/s2-api-docs/. codeatlas:/tmp/s2-api-docs
-docker exec codeatlas bash -lc 'cd /workspaces/SoleMD.Infra/codeatlas && /app/.venv/bin/python -m repowise.docs.scrapers.semantic_scholar --publish'
+docker exec repowise-docs python -m repowise.docs.scrapers.cosmograph --all
+docker exec repowise-docs python -m repowise.docs.scrapers.semantic_scholar --all
 ```
 
-Notes:
-- The source tree is mounted read-only in the live container, so `--fetch` and
-  `--process` should run on the host while `--publish` runs in the container.
-- `--publish` writes snapshot rows, updates freshness state, and queues reindex
-  work. It does not push to GitHub.
+`--all` fetches, normalizes, publishes, and removes its scratch directory after
+publication. `--publish` alone uses previously generated files, updates snapshot
+and freshness rows, and queues indexing. The source package is installed in the
+worker image; rebuild through Infra after changing scraper code.
+
+For fetch-only debugging from the RepoWise checkout, use
+`uv run --frozen --extra docs python -m repowise.docs.scrapers.cosmograph --fetch`.
+Its output remains in the host's `/tmp/cosmograph-docs`; copy it into the worker's
+matching path before publishing from there.
 
 ## Writing a New Scraper
 
@@ -103,13 +100,5 @@ Cleanup contract:
 - Runtime bootstrap and scheduler refreshes use temporary directories that are
   removed automatically once the snapshot has been embedded into Postgres.
 
-## Snapshot Libraries
-
-The current snapshot-backed libraries are:
-
-| Library | CodeAtlas library ID |
-|---------|----------------------|
-| Cosmograph Docs | `/codeatlas/cosmograph` |
-| 1Password Developer Docs | `/codeatlas/1password-developer` |
-| PubTator3 API Docs | `/codeatlas/pubtator3` |
-| Semantic Scholar API Docs | `/codeatlas/semantic-scholar-api` |
+Historical `/codeatlas/...` library IDs and `.codeatlas-snapshot.json` metadata
+filenames remain stable compatibility identifiers. RepoWise owns their runtime.
