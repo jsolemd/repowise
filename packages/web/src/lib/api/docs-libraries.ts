@@ -1,19 +1,6 @@
-/**
- * The documentation service's library inventory, read through this server's
- * `/api/docs-libraries` proxy.
- *
- * Typed here rather than in `@repowise-dev/api-client` because the payload is
- * not this server's: it belongs to the docs service, and only the dashboard
- * reads it. Keeping the shape next to its one consumer means the shared client
- * package does not acquire a dependency on a service it never talks to.
- *
- * Every string that the docs service can leave unset is `| null` rather than
- * optional. That distinction is the whole point of the page: a library whose
- * freshness was never established reads as "unknown", and an optional field
- * would let that state disappear into `undefined` and render as blank.
- */
+/** RepoWise documentation inventory, browsing, search, and management. */
 
-import { apiGet } from "@repowise-dev/api-client";
+import { apiGet, apiPost } from "@repowise-dev/api-client";
 import "./client";
 
 /** What the indexer last did with a library. */
@@ -121,3 +108,44 @@ export interface DocsLibrariesResponse {
 
 export const getDocsLibraries = () =>
   apiGet<DocsLibrariesResponse>("/api/docs-libraries");
+
+export interface DocFilesPage {
+  library_id: string;
+  library: {
+    name: string;
+    repo: string | null;
+    branch: string | null;
+    source_type: string;
+    status: string;
+    indexed_ref: string | null;
+    indexed_at: string | null;
+  };
+  files: { file_path: string; chunk_count: number; indexed_at: string | null }[];
+  pagination: { total: number; offset: number; limit: number; returned: number; has_more: boolean; next_offset: number | null };
+}
+
+export interface DocContent {
+  content: string;
+  path: string;
+  library_id: string;
+  truncated: boolean;
+}
+
+export interface DocSearchResults {
+  results: { chunk_id: string; file_path: string; title: string; preview: string; source_url: string }[];
+  warnings?: string[];
+}
+
+export async function callDocsTool<T>(name: string, args: Record<string, unknown>): Promise<T> {
+  const result = await apiPost<{ status: string; payload: T & { error?: string } }>(
+    `/api/docs-libraries/tools/${encodeURIComponent(name)}`, { ...args, output: "json" },
+  );
+  if (result.status === "error") throw new Error(result.payload.error || "Documentation request failed.");
+  return result.payload;
+}
+
+export function documentsHref(library: string, path?: string): string {
+  const params = new URLSearchParams({ library });
+  if (path) params.set("path", path);
+  return `/docs-libraries/documents?${params}`;
+}

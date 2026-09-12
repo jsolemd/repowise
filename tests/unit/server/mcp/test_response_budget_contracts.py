@@ -551,7 +551,8 @@ def test_budget_hooks_run_for_the_tool_that_registered_them() -> None:
 
 #: Real response shapes, recorded by ``scripts/measure_mcp_response_sizes.py``
 #: against an indexed repository. Regenerate with ``--skeletons`` when a tool's
-#: payload changes shape.
+#: payload changes shape. Documentation envelopes also retain the docs worker
+#: golden-master shapes; file browsing uses the handler contract in test_docs.py.
 _SHAPES_FIXTURE = (
     Path(__file__).resolve().parents[3] / "fixtures" / "mcp" / "tool_response_shapes.json"
 )

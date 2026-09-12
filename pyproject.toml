@@ -111,6 +111,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+docs = [
+    "beautifulsoup4>=4.12.3,<5",
+    "qdrant-client==1.16.2",
+    "asyncpg>=0.29,<1",
+    "jsonschema>=4,<5",
+    "tree-sitter-language-pack==1.4.1",
+    "pydantic-settings>=2,<3",
+]
 postgres = [
     "pgvector>=0.3,<1",
     "asyncpg>=0.29,<1",
@@ -134,6 +142,8 @@ dev = [
 repowise = "repowise.cli.main:cli"
 repowise-augment = "repowise.cli.augment_hook:main"
 repowise-rewrite = "repowise.cli.rewrite_hook:main"
+repowise-docs = "repowise.docs.cli:main"
+repowise-docs-worker = "repowise.docs.transport.http_server:main"
 
 [project.urls]
 Homepage = "https://github.com/repowise-dev/repowise"
@@ -148,13 +158,15 @@ Documentation = "https://github.com/repowise-dev/repowise/blob/main/docs/start/U
 "repowise.core" = "packages/core/src/repowise/core"
 "repowise.cli" = "packages/cli/src/repowise/cli"
 "repowise.server" = "packages/server/src/repowise/server"
+"repowise.docs" = "packages/docs/src/repowise/docs"
 
 [tool.setuptools.packages.find]
-where = ["packages/core/src", "packages/cli/src", "packages/server/src"]
+where = ["packages/core/src", "packages/cli/src", "packages/server/src", "packages/docs/src"]
 include = ["repowise*"]
 namespaces = true
 
 [tool.setuptools.package-data]
+"repowise.docs" = ["scrapers/*.json"]
 "repowise.core.ingestion" = ["queries/*.scm"]
 "repowise.core.generation" = ["templates/*.j2"]
 # Bundled copy of docs/CHANGELOG.md so the CLI `whats-new` / post-upgrade panel
@@ -172,6 +184,11 @@ namespaces = true
 # ---------------------------------------------------------------------------
 # uv workspace (kept for local development)
 # ---------------------------------------------------------------------------
+[tool.uv]
+# These are separate process roles. On Python 3.14 the docs client requires
+# NumPy 2, while graspologic still requires NumPy 1.
+conflicts = [[{ extra = "docs" }, { extra = "graph-extra" }]]
+
 [tool.uv.workspace]
 members = [
     "packages/core",
@@ -265,5 +282,6 @@ check_untyped_defs = true
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = ["unit: isolated unit test", "integration: requires running backing services", "eval: live retrieval quality checks"]
 addopts = "-v --tb=short"
 pythonpath = ["."]

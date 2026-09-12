@@ -1,5 +1,7 @@
 "use client";
 
+import Link from "next/link";
+import { AddDocLibrary } from "./library-actions";
 import { useMemo, useState } from "react";
 import useSWR from "swr";
 import { BookOpen } from "lucide-react";
@@ -18,6 +20,7 @@ import { formatNumber, formatRelativeTimeOrNull } from "@repowise-dev/ui/lib/for
 import { ApiClientError } from "@/lib/api/client";
 import {
   getDocsLibraries,
+  documentsHref,
   type DocsJob,
   type DocsJobs,
   type DocsLibrariesResponse,
@@ -69,9 +72,9 @@ const COLUMNS: ResponsiveColumn<DocsLibrary>[] = [
       const why = problem(lib);
       return (
         <div className="min-w-0">
-          <span className="text-sm font-medium text-[var(--color-text-primary)]">
+          <Link href={documentsHref(lib.library_id)} className="text-sm font-medium text-[var(--color-accent-primary)] hover:underline">
             {lib.name}
-          </span>
+          </Link>
           {source && (
             <span className="mt-0.5 block font-mono text-xs text-[var(--color-text-tertiary)] [overflow-wrap:anywhere]">
               {source}
@@ -276,6 +279,7 @@ export function DocsLibrariesSection() {
   return (
     <>
       <StatRibbon stats={ribbon} />
+      <AddDocLibrary onAdded={() => void mutate()} />
 
       <OverviewSection
         title="Libraries"
@@ -285,7 +289,7 @@ export function DocsLibrariesSection() {
           <EmptyState
             icon={<BookOpen className="h-8 w-8" />}
             title="No documentation libraries"
-            description="The documentation service is running but holds no libraries yet. Add one with the docs MCP server's add_doc_library tool."
+            description="Add a documentation source to start browsing and searching its files."
           />
         ) : (
           <ResponsiveTable

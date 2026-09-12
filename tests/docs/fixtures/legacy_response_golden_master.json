@@ -1,0 +1,434 @@
+{
+  "_note": "Frozen bytes of the retired code_search legacy renderer and the doc-tool schemas it published, captured at commit e92b35d before the docs writer was relocated into codeatlas-docs. These are the bytes and schemas MCP clients already depend on; doc_search must keep producing them after code_search is deleted in unit 2.3. Regenerate ONLY with a deliberate, reviewed contract change.",
+  "doc_tool_schemas": {
+    "add_doc_library": {
+      "additionalProperties": false,
+      "properties": {
+        "branch": {
+          "default": "main",
+          "description": "Git branch to index.",
+          "type": "string"
+        },
+        "description": {
+          "description": "Optional description of the library.",
+          "type": "string"
+        },
+        "docs_path": {
+          "description": "Path to docs within the repository.",
+          "type": "string"
+        },
+        "exclude_patterns": {
+          "description": "Optional exclude globs.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "include_patterns": {
+          "description": "Optional include globs.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "name": {
+          "description": "Human-readable library name.",
+          "type": "string"
+        },
+        "output": {
+          "default": "json",
+          "description": "Output format",
+          "enum": [
+            "json"
+          ],
+          "type": "string"
+        },
+        "repo": {
+          "description": "GitHub repository in owner/repo format.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "repo",
+        "name"
+      ],
+      "type": "object"
+    },
+    "delete_doc_library": {
+      "additionalProperties": false,
+      "properties": {
+        "confirm": {
+          "description": "Must be true to confirm deletion.",
+          "type": "boolean"
+        },
+        "library_id": {
+          "description": "Full library ID.",
+          "type": "string"
+        },
+        "output": {
+          "default": "json",
+          "description": "Output format",
+          "enum": [
+            "json"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "library_id",
+        "confirm"
+      ],
+      "type": "object"
+    },
+    "expand_doc_chunk": {
+      "additionalProperties": false,
+      "properties": {
+        "chunk_id": {
+          "description": "Chunk ID to expand.",
+          "type": "string"
+        },
+        "lines_after": {
+          "default": 30,
+          "description": "Lines of context after the chunk.",
+          "maximum": 200,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "lines_before": {
+          "default": 30,
+          "description": "Lines of context before the chunk.",
+          "maximum": 200,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "output": {
+          "default": "json",
+          "description": "Output format",
+          "enum": [
+            "markdown",
+            "json"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "chunk_id"
+      ],
+      "type": "object"
+    },
+    "export_doc_bundle": {
+      "additionalProperties": false,
+      "properties": {
+        "library_id": {
+          "description": "Full library ID.",
+          "type": "string"
+        },
+        "output": {
+          "default": "json",
+          "description": "Output format",
+          "enum": [
+            "json"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "library_id"
+      ],
+      "type": "object"
+    },
+    "import_doc_bundle": {
+      "additionalProperties": false,
+      "properties": {
+        "bundle_path": {
+          "description": "Path to the .docbundle.json.gz file.",
+          "type": "string"
+        },
+        "output": {
+          "default": "json",
+          "description": "Output format",
+          "enum": [
+            "json"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "bundle_path"
+      ],
+      "type": "object"
+    },
+    "list_doc_libraries": {
+      "additionalProperties": false,
+      "properties": {
+        "filter": {
+          "description": "Case-insensitive substring matched against library_id, name, description, or repo.",
+          "type": "string"
+        },
+        "include_stats": {
+          "default": true,
+          "description": "Include chunk/file/index statistics.",
+          "type": "boolean"
+        },
+        "limit": {
+          "description": "Max libraries to return on this page (omit for all).",
+          "maximum": 200,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "offset": {
+          "default": 0,
+          "description": "Zero-based offset into the ordered result list.",
+          "maximum": 10000,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "output": {
+          "default": "json",
+          "description": "Output format",
+          "enum": [
+            "json"
+          ],
+          "type": "string"
+        },
+        "status": {
+          "description": "Optional library-status filter.",
+          "enum": [
+            "pending",
+            "indexing",
+            "ready",
+            "error"
+          ],
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "read_doc": {
+      "additionalProperties": false,
+      "properties": {
+        "file_path": {
+          "deprecated": true,
+          "description": "Deprecated alias for path.",
+          "type": "string"
+        },
+        "library_id": {
+          "description": "Full library ID.",
+          "type": "string"
+        },
+        "max_tokens": {
+          "default": 10000,
+          "description": "Maximum tokens to return.",
+          "maximum": 50000,
+          "minimum": 100,
+          "type": "integer"
+        },
+        "output": {
+          "default": "json",
+          "description": "Output format",
+          "enum": [
+            "markdown",
+            "json"
+          ],
+          "type": "string"
+        },
+        "path": {
+          "description": "Path within the cached repo.",
+          "type": "string"
+        },
+        "section": {
+          "description": "Optional section anchor to extract.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "library_id",
+        "path"
+      ],
+      "type": "object"
+    },
+    "resolve_library_id": {
+      "additionalProperties": false,
+      "properties": {
+        "library_name": {
+          "description": "Library name or partial ID to resolve.",
+          "type": "string"
+        },
+        "output": {
+          "default": "json",
+          "description": "Output format",
+          "enum": [
+            "json"
+          ],
+          "type": "string"
+        },
+        "query": {
+          "deprecated": true,
+          "description": "Deprecated alias for library_name.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "library_name"
+      ],
+      "type": "object"
+    },
+    "search_docs": {
+      "additionalProperties": false,
+      "properties": {
+        "chunk_types": {
+          "description": "Optional chunk-type filter.",
+          "items": {
+            "enum": [
+              "doc",
+              "code",
+              "config",
+              "changelog",
+              "llms_txt"
+            ],
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "exact_match": {
+          "default": false,
+          "description": "Prefer exact API/name matches over semantic similarity.",
+          "type": "boolean"
+        },
+        "include_code_blocks": {
+          "description": "Include adjacent code blocks from the same section.",
+          "type": "boolean"
+        },
+        "library_id": {
+          "description": "Full library ID.",
+          "type": "string"
+        },
+        "library_ids": {
+          "description": "Search several libraries at once. >1 entry searches all; a single entry equals library_id.",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 10,
+          "minItems": 1,
+          "type": "array"
+        },
+        "limit": {
+          "default": 6,
+          "description": "Maximum results to return.",
+          "maximum": 50,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "output": {
+          "default": "json",
+          "description": "Output format",
+          "enum": [
+            "markdown",
+            "json"
+          ],
+          "type": "string"
+        },
+        "query": {
+          "description": "Documentation search query.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "type": "object"
+    },
+    "search_docs_multi": {
+      "additionalProperties": false,
+      "properties": {
+        "chunk_types": {
+          "description": "Optional chunk-type filter.",
+          "items": {
+            "enum": [
+              "doc",
+              "code",
+              "config",
+              "changelog",
+              "llms_txt"
+            ],
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "library_ids": {
+          "description": "List of library IDs to search across.",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 10,
+          "minItems": 1,
+          "type": "array"
+        },
+        "limit_per_library": {
+          "default": 3,
+          "description": "Maximum results per library.",
+          "maximum": 20,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "output": {
+          "default": "json",
+          "description": "Output format",
+          "enum": [
+            "markdown",
+            "json"
+          ],
+          "type": "string"
+        },
+        "query": {
+          "description": "Documentation search query.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "library_ids",
+        "query"
+      ],
+      "type": "object"
+    },
+    "update_doc_library": {
+      "additionalProperties": false,
+      "properties": {
+        "force": {
+          "default": false,
+          "description": "Force a full reindex instead of incremental update.",
+          "type": "boolean"
+        },
+        "library_id": {
+          "description": "Full library ID.",
+          "type": "string"
+        },
+        "output": {
+          "default": "json",
+          "description": "Output format",
+          "enum": [
+            "json"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "library_id"
+      ],
+      "type": "object"
+    }
+  },
+  "error": "{\"status\":\"error\",\"tool\":\"search_docs\",\"confidence\":\"high\",\"next_action\":\"Fix tool arguments to match schema and retry.\",\"payload\":{\"error\":\"query is required\",\"error_code\":\"invalid_arguments\",\"evidence_card\":{\"tool\":\"search_docs\",\"selected_owner\":{\"role\":\"unknown\",\"role_reasons\":[\"missing_path\"]},\"verifier\":{\"status\":\"pass\"}}}}",
+  "success": {
+    "add_doc_library": "{\"status\":\"success\",\"tool\":\"add_doc_library\",\"confidence\":\"high\",\"next_action\":\"Continue with the next docs tool.\",\"payload\":{\"library_id\":\"/owner/repo\",\"evidence_card\":{\"tool\":\"add_doc_library\",\"selected_owner\":{\"role\":\"unknown\",\"role_reasons\":[\"missing_path\"]},\"verifier\":{\"status\":\"pass\"}},\"disposition\":\"queued\"}}",
+    "delete_doc_library": "{\"status\":\"success\",\"tool\":\"delete_doc_library\",\"confidence\":\"high\",\"next_action\":\"Continue with the next docs tool.\",\"payload\":{\"library_id\":\"/owner/repo\",\"evidence_card\":{\"tool\":\"delete_doc_library\",\"selected_owner\":{\"role\":\"unknown\",\"role_reasons\":[\"missing_path\"]},\"verifier\":{\"status\":\"pass\"}},\"disposition\":\"deleted\"}}",
+    "expand_doc_chunk": "{\"status\":\"success\",\"tool\":\"expand_doc_chunk\",\"confidence\":\"high\",\"next_action\":\"Continue with the next docs tool.\",\"payload\":{\"chunk_id\":\"chunk-1\",\"file_path\":\"docs/api.md\",\"evidence_card\":{\"tool\":\"expand_doc_chunk\",\"selected_owner\":{\"file\":\"docs/api.md\",\"role\":\"docs_context\",\"role_reasons\":[\"non_source_path\"]},\"why_selected\":[\"explicit_tool_target\"],\"verifier\":{\"status\":\"pass\"}}}}",
+    "export_doc_bundle": "{\"status\":\"success\",\"tool\":\"export_doc_bundle\",\"confidence\":\"high\",\"next_action\":\"Continue with the next docs tool.\",\"payload\":{\"library_id\":\"/owner/repo\",\"evidence_card\":{\"tool\":\"export_doc_bundle\",\"selected_owner\":{\"role\":\"unknown\",\"role_reasons\":[\"missing_path\"]},\"verifier\":{\"status\":\"pass\"}},\"disposition\":\"exported\"}}",
+    "import_doc_bundle": "{\"status\":\"success\",\"tool\":\"import_doc_bundle\",\"confidence\":\"high\",\"next_action\":\"Continue with the next docs tool.\",\"payload\":{\"library_id\":\"/owner/repo\",\"evidence_card\":{\"tool\":\"import_doc_bundle\",\"selected_owner\":{\"role\":\"unknown\",\"role_reasons\":[\"missing_path\"]},\"verifier\":{\"status\":\"pass\"}},\"disposition\":\"imported\"}}",
+    "list_doc_libraries": "{\"status\":\"success\",\"tool\":\"list_doc_libraries\",\"confidence\":\"high\",\"next_action\":\"Continue with the next docs tool.\",\"payload\":{\"libraries\":[],\"offset\":0,\"returned\":0,\"evidence_card\":{\"tool\":\"list_doc_libraries\",\"selected_owner\":{\"role\":\"unknown\",\"role_reasons\":[\"missing_path\"]},\"verifier\":{\"status\":\"pass\"}}}}",
+    "read_doc": "{\"status\":\"success\",\"tool\":\"read_doc\",\"confidence\":\"high\",\"next_action\":\"Continue with the next docs tool.\",\"payload\":{\"library_id\":\"/owner/repo\",\"path\":\"docs/api.md\",\"evidence_card\":{\"tool\":\"read_doc\",\"selected_owner\":{\"role\":\"unknown\",\"role_reasons\":[\"missing_path\"]},\"verifier\":{\"status\":\"pass\"}}}}",
+    "resolve_library_id": "{\"status\":\"success\",\"tool\":\"resolve_library_id\",\"confidence\":\"high\",\"next_action\":\"Continue with the next docs tool.\",\"payload\":{\"library_id\":\"/owner/repo\",\"confidence\":0.98,\"evidence_card\":{\"tool\":\"resolve_library_id\",\"selected_owner\":{\"role\":\"unknown\",\"role_reasons\":[\"missing_path\"]},\"verifier\":{\"status\":\"pass\"}}}}",
+    "search_docs": "{\"status\":\"success\",\"tool\":\"search_docs\",\"confidence\":\"high\",\"next_action\":\"Continue with the next docs tool.\",\"payload\":{\"library_id\":\"/owner/repo\",\"query\":\"API Foo\",\"results\":[{\"file_path\":\"docs/api.md\",\"title\":\"Foo\",\"anchor\":\"foo\",\"chunk_type\":\"doc\",\"score\":0.95,\"retrieval_rank_features\":[\"semantic\",\"lexical\"],\"rank_explain\":{\"matched_on\":[\"Foo\"],\"signal_preview\":[\"api\",\"heading\"]},\"file_facets\":{\"route_paths\":[\"/foo\"]},\"chunk_id\":\"chunk-1\"}],\"evidence_card\":{\"tool\":\"search_docs\",\"selected_owner\":{\"file\":\"docs/api.md\",\"role\":\"docs_context\",\"role_reasons\":[\"non_source_path\",\"route_surface\"]},\"why_selected\":[\"semantic\",\"lexical\",\"matched_on:Foo\"],\"verifier\":{\"status\":\"pass\"}},\"recommended_start\":{\"library_id\":\"/owner/repo\",\"file_path\":\"docs/api.md\",\"anchor\":\"foo\",\"title\":\"Foo\",\"chunk_type\":\"doc\",\"score\":0.95}}}",
+    "update_doc_library": "{\"status\":\"success\",\"tool\":\"update_doc_library\",\"confidence\":\"high\",\"next_action\":\"Continue with the next docs tool.\",\"payload\":{\"library_id\":\"/owner/repo\",\"evidence_card\":{\"tool\":\"update_doc_library\",\"selected_owner\":{\"role\":\"unknown\",\"role_reasons\":[\"missing_path\"]},\"verifier\":{\"status\":\"pass\"}},\"disposition\":\"queued\"}}"
+  }
+}

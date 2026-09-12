@@ -2,7 +2,7 @@
 
 repowise exposes a curated set of tools via the [Model Context Protocol](https://modelcontextprotocol.io) (MCP). These tools give AI coding assistants (Claude Code, Codex, Cursor, Cline, Windsurf) structured access to your codebase intelligence: dependency graph, git history, documentation, and architectural decisions.
 
-30 tools are registered in total. A single-repo server advertises 11 by default: exactly the canonical tools. Workspace mode adds the `list_repos` discovery utility, for 12. 18 specialist tools are opt-in, subject to mode eligibility. The surface is configurable; see [Configuring the tool surface](#configuring-the-tool-surface).
+41 tools are registered in total. A single-repo server advertises 11 by default: exactly the canonical tools. Workspace mode adds the `list_repos` discovery utility, for 12. 29 specialist tools are opt-in, subject to mode eligibility. The surface is configurable; see [Configuring the tool surface](#configuring-the-tool-surface).
 
 **Start the MCP server:**
 
@@ -36,7 +36,7 @@ repowise mcp --transport sse --port 7338 # legacy SSE transport
 **Workspace discovery utility (default in workspace mode, 1)**
 [list_repos](#list_repos)
 
-**Opt-in specialists (off by default everywhere, 18)**
+**Opt-in specialists (off by default everywhere, 29)**
 [get_architecture](#get_architecture) &middot;
 [get_blast_radius](#get_blast_radius) &middot;
 [get_dependents](#get_dependents) &middot;
@@ -54,7 +54,18 @@ repowise mcp --transport sse --port 7338 # legacy SSE transport
 [manage_decision](#manage_decision) &middot;
 [get_reference_sites](#get_reference_sites) &middot;
 [preview_symbol_rename](#preview_symbol_rename) &middot;
-[set_finding_status](#set_finding_status)
+[set_finding_status](#set_finding_status) &middot;
+[list_doc_files](#list_doc_files) &middot;
+[resolve_library_id](#resolve_library_id) &middot;
+[search_docs](#search_docs) &middot;
+[expand_doc_chunk](#expand_doc_chunk) &middot;
+[list_doc_libraries](#list_doc_libraries) &middot;
+[read_doc](#read_doc) &middot;
+[update_doc_library](#update_doc_library) &middot;
+[add_doc_library](#add_doc_library) &middot;
+[delete_doc_library](#delete_doc_library) &middot;
+[export_doc_bundle](#export_doc_bundle) &middot;
+[import_doc_bundle](#import_doc_bundle)
 
 Also see [Configuring the tool surface](#configuring-the-tool-surface), [Reversible truncation](#reversible-truncation-_metaomitted) and [Unrecognised arguments](#unrecognised-arguments-ignored_arguments).
 
@@ -1908,3 +1919,134 @@ In addition to the MCP tools above, `repowise init` installs AI-agent hooks (Cla
 - **Codex PostToolUse**: after edits or git operations, Codex receives a freshness reminder when indexed context may be stale.
 
 Hooks are lightweight reminders. MCP tools are for deeper, on-demand investigation. See [Auto-Sync](../scale/AUTO_SYNC.md) and [Codex Integration](CODEX.md) for details.
+
+## Library documentation
+
+The optional RepoWise docs worker provides external library references. These tools share the RepoWise MCP endpoint and dashboard at `/docs-libraries`; they are independent of repository code indexing. Configure `REPOWISE_DOCS_URL` (default `http://127.0.0.1:8101`) and optional `REPOWISE_DOCS_TOKEN`. The worker has no public MCP endpoint.
+
+### `list_doc_files`
+
+Browse indexed documentation files within a library, with a path filter and exact pagination totals.
+
+| Argument | Type | Required |
+|---|---|---|
+| `library_id` | string | yes |
+| `query` | string | no |
+| `offset` | integer | no |
+| `limit` | integer | no |
+| `output` | string | no |
+
+### `resolve_library_id`
+
+Resolve a library name to its full indexed documentation library ID.
+
+| Argument | Type | Required |
+|---|---|---|
+| `library_name` | string | yes |
+| `query` | string | no |
+| `output` | string | no |
+
+### `search_docs`
+
+Search indexed external documentation for one library using hybrid retrieval. Use `exact_match=true` for API/function lookups.
+
+| Argument | Type | Required |
+|---|---|---|
+| `library_id` | string | no |
+| `library_ids` | array | no |
+| `query` | string | yes |
+| `limit` | integer | no |
+| `chunk_types` | array | no |
+| `include_code_blocks` | boolean | no |
+| `exact_match` | boolean | no |
+| `output` | string | no |
+
+### `expand_doc_chunk`
+
+Expand one documentation chunk with surrounding file context.
+
+| Argument | Type | Required |
+|---|---|---|
+| `chunk_id` | string | yes |
+| `lines_before` | integer | no |
+| `lines_after` | integer | no |
+| `output` | string | no |
+
+### `list_doc_libraries`
+
+List indexed documentation libraries and their status. Paginated: pass `offset` + `limit`; `next_offset` in the response points to the next page. Pass `filter` to substring-match against library_id, name, description, or repo (case-insensitive) — useful when the registry has dozens of libraries (e.g. `filter='gsap'`).
+
+| Argument | Type | Required |
+|---|---|---|
+| `include_stats` | boolean | no |
+| `status` | string | no |
+| `filter` | string | no |
+| `offset` | integer | no |
+| `limit` | integer | no |
+| `output` | string | no |
+
+### `read_doc`
+
+Read a full indexed documentation file or one anchored section.
+
+| Argument | Type | Required |
+|---|---|---|
+| `library_id` | string | yes |
+| `path` | string | yes |
+| `file_path` | string | no |
+| `section` | string | no |
+| `max_tokens` | integer | no |
+| `output` | string | no |
+
+### `update_doc_library`
+
+Queue a docs reindex for one library.
+
+| Argument | Type | Required |
+|---|---|---|
+| `library_id` | string | yes |
+| `force` | boolean | no |
+| `output` | string | no |
+
+### `add_doc_library`
+
+Register a new documentation library and queue its initial index.
+
+| Argument | Type | Required |
+|---|---|---|
+| `repo` | string | yes |
+| `name` | string | yes |
+| `description` | string | no |
+| `docs_path` | string | no |
+| `branch` | string | no |
+| `include_patterns` | array | no |
+| `exclude_patterns` | array | no |
+| `output` | string | no |
+
+### `delete_doc_library`
+
+Delete an indexed documentation library and all of its stored data.
+
+| Argument | Type | Required |
+|---|---|---|
+| `library_id` | string | yes |
+| `confirm` | boolean | yes |
+| `output` | string | no |
+
+### `export_doc_bundle`
+
+Export one library's indexed docs as a portable bundle.
+
+| Argument | Type | Required |
+|---|---|---|
+| `library_id` | string | yes |
+| `output` | string | no |
+
+### `import_doc_bundle`
+
+Import a previously exported documentation bundle.
+
+| Argument | Type | Required |
+|---|---|---|
+| `bundle_path` | string | yes |
+| `output` | string | no |

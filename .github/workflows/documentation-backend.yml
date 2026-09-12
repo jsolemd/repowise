@@ -1,0 +1,27 @@
+name: Documentation backend
+on:
+  push:
+    branches: [main, develop, solemd-source-search]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  docs:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e
+        with:
+          version: "0.10.0"
+          enable-cache: true
+      - run: uv sync --frozen --extra docs --python 3.13
+      - run: uv run --frozen --extra docs pytest tests/docs tests/unit/server/test_docs_libraries.py tests/unit/server/mcp/test_docs.py -m 'not integration and not eval' -q
+      - run: docker build -t repowise-docs:test packages/docs
+      - run: docker run --rm repowise-docs:test python -c 'from repowise.docs.transport.http_server import create_app; assert create_app()'

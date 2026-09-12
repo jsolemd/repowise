@@ -269,6 +269,9 @@ def instrument(fn: Callable[..., Any]) -> Callable[..., Any]:
     Non-coroutine callables are returned unchanged — every OSS MCP tool is
     ``async``, and a sync tool has no measured-response hook here.
     """
+    # External library references have no workspace repository or code-savings baseline.
+    if getattr(fn, "__repowise_trust_kind__", None) == "documentation":
+        return fn
     if not inspect.iscoroutinefunction(fn):
         return fn
 

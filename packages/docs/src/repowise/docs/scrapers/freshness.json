@@ -1,0 +1,54 @@
+{
+  "cosmograph": {
+    "build_id": "WUfBDHiFuv1rgdUYEuwlx",
+    "doc_search_id": "/codeatlas/cosmograph",
+    "last_scraped": "2026-04-18",
+    "pages_scraped": 72,
+    "site_url": "https://cosmograph.app",
+    "strategy": "next_build",
+    "total_size_kb": 422.2
+  },
+  "onepassword_developer": {
+    "doc_search_id": "/codeatlas/1password-developer",
+    "last_scraped": "2026-04-16",
+    "pages_scraped": 231,
+    "site_url": "https://developer.1password.com/docs/",
+    "source_digest": "6e3b56f15ab8115b557e2bc6f02118fff119fd4cb5620ec81640ec688e450585",
+    "sources": [
+      "https://developer.1password.com/sitemap.xml",
+      "https://developer.1password.com/docs/cli/reference/commands/run",
+      "https://developer.1password.com/docs/environments/read-environment-variables/",
+      "https://developer.1password.com/docs/ssh/agent/"
+    ],
+    "strategy": "source_digest",
+    "total_size_kb": 1217.1
+  },
+  "pubtator3": {
+    "doc_search_id": "/codeatlas/pubtator3",
+    "last_scraped": "2026-04-18",
+    "pages_scraped": 3,
+    "site_url": "https://www.ncbi.nlm.nih.gov/research/pubtator3/api",
+    "source_digest": "dd9935749b6229bdae1cccf5af363b9f17d3c8b0e7bcc78b7eada09d95553030",
+    "sources": [
+      "https://www.ncbi.nlm.nih.gov/research/bionlp/APIs/usage/",
+      "https://raw.githubusercontent.com/ncbi-nlp/pubtator-gpt/main/README.md",
+      "https://ftp.ncbi.nlm.nih.gov/pub/lu/PubTator3/"
+    ],
+    "strategy": "source_digest",
+    "total_size_kb": 14.6
+  },
+  "semantic_scholar": {
+    "doc_search_id": "/codeatlas/semantic-scholar-api",
+    "last_scraped": "2026-04-18",
+    "pages_scraped": 9,
+    "site_url": "https://www.semanticscholar.org/product/api",
+    "source_digest": "e8eedece31d2fc36a641374811ea70cd38097169b0bbf35d7e2d98850abd68a4",
+    "strategy": "source_digest",
+    "swagger_urls": [
+      "https://api.semanticscholar.org/graph/v1/swagger.json",
+      "https://api.semanticscholar.org/recommendations/v1/swagger.json",
+      "https://api.semanticscholar.org/datasets/v1/swagger.json"
+    ],
+    "total_size_kb": 55
+  }
+}

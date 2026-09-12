@@ -22,7 +22,7 @@ export default function DocsLibrariesPage() {
     <PageShell
       title="Documentation libraries"
       icon={<BookOpen className="h-5 w-5 text-[var(--color-text-tertiary)]" />}
-      description="Every external library the documentation service has indexed, how current each copy is, and what the indexer is working on."
+      description="Browse and search indexed documents, manage library sources, and track freshness and indexing."
     >
       <DocsLibrariesSection />
     </PageShell>

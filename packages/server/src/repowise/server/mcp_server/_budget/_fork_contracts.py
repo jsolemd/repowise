@@ -24,12 +24,13 @@ and protect everything a reader has to have in order to act on what survives**
 
 from __future__ import annotations
 
+from repowise.server.mcp_server._budget._fork_docs import sync_document_page, trim_document_content
 from repowise.server.mcp_server._budget._search_snippets import trim_search_snippets
 from repowise.server.mcp_server._budget.contracts import (
     _CONTRACTS,
     ResponseBudgetContract,
 )
-from repowise.server.mcp_server._budget.hooks import register_pre_shed
+from repowise.server.mcp_server._budget.hooks import register_post_enforce, register_pre_shed
 
 __all__ = ["FORK_CONTRACTS"]
 
@@ -42,6 +43,40 @@ _ALWAYS = ("status", "error")
 _PAGING = ("total", "returned", "offset", "next_offset", "has_more", "limit", "pagination")
 
 FORK_CONTRACTS: dict[str, ResponseBudgetContract] = {
+    **{
+        name: ResponseBudgetContract(
+            "blocks",
+            {
+                "list_doc_files": ("payload.files[]",),
+                "search_docs": ("payload.results[]",),
+                "list_doc_libraries": ("payload.libraries[]",),
+            }.get(name, ()),
+            expansion_argument=None,
+            protected=(
+                "status",
+                "tool",
+                "confidence",
+                "next_action",
+                "payload",
+                "content",
+                "error",
+                "trust",
+            ),
+        )
+        for name in (
+            "list_doc_files",
+            "resolve_library_id",
+            "search_docs",
+            "expand_doc_chunk",
+            "list_doc_libraries",
+            "read_doc",
+            "update_doc_library",
+            "add_doc_library",
+            "delete_doc_library",
+            "export_doc_bundle",
+            "import_doc_bundle",
+        )
+    },
     # --- task slices -------------------------------------------------------
     # One envelope, three tools. ``history`` is the last five events and goes
     # first; ``edges`` and ``externals`` are already capped and ranked, so the
@@ -274,3 +309,7 @@ for _name, _contract in FORK_CONTRACTS.items():
     _CONTRACTS.setdefault(_name, _contract)
 
 register_pre_shed("search_codebase", trim_search_snippets)
+
+register_post_enforce("list_doc_files", sync_document_page)
+for _tool in ("read_doc", "expand_doc_chunk"):
+    register_pre_shed(_tool, trim_document_content)

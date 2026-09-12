@@ -2301,5 +2301,299 @@
     "status": null,
     "status_changed_at": null,
     "status_reason": null
+  },
+  "add_doc_library": {
+    "status": "success",
+    "tool": "add_doc_library",
+    "confidence": "high",
+    "next_action": "Continue with the next docs tool.",
+    "payload": {
+      "library_id": "/owner/repo",
+      "evidence_card": {
+        "tool": "add_doc_library",
+        "selected_owner": {
+          "role": "unknown",
+          "role_reasons": [
+            "missing_path"
+          ]
+        },
+        "verifier": {
+          "status": "pass"
+        }
+      },
+      "disposition": "queued"
+    }
+  },
+  "delete_doc_library": {
+    "status": "success",
+    "tool": "delete_doc_library",
+    "confidence": "high",
+    "next_action": "Continue with the next docs tool.",
+    "payload": {
+      "library_id": "/owner/repo",
+      "evidence_card": {
+        "tool": "delete_doc_library",
+        "selected_owner": {
+          "role": "unknown",
+          "role_reasons": [
+            "missing_path"
+          ]
+        },
+        "verifier": {
+          "status": "pass"
+        }
+      },
+      "disposition": "deleted"
+    }
+  },
+  "expand_doc_chunk": {
+    "status": "success",
+    "tool": "expand_doc_chunk",
+    "confidence": "high",
+    "next_action": "Continue with the next docs tool.",
+    "payload": {
+      "chunk_id": "chunk-1",
+      "file_path": "docs/api.md",
+      "evidence_card": {
+        "tool": "expand_doc_chunk",
+        "selected_owner": {
+          "file": "docs/api.md",
+          "role": "docs_context",
+          "role_reasons": [
+            "non_source_path"
+          ]
+        },
+        "why_selected": [
+          "explicit_tool_target"
+        ],
+        "verifier": {
+          "status": "pass"
+        }
+      }
+    }
+  },
+  "export_doc_bundle": {
+    "status": "success",
+    "tool": "export_doc_bundle",
+    "confidence": "high",
+    "next_action": "Continue with the next docs tool.",
+    "payload": {
+      "library_id": "/owner/repo",
+      "evidence_card": {
+        "tool": "export_doc_bundle",
+        "selected_owner": {
+          "role": "unknown",
+          "role_reasons": [
+            "missing_path"
+          ]
+        },
+        "verifier": {
+          "status": "pass"
+        }
+      },
+      "disposition": "exported"
+    }
+  },
+  "import_doc_bundle": {
+    "status": "success",
+    "tool": "import_doc_bundle",
+    "confidence": "high",
+    "next_action": "Continue with the next docs tool.",
+    "payload": {
+      "library_id": "/owner/repo",
+      "evidence_card": {
+        "tool": "import_doc_bundle",
+        "selected_owner": {
+          "role": "unknown",
+          "role_reasons": [
+            "missing_path"
+          ]
+        },
+        "verifier": {
+          "status": "pass"
+        }
+      },
+      "disposition": "imported"
+    }
+  },
+  "list_doc_libraries": {
+    "status": "success",
+    "tool": "list_doc_libraries",
+    "confidence": "high",
+    "next_action": "Continue with the next docs tool.",
+    "payload": {
+      "libraries": [],
+      "offset": 0,
+      "returned": 0,
+      "evidence_card": {
+        "tool": "list_doc_libraries",
+        "selected_owner": {
+          "role": "unknown",
+          "role_reasons": [
+            "missing_path"
+          ]
+        },
+        "verifier": {
+          "status": "pass"
+        }
+      }
+    }
+  },
+  "read_doc": {
+    "status": "success",
+    "tool": "read_doc",
+    "confidence": "high",
+    "next_action": "Continue with the next docs tool.",
+    "payload": {
+      "library_id": "/owner/repo",
+      "path": "docs/api.md",
+      "evidence_card": {
+        "tool": "read_doc",
+        "selected_owner": {
+          "role": "unknown",
+          "role_reasons": [
+            "missing_path"
+          ]
+        },
+        "verifier": {
+          "status": "pass"
+        }
+      }
+    }
+  },
+  "resolve_library_id": {
+    "status": "success",
+    "tool": "resolve_library_id",
+    "confidence": "high",
+    "next_action": "Continue with the next docs tool.",
+    "payload": {
+      "library_id": "/owner/repo",
+      "confidence": 0.98,
+      "evidence_card": {
+        "tool": "resolve_library_id",
+        "selected_owner": {
+          "role": "unknown",
+          "role_reasons": [
+            "missing_path"
+          ]
+        },
+        "verifier": {
+          "status": "pass"
+        }
+      }
+    }
+  },
+  "search_docs": {
+    "status": "success",
+    "tool": "search_docs",
+    "confidence": "high",
+    "next_action": "Continue with the next docs tool.",
+    "payload": {
+      "library_id": "/owner/repo",
+      "query": "API Foo",
+      "results": [
+        {
+          "file_path": "docs/api.md",
+          "title": "Foo",
+          "anchor": "foo",
+          "chunk_type": "doc",
+          "score": 0.95,
+          "retrieval_rank_features": [
+            "semantic",
+            "lexical"
+          ],
+          "rank_explain": {
+            "matched_on": [
+              "Foo"
+            ],
+            "signal_preview": [
+              "api",
+              "heading"
+            ]
+          },
+          "file_facets": {
+            "route_paths": [
+              "/foo"
+            ]
+          },
+          "chunk_id": "chunk-1"
+        }
+      ],
+      "evidence_card": {
+        "tool": "search_docs",
+        "selected_owner": {
+          "file": "docs/api.md",
+          "role": "docs_context",
+          "role_reasons": [
+            "non_source_path",
+            "route_surface"
+          ]
+        },
+        "why_selected": [
+          "semantic",
+          "lexical",
+          "matched_on:Foo"
+        ],
+        "verifier": {
+          "status": "pass"
+        }
+      },
+      "recommended_start": {
+        "library_id": "/owner/repo",
+        "file_path": "docs/api.md",
+        "anchor": "foo",
+        "title": "Foo",
+        "chunk_type": "doc",
+        "score": 0.95
+      }
+    }
+  },
+  "update_doc_library": {
+    "status": "success",
+    "tool": "update_doc_library",
+    "confidence": "high",
+    "next_action": "Continue with the next docs tool.",
+    "payload": {
+      "library_id": "/owner/repo",
+      "evidence_card": {
+        "tool": "update_doc_library",
+        "selected_owner": {
+          "role": "unknown",
+          "role_reasons": [
+            "missing_path"
+          ]
+        },
+        "verifier": {
+          "status": "pass"
+        }
+      },
+      "disposition": "queued"
+    }
+  },
+  "list_doc_files": {
+    "status": "success",
+    "tool": "list_doc_files",
+    "payload": {
+      "library_id": "/example/docs",
+      "library": {
+        "name": "Example",
+        "status": "ready"
+      },
+      "files": [
+        {
+          "file_path": "docs/api.md",
+          "chunk_count": 2,
+          "indexed_at": null
+        }
+      ],
+      "pagination": {
+        "total": 1,
+        "offset": 0,
+        "limit": 50,
+        "returned": 1,
+        "has_more": false,
+        "next_offset": null
+      }
+    }
   }
 }

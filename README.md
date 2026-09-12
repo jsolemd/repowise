@@ -1065,3 +1065,7 @@ without AGPL obligations), see
 </p>
 
 </div>
+
+The SoleMD fork also owns the documentation backend in [`packages/docs`](packages/docs).
+Its library inventory, document browser, search, previews, and refresh controls live
+under `/docs-libraries`; documentation tools share the RepoWise MCP endpoint.

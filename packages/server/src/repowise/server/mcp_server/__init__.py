@@ -61,6 +61,17 @@ from repowise.server.mcp_server import _state
 #: ``tool name -> submodule``. The full set is what ``ensure_full_surface``
 #: imports; individually they are what a single-tool consumer pays for.
 _TOOL_MODULES: dict[str, str] = {
+    "list_doc_files": "tool_docs",
+    "resolve_library_id": "tool_docs",
+    "search_docs": "tool_docs",
+    "expand_doc_chunk": "tool_docs",
+    "list_doc_libraries": "tool_docs",
+    "read_doc": "tool_docs",
+    "update_doc_library": "tool_docs",
+    "add_doc_library": "tool_docs",
+    "delete_doc_library": "tool_docs",
+    "export_doc_bundle": "tool_docs",
+    "import_doc_bundle": "tool_docs",
     "build_task_slice": "tool_slices",
     "extend_task_slice": "tool_slices",
     "find_clones": "tool_clones",
@@ -162,7 +173,11 @@ def tool_middleware(fn: Any) -> Any:
     def budget(inner: Any) -> Any:
         @wraps(inner)
         async def wrapped(*args: Any, **kwargs: Any) -> Any:
-            repo_root = await resolve_response_budget_repo_root(signature, args, kwargs)
+            repo_root = (
+                None
+                if evidence_kind == "documentation"
+                else await resolve_response_budget_repo_root(signature, args, kwargs)
+            )
             result = enforce_response_budget(
                 fn.__name__,
                 await inner(*args, **kwargs),
