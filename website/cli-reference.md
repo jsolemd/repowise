@@ -65,6 +65,7 @@ repowise init [PATH] [OPTIONS]
 | `--agents` / `--no-agents` | flag | config | Generate or skip managed `AGENTS.md` for Codex |
 | `--codex` / `--no-codex` | flag | prompt/skip | Generate or skip project-local Codex MCP config and hooks |
 | `--distill-hook` / `--no-distill-hook` | flag | prompt/skip | Install or skip the Claude Code command-rewrite hook that routes noisy commands through `repowise distill` |
+| `--hook` / `--no-hook` | flag | on | Install or skip the post-commit hook that runs `repowise update` after each commit. Interactive runs ask; `--yes` and non-interactive runs install it and print how to undo it |
 | `--editor-setup` / `--no-editor-setup` | flag | true | Register the MCP server and hooks in your global Claude Code / Claude Desktop config. `--no-editor-setup` indexes the repo and leaves everything outside it untouched |
 | `--yes` / `-y` | flag | false | Skip the cost confirmation prompt |
 
@@ -517,6 +518,8 @@ repowise health [PATH] [OPTIONS]
 |------|------|---------|-------------|
 | `--file` | string | — | Deep-dive a single file (relative path) |
 | `--module` | string | — | Restrict to files whose path starts with this prefix |
+| `--scope` | choice | all | `all` or `production`. Tests score higher than production code, so narrowing lowers every figure without a defect being found |
+| `--counts` | choice | everything | `everything` or `code_shape`. `code_shape` removes the git-derived half of the score, which rises as a file is worked on |
 | `--refactoring-targets` | flag | false | Ranked refactoring candidates by impact/effort |
 | `--trend` | flag | false | Last health snapshots + declining alerts |
 | `--badge` | flag | false | Ready-to-paste health badge Markdown |

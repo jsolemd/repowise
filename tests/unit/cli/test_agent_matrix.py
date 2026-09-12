@@ -278,7 +278,7 @@ COUNT_CLAIMS: tuple[tuple[str, str, str], ...] = (
     ("docs/agent/MCP_TOOLS.md", "flagship", "part of the {w}-tool headline set"),
     ("packages/cli/README.md", "total", "Exposes {n} registered MCP tools"),
     ("packages/cli/README.md", "single_repo", "({n} advertised by default"),
-    ("packages/cli/README.md", "flagship", "the {w} flagship tools plus"),
+    ("packages/cli/README.md", "flagship", "the {w} flagship tools)"),
     ("docs/agent/MCP_TOOLS.md", "opt_in", "(off by default everywhere, {n})"),
     ("website/mcp-server.md", "opt_in", "and {w} opt-in tools."),
     ("packages/server/README.md", "opt_in", "{w} further tools are opt-in"),

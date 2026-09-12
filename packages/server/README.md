@@ -11,7 +11,7 @@ FastAPI REST API, webhook handlers, MCP server, and background job scheduler for
 | Component | Description |
 |-----------|-------------|
 | **REST API** | FastAPI application with full CRUD for repos, pages (with version history), symbols, jobs, git analytics, dead code, decisions, graph intelligence, blast radius, costs, knowledge map, security findings, providers, chat, CLAUDE.md generation, and multi-repo workspace |
-| **MCP Server** | 29 registered MCP tools (11 advertised by default in single-repo mode: the canonical set plus `get_index_status`) for AI coding assistants (Claude Code, Cursor, Cline) |
+| **MCP Server** | 30 registered MCP tools (11 advertised by default in single-repo mode: the canonical set plus `get_index_status`) for AI coding assistants (Claude Code, Cursor, Cline) |
 | **Webhooks** | GitHub and GitLab push event handlers — trigger sync jobs automatically on push |
 | **Scheduler** | APScheduler background jobs — polling fallback (auto-syncs diverged repos), stale page detection |
 
@@ -226,15 +226,15 @@ Job progress events (`JobProgressEvent`) carry: `event` type, `file` currently b
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/api/health` | Server health — db connectivity, embedder info, scheduler status |
+| `GET` | `/health` | Server liveness/readiness, version, and database connectivity |
 
 ---
 
 ## MCP Server
 
-repowise registers 29 MCP tools and advertises **11 by default** in single-repo
+repowise registers 30 MCP tools and advertises **11 by default** in single-repo
 mode (the canonical set plus `get_index_status`). Workspace mode adds
-`list_repos`; seventeen further tools are opt-in where eligible. See
+`list_repos`; eighteen further tools are opt-in where eligible. See
 [`docs/agent/MCP_TOOLS.md`](../../docs/agent/MCP_TOOLS.md).
 Start the MCP server via:
 
@@ -258,7 +258,7 @@ repowise mcp --transport sse          # legacy SSE transport on port 7338
 | `get_health` | 1–10 code-health scores and marker findings | Before refactoring — find the worst files |
 | `get_index_status(mode?, path?)` | Source-search trust, store parity, queue depth, and path eligibility | Before relying on indexed search results |
 
-Also on by default: `list_repos`. Opt-in / workspace-only tools are documented in `MCP_TOOLS.md`.
+Workspace mode also enables `list_repos` by default. Opt-in / workspace-only tools are documented in `MCP_TOOLS.md`.
 
 **Claude Code / Cursor / Cline setup** — add to your MCP config:
 

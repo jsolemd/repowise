@@ -22,7 +22,7 @@ Connect repowise to Claude Code, Codex, Cursor, Cline, or any MCP-compatible edi
 
 ## Overview
 
-The MCP (Model Context Protocol) server is how repowise talks to AI coding assistants. It registers 29 tools: a curated 11-tool default surface in a single repository (the canonical set plus `get_index_status`), `list_repos` added by default in workspace mode, and seventeen opt-in tools. Mode eligibility still applies. Once connected, your editor's AI can query your codebase wiki for synthesized answers, symbols, docs, ownership, file and change-risk signals, code health, architectural decisions, and source-index trust.
+The MCP (Model Context Protocol) server is how repowise talks to AI coding assistants. It registers 30 tools: a curated 11-tool default surface in a single repository (the canonical set plus `get_index_status`), `list_repos` added by default in workspace mode, and eighteen opt-in tools. Mode eligibility still applies. Once connected, your editor's AI can query your codebase wiki for synthesized answers, symbols, docs, ownership, file and change-risk signals, code health, architectural decisions, and source-index trust.
 
 Start the server with:
 
@@ -172,8 +172,8 @@ Clients connect to `http://localhost:7338/sse` and receive server-sent events.
 
 ## The default single-repo tools
 
-The ten flagship tools below, plus `list_repos`, are on by default in a
-single-repo server. Full reference: [MCP_TOOLS.md](https://github.com/repowise-dev/repowise/blob/main/docs/agent/MCP_TOOLS.md).
+The ten upstream flagship tools below, plus `get_index_status`, are on by default in a
+single-repo server. Workspace mode also enables `list_repos`. Full reference: [MCP_TOOLS.md](https://github.com/repowise-dev/repowise/blob/main/docs/agent/MCP_TOOLS.md).
 
 ### `get_answer(question, scope?)`
 
@@ -431,7 +431,7 @@ Returns a tiered report of unused code.
 
 **When to use:** Before any cleanup or removal tasks. Gives confirmed unused code rather than guesses.
 
-Also always on by default: `list_repos()` (repo aliases for the `repo=` parameter
+Workspace mode also enables `list_repos()` by default (repo aliases for the `repo=` parameter
 on other tools). See [Supplementary tools](#supplementary-tools) below.
 
 Full parameter tables and return shapes live in the repo guide:
@@ -441,14 +441,14 @@ Full parameter tables and return shapes live in the repo guide:
 
 ## Supplementary tools
 
-### `list_repos()` (default)
+### `list_repos()` (default in workspace mode)
 
 Lists the repos this server is serving. In workspace mode returns every
 configured alias; in single-repo mode a single `"default"` alias.
 
-### Workspace-only (default in a workspace)
+### Workspace-only specialists
 
-When the server starts inside a workspace, two more tools appear automatically:
+These tools can be enabled when the server starts inside a workspace:
 
 | Tool | Purpose |
 |------|---------|

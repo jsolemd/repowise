@@ -45,7 +45,7 @@ scratch.
 
 The landing view. Repo KPIs (files, symbols, entry points, dead exports, health
 averages), an attention panel that promotes whatever currently deserves it
-(declining health, a stale doc set, an alert-band file), a decisions timeline,
+(declining health, a stale doc set, an at-risk file), a decisions timeline,
 quick actions, and a live banner while an index or generation job is running.
 If a job is in flight, the progress and log stream here.
 
@@ -149,7 +149,7 @@ zoomed on one node. The older `/c4` and `/zoom` URLs redirect here.
 
 **Answers:** which files have the strongest defect indicators, and why?
 
-<img src="../../.github/assets/dashboard/code-health.png" alt="Repowise code health: the three co-equal pillars, the alert/warning/healthy band distribution, KPI cards and the code health map" width="100%" />
+<img src="../../.github/assets/dashboard/code-health.png" alt="Repowise code health: the three co-equal pillars, the health band distribution, KPI cards and the code health map" width="100%" />
 
 Tabs behind `?tab=`:
 

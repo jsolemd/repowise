@@ -21,7 +21,7 @@ describe("repo navigation under the deployment policy", () => {
     expect(labels).not.toContain("Chat");
   });
 
-  it("drops only Chat, and drops its now-empty group with it", () => {
+  it("drops only Chat and preserves the other navigation items", () => {
     const on = repoNavGroups("r1");
     const off = repoNavGroups("r1", { generativeDisabled: true });
 
@@ -29,10 +29,9 @@ describe("repo navigation under the deployment policy", () => {
     const offLabels = off.flatMap((g) => g.items).map((i) => i.label);
 
     expect(onLabels.filter((l) => l !== "Chat")).toEqual(offLabels);
-    // The Chat group holds nothing else, so it should not survive as an empty
-    // separator — a blank group renders as a stray divider.
     expect(off.every((g) => g.items.length > 0)).toBe(true);
-    expect(off).toHaveLength(on.length - 1);
+    expect(on[0].items[1].label).toBe("Chat");
+    expect(off).toHaveLength(on.length);
   });
 
   it("leaves every href intact for the groups that remain", () => {

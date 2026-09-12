@@ -330,6 +330,7 @@ def _run_generation_phase(
     resume: bool,
     test_run: bool,
     timings: Any | None = None,
+    warnings: list[str] | None = None,
 ) -> tuple[bool, bool]:
     """Run the LLM generation phase for a single-repo init.
 
@@ -460,6 +461,7 @@ def _run_generation_phase(
         verbose=True,
         test_run=test_run,
         timings=timings,
+        warnings=warnings,
     )
     return False, False
 
@@ -467,6 +469,25 @@ def _run_generation_phase(
 # ---------------------------------------------------------------------------
 # CLI command
 # ---------------------------------------------------------------------------
+
+
+def _interactive_gate(
+    *,
+    isatty: bool,
+    provider_name: str | None,
+    index_only: bool,
+    yes: bool,
+    resume: bool,
+) -> bool:
+    """Whether the interactive questionnaire runs.
+
+    Interactive requires a TTY, no explicit provider, docs on, and neither
+    --yes nor --resume. --resume skips the gate because the prior run
+    already answered every question and those answers are on disk
+    (config.yaml); re-asking would let a resumed run diverge from the pages
+    already written with them (issue #2098).
+    """
+    return isatty and provider_name is None and not index_only and not yes and not resume
 
 
 @click.command("init")
@@ -622,6 +643,19 @@ def _run_generation_phase(
         "consent, and this flag decides all four without a prompt. Default: "
         "ask when interactive, skip otherwise. In workspace mode the verdict "
         "applies to every selected repo."
+    ),
+)
+@click.option(
+    "--hook/--no-hook",
+    "hook",
+    default=None,
+    help=(
+        "Install the post-commit hook that runs `repowise update` after each "
+        "commit, so the index stays current without anyone typing it. Default: "
+        "on. Interactive runs ask; --yes and non-interactive runs install it and "
+        "print how to undo it (`repowise hook uninstall`). --no-hook skips it. "
+        "--no-editor-setup skips it too, since a git hook is a write outside "
+        ".repowise/. In workspace mode the choice applies to every selected repo."
     ),
 )
 @click.option(
@@ -803,6 +837,7 @@ def init_command(
     agents_md: bool | None,
     codex_setup: bool | None,
     distill_hook: bool | None,
+    hook: bool | None,
     editor_setup: bool,
     save_key: bool,
     include_submodules: bool,
@@ -990,6 +1025,7 @@ def init_command(
             agents_md=agents_md,
             codex_setup=codex_setup,
             distill_hook=distill_hook,
+            hook=hook,
             editor_setup=editor_setup,
             save_key=save_key,
             include_submodules=include_submodules,
@@ -1046,7 +1082,23 @@ def init_command(
     # ---- Interactive mode (TTY, no explicit flags) ----
     # --yes forces non-interactive even on a TTY (mirrors the workspace path),
     # so a scripted `init -y` never blocks on the mode-selection menu.
-    is_interactive = sys.stdin.isatty() and provider_name is None and not index_only and not yes
+    # --resume skips the gate too: the prior run already answered every
+    # question, and those answers are on disk (config.yaml), so re-asking
+    # would let a resumed run diverge from the pages already written with
+    # them (issue #2098).
+    is_interactive = _interactive_gate(
+        isatty=sys.stdin.isatty(),
+        provider_name=provider_name,
+        index_only=index_only,
+        yes=yes,
+        resume=resume,
+    )
+
+    if resume:
+        console.print(
+            f"[bold]Resuming[/] the previous run in {repo_path}, "
+            "reusing the answers it already saved to config.yaml."
+        )
 
     # Output language picked in the advanced-mode generation section; None
     # until chosen. Resolved below: flag > this > config.yaml > English.
@@ -1576,6 +1628,7 @@ def init_command(
             # file. Resuming against it would skip the entire model run and
             # say nothing, so a template wiki is never a run to continue.
             resume=resume and _prior_docs_mode != "deterministic",
+            warnings=run_warnings,
             test_run=test_run,
             timings=callback.table,
         )
@@ -1830,8 +1883,14 @@ def init_command(
         embedder_name_resolved=embedder_name_resolved,
     )
 
-    # Offer to install post-commit hook (both index-only and full modes)
-    offer_hook_install(console, [repo_path], yes=yes)
+    # Post-commit auto-sync hook (both index-only and full modes)
+    offer_hook_install(
+        console,
+        [repo_path],
+        flag=hook,
+        yes=yes,
+        no_editor_setup=not editor_setup,
+    )
 
     # Opt-in distill command-rewrite hook for Claude Code. The workspace flow
     # runs its own offer across all selected repos inside _workspace_init.

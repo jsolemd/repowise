@@ -10,9 +10,9 @@
  *
  * Band cutoffs are the SINGLE TypeScript mirror of the canonical Python source
  * in `packages/core/src/repowise/core/analysis/health/grading.py`. The two are
- * kept in sync by a parity test (`__tests__/health/band-cutoffs.test.ts` here,
- * `tests/unit/health/test_grading.py` in core). Do not hardcode `4`/`8` band
- * cutoffs anywhere else — derive from these consts or read the API `band`.
+ * kept in sync by a parity test (`__tests__/health.test.ts` here,
+ * `tests/unit/health/test_grading.py` in core). Do not hardcode band cutoffs
+ * anywhere else — derive from these consts or read the API `band`.
  */
 
 import type { C4IoKind } from "./external-systems.js";
@@ -48,9 +48,27 @@ export const HEALTH_DIMENSIONS: readonly HealthDimension[] = [
   "performance",
 ] as const;
 
+/**
+ * What a code-health figure counts. `everything` is the calibrated score;
+ * `code_shape` removes the git-derived half, which rises as a file is worked
+ * on and so answers what a repository has been through rather than what its
+ * code is like.
+ */
+export type HealthCounts = "everything" | "code_shape";
+export const HEALTH_COUNTS: readonly HealthCounts[] = ["everything", "code_shape"] as const;
+
+/**
+ * Which half of a repository a health figure describes. Tests score higher
+ * than production code, so narrowing lowers every figure without a defect
+ * having been found — `all` is the default for that reason.
+ */
+export type HealthScope = "all" | "production";
+
+export const HEALTH_SCOPES: readonly HealthScope[] = ["all", "production"] as const;
+
 /** Display labels for the dimensions surfaced today. */
 export const HEALTH_DIMENSION_LABEL: Record<HealthDimension, string> = {
-  defect: "Defect risk",
+  defect: "Code health",
   maintainability: "Maintainability",
   performance: "Performance",
 };
@@ -75,22 +93,41 @@ export const PERF_BOUNDARY_LABEL: Record<C4IoKind, string> = {
  * ------------------------------------------------------------------ */
 
 /**
- * The 3 defect-backed health buckets. Alert files carry roughly 17x the
- * defect rate of Healthy files on our calibration corpus, so the boundaries
- * are empirically defensible rather than arbitrary. This replaces the legacy
- * ad-hoc 4-band labeling (`critical/poor/fair/good`).
+ * The five absolute health bands: a score means the same thing behind a
+ * firewall as against a public corpus. Excellent and Good share one green and
+ * are told apart by the word. Mirror of `grading.py`, parity-tested both ways.
  */
-export type HealthBand = "healthy" | "warning" | "alert";
+export type HealthBand = "excellent" | "good" | "fair" | "needs_work" | "at_risk";
 
-/** Score at or above this is Healthy. */
-export const HEALTHY_MIN = 8.0;
-/** Score below this is Alert; `[ALERT_MAX, HEALTHY_MIN)` is Warning. */
-export const ALERT_MAX = 4.0;
+export const EXCELLENT_MIN = 8.5;
+export const GOOD_MIN = 7.0;
+export const FAIR_MIN = 5.5;
+export const NEEDS_WORK_MIN = 4.0;
+
+/** Worst-first, matching how the surfaces list files. */
+export const HEALTH_BAND_ORDER: readonly HealthBand[] = [
+  "at_risk",
+  "needs_work",
+  "fair",
+  "good",
+  "excellent",
+] as const;
 
 export const HEALTH_BAND_LABEL: Record<HealthBand, string> = {
-  healthy: "Healthy",
-  warning: "Warning",
-  alert: "Alert",
+  excellent: "Excellent",
+  good: "Good",
+  fair: "Fair",
+  needs_work: "Needs work",
+  at_risk: "At risk",
+};
+
+/** The range each band covers, for keys and legends that show the boundaries. */
+export const HEALTH_BAND_RANGE_LABEL: Record<HealthBand, string> = {
+  excellent: "8.5+",
+  good: "7.0 to 8.5",
+  fair: "5.5 to 7.0",
+  needs_work: "4.0 to 5.5",
+  at_risk: "under 4.0",
 };
 
 /**
@@ -98,9 +135,11 @@ export const HEALTH_BAND_LABEL: Record<HealthBand, string> = {
  * API-provided `band` where available; use this only when deriving locally.
  */
 export function bandForScore(score: number): HealthBand {
-  if (score < ALERT_MAX) return "alert";
-  if (score < HEALTHY_MIN) return "warning";
-  return "healthy";
+  if (score >= EXCELLENT_MIN) return "excellent";
+  if (score >= GOOD_MIN) return "good";
+  if (score >= FAIR_MIN) return "fair";
+  if (score >= NEEDS_WORK_MIN) return "needs_work";
+  return "at_risk";
 }
 
 export interface HealthBandShare {
@@ -113,7 +152,7 @@ export interface HealthBandShare {
 }
 
 /**
- * NLOC-weighted distribution of files across the 3 bands. The repo-level
+ * NLOC-weighted distribution of files across the bands. The repo-level
  * "health distribution" surfaced on the dashboard + badge.
  */
 export interface HealthDistribution {
@@ -179,6 +218,20 @@ export interface HealthFileMetric {
   defect_score?: number | null;
   maintainability_score?: number | null;
   performance_score?: number | null;
+  /**
+   * The defect deduction split into the half a rewrite can move (code shape)
+   * and the half only time can (git history). They sum to the total deduction,
+   * so `unclamped_score` is `10 - structure - history` — the only number that
+   * moves for a file held at the score floor. Absent on older payloads.
+   */
+  structure_deduction?: number | null;
+  history_deduction?: number | null;
+  unclamped_score?: number | null;
+  /**
+   * Test material, decided at ingestion. Drives the production/all scope
+   * without re-deriving the answer from the path on every surface.
+   */
+  is_test?: boolean;
   /**
    * Open performance-risk findings on this file. The performance lens on the
    * code-health map colors by this count (+ `performance_analyzed`), not by the
@@ -513,11 +566,23 @@ export interface HealthOverviewSummary {
    *  (a clean repo returns `null` rather than a misleading "worst" at 10.0). */
   worst_performance_path?: string | null;
   worst_performance_score?: number | null;
+  /**
+   * `average_health`'s two halves, in deduction points: what the code's own
+   * shape costs, and what its git history costs. They sum to the total
+   * deduction, so ten minus both is the unclamped score. `null`/absent until
+   * the rows carry the split.
+   */
+  structure_average?: number | null;
+  history_average?: number | null;
+  /** What this response counted. Echoed so a label cannot get ahead of its data. */
+  counts?: HealthCounts;
+  /** Files a code-shape reading cannot answer for, having no recorded split. */
+  unscored_files?: number;
 }
 
 export interface HealthOverviewResponse {
   summary: HealthOverviewSummary;
-  /** NLOC-weighted file distribution across the 3 bands. */
+  /** NLOC-weighted file distribution across the health bands. */
   distribution?: HealthDistribution | null;
   defect_accuracy?: DefectAccuracy | null;
   files: HealthFileMetric[];
@@ -543,6 +608,9 @@ export interface HealthFilesResponse {
 }
 
 export interface HealthFilesQuery {
+  counts?: HealthCounts;
+  /** Which half of the repository to describe. Defaults to `"all"`. */
+  scope?: HealthScope;
   limit?: number;
   offset?: number;
   sort?: string;
@@ -646,9 +714,12 @@ export interface HealthMapFeed {
 }
 
 export interface HealthMapQuery {
+  counts?: HealthCounts;
   cap?: number;
   /** Paths guaranteed a node, admitted before any other band. */
   active?: string[];
+  /** Which half of the repository to describe. Defaults to `"all"`. */
+  scope?: HealthScope;
 }
 
 /* ------------------------------------------------------------------ *
@@ -779,26 +850,54 @@ export interface FileHealthTrend {
 export interface HealthTrendResponse {
   history: Array<{
     taken_at: string | null;
-    hotspot_health: number;
+    /** `null` under a narrowed scope, which recorded only the average. */
+    hotspot_health: number | null;
     average_health: number;
     worst_performer_path: string | null;
     worst_performer_score: number | null;
+    /**
+     * The headline's two halves in deduction points, and the maintainability
+     * pillar, at this snapshot. `null` before each was recorded and under a
+     * narrowed scope, so a series can start partway along the axis rather than
+     * reading an unrecorded point as a zero.
+     */
+    structure_average?: number | null;
+    history_average?: number | null;
+    maintainability_average?: number | null;
   }>;
   summary: {
-    current_hotspot_health: number;
+    /** `null` under a narrowed scope: only the average covers both populations. */
+    current_hotspot_health: number | null;
     current_average_health: number;
     previous_hotspot_health: number | null;
     previous_average_health: number | null;
     hotspot_delta: number | null;
     average_delta: number | null;
+    /** The newest reading's two halves, in deduction points. */
+    current_structure_deduction?: number | null;
+    current_history_deduction?: number | null;
   };
   alerts: Array<{
+    /**
+     * `"declining"` and `"predicted_decline"` are regressions. `"history_drag"`
+     * is a fall whose whole cause is git history while the code shape held or
+     * improved: the same numbers with the opposite reading, and nothing to fix.
+     */
     kind: string;
     metric: string;
     current: number;
     baseline: number | null;
     delta: number;
     message: string;
+    /**
+     * Which half of the headline moved, and how far each half moved in score
+     * points. These are changes in mean deduction, so they sum to `delta` only
+     * while no file sits at the score floor. `null` on the hotspot metric,
+     * whose halves are not snapshotted, and on histories predating the split.
+     */
+    driver?: "structure" | "history" | null;
+    structure_delta?: number | null;
+    history_delta?: number | null;
   }>;
   /** Largest movements first, in either direction, capped server-side. */
   file_deltas: Array<{
@@ -813,6 +912,8 @@ export interface HealthTrendResponse {
    */
   file_deltas_total?: number;
   snapshot_count: number;
+  /** Which half of the repository these figures describe. */
+  scope?: HealthScope;
 }
 
 /* ------------------------------------------------------------------ *
@@ -978,6 +1079,11 @@ export interface HealthWorkItem {
   primary_finding_id?: string;
   total_impact: number;
   finding_count: number;
+  /**
+   * How many of those are still open. Equal to `finding_count` under the
+   * default status filter. Optional: an older backend does not send it.
+   */
+  open_finding_count?: number;
   biomarkers: string[];
   effort_bucket: "S" | "M" | "L" | "XL";
   impact_per_effort: number;
@@ -1001,16 +1107,42 @@ export interface HealthWorkItem {
 
 export interface HealthWorkQueueResponse {
   targets: HealthWorkItem[];
+  /** Files matching the filters, before the page slice. */
   total: number;
+  /**
+   * Findings across those files. The view lists files but triages findings, so
+   * the file count alone leaves the size of the work unsaid. Optional: an older
+   * backend does not send it and the view omits the clause rather than
+   * inventing one.
+   */
+  finding_total?: number;
+  offset?: number;
+  limit?: number;
 }
 
 export interface HealthWorkQueueQuery {
+  counts?: HealthCounts;
   limit?: number;
+  offset?: number;
   module?: string;
   biomarker?: string;
+  /** Severity floor. Ignored by the server when `severity` is given. */
   min_severity?: string;
+  /** Exact severities, comma-separated. */
+  severity?: string;
+  dimension?: HealthDimension;
+  /** Comma-separated statuses, or `"all"`. Defaults to open work. */
+  status?: string;
+  /** Substring filter on `file_path`. */
+  search?: string;
+  only_hotspots?: boolean;
+  only_untested?: boolean;
+  /** Files below the score green starts at. */
+  only_failing?: boolean;
   max_effort?: string;
   sort?: "impact_per_effort" | "total_impact" | "score" | "finding_count";
+  /** Which half of the repository to describe. Defaults to `"all"`. */
+  scope?: HealthScope;
 }
 
 /** @deprecated Use HealthWorkItem; this is a file triage row, not a plan. */

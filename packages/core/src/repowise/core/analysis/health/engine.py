@@ -65,7 +65,14 @@ from .refactoring import (
     rank_suggestions,
 )
 from .refactoring.graph_signals import build_file_scc_index, build_methods_by_file
-from .scoring import attach_impacts, compute_kpis, remap_severities, score_file
+from .scope import scores_language
+from .scoring import (
+    attach_impacts,
+    compute_kpis,
+    deduction_split,
+    remap_severities,
+    score_file,
+)
 from .source_reader import SourceReader, disk_source_reader
 from .walk_cache import HealthWalkCache
 
@@ -92,7 +99,15 @@ log = structlog.get_logger(__name__)
 # Not a licence to move a calibrated scoring weight — those are frozen
 # independently of this stamp.
 #
-# Current stamp: C gained a complexity node map. ``LANGUAGE_NODE_MAPS`` had no
+# Current stamp: F# and Objective-C gained working complexity node maps and
+# Elixir lost its broken one, so stored complexity changes for files in those
+# languages. It has to move for the cache too: ``HealthWalkCache`` keys on this
+# stamp and the file's bytes, neither of which a node-map change alters.
+#
+# v10: non-code files stopped being scored and the deduction was split into its
+# structure and history halves, stored per file.
+#
+# v9: C gained a complexity node map. ``LANGUAGE_NODE_MAPS`` had no
 # ``c`` entry, so every C file scored as if it had no branches: ``max_ccn`` and
 # the maintainability index were computed off an empty node set and persisted
 # that way. The map is present now, so a C file's stored complexity metrics and
@@ -106,7 +121,7 @@ log = structlog.get_logger(__name__)
 # forms. Files that were counted untested and are not become tested, which
 # moves untested-hotspot findings and the scores that carry them, on every
 # language with a prefix or spec convention rather than Ruby alone.
-HEALTH_ANALYZER_VERSION = 9
+HEALTH_ANALYZER_VERSION = 11
 
 # Method-level smells that make the dataflow / Extract Method pass worthwhile.
 # Only files carrying one of these get a CFG + def/use + reaching pass built.
@@ -500,6 +515,8 @@ class HealthAnalyzer:
         for pf in self.parsed_files:
             if changed_set is not None and pf.file_info.path not in changed_set:
                 continue
+            if not scores_language(pf.file_info.language):
+                continue
             try:
                 fcx = self._walk(pf)
             except Exception as exc:
@@ -678,7 +695,8 @@ class HealthAnalyzer:
         target_files = [
             pf
             for pf in self.parsed_files
-            if changed_set is None or pf.file_info.path in changed_set
+            if (changed_set is None or pf.file_info.path in changed_set)
+            and scores_language(pf.file_info.language)
         ]
         if not target_files:
             if dup_task is not None:
@@ -1106,6 +1124,7 @@ class HealthAnalyzer:
         defect_score = scores["defect"]
         maint_score = scores["maintainability"]
         perf_score = scores["performance"]
+        structure_deduction, history_deduction = deduction_split(findings)
         metric = HealthFileMetricData(
             file_path=file_path,
             score=round(defect_score, 2),
@@ -1128,6 +1147,9 @@ class HealthAnalyzer:
             defect_score=round(defect_score, 2),
             maintainability_score=(round(maint_score, 2) if maint_score is not None else None),
             performance_score=(round(perf_score, 2) if perf_score is not None else None),
+            structure_deduction=structure_deduction,
+            history_deduction=history_deduction,
+            is_test=bool(pf.file_info.is_test),
         )
 
         # Refactoring layer: reuse the data just computed (class cohesion

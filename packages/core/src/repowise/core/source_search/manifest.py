@@ -76,6 +76,12 @@ def identify_embedder(
     second adapter merely to fingerprint the first one.
     """
 
+    from repowise.core.providers.embedding.caching import CachingEmbedder
+
+    # Memoization changes query cost, not the adapter that produced the vectors.
+    while isinstance(embedder, CachingEmbedder):
+        embedder = embedder.inner
+
     resolved_provider = (provider or "").strip().lower()
     if not resolved_provider:
         module_leaf = type(embedder).__module__.rsplit(".", 1)[-1].lower()

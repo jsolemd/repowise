@@ -2,6 +2,7 @@ import type { ReactNode } from "react";
 import type {
   HealthCoverageResponse,
   HealthFilesQuery,
+  HealthScope,
   HealthFilesResponse,
   HealthFinding,
   HealthOverviewResponse,
@@ -24,8 +25,13 @@ export interface CodeHealthFindingsQuery {
   biomarker_type?: string;
   file_path?: string;
   min_severity?: string;
+  /** Exact severities, comma-separated. Overrides `min_severity`. */
+  severity?: string;
   dimension?: string;
+  /** Comma-separated statuses, or `"all"`. Defaults to open work. */
+  status?: string;
   limit?: number;
+  scope?: HealthScope;
 }
 
 export type FindingStatusValue =
@@ -74,7 +80,12 @@ export interface CodeHealthAdapter {
   ): Promise<Paginated<HealthFinding>>;
   /** Fetch one exact canonical plan for the performance drawer. */
   getRefactoringPlan?(planId: string): Promise<RefactoringPlan>;
-  listFiles(opts?: HealthFilesQuery): Promise<HealthFilesResponse>;
+  /**
+   * @deprecated Unused. The repo's Files page owns the file inventory; the
+   * health views are triage surfaces and list only what carries findings.
+   * Optional so a host can stop binding it without breaking its build.
+   */
+  listFiles?(opts?: HealthFilesQuery): Promise<HealthFilesResponse>;
   getHealthWorkQueue?(
     opts?: HealthWorkQueueQuery,
   ): Promise<HealthWorkQueueResponse>;

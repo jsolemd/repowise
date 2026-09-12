@@ -372,23 +372,17 @@ describe("HealthFileDrawer metrics", () => {
     expect(cellValue("Duplication")).toBe("not measured");
   });
 
-  it("leads with the file's own score and band", () => {
+  it("leads with the file's own score and a canonical band", () => {
     render(<HealthFileDrawer open onClose={() => {}} metric={metric({ score: 1.0 })} />);
     expect(screen.getByText("1.0")).toBeInTheDocument();
-    // "Alert", not "Critical". The drawer reads `healthBand`, which now reads
-    // `bandForScore` — the vocabulary the distribution bar, the badge and the
-    // workspace repo list have always used. It said "Critical" only because
-    // `healthBand` carried a five-step ladder of its own.
-    expect(screen.getByText("Alert")).toBeInTheDocument();
+    // The shared band word, never a local one: this pill sits beside marks
+    // that all derive from `bandForScore`.
+    expect(screen.getByText("At risk")).toBeInTheDocument();
   });
 
-  it("bands a 6.8 the way every other surface does", () => {
-    // The regression that made this worth pinning: 6.8 read "Good" in green
-    // here and on the repo overview, and "Warning" in amber on /workspace and
-    // in the health distribution — one file, one score, two verdicts.
+  it("uses the shared band for a mid-range score", () => {
     render(<HealthFileDrawer open onClose={() => {}} metric={metric({ score: 6.8 })} />);
-    expect(screen.getByText("Warning")).toBeInTheDocument();
-    expect(screen.queryByText("Good")).toBeNull();
+    expect(screen.getByText("Fair")).toBeInTheDocument();
   });
 
   it("offers one link to the full page", () => {
@@ -626,5 +620,52 @@ describe("HealthFileDrawer under the performance lens", () => {
     // And refuses the reading that a clear detector run means the file is fast.
     const empty = clean.getByText(/No open cause names this file/).textContent ?? "";
     expect(empty).toContain("not a measurement that it is fast");
+  });
+});
+
+describe("HealthFileDrawer leading cause", () => {
+  it("passes over a history lead for the strongest code-shape finding", () => {
+    render(
+      <HealthFileDrawer
+        open
+        onClose={() => {}}
+        metric={metric({ primary_biomarker: "co_change_scatter", primary_reason: "edits scatter" })}
+        findings={[
+          finding({ biomarker_type: "co_change_scatter", health_impact: 1.8 }),
+          finding({ biomarker_type: "brain_method", health_impact: 0.4 }),
+        ]}
+      />,
+    );
+    // The server's lead is the history marker; the drawer must not present it
+    // as the thing to fix.
+    expect(screen.getByText(/Brain method\./)).toBeInTheDocument();
+    expect(screen.queryByText(/Co-change scatter\./)).not.toBeInTheDocument();
+  });
+
+  it("says so when a file's whole deduction is history", () => {
+    render(
+      <HealthFileDrawer
+        open
+        onClose={() => {}}
+        metric={metric({ primary_biomarker: "co_change_scatter", primary_reason: "edits scatter" })}
+        findings={[finding({ biomarker_type: "co_change_scatter", health_impact: 1.8 })]}
+      />,
+    );
+    expect(screen.getByText(/Its deduction is all\s+history/)).toBeInTheDocument();
+  });
+
+  it("marks a history finding as a watch item, not a pillar", () => {
+    render(
+      <HealthFileDrawer
+        open
+        onClose={() => {}}
+        metric={metric()}
+        findings={[finding({ biomarker_type: "prior_defect", health_impact: 1.0 })]}
+      />,
+    );
+    expect(screen.getAllByText("Watch").length).toBeGreaterThan(0);
+    // No pillar chip: the pillar colours mark where work belongs, and this is
+    // not work. The title is what distinguishes the chip from the score label.
+    expect(document.querySelector('[title="Code health pillar"]')).toBeNull();
   });
 });

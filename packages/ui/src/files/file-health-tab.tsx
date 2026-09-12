@@ -137,7 +137,7 @@ export function FileHealthTab({
 
   const pillars: RibbonStat[] = [];
   if (metric) {
-    // Defect risk is deliberately absent: the header's lede carries it at 44px
+    // Code health is deliberately absent: the header's lede carries it at 44px
     // with its band, on screen from whichever tab you arrive on. Repeating it
     // here at a quarter the size is the same number twice.
     if (metric.maintainability_score != null) {
@@ -171,9 +171,9 @@ export function FileHealthTab({
           title="The three signals"
           description={
             <>
-              Defect risk is the calibrated number in the header. Maintainability and performance
+              Code health is the calibrated number in the header. Maintainability and performance
               are co-equal signals rather than a blend of it, and they are banded the same way —
-              healthy at 8 and above, alert below 4.{" "}
+              Good from 7.0, at risk below 4.0.{" "}
               {metric.has_test_file
                 ? "This file has a paired test file."
                 : "No paired test file was found for it."}

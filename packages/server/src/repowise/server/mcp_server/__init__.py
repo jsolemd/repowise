@@ -3,12 +3,13 @@
 By default a single-repo server exposes eleven tools (get_answer, get_context,
 get_symbol, search_codebase, get_overview, get_risk, get_change_risk, get_why,
 get_dead_code, get_health, get_index_status). Workspace mode also exposes the
-``list_repos`` discovery utility by default. Seventeen further tools
-(get_dependents, get_dependency_path,
+``list_repos`` discovery utility by default. Eighteen further tools (get_dependents,
+get_dependency_path,
 get_execution_flows, generate_refactoring_code, get_conformance,
 reindex_repository, build_task_slice, get_task_slice, extend_task_slice,
 get_query_quality, find_clones, find_patterns, manage_decision,
-get_reference_sites, preview_symbol_rename, get_architecture, get_blast_radius)
+get_reference_sites, preview_symbol_rename, get_architecture, get_blast_radius,
+set_finding_status)
 are registered but off by default
 and can be opted in via the ``mcp.tools`` config block or the
 ``repowise mcp --tools`` flag; architecture, blast radius and conformance are
@@ -31,6 +32,7 @@ Usage:
 from __future__ import annotations
 
 import importlib
+import logging
 import sys
 from types import ModuleType
 from typing import Any
@@ -64,6 +66,7 @@ _TOOL_MODULES: dict[str, str] = {
     "find_clones": "tool_clones",
     "find_patterns": "tool_patterns",
     "generate_refactoring_code": "tool_refactoring",
+    "set_finding_status": "tool_findings",
     "get_answer": "tool_answer",
     "get_architecture": "tool_architecture",
     "get_blast_radius": "tool_blast_radius",
@@ -224,7 +227,17 @@ def ensure_full_surface() -> Any:
         return _mcp
 
     for module in dict.fromkeys(_TOOL_MODULES.values()):
-        importlib.import_module(f"{__name__}.{module}")
+        try:
+            importlib.import_module(f"{__name__}.{module}")
+        except ImportError as exc:
+            # One tool's optional dependency must not take the whole surface
+            # down: a host respawns a server that dies at import, forever.
+            logging.getLogger("repowise.mcp").warning(
+                "repowise MCP: skipping tool module %s, cannot import %s: %s",
+                module,
+                exc.name or "a dependency",
+                exc,
+            )
 
     from repowise.core.registry import mcp_tool_registry
     from repowise.server.mcp_server._tool_metadata import resolve_tool_metadata
@@ -266,6 +279,8 @@ _STATE_NAMES = frozenset(
         "_workspace_root",
         "_cross_repo_enricher",
         "_embedder_status",
+        "_release_check",
+        "_release_announced",
     }
 )
 

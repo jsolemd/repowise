@@ -14,6 +14,7 @@ from repowise.core.source_search.manifest import (
     SourceIndexManifest,
     corpus_hash,
     default_manifest_path,
+    identify_embedder,
     inspect_manifest,
     read_manifest,
     recipe_fingerprint,
@@ -79,6 +80,28 @@ def test_an_empty_corpus_still_hashes():
 
 def test_the_fingerprint_is_stable_for_one_recipe():
     assert recipe_fingerprint(_OLLAMA) == recipe_fingerprint(_OLLAMA)
+
+
+@pytest.mark.parametrize("layers", [1, 2])
+def test_query_cache_preserves_the_producing_embedder_identity(layers):
+    from repowise.core.providers.embedding.caching import CachingEmbedder
+    from repowise.core.providers.embedding.ollama import OllamaEmbedder
+
+    adapter = OllamaEmbedder(model="embeddinggemma", dimensions=768)
+    wrapped = adapter
+    for _ in range(layers):
+        wrapped = CachingEmbedder(wrapped)
+
+    assert identify_embedder(wrapped) == _OLLAMA
+    assert recipe_fingerprint(identify_embedder(wrapped)) == recipe_fingerprint(_OLLAMA)
+    identity_options = {
+        "provider": "ollama",
+        "document_prefix": "document: ",
+        "query_prefix": "query: ",
+    }
+    assert identify_embedder(wrapped, **identity_options) == identify_embedder(
+        adapter, **identity_options
+    )
 
 
 @pytest.mark.parametrize(

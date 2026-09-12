@@ -111,6 +111,87 @@ async def _all_pages_for_reconciliation(session: object, repo_id: str) -> list:
     return list(result.all())
 
 
+def _provider_checks(repo_path: _DoctorPath) -> list[DoctorCheck]:
+    """Report provider implementations, configuration errors, and usability.
+
+    These are three distinct claims.  In particular, an empty validation
+    warning list means no configured key is malformed; it does not prove that
+    an LLM provider will resolve for this repository.
+    """
+    checks: list[DoctorCheck] = []
+
+    try:
+        from repowise.core.providers import list_providers
+
+        providers = list_providers()
+        checks.append(
+            _check(
+                "Providers",
+                bool(providers),
+                f"Implementations loaded: {', '.join(providers)}",
+            )
+        )
+    except Exception as exc:
+        checks.append(_check("Providers", False, str(exc)))
+
+    from repowise.cli.helpers import validate_provider_config
+
+    config_warnings = validate_provider_config()
+    config_ok = not config_warnings
+    config_detail = "No misconfigured provider keys" if config_ok else "; ".join(config_warnings)
+    checks.append(_check("Provider config", config_ok, config_detail))
+
+    from repowise.core.providers.llm.registry import provider_available_for_repo
+
+    llm_available = provider_available_for_repo(repo_path)
+    llm_detail = (
+        "Resolves for this repository"
+        if llm_available
+        else "None configured — prose degrades to a structural wiki; set a key or pass --provider"
+    )
+    # Keyless operation is supported, so this is informational rather than a
+    # failing health check.  The detail tells users what init will actually do.
+    checks.append(_check("LLM provider", True, llm_detail))
+    return checks
+
+
+def _repowise_dir_check(repowise_dir: _DoctorPath) -> DoctorCheck:
+    """Exists and writable, probed with a real file: os.access lies on Windows."""
+    if not repowise_dir.exists():
+        return _check(".repowise/ directory", False, f"{repowise_dir} (run 'repowise init')")
+    probe = repowise_dir / ".doctor-write-probe"
+    try:
+        probe.write_text("", encoding="utf-8")
+        probe.unlink()
+    except OSError as exc:
+        return _check(
+            ".repowise/ directory",
+            False,
+            f"{repowise_dir} is not writable ({exc.strerror or exc}); fix its permissions",
+        )
+    return _check(".repowise/ directory", True, str(repowise_dir))
+
+
+def _autosync_hook_check(repo_path: _DoctorPath) -> DoctorCheck:
+    """Report the post-commit hook through hooks.status, which asks git for the
+    real hooks directory, so worktrees and core.hooksPath read correctly."""
+    try:
+        from repowise.cli.hooks import status as _hook_status
+
+        state = _hook_status(repo_path)
+    except Exception as exc:
+        return _check("Post-commit hook", True, f"could not read hook state ({exc})")
+    if state.startswith("installed"):
+        return _check("Post-commit hook", True, state)
+    if state == "not installed":
+        return _check(
+            "Post-commit hook",
+            True,
+            "not installed; the index updates only when you run 'repowise update' "
+            "('repowise hook install' turns auto-sync on)",
+        )
+    return _check("Post-commit hook", True, state)
+
 
 def _run_repo_checks(
     repo_path: _DoctorPath, repair: bool, *, fmt: str = "table"
@@ -134,9 +215,15 @@ def _run_repo_checks(
     except Exception:
         checks.append(_check("Git repository", False, "Not a git repo"))
 
-    # 2. .repowise/ exists?
+    # 2. .repowise/ exists and takes a write? The MCP server refuses to start
+    # on a directory it cannot write, so an existence-only row would say OK
+    # for the one state that makes every tool call fail.
     repowise_dir = get_repowise_dir(repo_path)
-    checks.append(_check(".repowise/ directory", repowise_dir.exists(), str(repowise_dir)))
+    checks.append(_repowise_dir_check(repowise_dir))
+
+    # 2b. Post-commit auto-sync hook. init installs it by default; not having
+    # it is a choice (--no-hook), so its absence is informational, not a fail.
+    checks.append(_autosync_hook_check(repo_path))
 
     # 3. Database connectable?
     db_path = repowise_dir / "wiki.db"
@@ -212,24 +299,8 @@ def _run_repo_checks(
         except Exception as e:
             checks.append(_check("Store format", True, f"Could not check: {e}"))
 
-    # 5. Provider importable?
-    provider_ok = False
-    try:
-        from repowise.core.providers import list_providers
-
-        providers = list_providers()
-        provider_ok = len(providers) > 0
-        checks.append(_check("Providers", provider_ok, ", ".join(providers)))
-    except Exception as e:
-        checks.append(_check("Providers", False, str(e)))
-
-    # 6. Provider configuration?
-    from repowise.cli.helpers import validate_provider_config
-
-    config_warnings = validate_provider_config()
-    config_ok = len(config_warnings) == 0
-    config_detail = "All required API keys configured" if config_ok else "; ".join(config_warnings)
-    checks.append(_check("Provider config", config_ok, config_detail))
+    # 5-6. Provider implementations, configuration, and repo-level usability.
+    checks.extend(_provider_checks(repo_path))
 
     # 6b. Hosted account (informational: signed out is not a failure).
     try:

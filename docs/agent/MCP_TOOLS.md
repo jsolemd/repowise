@@ -2,7 +2,7 @@
 
 repowise exposes a curated set of tools via the [Model Context Protocol](https://modelcontextprotocol.io) (MCP). These tools give AI coding assistants (Claude Code, Codex, Cursor, Cline, Windsurf) structured access to your codebase intelligence: dependency graph, git history, documentation, and architectural decisions.
 
-29 tools are registered in total. A single-repo server advertises 11 by default: exactly the canonical tools. Workspace mode adds the `list_repos` discovery utility, for 12. 17 specialist tools are opt-in, subject to mode eligibility. The surface is configurable; see [Configuring the tool surface](#configuring-the-tool-surface).
+30 tools are registered in total. A single-repo server advertises 11 by default: exactly the canonical tools. Workspace mode adds the `list_repos` discovery utility, for 12. 18 specialist tools are opt-in, subject to mode eligibility. The surface is configurable; see [Configuring the tool surface](#configuring-the-tool-surface).
 
 **Start the MCP server:**
 
@@ -36,7 +36,7 @@ repowise mcp --transport sse --port 7338 # legacy SSE transport
 **Workspace discovery utility (default in workspace mode, 1)**
 [list_repos](#list_repos)
 
-**Opt-in specialists (off by default everywhere, 17)**
+**Opt-in specialists (off by default everywhere, 18)**
 [get_architecture](#get_architecture) &middot;
 [get_blast_radius](#get_blast_radius) &middot;
 [get_dependents](#get_dependents) &middot;
@@ -53,7 +53,8 @@ repowise mcp --transport sse --port 7338 # legacy SSE transport
 [get_query_quality](#get_query_quality) &middot;
 [manage_decision](#manage_decision) &middot;
 [get_reference_sites](#get_reference_sites) &middot;
-[preview_symbol_rename](#preview_symbol_rename)
+[preview_symbol_rename](#preview_symbol_rename) &middot;
+[set_finding_status](#set_finding_status)
 
 Also see [Configuring the tool surface](#configuring-the-tool-surface), [Reversible truncation](#reversible-truncation-_metaomitted) and [Unrecognised arguments](#unrecognised-arguments-ignored_arguments).
 
@@ -181,9 +182,12 @@ promotion happens in the served MCP wrapper and nowhere else.
 | `semantic_search` | Only when `false`, meaning these results are full-text only — either the index is keyless, or the semantic leg did not run for this request |
 | `retrieval_degraded` | Only when a retrieval leg fell over on **this** request (`["vector"]`). The results are still served, and a miss in them is not evidence of absence. Nothing to restart: the leg is retried per request, and the key disappears on the next whole one |
 | `retrieval_degraded_reason` | Alongside `retrieval_degraded`: what failed, and the cause it reported |
+| `newer_release` | Once per server process, in the first response after the background check sees a newer repowise on PyPI: the available version, the running one, and that the MCP server needs a restart after upgrading. Repeats only for a later, newer version |
 | `response_budget` | Always: `limit_chars` (the ceiling that applied), `tier` (`default` or `expanded`, chosen by whether the call passed an expansion argument), `serialized_chars` (the size delivered) |
 | `scope_hint` | `get_context` and `get_answer`, when knowledge-graph layers exist that contain none of the served paths: one sentence naming up to three of them with file counts, so an agent knows which areas the answer did not touch |
 | `complete` | When the response served whole units: how many symbol bodies (bounds verified against the live file) or whole files, and that they need not be re-opened. Sliced bodies and partial ranges are never counted |
+| `completeness` | Always: `capped`, plus `shown` and `total` summed over every collection a reducing pass counted, and `reason` naming the pass that dropped the most. The sum spans unlike collections and sits inside whatever `limit` the call already applied, so it measures what survived reduction, not what share of the repository you hold. Absent `shown`/`total` means no pass counted rows |
+| `floor` | Only when the response carries a count derived by walking the indexed graph: names those fields, whose values are lower bounds because an edge the index failed to resolve is uncounted rather than proven absent |
 | `state` | Only when something fired: `degraded` plus `degraded_reasons` mapping each contributing key to its reason (a synthesis reason string, the retrieval legs that broke), `partial`, `truncated`. A coarse roll-up of the response's own flags |
 
 Silence on `stale_warning` means the index is current; don't infer staleness from its absence. `list_repos`, `get_architecture`, `get_blast_radius`, and `get_conformance` don't carry a freshness envelope at all. Neither does `search_codebase` when a workspace call merges results from several repos, since there is no single indexed commit to compare.
@@ -217,8 +221,20 @@ matching your filters."* beside a summary counting hundreds of unused exports
 
 `get_dead_code`'s `min_confidence` additionally accepts the tier names the
 response is organised by — `"high"` (0.8), `"medium"` (0.5), `"low"` (0.0) — as
-well as a float. `get_health` reports the same thing under its own older name,
-`unknown_only_keys`, for the `only` projection.
+well as a float.
+
+`get_health` is the exception to the shape. It reports a misspelled `only` key
+under its own older name, `unknown_only_keys`, and everything else —
+`refactoring_*` and `performance_*` filters, `scope`, `counts` — in
+`ignored_arguments` as a flat map of argument to the value that was dropped:
+
+```jsonc
+"ignored_arguments": { "counts": "code-shape", "refactoring_effort": "tiny" }
+```
+
+A detail lookup (`finding_id`, `plan_id`, `opportunity_id`) reports `scope` and
+`counts` there too: it answers about one stored row, so a population control has
+nothing to act on.
 
 ---
 
@@ -616,7 +632,7 @@ Modification risk assessment for files or a set of changed files.
 | `include` | list[string] | No | Opt-in blocks: `graph` (typed `dependents`, `consumers`, `cross_repo_links`, structural `impact_surface`, `direct_risks`), `churn` (`change_magnitude`, `risk_type`, `change_pattern`) |
 | `repo` | string | No | *(workspace only)* Target repo alias |
 
-**Returns:** Per-file `hotspot_score` (0-1 churn percentile), `health_score` (0-10), hotspot status, direct directed `dependents_count`, historical `co_change_partners` (each with a recency-decayed `weight`, not an integer count), blast radius, recommended reviewers, test gap analysis, and security signals. With `include=["graph"]`, `dependents` preserves direct versus transitive structural reach, `consumers` contains typed contract consumers only, and `cross_repo_links` retains both repository identities, direction, relationship type, evidence kind, and file- or repository-level granularity. Package-manifest links are repository-level and never invent a target file. Every typed relationship collection carries matching total/emitted/truncated fields. `relationship_analysis` distinguishes available-empty analysis from unavailable, degraded, partial, and source-truncated artifacts and retains artifact generation/provenance fields. Structural reach is not proof of runtime breakage.
+**Returns:** Per-file `hotspot_score` (0-1 churn percentile), `health_score` (0-10), hotspot status, direct directed `dependents_count`, historical `co_change_partners` (each with a recency-decayed `weight`, not an integer count, and a `direction` of `a_to_b`, `b_to_a` or `undirected`, where `a` is the assessed file and `b` the partner; `conf_ab` and `conf_ba` are the share of each file's own commits that touched the other, and both are omitted on an index written before those commit totals were recorded, which also reads as `undirected`), blast radius, recommended reviewers, test gap analysis, and security signals. With `include=["graph"]`, `dependents` preserves direct versus transitive structural reach, `consumers` contains typed contract consumers only, and `cross_repo_links` retains both repository identities, direction, relationship type, evidence kind, and file- or repository-level granularity. Package-manifest links are repository-level and never invent a target file. Every typed relationship collection carries matching total/emitted/truncated fields. `relationship_analysis` distinguishes available-empty analysis from unavailable, degraded, partial, and source-truncated artifacts and retains artifact generation/provenance fields. Structural reach is not proof of runtime breakage.
 
 Test-gap analysis is the same resolver `get_context` reports from, so the two
 tools always agree about a file: `test_gap` is the negation of `tested`, and
@@ -1016,6 +1032,12 @@ representations of the same work in one response. The `include` **dimension** na
 | `performance_boundary` | string | No | `db` / `network` / `filesystem` / `subprocess` / `lock` / `none`. |
 | `performance_confidence` | string | No | Evidence confidence: `high` / `medium` / `low`. Fix safety and actionability are separate facets. |
 | `performance_sort` | string | No | `rank` (default) / `leverage` / `observations`. |
+| `scope` | string | No | Which files every figure describes: `all` (default) or `production`. Narrowing drops test files from the headline, the distribution and every ranked list. Tests score higher than production code, so `production` lowers the number without a defect having been found. |
+| `counts` | string | No | What the score counts: `everything` (default, the calibrated number) or `code_shape`, which removes the git-derived half. Change history rises as a file is worked on, so it answers what a repository has been through rather than what its code is like — `code_shape` is the reading that answers "is this code getting better". Files with no stored split are reported in `unscored_files` rather than counted. Findings from history are dropped, not re-scored. |
+
+An unrecognized `scope` or `counts` falls back to the default and is named in
+`ignored_arguments`, so a misspelling never answers a different question under
+the name you asked for. Both are echoed on the response.
 
 **Returns:** Dashboard mode (no `targets`) returns a `directive`, repo-level KPIs
 (hotspot health, average health, worst performer, maintainability / performance
@@ -1037,9 +1059,17 @@ block ranks and describes; this one recommends. Same role as `get_risk`'s
 `recovers_points` remains an exact deprecated alias during the compatibility
 window; `recovers_points_compatibility` names its replacement.
 
+**`watch` is context, not a task.** When the leading cause is history-derived —
+churn, ownership, co-change, prior fixes — the directive carries it under
+`watch` rather than in the fix path, because no edit to the file settles it.
+If *no* file has a code-shape lead, `next_action` says so instead of naming a
+file to change, so an agent is never sent to refactor a file whose deficit is
+its history.
+
 **Nothing is dropped silently.** Any `targets` entry that matched nothing is
 named in `unresolved` with a reason (`not_indexed` → run `repowise update`,
-`no_such_path`, `excluded`, `no_such_module`; a missed module name also returns
+`no_such_path`, `excluded`, `not_measured` → indexed, but carrying no stored
+split for the reading `counts` asked for, `no_such_module`; a missed module name also returns
 `known_modules`). Missing stored analysis is explicitly unavailable rather than
 fabricated as a healthy score. A
 target set that resolves to nothing still answers in targeted mode rather than
@@ -1094,7 +1124,7 @@ make that actionable rather than a mystery:
   `kpis.average_health_weighting` is `"nloc"`. When the weighted and unweighted
   numbers diverge, the gap is telling you to chase *big* files, not the long tail.
 - `gap_analysis` (dashboard mode) reports the net weighted points the average must
-  recover to reach the Healthy floor (8.0), how many files sit below it, and how
+  recover to reach the target score (8.0), how many files sit below it, and how
   few of them carry the whole gap (`files_to_reach_target`) or half of it
   (`files_for_half_gap`). This reframes a repo-wide number as a short worklist.
 - Every metric row carries `weighted_deficit = (8 - score) x nloc`: how much the
@@ -1826,6 +1856,26 @@ Every site a rename would touch, with per-site confidence. Reports only — it c
 ```
 preview_symbol_rename(symbol="src/calc.ts::computeTotal")
 preview_symbol_rename(symbol="computeTotal", new_name="totalOf")
+#### `set_finding_status`
+
+Records a durable disposition on one refactoring plan — the write half of the findings triage loop. `get_health(include=["refactoring"])` and the generated task prompts ask an agent to flag false positives, but until this tool there was nowhere to record that verdict from inside the agent loop. The status is stored on the plan row, and the analyzer's finalizer never re-emits a `false_positive` plan, so the triage survives every later run.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `suggestion_id` | string | Yes | The `id` or `public_id` of a plan from `get_health(include=["refactoring"])` |
+| `status` | string | Yes | One of `open`, `acknowledged`, `resolved`, `false_positive` |
+| `repo` | string | No | *(workspace only)* Target repo alias |
+| `reason` | string | No | Free-text audit note stored on the row (defaults to `"agent"`) |
+
+- `false_positive` — the plan is wrong for this repository; it is never re-emitted on future runs.
+- `acknowledged` — real, but the team is consciously not acting now; stays visible, stops counting as unheard.
+- `resolved` — the change landed (or the code moved on); a person-resolved plan stays resolved even if the detector still fires.
+- `open` — reset a prior decision.
+
+**When to use:** After `get_health(include=["refactoring"])` surfaces a plan you have judged, so the verdict becomes durable state instead of a one-off remark.
+
+```
+set_finding_status(suggestion_id="a1b2c3d4", status="false_positive", reason="false alarm: the class is a DTO")
 ```
 
 ---

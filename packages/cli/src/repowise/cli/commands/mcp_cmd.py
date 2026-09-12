@@ -9,12 +9,15 @@ import click
 
 from repowise.cli.helpers import console, find_repowise_repo_root, resolve_repo_path
 from repowise.cli.ui import load_dotenv
-from repowise.core.workspace.config import WorkspaceConfig, find_workspace_root
 
 
 def _workspace_summary(path: Path, *, no_workspace: bool = False) -> dict[str, object] | None:
     if no_workspace:
         return None
+    # Deferred so ``--no-workspace`` and ``--help`` skip the config module and
+    # its yaml import entirely.
+    from repowise.core.workspace.config import WorkspaceConfig, find_workspace_root
+
     workspace_root = find_workspace_root(path)
     if workspace_root is None:
         return None
@@ -154,7 +157,7 @@ def mcp_command(
 
     Exposes a curated set of tools for querying the repowise wiki via the MCP
     protocol: eleven by default in single-repo mode, plus one more by default
-    in workspace mode. Seventeen more are opt-in via ``--tools`` or the
+    in workspace mode. Eighteen more are opt-in via ``--tools`` or the
     ``mcp.tools`` config block. Supports stdio
     (for Claude Code, Codex, Cursor), streamable HTTP, and legacy SSE
     transports.
@@ -202,14 +205,19 @@ def mcp_command(
         pass
 
     from repowise.server.mcp_server import run_mcp
+    from repowise.server.mcp_server._server import StoreUnavailableError
 
     tools_override: str | None = "all" if all_tools else tools
 
-    run_mcp(
-        transport=transport,
-        repo_path=str(repo_path),
-        host=resolved_host,
-        port=port,
-        tools=tools_override,
-        workspace_mode=not no_workspace,
-    )
+    try:
+        run_mcp(
+            transport=transport,
+            repo_path=str(repo_path),
+            host=resolved_host,
+            port=port,
+            tools=tools_override,
+            workspace_mode=not no_workspace,
+        )
+    except StoreUnavailableError as exc:
+        # One line on stderr and exit 1, not a traceback the host respawns on.
+        raise click.ClickException(str(exc)) from exc
