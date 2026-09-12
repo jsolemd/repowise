@@ -36,7 +36,7 @@ export function FreshnessTableWithRegenerate({
         toast.error("Couldn't start regeneration", { description: toFriendlyMessage(e) });
       }
     },
-    [busy],
+    [busy, repoId],
   );
 
   return (
