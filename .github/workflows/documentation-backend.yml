@@ -25,3 +25,20 @@ jobs:
       - run: uv run --frozen --extra docs pytest tests/docs tests/unit/server/test_docs_libraries.py tests/unit/server/mcp/test_docs.py -m 'not integration and not eval' -q
       - run: docker build -t repowise-docs:test packages/docs
       - run: docker run --rm repowise-docs:test python -c 'from repowise.docs.transport.http_server import create_app; assert create_app()'
+      - name: Exercise schema compatibility on PostgreSQL
+        run: |
+          docker network create docs-test
+          docker build -t repowise-docs-db:test packages/docs/database
+          docker run -d --name docs-test-db --network docs-test --tmpfs /var/lib/postgresql/data -e POSTGRES_USER=doc_search -e POSTGRES_PASSWORD=doc_search -e POSTGRES_DB=doc_search repowise-docs-db:test
+          timeout 60s bash -c 'until docker exec docs-test-db pg_isready -U doc_search -d doc_search; do sleep 1; done'
+          docker run --rm -i --network docs-test -e DOC_SEARCH_POSTGRES_DSN=postgresql://doc_search:doc_search@docs-test-db:5432/doc_search repowise-docs:test python - <<'PYTHON'
+          import asyncio
+          from repowise.docs.db_runtime import init_pool, close_pool
+          async def verify():
+              for _ in range(2):
+                  pool = await init_pool()
+                  async with pool.acquire() as conn:
+                      assert await conn.fetchval("SELECT count(*) FROM doc_search.libraries") == 0
+                  await close_pool()
+          asyncio.run(verify())
+          PYTHON
