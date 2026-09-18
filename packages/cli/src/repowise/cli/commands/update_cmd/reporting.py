@@ -349,14 +349,17 @@ def show_workspace_completion(
     total_files: int,
     total_symbols: int,
     elapsed: float,
+    deferred: int = 0,
 ) -> None:
     """Render the completion panel for a workspace update."""
     metrics: list[tuple[str, str]] = [
         ("Workspace", ws_name),
         ("Repos updated", str(updated)),
     ]
-    if skipped:
-        metrics.append(("Skipped", str(skipped)))
+    if skipped > deferred:
+        metrics.append(("Skipped", str(skipped - deferred)))
+    if deferred:
+        metrics.append(("Deferred", str(deferred)))
     if errors:
         metrics.append(("Errors", str(errors)))
     if total_files:
@@ -369,9 +372,12 @@ def show_workspace_completion(
         ("repowise status --workspace", "show workspace status"),
         ("repowise serve", "browse a repo wiki at localhost:3000"),
     ]
+    outcome = "failed" if errors else "deferred" if deferred and not updated else "complete"
     console.print()
     console.print(
-        build_completion_panel("repowise workspace update complete", metrics, next_steps=next_steps)
+        build_completion_panel(
+            f"repowise workspace update {outcome}", metrics, next_steps=next_steps
+        )
     )
     console.print()
 

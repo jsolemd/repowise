@@ -459,7 +459,7 @@ def update_command(
 
 
 class UpdateOutcome(StrEnum):
-    """What a single-repo :func:`run_update` actually did.
+    """What :func:`run_update` actually did for a repository or workspace.
 
     The workspace docs loop used to count every non-raising ``run_update``
     return as a regeneration, so a run that bailed on the single-flight lock
@@ -729,7 +729,7 @@ def run_update(
                 "no-generative policy."
             )
         try:
-            _workspace_update(
+            workspace_outcome = _workspace_update(
                 target,
                 dry_run=dry_run,
                 agents_md=agents_md,
@@ -757,9 +757,9 @@ def run_update(
                 pages_generated=0,
                 cost_usd=0.0,
                 duration_s=time.monotonic() - start,
-                outcome=UpdateOutcome.REGENERATED.value,
+                outcome=workspace_outcome.value,
             )
-        return UpdateOutcome.REGENERATED
+        return workspace_outcome
 
     # --- Single-repo path from here on. ---
     repo_path = target.repo_path

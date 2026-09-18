@@ -5,11 +5,29 @@ from __future__ import annotations
 import time
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import click
 
 from repowise.cli.helpers import CommandTarget, console, run_async
+
+if TYPE_CHECKING:
+    from .command import UpdateOutcome
+
+
+def _workspace_outcome(*, updated: int, deferred: int, errors: list[str]) -> UpdateOutcome:
+    """Fail only after independent members and shared bookkeeping finish."""
+    from .command import UpdateOutcome
+
+    if errors:
+        raise click.ClickException(
+            f"Workspace update failed for {len(errors)} repo(s):\n" + "\n".join(errors)
+        )
+    if updated:
+        return UpdateOutcome.REGENERATED
+    if deferred:
+        return UpdateOutcome.DEFERRED
+    return UpdateOutcome.NOOP
 
 
 def _print_repo_result(result: Any) -> None:
@@ -21,7 +39,7 @@ def _print_repo_result(result: Any) -> None:
     """
     from repowise.core.update_lock import UPDATE_LOCK_SUSPECT_AFTER_SECONDS, format_lock_age
 
-    if result.error:
+    if result.error is not None:
         console.print(f"    [red]✗ {result.alias}: {result.error}[/red]")
     elif result.skipped_reason == "in_flight":
         # Surface skipped-because-in-flight as a yellow note rather than a
@@ -104,7 +122,7 @@ def _workspace_update(
     progress: str = "rich",
     include_working_tree: bool = False,
     accept_mass_deletion: bool = False,
-) -> None:
+) -> UpdateOutcome:
     """Update stale repos in a workspace.
 
     Takes a resolved :class:`CommandTarget` so the caller has full control
@@ -128,6 +146,7 @@ def _workspace_update(
         update_workspace,
     )
 
+    from .command import UpdateOutcome
     from .mode import _resolve_index_only_mode
 
     start = time.monotonic()
@@ -285,11 +304,11 @@ def _workspace_update(
                 repo_filter=repo_alias,
                 agents_md=agents_md,
             )
-        return
+        return UpdateOutcome.DRY_RUN if dry_run else UpdateOutcome.NOOP
 
     if dry_run:
         console.print(f"[yellow]Dry run \u2014 {stale_count} repo(s) would be updated.[/yellow]")
-        return
+        return UpdateOutcome.DRY_RUN
 
     # Repos that want docs go through the full single-repo docs path so their
     # wiki (pages, diagrams, decisions) stays as fresh as a single-repo update
@@ -297,7 +316,7 @@ def _workspace_update(
     # path below. Branching here keeps the common all-index-only workspace
     # update byte-for-byte on its original path with no behavior change.
     if docs_aliases:
-        _workspace_docs_update(
+        return _workspace_docs_update(
             ws_root=ws_root,
             ws_config=ws_config,
             repo_filter=repo_alias,
@@ -320,7 +339,6 @@ def _workspace_update(
             accept_mass_deletion=accept_mass_deletion,
             recipe_drift_aliases=recipe_drift_aliases,
         )
-        return
 
     # Run the updates
     def _on_start(alias: str) -> None:
@@ -370,7 +388,8 @@ def _workspace_update(
 
     # Summary
     updated = sum(1 for r in results if r.updated)
-    errors = sum(1 for r in results if r.error)
+    errors = [f"{r.alias}: {r.error}" for r in results if r.error is not None]
+    deferred = sum(1 for r in results if r.skipped_reason == "in_flight")
     skipped = sum(1 for r in results if r.skipped_reason)
     total_files = sum(r.file_count for r in results if r.updated)
     total_symbols = sum(r.symbol_count for r in results if r.updated)
@@ -390,11 +409,13 @@ def _workspace_update(
         ws_name=ws_root.name,
         updated=updated,
         skipped=skipped,
-        errors=errors,
+        errors=len(errors),
+        deferred=deferred,
         total_files=total_files,
         total_symbols=total_symbols,
         elapsed=time.monotonic() - start,
     )
+    return _workspace_outcome(updated=updated, deferred=deferred, errors=errors)
 
 
 _BREAKING_DETAIL_LINES = 3
@@ -482,7 +503,7 @@ def _workspace_docs_update(
     include_working_tree: bool,
     accept_mass_deletion: bool,
     recipe_drift_aliases: set[str],
-) -> None:
+) -> UpdateOutcome:
     """Update a workspace where at least one stale repo wants docs.
 
     Docs repos (``docs_aliases``) run through the full single-repo update
@@ -506,7 +527,7 @@ def _workspace_docs_update(
 
     changed_aliases: list[str] = []
     docs_updated = 0
-    docs_failed = 0
+    errors: list[str] = []
     docs_deferred = 0  # bailed on another update's single-flight lock
     docs_noop = 0  # already current / nothing to regenerate
 
@@ -539,6 +560,7 @@ def _workspace_docs_update(
             )
         )
         _remove_tombstoned_page_vectors(ws_root, ws_config, core_results)
+        errors.extend(f"{r.alias}: {r.error}" for r in core_results if r.error is not None)
         changed_aliases.extend(r.alias for r in core_results if r.updated)
         from repowise.cli.source_search_runtime import reconcile_configured_source_indexes
 
@@ -590,7 +612,7 @@ def _workspace_docs_update(
                 accept_mass_deletion=accept_mass_deletion,
             )
         except Exception as exc:
-            docs_failed += 1
+            errors.append(f"{entry.alias}: {exc}")
             console.print(f"    [red]✗ {entry.alias}: {exc}[/red]")
             continue
         # Count what actually happened. A run that bailed on another update's
@@ -651,14 +673,14 @@ def _workspace_docs_update(
         parts.append(f"{deferred} deferred to an in-flight update")
     if docs_noop:
         parts.append(f"{docs_noop} already current")
-    if docs_failed:
-        parts.append(f"[red]{docs_failed} failed[/red]")
+    if errors:
+        parts.append(f"[red]{len(errors)} failed[/red]")
     summary = ", ".join(parts) if parts else "nothing to update"
     console.print()
     # When every stale repo only deferred (a background update already owns the
     # work), "complete" would overclaim — the real regeneration is still
     # running elsewhere. Say so, and point at the log the hook writes.
-    if deferred and not (docs_updated or core_updated):
+    if deferred and not (docs_updated or core_updated or errors):
         from repowise.core.update_lock import UPDATE_LOCK_SUSPECT_AFTER_SECONDS, format_lock_age
 
         # The oldest lock is the one worth naming: it is the run most likely to
@@ -685,11 +707,14 @@ def _workspace_docs_update(
             f"[dim]({time.monotonic() - start:.1f}s)[/dim]"
         )
     else:
-        console.print(
-            f"[green]Workspace update complete[/green]: {summary} "
-            f"[dim]({time.monotonic() - start:.1f}s)[/dim]"
+        title = (
+            "[red]Workspace update failed[/red]"
+            if errors
+            else "[green]Workspace update complete[/green]"
         )
+        console.print(f"{title}: {summary} [dim]({time.monotonic() - start:.1f}s)[/dim]")
         _print_breaking_changes(ws_root, started_at)
+    return _workspace_outcome(updated=docs_updated + core_updated, deferred=deferred, errors=errors)
 
 
 def _refresh_workspace_editor_project_files(
