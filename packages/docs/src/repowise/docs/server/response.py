@@ -100,6 +100,13 @@ def _normalize_path(path: str) -> str:
 
 
 def _is_test_path(path: str) -> bool:
+    """Classify retrieved docs evidence in the standalone documentation worker.
+
+    This package deploys without repowise.core, so it cannot import the code
+    indexer's test_paths rules. These paths label evidence roles after docs
+    path normalization; they do not govern code-index traversal or analysis.
+    The cross-package architecture guard records that deployment boundary.
+    """
     normalized = _normalize_path(path).lower()
     if normalized.endswith("_test.py"):
         return True

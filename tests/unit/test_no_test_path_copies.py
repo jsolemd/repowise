@@ -94,6 +94,10 @@ _KNOWN: frozenset[str] = frozenset(
         # claim `conftest.py` and `tests/helpers.py`, and giving those fixture
         # parameters would be wrong.
         "packages/core/src/repowise/core/ingestion/framework_edges/pytest_edges.py",
+        # Independently packaged docs worker: core is not installed there.
+        # This predicate labels retrieved evidence roles after docs-specific
+        # normalization rather than governing code indexing or analysis.
+        "packages/docs/src/repowise/docs/server/response.py",
     }
 )
 

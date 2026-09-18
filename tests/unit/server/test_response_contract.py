@@ -41,6 +41,11 @@ WAIVED: dict[tuple[str, str], str] = {
         "owns the schema, and re-declaring it here would be a second copy to "
         "keep in step with a body this server never reads"
     ),
+    ("POST", "/api/docs-libraries/tools/{name}"): (
+        "proxies the documentation worker's tool result unchanged; the selected "
+        "tool owns its payload schema, so a single server response_model would "
+        "duplicate or discard fields from that per-tool contract"
+    ),
 }
 
 #: Routes still serving an anonymous object. Delete a line when you model one.
