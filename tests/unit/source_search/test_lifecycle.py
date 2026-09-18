@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -29,6 +30,7 @@ from repowise.core.source_search.generation import GenerationRef
 from repowise.core.source_search.indexer import build_source_index
 from repowise.core.source_search.lifecycle import (
     SourceIndexDeferredError,
+    _full_chunks,
     _select_plan,
     reconcile_source_index,
     record_source_index_error,
@@ -47,7 +49,7 @@ from repowise.core.source_search.outbox import (
     enqueue_incremental_update,
 )
 from repowise.core.source_search.status import inspect_source_index
-from repowise.core.source_search.vector_store import SourceChunkVectorStore
+from repowise.core.source_search.vector_store import SourceChunkRecord, SourceChunkVectorStore
 
 pytest.importorskip("lancedb")
 
@@ -313,6 +315,237 @@ async def test_incremental_edit_is_atomically_visible_and_idempotent(lifecycle_r
     store = _vector(repo, current)
     assert await store.count() == current.symbol_chunks + current.file_window_chunks
     await store.close()
+
+
+async def _physical_counts(repo, manifest) -> tuple[int, int]:
+    store = _vector(repo, manifest)
+    try:
+        await store._ensure_connected()
+        vector_rows = await store._table.count_rows()
+    finally:
+        await store.close()
+    with _fts(repo, manifest) as fts:
+        fts_rows = fts._conn.execute("SELECT count(*) FROM source_fts").fetchone()[0]
+    return vector_rows, fts_rows
+
+
+async def test_identical_full_snapshots_publish_receipts_without_appending_rows(lifecycle_repo):
+    repo = lifecycle_repo
+    (repo / "src/app.py").write_text(_APP_V2)
+    await _capture(repo, path="src/app.py")
+    await reconcile_source_index(repo, embedder=MockEmbedder(), embedder_identity=_IDENTITY)
+    old = read_manifest(default_manifest_path(repo))
+    assert old is not None and "src/app.py" in old.working_tree_ingest
+    before = await _physical_counts(repo, old)
+    counter = _CountingEmbedder()
+
+    for offset in range(1, 4):
+        result = await reconcile_source_index(
+            repo, embedder=counter, embedder_identity=_IDENTITY, force_full=True
+        )
+        current = read_manifest(default_manifest_path(repo))
+        assert current is not None
+        assert current.generation_sequence == old.generation_sequence + offset
+        assert current.corpus_hash == old.corpus_hash
+        assert current.working_tree_ingest == old.working_tree_ingest
+        assert (result.status, result.embedded, result.reused, result.chunks) == (
+            "published",
+            0,
+            0,
+            3,
+        )
+        assert await _physical_counts(repo, current) == before
+        generation = GenerationRef(current.generation_id, current.generation_sequence)
+        with _fts(repo, current) as fts:
+            assert fts.verify_generation(
+                generation, recipe_fingerprint=current.recipe_fingerprint, expected_count=3
+            )
+        store = _vector(repo, current)
+        assert await store.verify_generation(
+            generation, recipe_fingerprint=current.recipe_fingerprint, expected_count=3
+        )
+        await store.close()
+    assert counter.texts == 0
+    assert all(row.state == PUBLISHED for row in await _updates(repo))
+    with _fts(repo, old) as fts:
+        assert fts.query("newnebula")
+
+
+async def test_full_snapshot_stages_only_changed_added_and_omitted_files(lifecycle_repo):
+    repo = lifecycle_repo
+    (repo / "infra/removed.yaml").write_text("service: removedgalaxy\n")
+    _git(repo, "add", "infra/removed.yaml")
+    await reconcile_source_index(
+        repo, embedder=MockEmbedder(), embedder_identity=_IDENTITY, force_full=True
+    )
+    old = read_manifest(default_manifest_path(repo))
+    assert old is not None
+    assert await _physical_counts(repo, old) == (4, 4)
+
+    (repo / "infra/removed.yaml").unlink()
+    (repo / "infra/added.yaml").write_text("service: addedgalaxy\n")
+    _git(repo, "add", "infra/added.yaml")
+    (repo / "src/app.py").write_text(_APP_V2)
+    await _capture(repo, path="src/app.py")
+    result = await reconcile_source_index(
+        repo, embedder=MockEmbedder(), embedder_identity=_IDENTITY, force_full=True
+    )
+    current = read_manifest(default_manifest_path(repo))
+    assert current is not None
+    assert (result.chunks, result.embedded, result.reused) == (4, 2, 1)
+    assert await _physical_counts(repo, current) == (7, 7)
+    with _fts(repo, old) as prior, _fts(repo, current) as fresh:
+        assert prior.query("removedgalaxy") and prior.query("oldquasar")
+        assert not prior.query("addedgalaxy")
+        assert fresh.query("addedgalaxy") and fresh.query("newnebula")
+        assert not fresh.query("removedgalaxy") and not fresh.query("oldquasar")
+        assert fresh.query("durable_marker")
+    store = _vector(repo, current)
+    await store._ensure_connected()
+    retained = await store._table.query().where("file_path = 'infra/service.yaml'").to_list()
+    assert len(retained) == 1
+    assert retained[0]["valid_from"] < current.generation_sequence
+    await store.close()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("name", "renamed_metadata"),
+        ("kind", "method"),
+        ("start_line", 41),
+        ("end_line", 43),
+        ("is_test", True),
+        ("source", "file_window"),
+        ("text", "changed snippet with the same supplied hash"),
+    ],
+)
+async def test_full_snapshot_compares_persisted_metadata_not_only_hashes(
+    lifecycle_repo, monkeypatch, field, value
+):
+    repo = lifecycle_repo
+    old = read_manifest(default_manifest_path(repo))
+    assert old is not None
+    chunks = await _full_chunks(repo, None)
+    original = next(chunk for chunk in chunks if chunk.name == "alpha")
+    changed = replace(original, **{field: value})
+    assert changed.content_hash == original.content_hash
+
+    async def snapshot(*args):
+        return [changed if chunk == original else chunk for chunk in chunks]
+
+    monkeypatch.setattr("repowise.core.source_search.lifecycle._full_chunks", snapshot)
+    result = await reconcile_source_index(
+        repo, embedder=MockEmbedder(), embedder_identity=_IDENTITY, force_full=True
+    )
+    current = read_manifest(default_manifest_path(repo))
+    assert current is not None
+    assert (result.embedded, result.reused) == (0, 2)
+    assert await _physical_counts(repo, current) == (5, 5)
+    for manifest, expected in [(old, original), (current, changed)]:
+        store = _vector(repo, manifest)
+        records = await store.fetch_by_chunk_ids([original.chunk_id])
+        assert records[original.chunk_id] == SourceChunkRecord.from_chunk(expected)
+        await store.close()
+
+
+@pytest.mark.parametrize("damage", ["vector_row", "fts_row", "fts_payload", "fts_tokens"])
+async def test_full_snapshot_repairs_missing_or_corrupt_rows(lifecycle_repo, damage):
+    repo = lifecycle_repo
+    old = read_manifest(default_manifest_path(repo))
+    assert old is not None
+    if damage == "vector_row":
+        store = _vector(repo, old)
+        await store.delete_by_file(["src/app.py"])
+        await store.close()
+    else:
+        with _fts(repo, old) as fts:
+            if damage == "fts_row":
+                fts.delete_by_file(["src/app.py"])
+            elif damage == "fts_payload":
+                fts._conn.execute("DELETE FROM source_fts WHERE file_path = 'src/app.py'")
+            else:
+                fts._conn.execute(
+                    "UPDATE source_fts SET tokens = 'corruptpayload' WHERE file_path = 'src/app.py'"
+                )
+            fts._conn.commit()
+
+    await reconcile_source_index(
+        repo, embedder=MockEmbedder(), embedder_identity=_IDENTITY, force_full=True
+    )
+    current = read_manifest(default_manifest_path(repo))
+    assert current is not None
+    with _fts(repo, current) as fts:
+        assert fts.count() == 3
+        assert fts.query("oldquasar") and fts.query("stablecomet")
+        assert not fts.query("corruptpayload")
+    store = _vector(repo, current)
+    assert len(await store.active_records()) == 3
+    await store.close()
+
+
+@pytest.mark.parametrize("stage", ["after_fts", "after_vector", "after_ready"])
+@pytest.mark.parametrize("edited", [False, True])
+async def test_full_delta_retry_preserves_old_readers_and_row_counts(lifecycle_repo, stage, edited):
+    repo = lifecycle_repo
+    old = read_manifest(default_manifest_path(repo))
+    assert old is not None
+    if edited:
+        (repo / "src/app.py").write_text(_APP_V2)
+        await _capture(repo, path="src/app.py")
+
+    def crash(boundary):
+        if boundary == stage:
+            raise _Crash(boundary)
+
+    with pytest.raises(_Crash):
+        await reconcile_source_index(
+            repo,
+            embedder=MockEmbedder(),
+            embedder_identity=_IDENTITY,
+            force_full=True,
+            failure_injector=crash,
+        )
+    assert read_manifest(default_manifest_path(repo)) == old
+    with _fts(repo, old) as fts:
+        assert fts.query("oldquasar") and not fts.query("newnebula")
+
+    await reconcile_source_index(repo, embedder=MockEmbedder(), embedder_identity=_IDENTITY)
+    current = read_manifest(default_manifest_path(repo))
+    assert current is not None
+    assert await _physical_counts(repo, current) == ((5, 5) if edited else (3, 3))
+    with _fts(repo, current) as fts:
+        assert bool(fts.query("newnebula")) == edited
+        assert bool(fts.query("oldquasar")) != edited
+    assert all(row.state == PUBLISHED for row in await _updates(repo))
+
+
+@pytest.mark.parametrize("stage", ["after_fts", "after_vector"])
+async def test_full_snapshot_retry_can_shrink_to_an_empty_delta(lifecycle_repo, stage):
+    repo = lifecycle_repo
+    (repo / "src/app.py").write_text(_APP_V2)
+    await _capture(repo, path="src/app.py")
+
+    def crash(boundary):
+        if boundary == stage:
+            raise _Crash(boundary)
+
+    with pytest.raises(_Crash):
+        await reconcile_source_index(
+            repo,
+            embedder=MockEmbedder(),
+            embedder_identity=_IDENTITY,
+            force_full=True,
+            failure_injector=crash,
+        )
+    (repo / "src/app.py").write_text(_APP_V1)
+    await reconcile_source_index(repo, embedder=MockEmbedder(), embedder_identity=_IDENTITY)
+    current = read_manifest(default_manifest_path(repo))
+    assert current is not None
+    assert await _physical_counts(repo, current) == (3, 3)
+    with _fts(repo, current) as fts:
+        assert fts.count() == 3 and fts.query("oldquasar")
+        assert not fts.query("newnebula")
 
 
 async def test_fast_capture_replaces_a_tracked_excluded_file_window(lifecycle_repo):
@@ -829,6 +1062,7 @@ async def test_model_recipe_change_builds_beside_and_flips_once(lifecycle_repo):
     assert result.status == "published"
     assert current.recipe_fingerprint != old.recipe_fingerprint
     assert current.lance_table != old.lance_table
+    assert current.fts_path != old.fts_path
     assert current.symbol_chunks == old.symbol_chunks
     assert current.file_window_chunks == old.file_window_chunks
     old_store = _vector(repo, old)
@@ -837,6 +1071,51 @@ async def test_model_recipe_change_builds_beside_and_flips_once(lifecycle_repo):
     new_store = _vector(repo, current, embedder=wide)
     assert await new_store.count() == current.symbol_chunks + current.file_window_chunks
     await new_store.close()
+
+
+@pytest.mark.parametrize("stage", ["after_fts", "after_ready"])
+async def test_recipe_change_retries_with_fresh_fts_and_keeps_old_readers(lifecycle_repo, stage):
+    repo = lifecycle_repo
+    old = read_manifest(default_manifest_path(repo))
+    assert old is not None
+    wide = _WideEmbedder()
+    identity = EmbedderIdentity(provider="mock", model="WideMock", dims=16)
+
+    def crash(boundary):
+        if boundary == stage:
+            raise _Crash(boundary)
+
+    with _fts(repo, old) as prior:
+        with pytest.raises(_Crash):
+            await reconcile_source_index(
+                repo, embedder=wide, embedder_identity=identity, failure_injector=crash
+            )
+        assert read_manifest(default_manifest_path(repo)) == old
+        assert prior.query("oldquasar")
+        assert await _physical_counts(repo, old) == (3, 3)
+        staged_paths = set((repo / old.fts_path).parent.glob("source_fts_*.db")) - {
+            repo / old.fts_path
+        }
+        assert len(staged_paths) == 1
+        await reconcile_source_index(repo, embedder=wide, embedder_identity=identity)
+        current = read_manifest(default_manifest_path(repo))
+        assert current is not None and current.fts_path != old.fts_path
+        assert staged_paths == {repo / current.fts_path}
+        assert await _physical_counts(repo, current) == (3, 3)
+
+        # The next update must follow the published path, not the original
+        # source_fts_v2.db default. Both old handles and reopened readers work.
+        (repo / "src/app.py").write_text(_APP_V2)
+        await _capture(repo, path="src/app.py")
+        await reconcile_source_index(repo, embedder=wide, embedder_identity=identity)
+        updated = read_manifest(default_manifest_path(repo))
+        assert updated is not None and updated.fts_path == current.fts_path
+        with _fts(repo, updated) as fresh:
+            assert fresh.query("newnebula") and not fresh.query("oldquasar")
+        assert prior.query("oldquasar") and not prior.query("newnebula")
+        with _fts(repo, old) as reopened:
+            assert reopened.query("oldquasar") and not reopened.query("newnebula")
+        assert await _physical_counts(repo, old) == (3, 3)
 
 
 async def test_outbox_row_rolls_back_with_its_symbol_transaction(lifecycle_repo):

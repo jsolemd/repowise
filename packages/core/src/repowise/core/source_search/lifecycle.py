@@ -10,7 +10,7 @@ convergent rather than compensating.
 from __future__ import annotations
 
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -56,7 +56,7 @@ from .outbox import (
     mark_update_state,
     mark_updates_ready,
 )
-from .vector_store import SourceChunkVectorStore
+from .vector_store import SourceChunkRecord, SourceChunkVectorStore
 from .worktree import build_ingest_record
 
 __all__ = [
@@ -232,9 +232,7 @@ async def record_source_index_error(
     repo = Path(repo_path).resolve()
     _repository, updates = await _load_work(repo, db_url)
     pending_ids = [
-        update.generation_id
-        for update in updates
-        if update.state in {PENDING, BUILDING}
+        update.generation_id for update in updates if update.state in {PENDING, BUILDING}
     ]
     if pending_ids:
         await _set_state(repo, db_url, pending_ids, PENDING, error=error)
@@ -249,7 +247,9 @@ def _select_plan(
 ) -> _Plan | None:
     active_sequence = manifest.generation_sequence if manifest is not None else 0
     outstanding = [update for update in updates if update.sequence > active_sequence]
-    processable = [update for update in outstanding if update.upstream_ready and update.state != BLOCKED]
+    processable = [
+        update for update in outstanding if update.upstream_ready and update.state != BLOCKED
+    ]
     if not processable:
         return None
     target = processable[-1]
@@ -413,11 +413,7 @@ async def _full_chunks(repo: Path, db_url: str | None) -> list[SourceChunk]:
 
     symbols = await _load_symbols_for_paths(repo, db_url)
     unreadable = sorted(
-        {
-            symbol.file_path
-            for symbol in symbols
-            if not (repo / symbol.file_path).is_file()
-        }
+        {symbol.file_path for symbol in symbols if not (repo / symbol.file_path).is_file()}
     )
     if unreadable:
         raise SourceIndexDeferredError(
@@ -592,7 +588,9 @@ async def _reconcile_source_index_unlocked(
 
     managed_active = active is not None and active.generation_sequence > 0
     active_invalid = bool(
-        managed_active and active is not None and not await _verify_candidate(repo, embedder, active)
+        managed_active
+        and active is not None
+        and not await _verify_candidate(repo, embedder, active)
     )
     if active_invalid and not updates:
         await _enqueue_manual_full(repo, db_url)
@@ -671,6 +669,13 @@ async def _reconcile_source_index_unlocked(
             else vector_table_for_recipe(fingerprint)
         )
     )
+    # Keep both stores beside the old recipe. The manifest owns the path, so
+    # existing readers retain their file and retries reopen the same candidate.
+    fts_path = generation_fts_path(repo)
+    if same_recipe and active is not None:
+        fts_path = repo / active.fts_path
+    elif managed_active:
+        fts_path = fts_path.with_name(f"source_fts_{target.generation_id}.db")
     lance_dir = repo / ".repowise" / "lancedb"
     lance_dir.mkdir(parents=True, exist_ok=True)
     active_store = SourceChunkVectorStore(
@@ -702,12 +707,27 @@ async def _reconcile_source_index_unlocked(
             stale_files = dict(plan.stale_files)
         if not chunks and (plan.full or await active_store.count() == 0):
             raise SourceIndexDeferredError("the reconciled source corpus is empty")
+        covered_paths = {chunk.file_path for chunk in chunks}
+        if plan.full and same_recipe:
+            current: dict[str, Counter[SourceChunkRecord]] = defaultdict(Counter)
+            desired: dict[str, Counter[SourceChunkRecord]] = defaultdict(Counter)
+            for record in await active_store.active_records():
+                current[record.file_path][record] += 1
+            for chunk in chunks:
+                desired[chunk.file_path][SourceChunkRecord.from_chunk(chunk)] += 1
+            changed = {
+                path for path in current.keys() | desired.keys() if current[path] != desired[path]
+            }
+            with SourceFTSIndex(fts_path, generation=parent, read_only=True) as fts:
+                changed.update(fts.changed_file_paths(chunks))
+            close_paths = sorted(changed)
+            chunks = [chunk for chunk in chunks if chunk.file_path in changed]
         _inject(failure_injector, "after_chunks")
         load_seconds = time.perf_counter() - load_started
 
         embed_started = time.perf_counter()
         try:
-            reusable = await prior_store.vectors_by_content_hash() if same_recipe else {}
+            reusable = await prior_store.vectors_by_content_hash() if same_recipe and chunks else {}
         except Exception:
             log.warning("source_index_vector_reuse_skipped", exc_info=True)
             reusable = {}
@@ -727,7 +747,7 @@ async def _reconcile_source_index_unlocked(
         for generation in superseded:
             await active_store.rollback_generation(generation)
 
-        if plan.full:
+        if plan.full and not same_recipe:
             try:
                 close_paths = await active_store.active_file_paths()
             except Exception:
@@ -739,14 +759,13 @@ async def _reconcile_source_index_unlocked(
         vector_expected = active_count - closing_count + len(chunks)
 
         write_started = time.perf_counter()
-        fts_path = generation_fts_path(repo)
         with SourceFTSIndex(fts_path, generation=parent) as fts:
             for generation in superseded:
                 fts.rollback_generation(generation)
-            fts_close_paths = fts.active_file_paths() if plan.full else close_paths
-            fts_expected = (
-                fts.count() - fts.count_for_files(fts_close_paths) + len(chunks)
+            fts_close_paths = (
+                fts.active_file_paths() if plan.full and not same_recipe else close_paths
             )
+            fts_expected = fts.count() - fts.count_for_files(fts_close_paths) + len(chunks)
             fts.stage_generation(
                 target,
                 close_paths=fts_close_paths,
@@ -805,7 +824,7 @@ async def _reconcile_source_index_unlocked(
                 prior=active.working_tree_ingest if active is not None else {},
                 full=plan.full,
                 replaced=[(change.path, change.content_hash) for change in plan.replace],
-                covered={chunk.file_path for chunk in chunks},
+                covered=covered_paths,
             ),
         )
         await _set_state(

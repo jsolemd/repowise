@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from typing import Any
 
 from repowise.core.providers.embedding.base import Embedder
@@ -82,6 +82,23 @@ class SourceChunkRecord:
     source: str
     content_hash: str
     snippet: str
+
+    @classmethod
+    def from_chunk(cls, chunk: SourceChunk) -> SourceChunkRecord:
+        """The canonical persisted metadata, including the bounded snippet."""
+
+        return cls(
+            chunk_id=chunk.chunk_id,
+            file_path=chunk.file_path,
+            name=chunk.name,
+            kind=chunk.kind,
+            start_line=int(chunk.start_line),
+            end_line=int(chunk.end_line),
+            is_test=bool(chunk.is_test),
+            source=chunk.source,
+            content_hash=chunk.content_hash,
+            snippet=chunk.text[:STORED_SNIPPET_CHARS],
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -281,21 +298,12 @@ class SourceChunkVectorStore:
         generation: GenerationRef,
     ) -> dict[str, Any]:
         return {
+            **asdict(SourceChunkRecord.from_chunk(chunk)),
             "row_key": version_row_id(generation, chunk.chunk_id),
-            "chunk_id": chunk.chunk_id,
             "generation_id": generation.generation_id,
             "valid_from": generation.sequence,
             "valid_to": OPEN_ENDED_GENERATION,
             "vector": [float(value) for value in vector],
-            "file_path": chunk.file_path,
-            "name": chunk.name,
-            "kind": chunk.kind,
-            "start_line": int(chunk.start_line),
-            "end_line": int(chunk.end_line),
-            "is_test": bool(chunk.is_test),
-            "source": chunk.source,
-            "content_hash": chunk.content_hash,
-            "snippet": chunk.text[:STORED_SNIPPET_CHARS],
         }
 
     @staticmethod
@@ -442,6 +450,19 @@ class SourceChunkVectorStore:
             await self._table.delete(_quoted_in("file_path", file_paths[start : start + _IN_CHUNK]))
 
     # -- reading and verification ---------------------------------------
+
+    async def active_records(self) -> list[SourceChunkRecord]:
+        """Read complete visible metadata without loading embedding vectors."""
+
+        await self._ensure_connected()
+        if self._table is None:
+            return []
+        rows = await (
+            self._visible_query(self._table.query())
+            .select([field.name for field in fields(SourceChunkRecord)])
+            .to_list()
+        )
+        return [self._record(row) for row in rows]
 
     async def stored_vectors(self) -> dict[str, StoredVector]:
         """Visible vectors keyed by chunk id."""

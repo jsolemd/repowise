@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
+from collections import Counter, defaultdict
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -267,8 +268,8 @@ class SourceFTSIndex:
 
         rows = [self._chunk_row(chunk, generation) for chunk in chunks]
         with self._conn:
-            # Retrying this generation starts its new rows over, while the
-            # parent rows' valid_to=N assignment is naturally idempotent.
+            # Retry from the parent view: a full snapshot may now have a
+            # smaller delta (for example, an edit reverted before retry).
             retry_keys = [
                 str(row[0])
                 for row in self._conn.execute(
@@ -277,6 +278,10 @@ class SourceFTSIndex:
                 ).fetchall()
             ]
             self._delete_row_keys(retry_keys)
+            self._conn.execute(
+                f"UPDATE {_VERSIONS} SET valid_to = ? WHERE valid_to = ?",
+                (OPEN_ENDED_GENERATION, generation.sequence),
+            )
 
             for start in range(0, len(close_paths), _IN_CHUNK):
                 batch = list(dict.fromkeys(close_paths[start : start + _IN_CHUNK]))
@@ -408,6 +413,28 @@ class SourceFTSIndex:
 
     # -- verification and reading ---------------------------------------
 
+    def changed_file_paths(self, chunks: Sequence[SourceChunk]) -> set[str]:
+        """Compare a full snapshot with the actual visible lexical payloads.
+
+        Receipts count visibility rows, so they alone cannot detect a missing
+        or damaged FTS payload. Compare the same tokenised records we write,
+        including multiplicity, before retaining an unchanged file version.
+        """
+
+        expected: dict[str, Counter[tuple[str, ...]]] = defaultdict(Counter)
+        actual: dict[str, Counter[tuple[str, ...]]] = defaultdict(Counter)
+        for chunk in chunks:
+            expected[chunk.file_path][self._chunk_row(chunk, self.generation)[1:]] += 1
+        rows = self._conn.execute(
+            f"SELECT v.file_path, f.chunk_id, f.file_path, f.tokens, f.name "
+            f"FROM {_TABLE} AS f JOIN {_VERSIONS} AS v ON v.row_key = f.row_key "
+            "WHERE v.valid_from <= ? AND v.valid_to > ?",
+            (self.generation.sequence, self.generation.sequence),
+        )
+        for path, *record in rows:
+            actual[path][tuple(record)] += 1
+        return {path for path in expected.keys() | actual.keys() if expected[path] != actual[path]}
+
     def verify_generation(
         self,
         generation: GenerationRef,
@@ -520,8 +547,7 @@ class SourceFTSIndex:
                 ).fetchall()
             else:
                 rows = self._conn.execute(
-                    f"SELECT DISTINCT file_path FROM {_TABLE} "
-                    f"WHERE file_path IN ({placeholders})",
+                    f"SELECT DISTINCT file_path FROM {_TABLE} WHERE file_path IN ({placeholders})",
                     tuple(batch),
                 ).fetchall()
             found.update(str(row[0]) for row in rows if row[0])
