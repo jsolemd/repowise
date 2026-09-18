@@ -1,6 +1,29 @@
 """Tests for AST-based source symbol extraction."""
 
+import pytest
+
 from repowise.docs.chunking.extractors.ast_symbols import extract_ast_declarations
+
+
+@pytest.mark.parametrize(
+    ("language", "content"),
+    [
+        ("python", "class Widget:\n    pass\n"),
+        ("javascript", "export class Widget { run() { return 1; } }"),
+        ("typescript", "export class Widget { run(): number { return 1; } }"),
+        ("tsx", "export function Widget() { return <div />; }"),
+        ("java", "public class Widget { public int run() { return 1; } }"),
+        ("go", "package main\ntype Widget struct{}\n"),
+        ("rust", "pub struct Widget {}"),
+        ("kotlin", "class Widget {}"),
+        ("scala", "class Widget {}"),
+    ],
+)
+def test_supported_languages_extract_real_declarations(language, content):
+    """A missing grammar must fail verification, not quietly become a fallback."""
+    declarations = extract_ast_declarations(content, language)
+    assert declarations is not None, f"AST parser unavailable for {language}"
+    assert any(name == "Widget" for _, name, _ in declarations)
 
 
 def test_extract_python_declarations_includes_async_method():

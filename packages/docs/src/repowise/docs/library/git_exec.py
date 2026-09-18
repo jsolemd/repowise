@@ -6,6 +6,7 @@ import asyncio
 import logging
 import os
 import re
+import signal
 import tempfile
 import weakref
 from dataclasses import dataclass
@@ -142,12 +143,25 @@ async def run_git(
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     env=env,
+                    start_new_session=os.name == "posix",
                 )
 
                 try:
                     stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-                except TimeoutError:
-                    proc.kill()
+                except (TimeoutError, asyncio.CancelledError) as exc:
+                    # Git may have helpers holding its pipes open. Stop the
+                    # whole group, then drain and reap before releasing the
+                    # concurrency slot or propagating cancellation.
+                    try:
+                        if os.name == "posix":
+                            os.killpg(proc.pid, signal.SIGKILL)
+                        else:
+                            proc.kill()
+                    except ProcessLookupError:
+                        pass
+                    await proc.communicate()
+                    if isinstance(exc, asyncio.CancelledError):
+                        raise
                     raise GitError(
                         command=" ".join(cmd),
                         return_code=-1,
