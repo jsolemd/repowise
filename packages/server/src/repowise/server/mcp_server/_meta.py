@@ -526,11 +526,18 @@ def agent_trust(envelope: dict[str, Any]) -> dict[str, Any]:
         "runtime_breakage_proven",
         "existing_verified_code",
     )
-    trust = {key: envelope[key] for key in fields if key in envelope}
+    def project(member: dict[str, Any]) -> dict[str, Any]:
+        facts = {key: member[key] for key in fields if key in member}
+        scope = member.get("index_scope")
+        if isinstance(scope, dict):
+            facts["index_scope"] = _index_scope_trust(scope)
+        return facts
+
+    trust = project(envelope)
     freshness = envelope.get("repo_freshness")
     if isinstance(freshness, dict):
         trust["repo_freshness"] = {
-            alias: {key: member[key] for key in fields if key in member}
+            alias: project(member)
             for alias, member in freshness.items()
             if isinstance(member, dict)
         }
@@ -547,6 +554,47 @@ def agent_trust(envelope: dict[str, Any]) -> dict[str, Any]:
         if facts:
             trust["source_search"] = facts
     return trust
+
+
+def _index_scope_trust(scope: dict[str, Any]) -> dict[str, Any]:
+    """Bound the achieved coverage facts that must survive dropped protocol metadata."""
+    def scalars(value: Any, fields: tuple[str, ...]) -> dict[str, Any]:
+        if not isinstance(value, dict):
+            return {}
+        projected: dict[str, Any] = {}
+        for key in fields:
+            if key not in value:
+                continue
+            item = value[key]
+            if item is None or isinstance(item, (str, bool, int, float)):
+                projected[key] = item[:256] if isinstance(item, str) else item
+        return projected
+
+    facts = scalars(
+        scope, ("version", "run_mode", "content_provenance", "git_tier", "git_commit_cap")
+    )
+    groups = {
+        "git_history_coverage": (
+            "eligible_files", "files_with_history", "unavailable_files",
+            "retained_commits", "per_file_limit", "complete_through_depth",
+        ),
+        "file_pages": ("configured_cap", "effective_cap", "eligible", "generated", "omitted"),
+        "upgrade": ("status", "retryable", "next_stage"),
+        "search": ("full_text", "semantic"),
+    }
+    for key, fields in groups.items():
+        if key in scope:
+            facts[key] = None if scope[key] is None else scalars(scope[key], fields)
+    analysis = scope.get("analysis")
+    if isinstance(analysis, dict):
+        facts["analysis"] = {}
+        for key in ("unavailable", "skipped"):
+            values = analysis.get(key)
+            if isinstance(values, list):
+                facts["analysis"][key] = [str(value)[:256] for value in values[:8]]
+                if len(values) > 8:
+                    facts["analysis"][f"{key}_omitted"] = len(values) - 8
+    return facts
 
 
 def _source_trust(source: dict[str, Any]) -> dict[str, Any]:

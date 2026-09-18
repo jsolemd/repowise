@@ -74,6 +74,50 @@ def test_structural_and_generated_evidence_cannot_masquerade_as_runtime_or_sourc
     assert generated["_meta"]["existing_verified_code"] is False
 
 
+def test_index_scope_survives_hosts_that_drop_protocol_metadata():
+    from repowise.core.index_scope import resolve_index_scope
+
+    scope = resolve_index_scope({
+        "docs_mode": "deterministic",
+        "run_mode": "fast",
+        "git_tier": "essential",
+        "index_scope": {
+            "file_pages": {"eligible": 100, "generated": 20, "omitted": 80},
+            "analysis": {"unavailable": [f"analysis-{number}" for number in range(20)]},
+        },
+    })
+    scope["diagnostic_log"] = "internal trace" * 1000
+    result = _meta.finalize_trust_envelope({
+        "_meta": {
+            "index_scope": scope,
+            "repo_freshness": {"web": {"index_scope": scope, "index_behind": False}},
+        },
+    })
+    del result["_meta"]  # Model-visible payload on a connector that drops protocol metadata.
+
+    visible = result["trust"]["index_scope"]
+    assert visible["content_provenance"] == "template"
+    assert visible["run_mode"] == "fast"
+    assert visible["git_tier"] == "essential"
+    assert visible["file_pages"]["omitted"] == 80
+    assert len(visible["analysis"]["unavailable"]) == 8
+    assert visible["analysis"]["unavailable_omitted"] == 12
+    assert "diagnostic_log" not in visible
+    assert result["trust"]["repo_freshness"]["web"]["index_scope"] == visible
+
+
+def test_index_scope_projection_preserves_unknown_coverage_and_bounds_details():
+    scope = {
+        "git_commit_cap": None,
+        "git_history_coverage": None,
+        "analysis": {"skipped": ["x" * 2000]},
+    }
+    visible = _meta.agent_trust({"index_scope": scope})["index_scope"]
+    assert visible["git_commit_cap"] is None
+    assert visible["git_history_coverage"] is None
+    assert visible["analysis"]["skipped"] == ["x" * 256]
+
+
 def test_every_registered_tool_has_a_valid_tier_and_specialist_trust_kinds():
     from repowise.core.registry import TOOL_TIERS, mcp_tool_registry
     from repowise.server.mcp_server import ensure_full_surface
