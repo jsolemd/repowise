@@ -13,6 +13,7 @@ import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from repowise.cli.commands.augment_cmd import decision_inject
@@ -21,6 +22,14 @@ from repowise.core.persistence.models import GitMetadata, Repository
 
 _REPO_ID = "repo1"
 _PATH = "src/core/pipeline.py"
+
+
+@pytest.fixture(autouse=True)
+def _stable_notice_clock(time_machine):
+    # Both fixture creation and the notice read must share one instant. A
+    # backwards wall-clock adjustment otherwise turns exactly 14 days into
+    # 13 completed days and makes the copy assertion depend on host timing.
+    time_machine.move_to(datetime(2026, 9, 18, 12, tzinfo=UTC), tick=False)
 
 
 async def _build_wiki_db(repo_root: Path, **columns) -> None:
@@ -144,6 +153,21 @@ def test_humanize_age_reads_like_a_person_wrote_it():
     assert decision_inject._humanize_age(5) == "5 days ago"
     assert decision_inject._humanize_age(14) == "2 weeks ago"
     assert decision_inject._humanize_age(90) == "3 months ago"
+
+
+@pytest.mark.parametrize(
+    ("offset", "expected"),
+    [
+        (timedelta(microseconds=1), "13 days ago"),
+        (timedelta(), "2 weeks ago"),
+        (-timedelta(microseconds=1), "2 weeks ago"),
+    ],
+)
+def test_notice_age_uses_completed_days_at_week_boundary(offset, expected):
+    last_fix_at = _days_ago(14) + offset
+    days = decision_inject._days_since(last_fix_at)
+    assert days is not None
+    assert decision_inject._humanize_age(days) == expected
 
 
 def test_top_fix_symbol_tolerates_junk():
