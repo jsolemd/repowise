@@ -1780,19 +1780,19 @@ def run_update(
                     "fingerprint was retained so the next update retries."
                 )
 
-            if det_pages:
+            if det_pages or affected.decay_only:
                 # Its own session, apart from the index persist below, so it
                 # is its own row rather than a ``persist.*`` one.
                 with timed(timings, "render.persist"):
                     state["total_pages"] = persist_deterministic_pages(
                         repo_path=repo_path,
                         generated_pages=det_pages,
-                        # decay_only are cascade-reached templates the render
-                        # did not touch: marked stale so the view stays honest
-                        # about which pages predate this commit.
+                        # Persistence exempts only completed fresh renders;
+                        # skipped or failed pages still need their stale bit.
                         decay_paths=affected.decay_only,
                         degraded=degraded,
                     )
+            if det_pages:
                 state["last_docs_commit"] = head
                 console.print(
                     f"  [green]✓[/green] Re-rendered [bold]{len(det_pages)}[/bold] "

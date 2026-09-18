@@ -453,13 +453,27 @@ async def _persist_async(
             # already heals these pages; doing it first and exempting them
             # would skip the only pages that need it.
 
-            # Pages the cascade reached but the budget did not: marked stale so
-            # the coverage view is honest about which template pages predate
-            # the current commit.
+            # Stale-page reconciliation can append a path the cascade also
+            # planned to decay. Only a completed fresh render earns exemption;
+            # omitted pages and failure stubs must remain stale and retryable.
             try:
+                from repowise.core.generation.models import compute_page_id, is_stub_fallback
                 from repowise.core.pipeline.persist import mark_stale_pages
 
-                await mark_stale_pages(session, repo_id, decay_paths or [])
+                refreshed_ids = {
+                    page.page_id
+                    for page in generated_pages
+                    if page.freshness_status == "fresh" and not is_stub_fallback(page)
+                }
+                await mark_stale_pages(
+                    session,
+                    repo_id,
+                    (
+                        path
+                        for path in decay_paths or []
+                        if compute_page_id("file_page", path) not in refreshed_ids
+                    ),
+                )
             except Exception as exc:
                 degraded.append(f"Stale-page decay: {exc}")
 
