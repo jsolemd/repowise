@@ -25,11 +25,12 @@ def _result(index_done: bool) -> SimpleNamespace:
         repo_name="repo",
         index_persisted_incrementally=index_done,
         parsed_files=[parsed],
+        file_infos=[parsed.file_info],
         generated_pages=[],
         tech_stack=None,
         vector_store=None,
         dead_code_report=None,
-        health_report=None,
+        health_report=object(),
         decision_report=None,
         git_metadata_list=[],
         knowledge_graph_result=None,
@@ -61,6 +62,9 @@ async def test_both_routes_fire_every_post_index_hook(tmp_path, monkeypatch, ind
         persist_module, "persist_ingestion", lambda *_a, **_k: _record("ingestion", 0)
     )
     monkeypatch.setattr(persist_module, "persist_git", lambda *_a, **_k: _record("git"))
+    monkeypatch.setattr(
+        persist_module, "persist_symbol_analysis", lambda *_a, **_k: _record("symbol_analysis")
+    )
     monkeypatch.setattr(persist_module, "persist_analysis", lambda *_a, **_k: _record("analysis"))
     monkeypatch.setattr(
         persist_module, "persist_generation", lambda *_a, **_k: _record("generation")
@@ -97,6 +101,7 @@ async def test_both_routes_fire_every_post_index_hook(tmp_path, monkeypatch, ind
     await persist_result(_result(index_done), repo_path)
 
     post_index = [
+        "symbol_analysis",
         "analysis",
         "retired_sweep",
         "generation",

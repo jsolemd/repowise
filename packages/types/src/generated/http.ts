@@ -2332,6 +2332,7 @@ export interface RepoResponse {
   docs_skip_reason?: string | null;
   run_mode?: string | null;
   git_tier?: string | null;
+  index_scope?: Record<string, unknown> | null;
   initial_job_id?: string | null;
 }
 
@@ -2626,7 +2627,9 @@ export interface TestImpactEvidence {
 
 export interface TestImpactFile {
   source_file: string;
-  status: "measured" | "inferred" | "unknown";
+  status: "measured" | "inferred" | "unknown" | "deleted";
+  change_status?: string | null;
+  head_present?: boolean;
   measured_tests: string[];
   measured_tests_total: number;
   inferred_tests: string[];
@@ -2659,6 +2662,7 @@ export interface TestImpactResponse {
   files_total: number;
   files_without_measured_tests: string[];
   unknown_files: string[];
+  deleted_files?: string[];
   coverage: TestImpactCoverage;
   inference: TestImpactInference;
   analysis: TestImpactAnalysis;
@@ -2769,6 +2773,9 @@ export interface WorkspaceBreakingChange {
   provider_service?: string | null;
   provider_node_id?: string;
   detail: string;
+  side?: string | null;
+  comparison_source?: string | null;
+  comparison_key?: string | null;
   field_name?: string | null;
   old_value?: string | null;
   new_value?: string | null;
@@ -2891,6 +2898,9 @@ export interface WorkspaceContractsResponse {
 export interface WorkspaceCrossRepoSummary {
   co_change_count?: number;
   package_dep_count?: number;
+  package_diagnostic_count?: number;
+  package_diagnostics_emitted?: number;
+  package_diagnostic_codes?: string[];
   top_connections?: Record<string, unknown>[];
 }
 

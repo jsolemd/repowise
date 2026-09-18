@@ -55,9 +55,7 @@ def _print_repo_result(result: Any) -> None:
 
 def _remove_tombstoned_page_vectors(ws_root: Path, ws_config: Any, results: list[Any]) -> None:
     """Let the CLI host apply core persistence's page-vector delete contract."""
-    from repowise.cli.helpers import load_config
-
-    from .incremental import _build_update_vector_store
+    from .incremental import cleanup_retired_page_vectors
 
     by_alias = {result.alias: result for result in results}
     for entry in ws_config.repos:
@@ -77,13 +75,11 @@ def _remove_tombstoned_page_vectors(ws_root: Path, ws_config: Any, results: list
             if result is not None and result.updated
             else []
         )
-        if not page_ids:
+        if result is None or not result.updated:
             continue
         repo_path = (ws_root / entry.path).resolve()
         try:
-            store = _build_update_vector_store(repo_path, load_config(repo_path))
-            if store is not None:
-                run_async(store.delete_many(page_ids))
+            cleanup_retired_page_vectors(repo_path, page_ids)
         except Exception as exc:
             console.print(
                 f"  [yellow]{entry.alias}: retired page vector removal deferred: {exc}[/yellow]"
@@ -125,6 +121,7 @@ def _workspace_update(
     from repowise.cli.helpers import load_state
     from repowise.core.docs_mode import resolve_docs_mode
     from repowise.core.ingestion.change_detector import has_working_tree_changes
+    from repowise.core.repo_config import config_fingerprint
     from repowise.core.workspace import (
         check_repo_staleness,
         reconcile_repo_head_commit,
@@ -163,6 +160,14 @@ def _workspace_update(
         stored = entry.last_commit_at_index
         commit_stale, head, behind = check_repo_staleness(abs_path, stored)
         indexed = (abs_path / ".repowise").is_dir()
+        repo_state = load_state(abs_path) if indexed else {}
+        config_stale = bool(
+            indexed
+            and (
+                repo_state.get("config_fingerprint") is None
+                or repo_state.get("config_fingerprint") != config_fingerprint(abs_path)
+            )
+        )
         recipe_changes: tuple[str, ...] = ()
         if indexed:
             try:
@@ -177,11 +182,6 @@ def _workspace_update(
                 recipe_changes = ()
         if recipe_changes:
             recipe_drift_aliases.add(entry.alias)
-        repo_state = (
-            load_state(abs_path)
-            if indexed and (include_working_tree or accept_mass_deletion)
-            else None
-        )
         has_uncommitted_changes = (
             include_working_tree and indexed and has_working_tree_changes(abs_path)
         )
@@ -195,6 +195,7 @@ def _workspace_update(
         )
         is_stale = (
             commit_stale
+            or config_stale
             or has_uncommitted_changes
             or has_working_tree_cleanup
             or has_accepted_prune
@@ -204,6 +205,8 @@ def _workspace_update(
             status = "[dim]not indexed[/dim]"
         elif is_stale:
             reasons: list[str] = []
+            if config_stale:
+                reasons.append("config changed")
             if commit_stale:
                 reasons.append(f"{behind} new commit(s)")
             if has_uncommitted_changes:
@@ -221,8 +224,6 @@ def _workspace_update(
         if is_stale:
             stale_count += 1
             if indexed:
-                if repo_state is None:
-                    repo_state = load_state(abs_path)
                 if not _resolve_index_only_mode(
                     index_only=index_only, docs_flag=docs_flag, state=repo_state
                 ):

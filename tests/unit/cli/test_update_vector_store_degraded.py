@@ -8,9 +8,16 @@ is silently off.
 
 from __future__ import annotations
 
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
-from repowise.cli.commands.update_cmd.incremental import _build_update_vector_store
+import pytest
+
+from repowise.cli.commands.update_cmd.incremental import (
+    _build_update_vector_store,
+    cleanup_retired_page_vectors,
+)
+from repowise.core.pipeline.cleanup_debt import load_cleanup_debt
 
 
 def test_failure_is_recorded_in_degraded() -> None:
@@ -46,3 +53,18 @@ def test_success_returns_the_store() -> None:
     ):
         assert _build_update_vector_store("/tmp/repo", {"embedder": "ollama"}, degraded) is store
     assert degraded == []
+
+
+def test_failed_vector_cleanup_retries_without_new_retirements(tmp_path) -> None:
+    """A swept SQL row cannot rediscover its vector id on a later update."""
+    page_id = "module_page:removed"
+    store = SimpleNamespace(delete_many=AsyncMock(side_effect=OSError("store unavailable")))
+    with pytest.raises(OSError, match="store unavailable"):
+        cleanup_retired_page_vectors(tmp_path, [page_id], vector_store=store)
+    assert load_cleanup_debt(tmp_path)["vectors"] == {page_id}
+
+    store.delete_many = AsyncMock()
+    cleanup_retired_page_vectors(tmp_path, [], vector_store=store)
+
+    store.delete_many.assert_awaited_once_with([page_id])
+    assert load_cleanup_debt(tmp_path)["vectors"] == set()

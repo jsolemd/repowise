@@ -127,6 +127,117 @@ async def mark_tombstone_pages(
     return marked
 
 
+async def tombstone_file_pages_outside_scope(
+    session: Any, repo_id: str, current_file_paths: set[str]
+) -> list[str]:
+    """Tombstone active source-backed pages outside a full traversal's scope.
+
+    Files removed by ``exclude_patterns`` still exist on disk, so the ordinary
+    deleted-file tombstone path cannot identify them.  A successful full
+    traversal can: any active file page outside its parsed-file set is no longer
+    part of this index.
+    """
+    from sqlalchemy import select
+
+    from repowise.core.persistence.models import Page
+
+    pages = (
+        await session.execute(
+            select(Page).where(
+                Page.repository_id == repo_id,
+                Page.page_type.in_(("file_page", "api_contract", "infra_page", "symbol_spotlight")),
+                Page.freshness_status != "tombstone",
+            )
+        )
+    ).scalars()
+    marked: list[str] = []
+    for page in pages:
+        target = page.target_path or ""
+        source_path = target.split("::", 1)[0] if page.page_type == "symbol_spotlight" else target
+        if source_path in current_file_paths:
+            continue
+        page.freshness_status = "tombstone"
+        try:
+            metadata = json.loads(page.metadata_json or "{}")
+        except (json.JSONDecodeError, TypeError):
+            metadata = {}
+        metadata["successor_paths"] = []
+        page.metadata_json = json.dumps(metadata)
+        marked.append(page.id)
+    return marked
+
+
+async def reconcile_full_index_scope(
+    session: Any,
+    repo_id: str,
+    current_graph_paths: set[str],
+    current_git_paths: set[str],
+    *,
+    exclusion_plan: ExclusionPrunePlan | None = None,
+) -> list[str]:
+    """Reconcile every source-backed store against one successful traversal."""
+    # Config-driven scope cleanup must honor the same mass-deletion verdict as
+    # the ordinary prune. A refused exclusion is still part of the stored scope.
+    protected_paths = (
+        exclusion_plan.paths if exclusion_plan is not None and exclusion_plan.refusals else set()
+    )
+    retained_graph_paths = current_graph_paths | protected_paths
+    tombstoned = await tombstone_file_pages_outside_scope(session, repo_id, retained_graph_paths)
+    await _prune_stale_file_rows(
+        session,
+        repo_id,
+        current_graph_paths,
+        current_git_paths,
+        protected_paths=protected_paths,
+        authoritative_empty=True,
+    )
+    from repowise.core.persistence.crud.decisions import (
+        purge_proposed_decisions_outside_files,
+    )
+
+    await purge_proposed_decisions_outside_files(session, repo_id, retained_graph_paths)
+    return tombstoned
+
+
+async def tombstone_pages_outside_generation(
+    session: Any, repo_id: str, current_page_ids: set[str]
+) -> list[str]:
+    """Retire generated pages absent from an authoritative full generation.
+
+    This is used only when generation configuration changed and the update ran
+    the complete generation ladder. It covers selection changes such as page
+    caps, spotlight ranking, and disabling onboarding, none of which imply that
+    the backing source file disappeared.
+    """
+    from sqlalchemy import select
+
+    from repowise.core.generation.models import GENERATION_LEVELS
+    from repowise.core.persistence.models import Page
+
+    pages = (
+        await session.execute(
+            select(Page).where(
+                Page.repository_id == repo_id,
+                Page.page_type.in_(tuple(GENERATION_LEVELS)),
+                Page.freshness_status != "tombstone",
+            )
+        )
+    ).scalars()
+    marked: list[str] = []
+    for page in pages:
+        if page.id in current_page_ids:
+            continue
+        page.freshness_status = "tombstone"
+        try:
+            metadata = json.loads(page.metadata_json or "{}")
+        except (json.JSONDecodeError, TypeError):
+            metadata = {}
+        metadata["successor_paths"] = []
+        page.metadata_json = json.dumps(metadata)
+        marked.append(page.id)
+    return marked
+
+
 async def tombstone_absent_file_pages(
     session: Any,
     repo_id: str,
@@ -627,6 +738,33 @@ async def persist_reference_sites(
     return len(sites)
 
 
+async def persist_symbol_analysis(
+    session: Any,
+    repo_id: str,
+    parsed_files: list[Any] | None,
+) -> None:
+    """Reconcile symbol rows after analysis mutates their derived fields.
+
+    Health analysis computes ``complexity_estimate`` on the in-memory symbols
+    after the resumable INDEX checkpoint has already persisted the parser
+    defaults.  Re-upsert just those symbol records before ANALYSIS is marked
+    complete; graph construction, Git analysis, and the rest of ingestion stay
+    untouched.  The upsert preserves each persisted row's database identity.
+    """
+    if not parsed_files:
+        return
+    from repowise.core.persistence.crud import batch_upsert_symbols
+
+    symbols: list[Any] = []
+    for pf in parsed_files:
+        for sym in pf.symbols:
+            if not getattr(sym, "file_path", None):
+                sym.file_path = pf.file_info.path
+            symbols.append(sym)
+    if symbols:
+        await batch_upsert_symbols(session, repo_id, symbols)
+
+
 def _changed_file_edges(
     graph_builder: Any,
     parsed_files: list[Any] | None,
@@ -822,6 +960,7 @@ async def _prune_stale_file_rows(
     current_git_file_paths: set[str],
     *,
     protected_paths: set[str] | frozenset[str] = frozenset(),
+    authoritative_empty: bool = False,
 ) -> int:
     """Delete file-scoped rows for files absent from the latest full pipeline run.
 
@@ -831,7 +970,8 @@ async def _prune_stale_file_rows(
     *current_graph_file_paths* (from ``parsed_files``) governs graph/analysis
     tables; *current_git_file_paths* (from ``git_metadata_list``) governs
     ``git_metadata`` only. Each set independently no-ops when empty to avoid
-    wiping rows on a broken run.
+    wiping rows on a broken run, unless ``authoritative_empty`` confirms that a
+    successful full traversal really produced an empty scope.
 
     Full runs only. The authority here is "absent from this run's output",
     which is only safe because a full run rebuilds every table it prunes from
@@ -842,7 +982,9 @@ async def _prune_stale_file_rows(
     from sqlalchemy import delete, or_, select
 
     from repowise.core.persistence.models import (
+        CoverageFile,
         DeadCodeFinding,
+        GitFunctionBlame,
         GitMetadata,
         GraphEdge,
         GraphMetric,
@@ -855,10 +997,17 @@ async def _prune_stale_file_rows(
 
     pruned_paths: set[str] = set()
 
-    async def _delete_stale_by_paths(model: Any, column: Any, current: set[str]) -> None:
+    async def _delete_stale_by_paths(
+        model: Any,
+        column: Any,
+        current: set[str],
+        *,
+        allow_empty: bool | None = None,
+    ) -> None:
         # Diff persisted paths against *current* in Python so the IN (...) is
         # bounded by the stale set, not the whole repo (SQLite param limit).
-        if not current:
+        empty_is_authoritative = authoritative_empty if allow_empty is None else allow_empty
+        if not current and not empty_is_authoritative:
             return
         existing = set(
             (await session.execute(select(column).where(model.repository_id == repo_id).distinct()))
@@ -878,7 +1027,7 @@ async def _prune_stale_file_rows(
     # ---- Graph nodes + edges -------------------------------------------------
     # File nodes key on node_id; symbol nodes on file_path. Delete edges before
     # nodes (no FK cascade between the tables).
-    if current_graph_file_paths:
+    if current_graph_file_paths or authoritative_empty:
         node_rows = (
             await session.execute(
                 select(GraphNode.node_id, GraphNode.node_type, GraphNode.file_path).where(
@@ -934,7 +1083,18 @@ async def _prune_stale_file_rows(
         HealthFileMetric, HealthFileMetric.file_path, current_graph_file_paths
     )
     await _delete_stale_by_paths(HealthFinding, HealthFinding.file_path, current_graph_file_paths)
-    await _delete_stale_by_paths(GitMetadata, GitMetadata.file_path, current_git_file_paths)
+    await _delete_stale_by_paths(CoverageFile, CoverageFile.file_path, current_graph_file_paths)
+    await _delete_stale_by_paths(
+        GitFunctionBlame, GitFunctionBlame.file_path, current_graph_file_paths
+    )
+    await _delete_stale_by_paths(
+        GitMetadata,
+        GitMetadata.file_path,
+        current_git_file_paths,
+        # An empty Git result is authoritative only when the successful source
+        # traversal is empty too. Otherwise it may be a degraded Git walk.
+        allow_empty=authoritative_empty and not current_graph_file_paths,
+    )
     return len(pruned_paths)
 
 
@@ -1911,6 +2071,63 @@ async def persist_git(result: Any, session: Any, repo_id: str) -> None:
         )
 
 
+async def replace_git_history(
+    session: Any,
+    repo_id: str,
+    git_meta_map: dict[str, dict],
+    git_summary: Any,
+) -> None:
+    """Replace every history-derived row from one authoritative Git walk."""
+    from types import SimpleNamespace
+
+    from sqlalchemy import delete
+
+    from repowise.core.persistence.models import (
+        FixEvent,
+        GitCommit,
+        GitMetadata,
+    )
+
+    # Function blame describes the current source tree and is produced by the
+    # health pass, not by persist_git. Preserve it across a history-window
+    # replacement; scope reconciliation prunes entries for excluded files.
+    for model in (FixEvent, GitCommit, GitMetadata):
+        await session.execute(delete(model).where(model.repository_id == repo_id))
+    await persist_git(
+        SimpleNamespace(
+            git_metadata_list=list(git_meta_map.values()),
+            git_summary=git_summary,
+        ),
+        session,
+        repo_id,
+    )
+
+
+async def persist_git_refresh(
+    session: Any,
+    repo_id: str,
+    git_meta_map: dict[str, dict],
+    git_decay_map: dict[str, dict] | None,
+    full_git_summary: Any | None,
+) -> None:
+    """Persist either a full history replacement or an incremental refresh."""
+    if full_git_summary is not None:
+        await replace_git_history(session, repo_id, git_meta_map, full_git_summary)
+        return
+
+    from repowise.core.persistence.crud import (
+        recompute_git_percentiles,
+        upsert_git_metadata_bulk,
+    )
+
+    await upsert_git_metadata_bulk(
+        session,
+        repo_id,
+        [*git_meta_map.values(), *(git_decay_map or {}).values()],
+    )
+    await recompute_git_percentiles(session, repo_id)
+
+
 async def _analyzed_commit(session: Any, repo_id: str) -> str | None:
     """Live HEAD of the repo being indexed, for stamping health rows.
 
@@ -2031,9 +2248,7 @@ async def save_full_health_report(
         # open plan a person has triaged, and empty both queues on the strength
         # of a parse failure or an exclude pattern that matched everything.
         return
-    await save_health_metrics(
-        session, repo_id, metrics, analyzed_commit=analyzed_commit
-    )
+    await save_health_metrics(session, repo_id, metrics, analyzed_commit=analyzed_commit)
     # One savepoint over the findings and everything derived from them, so a
     # rebuild that failed halfway cannot leave the queue describing findings
     # that were never stored. It runs on an empty finding set too: the queue
@@ -2067,9 +2282,7 @@ async def save_full_health_report(
         # Fold the plans just written into per-file opportunities. Last in the
         # savepoint because it composes over the stored rows, so it has to see
         # the reconciliation above rather than the detector output.
-        await finalize_refactoring_opportunities(
-            session, repo_id, analyzed_commit=analyzed_commit
-        )
+        await finalize_refactoring_opportunities(session, repo_id, analyzed_commit=analyzed_commit)
 
 
 async def persist_analysis(result: Any, session: Any, repo_id: str) -> None:
@@ -2376,6 +2589,11 @@ async def persist_post_index_result(
     row can recover it. The CLI checkpoint route passes it explicitly because a
     rehydrated result need not retain enough absolute-path information.
     """
+    # Analysis runs after the resumable INDEX checkpoint and updates in-memory
+    # symbol complexity. This required write heals a best-effort checkpoint on
+    # either route before the final transaction can claim ANALYSIS complete.
+    if getattr(result, "health_report", None) is not None:
+        await persist_symbol_analysis(session, repo_id, getattr(result, "parsed_files", None))
     await persist_analysis(result, session, repo_id)
 
     # Retired rows predate this run by definition. Sweep them before the page
@@ -2436,6 +2654,7 @@ async def persist_pipeline_result(
     repo_id: str,
     *,
     exclusion_plan: ExclusionPrunePlan | None = None,
+    replace_full_git_history: bool = False,
 ) -> list[str]:
     """Persist all outputs from a :class:`PipelineResult` into the database.
 
@@ -2471,26 +2690,39 @@ async def persist_pipeline_result(
     # persisters re-upsert. graph/analysis tables key off parsed_files;
     # git_metadata keys off the git indexer's set (a file can be git-tracked
     # but unparsed). Runs only here, never in the reusable phase persisters.
-    current_graph_file_paths = {pf.file_info.path for pf in result.parsed_files}
+    # ``file_infos`` is the successful traversal set and survives individual
+    # read/parse failures. Using parsed_files here would misclassify a locked
+    # or temporarily unparsable file as excluded and erase its prior rows.
+    current_graph_file_paths = {file_info.path for file_info in result.file_infos}
     current_git_file_paths = {
         (gm if isinstance(gm, dict) else dataclasses.asdict(gm)).get("file_path", "")
         for gm in result.git_metadata_list
     }
     current_git_file_paths.discard("")
-    protected_paths: set[str] | frozenset[str] = (
-        exclusion_plan.paths if exclusion_plan is not None and exclusion_plan.refusals else set()
-    )
-    pruned = await _prune_stale_file_rows(
-        session,
-        repo_id,
-        current_graph_file_paths,
-        current_git_file_paths,
-        protected_paths=protected_paths,
+    swept_page_ids = await reconcile_full_index_scope(
+        session, repo_id, current_graph_file_paths, current_git_file_paths,
+        exclusion_plan=exclusion_plan,
     )
 
     symbol_count = await persist_ingestion(result, session, repo_id)
-    await persist_git(result, session, repo_id)
-    swept_page_ids = await persist_post_index_result(
+    if replace_full_git_history:
+        from repowise.core.persistence.crud import purge_proposed_decisions_by_source
+
+        await purge_proposed_decisions_by_source(session, repo_id, "git_archaeology")
+        await replace_git_history(
+            session,
+            repo_id,
+            {
+                (gm if isinstance(gm, dict) else dataclasses.asdict(gm))["file_path"]: (
+                    gm if isinstance(gm, dict) else dataclasses.asdict(gm)
+                )
+                for gm in result.git_metadata_list
+            },
+            result.git_summary,
+        )
+    else:
+        await persist_git(result, session, repo_id)
+    swept_page_ids += await persist_post_index_result(
         result,
         session,
         repo_id,
@@ -2504,6 +2736,5 @@ async def persist_pipeline_result(
         graph_nodes=result.graph_builder.graph().number_of_nodes(),
         symbols=symbol_count,
         git_files=len(result.git_metadata_list),
-        pruned_file_paths=pruned,
     )
     return swept_page_ids

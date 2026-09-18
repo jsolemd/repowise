@@ -8,8 +8,10 @@ graph / dead-code / health / git data does not leak into those surfaces.
 
 from __future__ import annotations
 
+import pytest
 from sqlalchemy import select
 
+from repowise.core.persistence.crud import upsert_page
 from repowise.core.persistence.models import (
     DeadCodeFinding,
     GitMetadata,
@@ -18,11 +20,17 @@ from repowise.core.persistence.models import (
     GraphNode,
     HealthFileMetric,
     HealthFinding,
+    Page,
     SecurityFinding,
     WikiSymbol,
 )
-from repowise.core.pipeline.persist import _prune_stale_file_rows
-from tests.unit.persistence.helpers import insert_repo
+from repowise.core.pipeline.persist import (
+    ExclusionPrunePlan,
+    _prune_stale_file_rows,
+    reconcile_full_index_scope,
+)
+from repowise.core.pipeline.prune_state import PruneRefusal
+from tests.unit.persistence.helpers import insert_repo, make_page_kwargs
 
 STALE = "tools/debug.js"
 KEPT = "src/app.js"
@@ -192,3 +200,32 @@ async def test_prune_keeps_git_indexed_unparsed_file(async_session):
         KEPT,
         f"{KEPT}::main",
     }
+
+
+@pytest.mark.parametrize("refused", [False, True])
+async def test_full_scope_cleanup_honors_exclusion_prune_verdict(async_session, refused):
+    """Upstream config reconciliation cannot bypass a refused fork prune."""
+    repo = await insert_repo(async_session)
+    await _seed(async_session, repo.id)
+    for path in (STALE, KEPT):
+        await upsert_page(
+            async_session,
+            **make_page_kwargs(repo.id, page_id=f"file_page:{path}", target_path=path),
+        )
+    plan = ExclusionPrunePlan(
+        paths=frozenset({STALE}),
+        refusals=(PruneRefusal("wiki_symbols", 25, 30),) if refused else (),
+    )
+
+    tombstones = await reconcile_full_index_scope(
+        async_session, repo.id, {KEPT}, {KEPT}, exclusion_plan=plan
+    )
+    await async_session.commit()
+
+    expected = {STALE, KEPT} if refused else {KEPT}
+    assert await _paths(async_session, WikiSymbol, WikiSymbol.file_path, repo.id) == expected
+    assert await _paths(async_session, GitMetadata, GitMetadata.file_path, repo.id) == expected
+    assert await _paths(async_session, HealthFinding, HealthFinding.file_path, repo.id) == expected
+    page = await async_session.get(Page, f"file_page:{STALE}")
+    assert page.freshness_status == ("fresh" if refused else "tombstone")
+    assert tombstones == ([] if refused else [f"file_page:{STALE}"])

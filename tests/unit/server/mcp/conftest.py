@@ -72,13 +72,13 @@ async def vector_store():
 
 
 @pytest.fixture
-async def repo_id(session: AsyncSession) -> str:
+async def repo_id(session: AsyncSession, tmp_path) -> str:
     """Create a test repository and return its ID."""
     repo = Repository(
         id="repo1",
         name="test-repo",
         url="https://github.com/example/test-repo",
-        local_path="/tmp/test-repo",
+        local_path=str(tmp_path),
         default_branch="main",
         settings_json="{}",
         created_at=_NOW,
@@ -565,7 +565,7 @@ async def populated_db(session: AsyncSession, repo_id: str) -> str:
 
 
 @pytest.fixture
-async def setup_mcp(factory, fts, vector_store, populated_db, monkeypatch):
+async def setup_mcp(factory, fts, vector_store, populated_db, tmp_path, monkeypatch):
     """Configure the MCP module's global state for testing."""
     import repowise.server.mcp_server as mcp_mod
     from repowise.server.mcp_server import _basis, _scope
@@ -579,7 +579,7 @@ async def setup_mcp(factory, fts, vector_store, populated_db, monkeypatch):
     mcp_mod._fts = fts
     mcp_mod._vector_store = vector_store
     mcp_mod._decision_store = InMemoryVectorStore(embedder=MockEmbedder())
-    mcp_mod._repo_path = "/tmp/test-repo"
+    mcp_mod._repo_path = str(tmp_path)
     # These stores are already constructed; no background loader will signal
     # readiness. Match the settled production context instead of timing out.
     ready = asyncio.Event()
