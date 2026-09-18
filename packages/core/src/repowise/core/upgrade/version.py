@@ -67,7 +67,12 @@ STORE_FORMAT_VERSION: int = 2
 #: already spent 3 on F42 and sealed live indexes with it, so taking upstream's
 #: numeral verbatim would leave every fork parse cache acceptable and the
 #: external edges unbuilt. Two independent invalidations, two numbers.
-PARSER_SCHEMA_VERSION: int = 4
+#:
+#: v5 (fork): JSDoc preceding a JS/TS export statement now reaches its
+#: declaration. Cached symbols from v4 omit that documentation, changing the
+#: source chunks derived from otherwise identical files. Keep this independent
+#: invalidation distinct from the next upstream parser-schema bump.
+PARSER_SCHEMA_VERSION: int = 5
 
 #: state.json key holding the store format version that wrote the store.
 STORE_FORMAT_VERSION_KEY = "store_format_version"

@@ -198,19 +198,21 @@ def clean_string_literal(text: str) -> str:
 
 
 def find_preceding_jsdoc(node: Node, src: str) -> str | None:
-    """Return the JSDoc comment immediately before *node*, if any."""
-    parent = node.parent
-    if parent is None:
-        return None
-    siblings = list(parent.children)
-    idx = next((i for i, s in enumerate(siblings) if s.id == node.id), -1)
-    if idx <= 0:
-        return None
-    prev = siblings[idx - 1]
-    if prev.type == "comment":
-        text = node_text(prev, src).strip()
-        if text.startswith("/**"):
-            return clean_jsdoc(text)
+    """Return JSDoc immediately before a declaration or its export wrapper."""
+    while (parent := node.parent) is not None:
+        prev = node.prev_sibling
+        if prev is not None and prev.type == "comment":
+            text = node_text(prev, src).strip()
+            # The nearest comment owns this position, even when it is not
+            # JSDoc. Never borrow an outer comment across an intervening one.
+            return clean_jsdoc(text) if text.startswith("/**") else None
+        if parent.type != "export_statement":
+            break
+        # In `/** ... */ export [default] function/class ...`, the comment
+        # precedes the export statement, not the captured declaration node.
+        # Only this immediate wrapper is transparent; members and nested
+        # declarations must not inherit their containing declaration's docs.
+        node = parent
     return None
 
 

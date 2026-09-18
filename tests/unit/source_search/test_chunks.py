@@ -68,6 +68,36 @@ def test_symbol_chunk_text_is_header_signature_docstring_body():
     assert chunk.source == SOURCE_SYMBOL
 
 
+def test_exported_renderer_jsdoc_reaches_the_symbol_chunk():
+    from repowise.core.ingestion.parser import ASTParser
+    from tests.unit.ingestion.parser._helpers import _make_file_info
+
+    source = b"""/** Render a transcript with a withheld-note redaction. */
+export function Transcript() {
+  return <span className="redaction-bar" />;
+}
+"""
+    path = "ui/transcript.tsx"
+    parsed = ASTParser().parse_file(_make_file_info(path, "typescript"), source)
+    symbol = next(s for s in parsed.symbols if s.name == "Transcript")
+    record = SymbolRecord(
+        symbol_id=symbol.id,
+        file_path=path,
+        name=symbol.name,
+        qualified_name=symbol.qualified_name,
+        kind=symbol.kind,
+        signature=symbol.signature,
+        docstring=symbol.docstring,
+        start_line=symbol.start_line,
+        end_line=symbol.end_line,
+        language="typescript",
+    )
+    chunk = build_symbol_chunk(record, source.decode().splitlines())
+    assert "Render a transcript with a withheld-note redaction." in chunk.text
+    assert chunk.start_line == 2
+    assert chunk.end_line == 4
+
+
 def test_symbol_header_falls_back_to_the_bare_name():
     chunk = build_symbol_chunk(_symbol(qualified_name=""), _FILE.splitlines())
     assert chunk.text.splitlines()[1] == "# function: parse_config"
