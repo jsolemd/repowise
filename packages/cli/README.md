@@ -356,7 +356,7 @@ repowise mcp --transport streamable-http
 repowise mcp --transport sse
 ```
 
-Exposes 30 registered MCP tools (11 advertised by default in single-repo mode:
+Exposes 41 registered MCP tools (11 advertised by default in single-repo mode:
 the eleven flagship tools). Workspace mode adds `list_repos`. These tools query wiki pages, symbols, the
 dependency graph, git analytics, ownership data, hotspots, dead code findings,
 code health, change risk, and decision intelligence. Full surface:

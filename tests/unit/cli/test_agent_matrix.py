@@ -61,6 +61,14 @@ GEN = _generator()
 COUNTS = GEN.tool_counts()
 
 
+@pytest.mark.parametrize(
+    ("count", "expected"),
+    [(30, "thirty"), (31, "thirty-one"), (41, "forty-one"), (99, "ninety-nine"), (100, "100")],
+)
+def test_spelling_does_not_limit_tool_surface_growth(count: int, expected: str) -> None:
+    assert GEN.spell(count) == expected
+
+
 def _on_disk(path: Path) -> str:
     """Read *path* with line endings normalised.
 
@@ -377,7 +385,12 @@ def _appears(phrase: str, text: str) -> bool:
     tools are registered in total", which condemns the correct sentence for
     containing the digits of a wrong one.
     """
-    return re.search(r"(?<![0-9A-Za-z])" + re.escape(phrase), text) is not None
+    return re.search(r"(?<![0-9A-Za-z-])" + re.escape(phrase), text) is not None
+
+
+def test_count_claim_does_not_match_part_of_a_compound_number() -> None:
+    assert not _appears("nine further tools", "twenty-nine further tools")
+    assert _appears("twenty-nine further tools", "twenty-nine further tools")
 
 
 @pytest.mark.parametrize(

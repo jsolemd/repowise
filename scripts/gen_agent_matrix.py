@@ -168,12 +168,8 @@ def tool_counts() -> dict[str, int]:
     }
 
 
-#: Complete through twenty, not just the values in use today. A partial map is
-#: a landmine: the counts here feed a module-scope constant and a parametrize
-#: argument in the golden test, so a missing entry is a *collection* error that
-#: takes down the very drift guards that exist to say which files to edit. The
-#: first tool to push a count to twelve, or the renamed lean tool this file
-#: warns about elsewhere, would have hit exactly that.
+#: Spell two-digit counts consistently. Tool counts feed module-scope golden
+#: cases, so a missing spelling must not prevent the drift checks collecting.
 _WORDS = {
     0: "zero",
     1: "one",
@@ -195,34 +191,24 @@ _WORDS = {
     17: "seventeen",
     18: "eighteen",
     19: "nineteen",
-    20: "twenty",
-    21: "twenty-one",
-    22: "twenty-two",
-    23: "twenty-three",
-    24: "twenty-four",
-    25: "twenty-five",
-    26: "twenty-six",
-    27: "twenty-seven",
-    28: "twenty-eight",
-    29: "twenty-nine",
-    30: "thirty",
 }
+_TENS = {
+    20: "twenty", 30: "thirty", 40: "forty", 50: "fifty",
+    60: "sixty", 70: "seventy", 80: "eighty", 90: "ninety",
+}
+_WORDS.update(
+    {
+        count: _TENS[count // 10 * 10] + (f"-{_WORDS[count % 10]}" if count % 10 else "")
+        for count in range(20, 100)
+    }
+)
 
 
 def spell(count: int) -> str:
-    """*count* as an English word, for prose that spells small numbers out.
-
-    Raises past twenty rather than falling back to the digits: the artifacts
-    this guards say "eleven MCP tools", and a silent switch to "21 MCP tools"
-    mid-sentence is the kind of drift that goes unnoticed for twenty-four
-    releases. Past twenty the prose wants rewriting by a person anyway.
-    """
-    if count not in _WORDS:
-        raise ValueError(
-            f"no spelled form for {count}. Prose that spells a number this large reads "
-            "badly; rewrite the sentence, or extend _WORDS in scripts/gen_agent_matrix.py."
-        )
-    return _WORDS[count]
+    """Spell small counts; use digits above ninety-nine without blocking drift checks."""
+    if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+        raise ValueError("tool counts must be non-negative integers")
+    return _WORDS.get(count, str(count))
 
 
 # ---------------------------------------------------------------------------
