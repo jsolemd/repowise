@@ -347,7 +347,7 @@ def _trim_blast_lists(
         value = trimmed_blast.get(key)
         if not isinstance(value, list):
             continue
-        if exclude_spec:
+        if exclude_spec is not None:
             value = [e for e in value if not is_excluded(_as_path(e), exclude_spec)]
             trimmed_blast[key] = value
         total = len(value)
@@ -554,7 +554,7 @@ def _build_pr_directive(
         full_gap_paths = {
             path
             for path in (_as_path(entry) for entry in pr_blast_radius.get("test_gaps") or [])
-            if path and not (exclude_spec and is_excluded(path, exclude_spec))
+            if path and not (exclude_spec is not None and is_excluded(path, exclude_spec))
         }
         all_missing_tests = [path for path in changed_files if path in full_gap_paths]
         missing_tests = all_missing_tests[:3]

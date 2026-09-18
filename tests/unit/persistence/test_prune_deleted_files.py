@@ -355,10 +355,12 @@ async def test_accept_mass_deletion_lifts_the_floor_for_one_run(async_session, r
 
 
 @pytest.mark.parametrize("accept", [False, True])
+@pytest.mark.parametrize("rule_source", ["config", "repowise_ignore"])
 async def test_mass_exclusion_uses_deleted_file_floor(
     async_session,
     repo_with_kept_file,
     accept,
+    rule_source,
 ):
     """A two-thirds exclusion is refused until the one-run override is supplied."""
     repo = await insert_repo(async_session)
@@ -369,9 +371,12 @@ async def test_mass_exclusion_uses_deleted_file_floor(
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text("export {};\n", encoding="utf-8")
         async_session.add(GitMetadata(repository_id=repo.id, file_path=path))
-    config = repo_with_kept_file / ".repowise" / "config.yaml"
-    config.parent.mkdir(parents=True)
-    config.write_text("exclude_patterns:\n  - generated/**\n", encoding="utf-8")
+    if rule_source == "config":
+        config = repo_with_kept_file / ".repowise" / "config.yaml"
+        config.parent.mkdir(parents=True)
+        config.write_text("exclude_patterns:\n  - generated/**\n", encoding="utf-8")
+    else:
+        (repo_with_kept_file / ".repowiseIgnore").write_text("generated/**\n", encoding="utf-8")
     await async_session.flush()
 
     pruned, refusals = await prune_deleted_file_rows(

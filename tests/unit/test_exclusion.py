@@ -158,3 +158,78 @@ def test_is_excluded_memoises_without_changing_its_answer(tmp_path):
 
     assert first == [False, True, False]
     assert second == first
+
+
+def test_repowise_ignore_uses_the_traversal_rule_and_reports_its_source(tmp_path):
+    from repowise.core.ingestion import FileTraverser
+
+    source = tmp_path / "captured.js"
+    source.write_text("export function captured() {}\n")
+    (tmp_path / ".repowiseIgnore").write_text("captured.js\n")
+    assert FileTraverser(tmp_path).file_info_for_path("captured.js") is None
+
+    assert is_excluded("captured.js", build_exclude_spec(tmp_path))
+    decision = exclusion_decision(tmp_path, "captured.js")
+    assert decision.excluded
+    assert decision.source == "repowise_ignore"
+    assert decision.pattern == "captured.js"
+
+
+def test_repowise_ignore_negation_does_not_reopen_git_excluded_files(tmp_path):
+    (tmp_path / ".gitignore").write_text("secret.py\n")
+    (tmp_path / ".repowiseIgnore").write_text("*.py\n!keep.py\n!secret.py\n")
+    spec = build_exclude_spec(tmp_path)
+
+    assert is_excluded("drop.py", spec)
+    assert not is_excluded("keep.py", spec)
+    assert is_excluded("secret.py", spec)
+    assert exclusion_decision(tmp_path, "secret.py").source == "gitignore"
+
+
+def test_repowise_ignore_pruned_parent_cannot_be_reopened_by_file_negation(tmp_path):
+    from repowise.core.ingestion import FileTraverser
+
+    (tmp_path / "vendor").mkdir()
+    (tmp_path / "vendor" / "keep.py").write_text("def keep(): pass\n")
+    (tmp_path / ".repowiseIgnore").write_text("vendor/\n!vendor/keep.py\n")
+    assert not list(FileTraverser(tmp_path).traverse())
+
+    assert is_excluded("vendor/keep.py", build_exclude_spec(tmp_path))
+    assert exclusion_decision(tmp_path, "vendor/keep.py").pattern == "vendor/"
+
+
+def test_repowise_ignore_ancestors_use_pathspec_platform_separators(tmp_path, monkeypatch):
+    import pathspec.util
+
+    monkeypatch.setattr(pathspec.util, "NORMALIZE_PATH_SEPS", ["\\"])
+    (tmp_path / ".repowiseIgnore").write_text("vendor/\n!vendor/keep.py\n")
+
+    assert is_excluded(r"vendor\keep.py", build_exclude_spec(tmp_path))
+    assert exclusion_decision(tmp_path, r"vendor\keep.py").pattern == "vendor/"
+
+
+def test_repowise_ignore_edit_invalidates_the_compiled_spec(tmp_path):
+    ignore = tmp_path / ".repowiseIgnore"
+    ignore.write_text("old.py\n")
+    before = build_exclude_spec(tmp_path)
+    assert is_excluded("old.py", before)
+    ignore.write_text("new_source.py\n")
+    after = build_exclude_spec(tmp_path)
+
+    assert not is_excluded("old.py", after)
+    assert is_excluded("new_source.py", after)
+
+
+def test_repowise_ignore_read_failure_cannot_be_mistaken_for_an_empty_rule(tmp_path, monkeypatch):
+    ignore = tmp_path / ".repowiseIgnore"
+    ignore.write_text("captured.js\n")
+    read_text = Path.read_text
+
+    def unreadable(path, *args, **kwargs):
+        if path == ignore:
+            raise PermissionError("ignore rules unavailable")
+        return read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", unreadable)
+    with pytest.raises(PermissionError, match="ignore rules unavailable"):
+        build_exclude_spec(tmp_path)

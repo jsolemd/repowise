@@ -65,3 +65,18 @@ async def test_filename_fallback_when_map_has_no_data(async_session):
 
     assert "src/foo.py" not in gaps  # name-matched test -> not a gap
     assert "src/bar.py" in gaps  # no test, no coverage -> gap
+
+
+async def test_root_repowise_ignore_filters_changed_files(async_session, tmp_path):
+    repo = await insert_repo(async_session, local_path=str(tmp_path))
+    (tmp_path / ".repowiseIgnore").write_text("vendor/\n")
+    await _node(async_session, repo.id, "vendor/captured.py")
+    await _node(async_session, repo.id, "src/keep.py")
+    await async_session.commit()
+
+    blast = await PRBlastRadiusAnalyzer(async_session, repo.id).analyze_files(
+        ["vendor/captured.py", "src/keep.py"]
+    )
+
+    assert [row["path"] for row in blast["direct_risks"]] == ["src/keep.py"]
+    assert blast["test_gaps"] == ["src/keep.py"]

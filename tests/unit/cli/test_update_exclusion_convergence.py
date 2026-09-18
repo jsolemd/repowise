@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 from sqlalchemy import select
 
 from repowise.cli._repo_session import open_repo_db
@@ -17,6 +18,7 @@ from repowise.core.persistence.models import (
     GitMetadata,
     GraphNode,
     Page,
+    Repository,
     SourceIndexUpdate,
     WikiSymbol,
 )
@@ -27,9 +29,11 @@ def _git(repo: Path, *args: str) -> None:
     subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True)
 
 
+@pytest.mark.parametrize("rule_source", ["config", "repowise_ignore"])
 async def test_update_sweeps_newly_excluded_file_from_all_derived_stores(
     tmp_path: Path,
     monkeypatch,
+    rule_source: str,
 ) -> None:
     # This assertion includes the opt-in source outbox; do not inherit whether
     # the deployment or a previously collected test enabled that lane.
@@ -106,11 +110,28 @@ async def test_update_sweeps_newly_excluded_file_from_all_derived_stores(
         )
     await engine.dispose()
 
-    config = repo_path / ".repowise" / "config.yaml"
-    config.write_text("exclude_patterns:\n  - generated/**\n", encoding="utf-8")
+    from repowise.core.ingestion import ASTParser
+
+    ignored_source = repo_path / "generated/drop.py"
+    ignored_bytes = ignored_source.read_bytes()
+    original_parse = ASTParser.parse_file
+
+    def parse_included(parser, info, source):
+        assert info.path != "generated/drop.py", "explicitly ignored source must not be parsed"
+        return original_parse(parser, info, source)
+
+    monkeypatch.setattr(ASTParser, "parse_file", parse_included)
+    if rule_source == "config":
+        rules = repo_path / ".repowise" / "config.yaml"
+        rules.write_text("exclude_patterns:\n  - generated/**\n", encoding="utf-8")
+        exclude_patterns = ["generated/**"]
+    else:
+        rules = repo_path / ".repowiseIgnore"
+        rules.write_text("generated/**\n", encoding="utf-8")
+        exclude_patterns = []
     parsed_files, _sources, graph_builder, _structure, _count = _build_repo_graph(
         repo_path,
-        ["generated/**"],
+        exclude_patterns,
     )
     assert {pf.file_info.path for pf in parsed_files} == {"src/keep.py"}
 
@@ -137,7 +158,7 @@ async def test_update_sweeps_newly_excluded_file_from_all_derived_stores(
         generated_pages=[],
         file_diffs=[
             SimpleNamespace(
-                path=".repowise/config.yaml",
+                path=rules.relative_to(repo_path).as_posix(),
                 old_path=None,
                 status="modified",
             )
@@ -160,6 +181,10 @@ async def test_update_sweeps_newly_excluded_file_from_all_derived_stores(
 
     engine, sf, _ = await open_repo_db(repo_path, repo_name="repo")
     async with get_session(sf) as session:
+        from repowise.core.ingestion.parse_cache import parser_fingerprint
+
+        repository = await session.get(Repository, repo_id)
+        assert repository.symbols_parser_fingerprint == parser_fingerprint()
         symbol_paths = set(
             (
                 await session.execute(
@@ -195,6 +220,8 @@ async def test_update_sweeps_newly_excluded_file_from_all_derived_stores(
     assert "generated/drop.py" not in refsite_paths
     assert page is not None and page.freshness_status == "tombstone"
     assert len(full_updates) == 1
+    assert full_updates[0].upstream_ready
+    assert ignored_source.read_bytes() == ignored_bytes
 
     fts = FullTextSearch(engine)
     await fts.ensure_index()

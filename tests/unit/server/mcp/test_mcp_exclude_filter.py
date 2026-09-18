@@ -10,6 +10,29 @@ import pytest
 SPEC = pathspec.PathSpec.from_lines("gitwildmatch", [".claude/", "tools/"])
 
 
+@pytest.mark.parametrize("shape", ["rows", "nodes", "dicts", "paths", "embedded"])
+def test_filter_helpers_honour_root_repowise_ignore_only(tmp_path, shape):
+    from repowise.server.mcp_server import _helpers as helpers
+
+    (tmp_path / ".repowiseIgnore").write_text("vendor/\n")
+    spec = helpers._get_exclude_spec(tmp_path)
+    paths = ["src/keep.py", "vendor/drop.py"]
+    if shape == "rows":
+        rows = [SimpleNamespace(file_path=path) for path in paths]
+        assert helpers.filter_rows_by_attr(rows, "file_path", spec) == rows[:1]
+    elif shape == "nodes":
+        nodes = [SimpleNamespace(node_type="file", node_id=path) for path in paths]
+        assert helpers.filter_graph_nodes(nodes, spec) == nodes[:1]
+    elif shape == "dicts":
+        rows = [{"file_path": path} for path in paths]
+        assert helpers.filter_dicts_by_key(rows, "file_path", spec) == rows[:1]
+    elif shape == "paths":
+        assert helpers.filter_path_list(paths, spec) == paths[:1]
+    else:
+        ids = [f"{path}::run" for path in paths]
+        assert helpers.filter_embedded_path_ids(ids, spec) == ids[:1]
+
+
 # ---------------------------------------------------------------------------
 # _get_exclude_spec / is_excluded
 # ---------------------------------------------------------------------------

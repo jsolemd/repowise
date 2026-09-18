@@ -684,14 +684,14 @@ def is_excluded(path: str | None, spec: Any) -> bool:
 
 def filter_rows_by_attr(rows: list, attr: str, spec: Any) -> list:
     """Shape A: drop ORM rows whose ``attr`` path is excluded."""
-    if not spec:
+    if spec is None:
         return rows
     return [r for r in rows if not is_excluded(getattr(r, attr, None), spec)]
 
 
 def filter_graph_nodes(nodes: list, spec: Any) -> list:
     """Shape B: file nodes match on ``node_id``, symbol nodes on ``file_path``."""
-    if not spec:
+    if spec is None:
         return nodes
     out = []
     for n in nodes:
@@ -704,7 +704,7 @@ def filter_graph_nodes(nodes: list, spec: Any) -> list:
 
 def filter_dicts_by_key(items: list, key: str, spec: Any) -> list:
     """Shape C: drop result dicts whose ``key`` path is excluded."""
-    if not spec:
+    if spec is None:
         return items
     return [d for d in items if not is_excluded(d.get(key), spec)]
 
@@ -720,13 +720,13 @@ def filter_path_list(paths: list | None, spec: Any) -> list:
     """Shape D: filter a list of path strings (None -> [])."""
     if not paths:
         return []
-    if not spec:
+    if spec is None:
         return list(paths)
     return [p for p in paths if not is_excluded(p, spec)]
 
 
 def filter_embedded_path_ids(ids: list, spec: Any) -> list:
     """Shape E: ids look like ``"path::Name"``; match on the file portion."""
-    if not spec:
+    if spec is None:
         return ids
     return [i for i in ids if not is_excluded(i.split("::", 1)[0], spec)]

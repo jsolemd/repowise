@@ -1,7 +1,7 @@
 """Query-time exclusion: compile a repo's exclude rules and filter rows.
 
 Excluded files are skipped at ingest time, but DB rows may predate an
-``exclude_patterns`` / gitignore change, so read paths (MCP tools, editor-file
+``exclude_patterns`` / ignore change, so read paths (MCP tools, editor-file
 generation) filter again at query time. This module is the single home for
 that logic; ``repowise.server.mcp_server._helpers`` delegates here.
 """
@@ -18,7 +18,7 @@ from typing import Any, Literal
 # low enough that 64 cached specs cannot pin unbounded memory.
 _MEMO_MAX = 200_000
 
-ExclusionRuleSource = Literal["config", "gitignore", "git_info_exclude"]
+ExclusionRuleSource = Literal["config", "gitignore", "git_info_exclude", "repowise_ignore"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,6 +51,7 @@ def _rule_files(root: Path) -> tuple[Path, ...]:
     return (
         get_repowise_dir(root) / CONFIG_FILENAME,
         *(path for _source, path in _gitignore_sources(root)),
+        root / ".repowiseIgnore",
     )
 
 
@@ -77,13 +78,14 @@ def _rules_stamp(root: Path) -> tuple[tuple[int, int], ...]:
 # Sized for workspace mode, not for one repo. A workspace can register many
 # repos, and an agent sweeping them round-robin past the cache size gets a 0%
 # hit rate — which is worse than no cache, since a miss now also pays
-# ``Path.resolve()`` and three ``stat`` calls. Specs are small; the mtime/size
+# ``Path.resolve()`` and the rule-file ``stat`` calls. Specs are small; the mtime/size
 # stamp in the key means stale entries are unreachable rather than merely old.
 @lru_cache(maxsize=64)
 def _compile_spec(root_key: str, _stamp: tuple[tuple[int, int], ...]) -> Any:
     """Compile and cache one repo's spec. Keyed by root + rule-file mtimes."""
     import pathspec
 
+    from repowise.core.ingestion.traverser import _load_extra_ignore_spec
     from repowise.core.repo_config import load_repo_config
 
     root = Path(root_key)
@@ -105,7 +107,11 @@ def _compile_spec(root_key: str, _stamp: tuple[tuple[int, int], ...]) -> Any:
         compiled = pathspec.PathSpec.from_lines("gitwildmatch", lines)
         patterns.extend(compiled.patterns)
         sources.extend([source] * len(compiled.patterns))
-    if not patterns:
+    # Traversal treats its root .repowiseIgnore as a separate veto, so a
+    # negation there cannot reopen a Git/config exclusion. Reuse its loader,
+    # including read failures: unreadable rules cannot authorize a prune.
+    extra_ignore = _load_extra_ignore_spec(root, ".repowiseIgnore")
+    if not patterns and not extra_ignore.patterns:
         return None
     # Concatenating the compiled patterns preserves the exact cross-source
     # precedence of the former one-shot ``from_lines`` call, including a later
@@ -113,6 +119,7 @@ def _compile_spec(root_key: str, _stamp: tuple[tuple[int, int], ...]) -> Any:
     # name the rule set containing the final deciding pattern.
     spec = pathspec.PathSpec(patterns)
     spec._repowise_rule_sources = tuple(sources)  # type: ignore[attr-defined]
+    spec._repowise_extra_ignore = extra_ignore  # type: ignore[attr-defined]
     # Per-path decision memo, carried on the spec so it lives exactly as long as
     # the compiled spec does. ``match_file`` is a regex sweep over every pattern;
     # a repo-wide read filters the same few thousand paths over and over, both
@@ -125,7 +132,8 @@ def build_exclude_spec(repo_path: Path | str) -> Any:
     """Compile the repo's exclusion rules into a PathSpec, or ``None``.
 
     Unions ``.repowise/config.yaml`` ``exclude_patterns`` with the repo's
-    gitignore stack (``.gitignore`` + ``.git/info/exclude``). Indexes built
+    gitignore stack (``.gitignore`` + ``.git/info/exclude``), then applies the
+    root ``.repowiseIgnore`` independently as traversal does. Indexes built
     before the traverser honoured ``info/exclude`` still contain rows for
     local-only scratch dirs; filtering them at query time keeps those paths
     out of generated output without forcing a reindex.
@@ -140,6 +148,24 @@ def build_exclude_spec(repo_path: Path | str) -> Any:
     except OSError:
         root_key = str(root)
     return _compile_spec(root_key, _rules_stamp(root))
+
+
+def _extra_ignore_check(path: str, spec: Any) -> Any:
+    """Apply the root traversal rule to directories before the file itself."""
+    from pathspec.util import normalize_file
+
+    extra_ignore = getattr(spec, "_repowise_extra_ignore", None)
+    if extra_ignore is None:
+        return None
+    path = normalize_file(path)
+    parts = path.split("/")
+    # Traversal never reaches a file below an ignored directory; a later
+    # file-level negation cannot reopen that pruned directory.
+    for depth in range(1, len(parts)):
+        checked = extra_ignore.check_file("/".join(parts[:depth]) + "/")
+        if checked.include:
+            return checked
+    return extra_ignore.check_file(path)
 
 
 def is_excluded(path: str | None, spec: Any) -> bool:
@@ -158,16 +184,19 @@ def is_excluded(path: str | None, spec: Any) -> bool:
             # that. Dropping the whole memo costs one repopulation pass and
             # keeps a long-lived server from growing without limit.
             memo.clear()
-        cached = memo[path] = bool(spec.match_file(path))
+        extra_checked = _extra_ignore_check(path, spec)
+        cached = memo[path] = bool(
+            spec.match_file(path) or (extra_checked is not None and extra_checked.include)
+        )
     return cached
 
 
 def exclusion_decision(repo_path: Path | str, path: str) -> ExclusionDecision:
     """Return whether *path* is excluded and which rule source decided it.
 
-    The winning source is read from the same combined, ordered PathSpec used by
-    :func:`is_excluded`; it is not reconstructed by matching three independent
-    specs, which would get cross-file negations wrong.
+    Git/config rules retain their combined ordering and cross-file negations.
+    The root ``.repowiseIgnore`` is an independent veto, as in traversal.
+    Both decisions use the same compiled rules as :func:`is_excluded`.
     """
 
     spec = build_exclude_spec(repo_path)
@@ -175,6 +204,20 @@ def exclusion_decision(repo_path: Path | str, path: str) -> ExclusionDecision:
         return ExclusionDecision(excluded=False, matched=False)
 
     checked = spec.check_file(path)
+    extra_checked = _extra_ignore_check(path, spec)
+    if (
+        extra_checked is not None
+        and not checked.include
+        and (extra_checked.include or checked.index is None)
+    ):
+        if extra_checked.index is None:
+            return ExclusionDecision(excluded=False, matched=False)
+        return ExclusionDecision(
+            excluded=bool(extra_checked.include),
+            matched=True,
+            source="repowise_ignore",
+            pattern=spec._repowise_extra_ignore.patterns[extra_checked.index].pattern,
+        )
     if checked.index is None or checked.include is None:
         return ExclusionDecision(excluded=False, matched=False)
 

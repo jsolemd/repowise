@@ -608,6 +608,33 @@ def test_risk_trim_blast_lists_collects_drops(repo_root: Path):
     assert "pkg/f14.py" not in stored  # kept entries are not stored
 
 
+def test_risk_directive_honours_root_repowise_ignore_only(repo_root: Path):
+    from repowise.core.exclusion import build_exclude_spec
+    from repowise.server.mcp_server.tool_risk.directives import _build_pr_directive
+
+    (repo_root / ".repowiseIgnore").write_text("vendor/\n")
+    paths = ["vendor/drop.py", "src/keep.py"]
+    response = {"targets": {}}
+    _build_pr_directive(
+        response,
+        {
+            "transitive_affected": paths,
+            "test_gaps": paths,
+            "test_impact": {"coverage": {"status": "available"}},
+        },
+        paths,
+        build_exclude_spec(repo_root),
+        OmissionCollector("get_risk", repo_root=repo_root),
+        [],
+        set(),
+        "fixture",
+    )
+
+    assert response["pr_blast_radius"]["transitive_affected"] == ["src/keep.py"]
+    assert response["directive"]["missing_tests"] == ["src/keep.py"]
+    assert response["directive"]["missing_tests_total"] == 1
+
+
 @pytest.mark.asyncio
 async def test_get_overview_module_cap_is_expandable(setup_mcp, session, repo_root: Path):
     from datetime import UTC, datetime

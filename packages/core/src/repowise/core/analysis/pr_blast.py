@@ -118,7 +118,9 @@ class PRBlastRadiusAnalyzer:
             if repo_path:
                 exclude_spec = build_exclude_spec(repo_path)
         changed_files = [
-            path for path in changed_files if not (exclude_spec and is_excluded(path, exclude_spec))
+            path
+            for path in changed_files
+            if not (exclude_spec is not None and is_excluded(path, exclude_spec))
         ]
         changed_set = set(changed_files)
 

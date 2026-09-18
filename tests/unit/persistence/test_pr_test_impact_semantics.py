@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from repowise.core.analysis.health.coverage import TestCoverage
 from repowise.core.analysis.test_impact import analyze_test_impact
 from repowise.core.exclusion import build_exclude_spec
@@ -96,17 +98,21 @@ async def _seed(session, repo_id: str, fixture: dict, *, with_coverage: bool = T
     await session.commit()
 
 
+@pytest.mark.parametrize("ignore_source", ["config", "repowise_ignore"])
 async def test_sealed_population_retains_basis_availability_exclusions_and_totals(
-    async_session, tmp_path
+    async_session, tmp_path, ignore_source
 ):
     fixture = _fixture()
     repo = await insert_repo(async_session, name="alpha", head_commit="fixture-head")
     await _seed(async_session, repo.id, fixture)
-    (tmp_path / ".repowise").mkdir()
-    (tmp_path / ".repowise" / "config.yaml").write_text(
-        "exclude_patterns:\n  - src/excluded.py\n  - tests/excluded/**\n",
-        encoding="utf-8",
-    )
+    if ignore_source == "repowise_ignore":
+        (tmp_path / ".repowiseIgnore").write_text("src/excluded.py\ntests/excluded/**\n")
+    else:
+        (tmp_path / ".repowise").mkdir()
+        (tmp_path / ".repowise" / "config.yaml").write_text(
+            "exclude_patterns:\n  - src/excluded.py\n  - tests/excluded/**\n",
+            encoding="utf-8",
+        )
 
     impact = await analyze_test_impact(
         async_session,
@@ -263,7 +269,10 @@ async def test_dedup_retains_measured_and_inferred_basis(async_session):
     assert impact["files"][0]["inferred_tests_total"] == len(impact["files"][0]["inferred_tests"])
 
 
-async def test_exclusion_uses_test_id_path_when_test_file_is_missing(async_session, tmp_path):
+@pytest.mark.parametrize("ignore_source", ["config", "repowise_ignore"])
+async def test_exclusion_uses_test_id_path_when_test_file_is_missing(
+    async_session, tmp_path, ignore_source
+):
     repo = await insert_repo(async_session, name="excluded-node-id")
     await save_test_coverage(
         async_session,
@@ -279,11 +288,14 @@ async def test_exclusion_uses_test_id_path_when_test_file_is_missing(async_sessi
         ],
         source_format="coverage.py",
     )
-    (tmp_path / ".repowise").mkdir()
-    (tmp_path / ".repowise" / "config.yaml").write_text(
-        "exclude_patterns:\n  - tests/excluded/**\n",
-        encoding="utf-8",
-    )
+    if ignore_source == "repowise_ignore":
+        (tmp_path / ".repowiseIgnore").write_text("tests/excluded/**\n")
+    else:
+        (tmp_path / ".repowise").mkdir()
+        (tmp_path / ".repowise" / "config.yaml").write_text(
+            "exclude_patterns:\n  - tests/excluded/**\n",
+            encoding="utf-8",
+        )
 
     impact = await analyze_test_impact(
         async_session,

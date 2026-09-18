@@ -113,7 +113,7 @@ async def analyze_test_impact(
         {
             path
             for path in changed_files
-            if path and not (exclude_spec and is_excluded(path, exclude_spec))
+            if path and not (exclude_spec is not None and is_excluded(path, exclude_spec))
         }
     )
     repository = repository_alias or repository_id
@@ -198,7 +198,7 @@ async def analyze_test_impact(
                 test_id = str(row["test_id"])
                 test_file = row.get("test_file")
                 runnable_file = str(test_file or test_id.split("::", 1)[0])
-                if exclude_spec and is_excluded(runnable_file, exclude_spec):
+                if exclude_spec is not None and is_excluded(runnable_file, exclude_spec):
                     continue
                 measured_by_file[path].append(test_id)
                 key = (repository_id, test_id)
@@ -228,7 +228,7 @@ async def analyze_test_impact(
         kept_tests = [
             test_id
             for test_id in all_tests
-            if not (exclude_spec and is_excluded(test_id, exclude_spec))
+            if not (exclude_spec is not None and is_excluded(test_id, exclude_spec))
         ]
         inferred_totals_by_file[path] = len(kept_tests)
         for test_id in kept_tests:

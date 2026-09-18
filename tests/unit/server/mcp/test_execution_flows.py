@@ -67,6 +67,45 @@ async def _flows(**kwargs):
     return await get_execution_flows(**kwargs)
 
 
+async def test_root_repowise_ignore_filters_entry_points(setup_mcp, flow_graph, tmp_path):
+    (tmp_path / ".repowiseIgnore").write_text("src/svc/alpha.py\n")
+
+    result = await _flows(top_n=2)
+
+    assert [flow["entry_point"] for flow in result["flows"]] == [_ENTRY_B]
+
+
+async def test_root_repowise_ignore_filters_downstream_hops(
+    setup_mcp, flow_graph, session, tmp_path
+):
+    hidden = "vendor/hidden.py::run"
+    session.add(
+        GraphNode(
+            id="flow-hidden",
+            repository_id=flow_graph,
+            **_symbol(hidden, score=None, start=1, end=5),
+        )
+    )
+    session.add(
+        GraphEdge(
+            id="flow-hidden-edge",
+            repository_id=flow_graph,
+            source_node_id=_ENTRY_B,
+            target_node_id=hidden,
+            edge_type="calls",
+            confidence=0.95,
+            resolution_origin="self_scope",
+        )
+    )
+    await session.commit()
+    (tmp_path / ".repowiseIgnore").write_text("vendor/\n")
+
+    flow = _by_entry(await _flows(top_n=2), _ENTRY_B)
+
+    assert flow["trace"] == [_ENTRY_B]
+    assert flow["termination"] == "excluded_target"
+
+
 def _by_entry(result: dict, entry_point: str) -> dict:
     return next(f for f in result["flows"] if f["entry_point"] == entry_point)
 

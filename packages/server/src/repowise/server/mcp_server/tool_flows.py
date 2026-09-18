@@ -181,7 +181,7 @@ async def get_execution_flows(
                 entry_nodes.append((n, _ep_score(n)))
 
         exclude_spec = _get_exclude_spec(ctx.path)
-        if exclude_spec:
+        if exclude_spec is not None:
             entry_nodes = [
                 (n, s)
                 for (n, s) in entry_nodes
@@ -221,7 +221,7 @@ async def get_execution_flows(
             )
             # Drop excluded files reached downstream so they don't leak via the
             # trace (entry-point filtering above doesn't cover BFS descendants).
-            if exclude_spec:
+            if exclude_spec is not None:
                 filtered = filter_embedded_path_ids(trace, exclude_spec)
                 # The walk classified the node it actually stopped at. When
                 # filtering drops that node, the trace we publish ends earlier
