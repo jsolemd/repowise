@@ -206,7 +206,10 @@ def test_the_shape_is_what_gets_caught() -> None:
 
 def test_builtin_type_lists_live_on_the_language_specs() -> None:
     strays: dict[str, list[str]] = {}
-    for path in sorted(_PACKAGES.rglob("*.py")):
+    # Independently deployed packages can keep a native .venv beside src.
+    # Their dependencies are not RepoWise type extractors; inspect first-party
+    # package source, including new files that have not been staged in Git.
+    for path in sorted(_PACKAGES.glob("*/src/**/*.py")):
         if _SPECS in path.parents:
             continue
         try:
@@ -235,6 +238,25 @@ def test_builtin_type_lists_live_on_the_language_specs() -> None:
         + "\n\nPut them on that language's LanguageSpec.builtin_types and read them"
         " back with get_builtin_types()."
     )
+
+
+def test_builtin_type_guard_ignores_dependencies_but_checks_new_source(
+    tmp_path, monkeypatch
+) -> None:
+    import sys
+
+    package_root = tmp_path / "packages"
+    dependency = package_root / "docs" / ".venv" / "lib" / "site-packages" / "lexer.py"
+    dependency.parent.mkdir(parents=True)
+    dependency.write_text("BUILTIN_TYPES = {'str'}\n", encoding="utf-8")
+    monkeypatch.setattr(sys.modules[__name__], "_PACKAGES", package_root)
+    test_builtin_type_lists_live_on_the_language_specs()
+
+    source = package_root / "core" / "src" / "new_extractor.py"
+    source.parent.mkdir(parents=True)
+    source.write_text("BUILTIN_TYPES = {'str'}\n", encoding="utf-8")
+    with pytest.raises(AssertionError, match="new_extractor.py"):
+        test_builtin_type_lists_live_on_the_language_specs()
 
 
 @pytest.mark.parametrize(
