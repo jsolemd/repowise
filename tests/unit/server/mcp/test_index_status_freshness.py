@@ -142,6 +142,7 @@ def _healthy(indexed_commit: str, chunks: int) -> SourceIndexStatus:
         published_at="2026-08-21T16:01:00+00:00",
         embedder=_EMBEDDER,
         parser_fingerprint="parser-1",
+        symbols_parser_fingerprint="parser-1",
         symbol_chunks=chunks,
         file_window_chunks=0,
         files_covered=chunks,

@@ -107,6 +107,9 @@ class SourceIndexStatus:
     published_at: str | None = None
     embedder: EmbedderIdentity | None = None
     parser_fingerprint: str | None = None
+    #: SQL symbol provenance is independent of the derived publication's
+    #: parser identity. A current receipt cannot certify unchanged SQL rows.
+    symbols_parser_fingerprint: str | None = None
     symbol_chunks: int = 0
     file_window_chunks: int = 0
     files_covered: int = 0
@@ -161,6 +164,7 @@ class _SourceUpdateSnapshot:
     counts: dict[str, int]
     outstanding_total: int
     last_error: str | None
+    symbols_parser_fingerprint: str | None = None
 
 
 async def _source_update_snapshot(
@@ -201,15 +205,18 @@ async def _read_source_updates(
 
     repositories = list((await session.execute(select(Repository))).scalars().all())
     repository_id = None
+    symbols_parser = None
     for row in repositories:
         try:
             if row.local_path and Path(row.local_path).resolve() == repo:
                 repository_id = row.id
+                symbols_parser = getattr(row, "symbols_parser_fingerprint", None)
                 break
         except OSError:
             continue
     if repository_id is None and len(repositories) == 1:
         repository_id = repositories[0].id
+        symbols_parser = getattr(repositories[0], "symbols_parser_fingerprint", None)
     if repository_id is None:
         return _SourceUpdateSnapshot(None, {}, 0, None)
 
@@ -266,6 +273,7 @@ async def _read_source_updates(
         counts=counts,
         outstanding_total=sum(counts.values()),
         last_error=str(last_error_value) if last_error_value else None,
+        symbols_parser_fingerprint=symbols_parser,
     )
 
 
@@ -501,6 +509,7 @@ async def inspect_source_index(
         parser_fingerprint=(
             str(active_update.parser_fingerprint) if active_update is not None else None
         ),
+        symbols_parser_fingerprint=updates.symbols_parser_fingerprint,
         symbol_chunks=manifest.symbol_chunks if manifest else 0,
         file_window_chunks=manifest.file_window_chunks if manifest else 0,
         files_covered=manifest.files_covered if manifest else 0,

@@ -224,6 +224,12 @@ def _trust_state(
     ):
         known_stale.append("parser_fingerprint_mismatch")
     if (
+        status.symbols_parser_fingerprint is not None
+        and runtime_parser is not None
+        and status.symbols_parser_fingerprint != runtime_parser
+    ):
+        known_stale.append("symbols_parser_fingerprint_mismatch")
+    if (
         status.embedder is not None
         and runtime_embedder is not None
         and status.embedder != runtime_embedder
@@ -247,6 +253,8 @@ def _trust_state(
         reasons.append("vector_unverified")
     if status.parser_fingerprint is None or runtime_parser is None:
         reasons.append("parser_identity_unavailable")
+    if status.symbols_parser_fingerprint is None:
+        reasons.append("symbols_parser_identity_unavailable")
     if status.embedder is None or runtime_embedder is None:
         reasons.append("embedder_identity_unavailable")
     if status.state != "current":
@@ -425,6 +433,11 @@ async def _status_payload(ctx: Any, repository: Any, *, started: float) -> tuple
         if status.parser_fingerprint is not None and runtime_parser is not None
         else None
     )
+    symbols_parser_match = (
+        status.symbols_parser_fingerprint == runtime_parser
+        if status.symbols_parser_fingerprint is not None and runtime_parser is not None
+        else None
+    )
     embedder_match = (
         status.embedder == runtime_embedder
         if status.embedder is not None and runtime_embedder is not None
@@ -495,6 +508,8 @@ async def _status_payload(ctx: Any, repository: Any, *, started: float) -> tuple
             "indexed_parser_fingerprint": status.parser_fingerprint,
             "runtime_parser_fingerprint": runtime_parser,
             "parser_matches": parser_match,
+            "symbols_parser_fingerprint": status.symbols_parser_fingerprint,
+            "symbols_parser_matches": symbols_parser_match,
             "indexed_embedder": asdict(status.embedder) if status.embedder is not None else None,
             "runtime_embedder": (
                 asdict(runtime_embedder) if runtime_embedder is not None else None

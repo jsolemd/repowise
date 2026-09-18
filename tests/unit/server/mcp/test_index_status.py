@@ -55,6 +55,7 @@ def _status(**changes) -> SourceIndexStatus:
         published_at="2026-08-21T16:01:00+00:00",
         embedder=EmbedderIdentity(provider="mock", model="mock-embedder", dims=8),
         parser_fingerprint="parser-1",
+        symbols_parser_fingerprint="parser-1",
         symbol_chunks=7,
         file_window_chunks=3,
         files_covered=5,
@@ -353,6 +354,41 @@ def test_search_trust_is_explicitly_tri_state(status, head, expected, reason) ->
         assert reasons == []
     else:
         assert reason in reasons
+
+
+@pytest.mark.parametrize(
+    ("sql_parser", "expected_trust", "expected_reasons", "matches"),
+    [
+        ("parser-1", "trustworthy", [], True),
+        (None, "unknown", ["symbols_parser_identity_unavailable"], None),
+        ("older-parser", "stale", ["symbols_parser_fingerprint_mismatch"], False),
+    ],
+)
+async def test_current_publication_cannot_certify_stale_or_unknown_sql_symbols(
+    tmp_path, monkeypatch, sql_parser, expected_trust, expected_reasons, matches
+):
+    module = importlib.import_module("repowise.server.mcp_server.tool_index_status")
+    status = _status(symbols_parser_fingerprint=sql_parser)
+    monkeypatch.setattr(module, "inspect_source_index", AsyncMock(return_value=status))
+    monkeypatch.setattr(module, "_repo_facts", lambda _: ("indexed-head", {}))
+    monkeypatch.setattr(
+        module, "_runtime_identities", lambda _: (status.embedder, "parser-1", None)
+    )
+    context = SimpleNamespace(
+        path=tmp_path, alias="test", vector_store=SimpleNamespace(_embedder=None)
+    )
+    repository = SimpleNamespace(id="test", name="test")
+
+    payload, _, _ = await module._status_payload(context, repository, started=0)
+
+    assert payload["status"] == "current"  # The publication itself is complete.
+    assert payload["recipe"]["parser_matches"] is True
+    assert payload["recipe"]["symbols_parser_fingerprint"] == sql_parser
+    assert payload["recipe"]["symbols_parser_matches"] is matches
+    assert payload["trust"] == {
+        "search_results": expected_trust,
+        "reasons": expected_reasons,
+    }
 
 
 def _git(repo: Path, *args: str) -> None:
