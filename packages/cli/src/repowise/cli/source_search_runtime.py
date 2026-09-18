@@ -22,6 +22,43 @@ def _embedder_label(identity: Any) -> str:
     return f"{identity.provider}/{identity.model}/{identity.dims}d"
 
 
+async def configured_source_pending_updates(repo_path: Path | str) -> bool:
+    """Whether existing source work can be retried independently of SQL ingestion.
+
+    A failed publication can leave the parser and recipe identities current,
+    or have no manifest yet. Neither condition retires its durable queue.
+    Blocked rows require an upstream SQL repair and cannot be drained alone.
+    """
+    from repowise.core.source_search import source_search_enabled
+
+    if not source_search_enabled():
+        return False
+
+    from sqlalchemy.engine import make_url
+
+    from repowise.core.persistence.database import get_configured_db_url, resolve_db_url
+    from repowise.core.source_search.status import inspect_source_index
+
+    repo = Path(repo_path).resolve()
+    # Resolving the default URL creates its directory, so check before that
+    # resolver when no external database is configured.
+    if get_configured_db_url() is None and not (repo / ".repowise").is_dir():
+        return False
+    db_url = resolve_db_url(repo)
+    url = make_url(db_url)
+    # An update probe must not create a database for a never-indexed repo.
+    # Respect configured database locations rather than assuming local wiki.db.
+    if (
+        url.get_backend_name() == "sqlite"
+        and url.database not in {None, ":memory:"}
+        and not Path(url.database).is_file()
+    ):
+        return False
+
+    status = await inspect_source_index(repo, db_url=db_url, verify_stores=False)
+    return bool(status.pending_updates or status.building_updates or status.ready_updates)
+
+
 async def configured_source_recipe_changes(repo_path: Path | str) -> tuple[str, ...]:
     """Describe stored/runtime source-recipe drift for workspace skip logic.
 
