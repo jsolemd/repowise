@@ -93,7 +93,7 @@ export function Transcript() {
         language="typescript",
     )
     chunk = build_symbol_chunk(record, source.decode().splitlines())
-    assert "Render a transcript with a withheld-note redaction." in chunk.text
+    assert '"""Render a transcript with a withheld-note redaction."""' in chunk.text
     assert chunk.start_line == 2
     assert chunk.end_line == 4
 

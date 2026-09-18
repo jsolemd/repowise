@@ -28,7 +28,7 @@ def test_jsdoc_preceding_a_declaration_or_its_export(
     parsed = parser.parse_file(_make_file_info(path, language), source)
     assert parsed.parse_errors == []
     symbol = next(s for s in parsed.symbols if s.name == "named")
-    assert symbol.docstring and symbol.docstring.startswith("Describe the public operation.")
+    assert symbol.docstring == "Describe the public operation."
     assert symbol.start_line == 2
 
 
@@ -38,7 +38,7 @@ def test_jsdoc_preceding_an_exported_abstract_class(parser: ASTParser, prefix: s
     parsed = parser.parse_file(_make_file_info("service.ts", "typescript"), source)
     assert parsed.parse_errors == []
     docstring = next(s for s in parsed.symbols if s.name == "Service").docstring
-    assert docstring and docstring.startswith("Shared service contract.")
+    assert docstring == "Shared service contract."
 
 
 @pytest.mark.parametrize(("path", "language"), _LANGUAGES)
@@ -76,10 +76,7 @@ def test_comment_inside_export_takes_precedence_over_outer_jsdoc(
     parsed = parser.parse_file(_make_file_info(path, language), source)
     assert parsed.parse_errors == []
     docstring = next(s for s in parsed.symbols if s.name == "named").docstring
-    if expected is None:
-        assert docstring is None
-    else:
-        assert docstring and docstring.startswith(expected)
+    assert docstring == expected
 
 
 @pytest.mark.parametrize(("path", "language"), _LANGUAGES)
@@ -96,6 +93,6 @@ export class Service {
     parsed = parser.parse_file(_make_file_info(path, language), source)
     assert parsed.parse_errors == []
     symbols = {s.name: s for s in parsed.symbols}
-    assert symbols["Service"].docstring and symbols["Service"].docstring.startswith("The exported service.")
+    assert symbols["Service"].docstring == "The exported service."
     assert symbols["run"].docstring is None
-    assert symbols["stop"].docstring and symbols["stop"].docstring.startswith("Stop this service.")
+    assert symbols["stop"].docstring == "Stop this service."

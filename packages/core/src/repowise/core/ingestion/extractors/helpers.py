@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from inspect import cleandoc
+
 from tree_sitter import Node
 
 
@@ -234,11 +236,20 @@ def find_preceding_block_comment(node: Node, src: str, prefix: str) -> str | Non
 
 
 def clean_jsdoc(text: str) -> str:
-    """Strip JSDoc / block-comment delimiters and leading asterisks."""
-    lines = text.splitlines()
+    """Remove block delimiters and decorative stars, preserving their content."""
+    text = text.strip()
+    if not (text.startswith("/*") and text.endswith("*/")):
+        return text
+    body = text[2:-2]
+    if body.startswith("*"):
+        body = body[1:]  # JSDoc's extra opening star, not content punctuation.
     cleaned: list[str] = []
-    for line in lines:
-        line = line.strip().lstrip("/*").lstrip()
-        if line:
-            cleaned.append(line)
-    return "\n".join(cleaned).strip()
+    for index, line in enumerate(body.splitlines()):
+        stripped = line.lstrip()
+        if index and (stripped == "*" or stripped.startswith(("* ", "*\t"))):
+            # Remove one continuation marker and its separator. Remaining
+            # Markdown stars, indentation, blank lines and path slashes belong
+            # to the documentation. The opening line has no continuation marker.
+            line = stripped[2:] if len(stripped) > 1 else ""
+        cleaned.append(line)
+    return cleandoc("\n".join(cleaned)).rstrip()

@@ -69,8 +69,9 @@ STORE_FORMAT_VERSION: int = 2
 #: external edges unbuilt. Two independent invalidations, two numbers.
 #:
 #: v5 (fork): JSDoc preceding a JS/TS export statement now reaches its
-#: declaration. Cached symbols from v4 omit that documentation, changing the
-#: source chunks derived from otherwise identical files. Keep this independent
+#: declaration; block-comment delimiters are removed without consuming paths
+#: or Markdown content. Cached symbols from v4 carry missing or damaged docs,
+#: changing source chunks derived from otherwise identical files. Keep this
 #: invalidation distinct from the next upstream parser-schema bump.
 PARSER_SCHEMA_VERSION: int = 5
 
