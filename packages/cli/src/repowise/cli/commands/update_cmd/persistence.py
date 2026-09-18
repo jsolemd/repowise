@@ -840,13 +840,14 @@ async def _persist_full_update_async(
                         )
                     )
                     with timed(timings, "persist.scope_reconcile"):
-                        tombstoned_page_ids = await reconcile_full_index_scope(
+                        prune_outcome = await reconcile_full_index_scope(
                             session,
                             repo_id,
                             current_graph_paths,
                             set(git_meta_map),
                             exclusion_plan=exclusion_plan,
                         )
+                        tombstoned_page_ids = list(prune_outcome.tombstoned_page_ids)
                 except Exception as exc:
                     _skip("Config scope reconciliation", exc)
                     if require_config_rebuild_success:
@@ -1322,12 +1323,13 @@ async def _persist_full_update_async(
                 )
                 prune_outcome = DeletedFilePruneOutcome(
                     attempted=True,
-                    pruned_paths=pruned,
+                    pruned_paths=prune_outcome.pruned_paths + pruned,
                     refusals=tuple(refusals),
                 )
-                if pruned:
+                if prune_outcome.pruned_paths:
                     console.print(
-                        f"Pruned rows for [cyan]{pruned}[/cyan] deleted or excluded file(s)"
+                        f"Pruned rows for [cyan]{prune_outcome.pruned_paths}[/cyan] "
+                        "deleted or excluded file(s)"
                     )
                 for refusal in refusals:
                     console.print(f"[yellow]{refusal.message}[/yellow]")

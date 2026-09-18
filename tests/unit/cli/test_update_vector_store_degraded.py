@@ -68,3 +68,22 @@ def test_failed_vector_cleanup_retries_without_new_retirements(tmp_path) -> None
 
     store.delete_many.assert_awaited_once_with([page_id])
     assert load_cleanup_debt(tmp_path)["vectors"] == set()
+
+
+def test_vector_cleanup_store_open_failure_keeps_debt_for_retry(tmp_path) -> None:
+    """Adapter construction belongs to the host and cannot discard cleanup debt."""
+    page_id = "file_page:removed.py"
+    (tmp_path / ".repowise" / "lancedb").mkdir(parents=True)
+    store = SimpleNamespace(delete_many=AsyncMock())
+    with patch("repowise.cli.providers.build_embedder", return_value=object()), patch(
+        "repowise.cli.providers.build_vector_store",
+        side_effect=[RuntimeError("lance unavailable"), store],
+    ):
+        with pytest.raises(RuntimeError, match="lance unavailable"):
+            cleanup_retired_page_vectors(tmp_path, [page_id])
+        assert load_cleanup_debt(tmp_path)["vectors"] == {page_id}
+
+        cleanup_retired_page_vectors(tmp_path, [])
+
+    store.delete_many.assert_awaited_once_with([page_id])
+    assert load_cleanup_debt(tmp_path)["vectors"] == set()

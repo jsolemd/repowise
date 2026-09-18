@@ -217,7 +217,7 @@ async def test_full_scope_cleanup_honors_exclusion_prune_verdict(async_session, 
         refusals=(PruneRefusal("wiki_symbols", 25, 30),) if refused else (),
     )
 
-    tombstones = await reconcile_full_index_scope(
+    outcome = await reconcile_full_index_scope(
         async_session, repo.id, {KEPT}, {KEPT}, exclusion_plan=plan
     )
     await async_session.commit()
@@ -228,4 +228,14 @@ async def test_full_scope_cleanup_honors_exclusion_prune_verdict(async_session, 
     assert await _paths(async_session, HealthFinding, HealthFinding.file_path, repo.id) == expected
     page = await async_session.get(Page, f"file_page:{STALE}")
     assert page.freshness_status == ("fresh" if refused else "tombstone")
-    assert tombstones == ([] if refused else [f"file_page:{STALE}"])
+    assert outcome.attempted
+    assert outcome.pruned_paths == (0 if refused else 1)
+    assert outcome.refusals == plan.refusals
+    assert outcome.tombstoned_page_ids == (() if refused else (f"file_page:{STALE}",))
+
+    # Scope reconciliation consumes its own stale rows, so repeating it cannot
+    # inflate the count that the host combines with the later ordinary prune.
+    again = await reconcile_full_index_scope(
+        async_session, repo.id, {KEPT}, {KEPT}, exclusion_plan=plan
+    )
+    assert again.pruned_paths == 0

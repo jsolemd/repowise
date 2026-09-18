@@ -1804,13 +1804,14 @@ async def persist_incremental_index(
                     )
                     current_git_paths = set(git_meta_map)
                     with timed(timings, "persist.scope_reconcile"):
-                        tombstoned_page_ids = await reconcile_full_index_scope(
+                        prune_outcome = await reconcile_full_index_scope(
                             session,
                             repo_id,
                             current_graph_paths,
                             current_git_paths,
                             exclusion_plan=exclusion_plan,
                         )
+                        tombstoned_page_ids = list(prune_outcome.tombstoned_page_ids)
                 except Exception as exc:
                     _skip("Config scope reconciliation", exc)
 
@@ -2144,14 +2145,20 @@ async def persist_incremental_index(
                     )
                 prune_outcome = DeletedFilePruneOutcome(
                     attempted=True,
-                    pruned_paths=pruned,
+                    # Scope cleanup already removed its rows; the intervening
+                    # writes only restore retained traversal/Git paths. The
+                    # ordinary prune therefore counts only additional paths.
+                    pruned_paths=prune_outcome.pruned_paths + pruned,
                     refusals=tuple([*refusals, *module_refusals]),
                     tombstoned_page_ids=tuple(dict.fromkeys(tombstoned_page_ids)),
                     swept_page_ids=tuple(dict.fromkeys(swept_page_ids)),
                 )
                 prune_outcome_recorded = True
-                if pruned:
-                    log(f"Pruned rows for [cyan]{pruned}[/cyan] deleted or excluded file(s)")
+                if prune_outcome.pruned_paths:
+                    log(
+                        f"Pruned rows for [cyan]{prune_outcome.pruned_paths}[/cyan] "
+                        "deleted or excluded file(s)"
+                    )
                 for refusal in refusals:
                     log(f"[yellow]{refusal.message}[/yellow]")
                     if degraded is not None:

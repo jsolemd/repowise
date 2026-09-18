@@ -13,6 +13,7 @@ from repowise.cli.commands.update_cmd import command as update_cmd
 from repowise.cli.commands.update_cmd import workspace as workspace_cmd
 from repowise.cli.helpers import CommandTarget
 from repowise.cli.main import cli
+from repowise.core.repo_config import config_fingerprint
 from repowise.core.workspace.config import RepoEntry, WorkspaceConfig
 
 
@@ -47,6 +48,7 @@ def _workspace_target(
     state_dir.mkdir()
     state = {
         "last_sync_commit": head,
+        "config_fingerprint": config_fingerprint(repo),
         "docs_mode": "none",
         "working_tree_paths": working_tree_paths or [],
     }
@@ -196,7 +198,13 @@ def test_workspace_recipe_drift_forces_only_the_mismatched_current_repo(
     current_head = _git(current, "rev-parse", "HEAD")
     (current / ".repowise").mkdir()
     (current / ".repowise" / "state.json").write_text(
-        json.dumps({"last_sync_commit": current_head, "docs_mode": "none"}),
+        json.dumps(
+            {
+                "last_sync_commit": current_head,
+                "config_fingerprint": config_fingerprint(current),
+                "docs_mode": "none",
+            }
+        ),
         encoding="utf-8",
     )
     target.ws_config.repos.append(

@@ -215,7 +215,7 @@ def test_exclusion_change_converges_update_and_next_full_index(
         ["update", str(repo), "--no-workspace", "--index-only"],
     )
     assert result.exit_code == 0, result.output
-    assert "deleted or excluded file(s)" in result.output
+    assert "Pruned rows for 1 deleted or excluded file(s)" in result.output
 
     async def _paths() -> tuple[set[str], set[str], set[str]]:
         from repowise.core.persistence import (

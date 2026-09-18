@@ -19,7 +19,7 @@ from repowise.core.generation.models import (
     STRUCTURALLY_KEYED_PAGE_TYPES,
     STUB_FALLBACK_ERROR,
 )
-from repowise.core.pipeline.prune_state import PruneRefusal
+from repowise.core.pipeline.prune_state import DeletedFilePruneOutcome, PruneRefusal
 
 logger = structlog.get_logger(__name__)
 
@@ -174,8 +174,8 @@ async def reconcile_full_index_scope(
     current_git_paths: set[str],
     *,
     exclusion_plan: ExclusionPrunePlan | None = None,
-) -> list[str]:
-    """Reconcile every source-backed store against one successful traversal."""
+) -> DeletedFilePruneOutcome:
+    """Reconcile source-backed stores and retain the cleanup result for the host."""
     # Config-driven scope cleanup must honor the same mass-deletion verdict as
     # the ordinary prune. A refused exclusion is still part of the stored scope.
     protected_paths = (
@@ -183,7 +183,7 @@ async def reconcile_full_index_scope(
     )
     retained_graph_paths = current_graph_paths | protected_paths
     tombstoned = await tombstone_file_pages_outside_scope(session, repo_id, retained_graph_paths)
-    await _prune_stale_file_rows(
+    pruned = await _prune_stale_file_rows(
         session,
         repo_id,
         current_graph_paths,
@@ -196,7 +196,12 @@ async def reconcile_full_index_scope(
     )
 
     await purge_proposed_decisions_outside_files(session, repo_id, retained_graph_paths)
-    return tombstoned
+    return DeletedFilePruneOutcome(
+        attempted=True,
+        pruned_paths=pruned,
+        refusals=exclusion_plan.refusals if exclusion_plan is not None else (),
+        tombstoned_page_ids=tuple(tombstoned),
+    )
 
 
 async def tombstone_pages_outside_generation(
@@ -2699,10 +2704,11 @@ async def persist_pipeline_result(
         for gm in result.git_metadata_list
     }
     current_git_file_paths.discard("")
-    swept_page_ids = await reconcile_full_index_scope(
+    scope_outcome = await reconcile_full_index_scope(
         session, repo_id, current_graph_file_paths, current_git_file_paths,
         exclusion_plan=exclusion_plan,
     )
+    swept_page_ids = list(scope_outcome.tombstoned_page_ids)
 
     symbol_count = await persist_ingestion(result, session, repo_id)
     if replace_full_git_history:
