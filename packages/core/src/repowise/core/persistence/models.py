@@ -118,6 +118,10 @@ class Repository(Base):
     # update's edge reconcile to every parsed file, once. NULL on stores written
     # before this, which is treated as a mismatch and heals the same way.
     graph_edges_parser_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Independent SQL symbol provenance: a derived source manifest or edge
+    # refresh cannot certify unchanged wiki_symbols. Written only together
+    # with a complete, hash-checked symbol reconciliation; NULL heals once.
+    symbols_parser_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
     settings_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_now_utc

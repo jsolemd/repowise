@@ -1763,6 +1763,7 @@ async def persist_incremental_index(
     # ``state.json`` and ``get_index_status`` can report the run as degraded.
     module_refusals: list[PruneRefusal] = []
     source_symbol_error: str | None = None
+    symbol_parser_refresh = None
     prune_outcome = DeletedFilePruneOutcome()
     # False until the prune step builds the real outcome. The tail below fills
     # in from the loose accumulators only when it never got there.
@@ -1993,8 +1994,14 @@ async def persist_incremental_index(
                 from repowise.core.pipeline.persist import persist_incremental_symbols
 
                 with timed(timings, "persist.symbols"):
-                    await persist_incremental_symbols(session, repo_id, parsed_files, changed_paths)
+                    symbol_parser_refresh = await persist_incremental_symbols(
+                        session, repo_id, parsed_files, changed_paths
+                    )
             except Exception as exc:
+                from repowise.core.persistence.parser_state import SymbolParserRefreshError
+
+                if isinstance(exc, SymbolParserRefreshError):
+                    raise
                 _skip("Symbol persist", exc, range_scoped=True)
                 source_symbol_error = str(exc)
 
@@ -2199,6 +2206,20 @@ async def persist_incremental_index(
                 except Exception as exc:
                     _skip("Queue rebuild after prune", exc)
 
+            if symbol_parser_refresh is not None:
+                from repowise.core.persistence.parser_state import complete_symbol_parser_refresh
+
+                await complete_symbol_parser_refresh(
+                    session,
+                    repo_id,
+                    symbol_parser_refresh,
+                    required_paths=set(getattr(
+                        graph_builder, "traversed_file_paths",
+                        [pf.file_info.path for pf in parsed_files or []],
+                    )),
+                    prune_ready=prune_outcome_recorded and not prune_outcome.refusals,
+                )
+
             # The source-index queue must commit atomically with the symbol
             # mutation it describes. A failed symbol step produces a durable
             # blocked row rather than letting the derived stores publish from
@@ -2206,7 +2227,7 @@ async def persist_incremental_index(
             from repowise.core.source_search import source_search_enabled
 
             if source_search_enabled():
-                if exclusion_plan.actionable_paths:
+                if exclusion_plan.actionable_paths or symbol_parser_refresh is not None:
                     from repowise.core.source_search.outbox import enqueue_full_update
 
                     await enqueue_full_update(
@@ -2216,6 +2237,7 @@ async def persist_incremental_index(
                         parsed_files=parsed_files,
                         upstream_ready=source_symbol_error is None,
                         upstream_error=source_symbol_error,
+                        upstream_refreshed=symbol_parser_refresh is not None,
                     )
                 else:
                     from repowise.core.source_search.outbox import enqueue_incremental_update

@@ -28,6 +28,30 @@ def _store(session: Any) -> Any:
     return SqlJobStore(session)
 
 
+async def invalidate_parser_completions(session: Any, repo_id: str) -> None:
+    """Retire old phase completions in the symbol refresh transaction.
+
+    Unlike best-effort checkpoint bookkeeping, this must either commit with
+    the parser witness or raise: otherwise a restarted process could skip an
+    old analysis just because a new INDEX phase had completed.
+    """
+    from repowise.core.persistence._interfaces.job_store import JobState
+
+    store = _store(session)
+    for phase in ResumePhase:
+        while jobs := await store.list_jobs(
+            repository_id=repo_id,
+            phase=str(phase),
+            state=JobState.COMPLETED,
+        ):
+            for job in jobs:
+                await store.update_state(
+                    job.id,
+                    JobState.CANCELLED,
+                    error="Parser changed; the pipeline phase must be recomputed.",
+                )
+
+
 class ResumeLedger:
     """Records phase lifecycle for one repository, committing each write."""
 

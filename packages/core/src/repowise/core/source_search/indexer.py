@@ -120,6 +120,14 @@ async def build_source_index(
     started = time.perf_counter()
     repo = Path(repo_path).resolve()
 
+    from repowise.core.persistence.parser_state import symbol_parser_refresh_required
+
+    if await symbol_parser_refresh_required(repo, db_url=db_url):
+        raise RuntimeError(
+            "Persisted SQL symbols need a parser refresh; run 'repowise update' "
+            "before rebuilding source search."
+        )
+
     load_started = time.perf_counter()
     symbols, indexed_commit = await _load_symbols(repo, db_url)
     symbol_chunks = _build_symbol_chunks(repo, symbols)

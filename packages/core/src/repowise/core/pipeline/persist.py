@@ -19,6 +19,7 @@ from repowise.core.generation.models import (
     STRUCTURALLY_KEYED_PAGE_TYPES,
     STUB_FALLBACK_ERROR,
 )
+from repowise.core.persistence.parser_state import SymbolParserRefresh, SymbolParserRefreshError
 from repowise.core.pipeline.prune_state import DeletedFilePruneOutcome, PruneRefusal
 
 logger = structlog.get_logger(__name__)
@@ -653,24 +654,38 @@ async def persist_incremental_symbols(
     repo_id: str,
     parsed_files: list[Any] | None,
     changed_paths: list[str],
-) -> None:
-    """Refresh ``wiki_symbols`` for changed+parsed files on an incremental update.
+) -> SymbolParserRefresh | None:
+    """Refresh changed symbols, widening to the whole parse after parser drift.
 
-    The incremental update path re-parses changed files but never persisted
-    their symbols, so wiki_symbols bounds fossilized at the last full index and
-    the get_answer hydrator served drifted signatures/bodies. This upserts the
-    changed files' fresh symbols and prunes symbols that vanished from a
-    still-existing file. Scoped to the changed set for cost — the repo-wide
-    ``batch_upsert_symbols`` reloads every symbol row.
+    A returned refresh carries actual hash-checked coverage. The caller must
+    certify it after pruning, then queue a full source receipt in the same
+    transaction. ``None`` input means no parse was supplied (metadata-only
+    callers); an empty list is an explicit parse of an empty corpus.
     """
-    if not parsed_files:
-        return
+    if parsed_files is None:
+        return None
+    from repowise.core.ingestion.parse_cache import parser_fingerprint
     from repowise.core.persistence.crud import reconcile_symbols_for_files
+    from repowise.core.persistence.parser_state import stored_symbol_parser
+
+    fingerprint = parser_fingerprint()
+    parser_changed = await stored_symbol_parser(session, repo_id) != fingerprint
+    if parser_changed:
+        changed_paths = [pf.file_info.path for pf in parsed_files or []]
 
     reconcile_paths, symbols = _changed_file_symbols(parsed_files, changed_paths)
-    if not reconcile_paths:
-        return
-    await reconcile_symbols_for_files(session, repo_id, reconcile_paths, symbols)
+    if reconcile_paths:
+        try:
+            await reconcile_symbols_for_files(session, repo_id, reconcile_paths, symbols)
+        except Exception as exc:
+            if parser_changed:
+                raise SymbolParserRefreshError(f"Symbol parser refresh failed: {exc}") from exc
+            raise
+    if parser_changed:
+        # The caller checks coverage after its deletion/exclusion prune, then
+        # stamps and queues a full source rebuild in this same transaction.
+        return SymbolParserRefresh(fingerprint, frozenset(reconcile_paths))
+    return None
 
 
 def _repo_root_from_parsed(parsed_files: list[Any]) -> Path | None:
@@ -1929,7 +1944,6 @@ async def persist_ingestion(result: Any, session: Any, repo_id: str) -> int:
     """
     from repowise.core.persistence import (
         batch_upsert_graph_edges,
-        batch_upsert_symbols,
         bulk_upsert_external_systems,
         link_graph_nodes_to_external_systems,
     )
@@ -1991,8 +2005,37 @@ async def persist_ingestion(result: Any, session: Any, repo_id: str) -> int:
             if not getattr(sym, "file_path", None):
                 sym.file_path = pf.file_info.path
             all_symbols.append(sym)
-    if all_symbols:
-        await batch_upsert_symbols(session, repo_id, all_symbols)
+    symbol_refresh = await persist_incremental_symbols(
+        session, repo_id, result.parsed_files,
+        [pf.file_info.path for pf in result.parsed_files],
+    )
+    if symbol_refresh is not None:
+        from repowise.core.persistence.parser_state import complete_symbol_parser_refresh
+
+        root = _repo_root_from_parsed(result.parsed_files)
+        exclusion_plan = (
+            await plan_excluded_file_prune(session, repo_id, root) if root is not None else None
+        )
+        await complete_symbol_parser_refresh(
+            session,
+            repo_id,
+            symbol_refresh,
+            required_paths={
+                info.path for info in getattr(result, "file_infos", [])
+            } | {pf.file_info.path for pf in result.parsed_files},
+            prune_ready=not (exclusion_plan and exclusion_plan.refusals),
+        )
+        from repowise.core.source_search import source_search_enabled
+
+        if source_search_enabled():
+            from repowise.core.source_search.outbox import enqueue_full_update
+
+            # Resume checkpoints commit INDEX before the final persistence
+            # phase. An interruption there must leave this receipt alongside
+            # the witness; the final phase's identical request deduplicates.
+            await enqueue_full_update(
+                session, repo_id, parsed_files=result.parsed_files, upstream_refreshed=True
+            )
 
     # ---- Security scan -------------------------------------------------------
     # Best-effort — never breaks the rest of the phase.

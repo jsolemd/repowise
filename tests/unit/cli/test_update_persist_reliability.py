@@ -360,6 +360,10 @@ def test_update_decay_paths_use_cascade_dependents(
             await init_db(engine)
             async with get_session(create_session_factory(engine)) as session:
                 repo = await upsert_repository(session, name="repo", local_path=str(tmp_path))
+                from repowise.core.ingestion.parse_cache import parser_fingerprint
+
+                # This test varies page decay over an unchanged SQL parse.
+                repo.symbols_parser_fingerprint = parser_fingerprint()
                 for page_id, page_type, target in [
                     ("file_page:src/a.py", "file_page", "src/a.py"),
                     ("module_page:pkg", "module_page", "pkg"),
@@ -510,6 +514,10 @@ def test_update_decay_paths_leaves_seed_file_page_stale(
             await init_db(engine)
             async with get_session(create_session_factory(engine)) as session:
                 repo = await upsert_repository(session, name="repo", local_path=str(tmp_path))
+                from repowise.core.ingestion.parse_cache import parser_fingerprint
+
+                # This test varies page decay over an unchanged SQL parse.
+                repo.symbols_parser_fingerprint = parser_fingerprint()
                 for page_id, page_type, target in [
                     ("file_page:src/a.py", "file_page", "src/a.py"),
                     ("module_page:pkg", "module_page", "pkg"),

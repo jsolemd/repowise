@@ -448,6 +448,7 @@ async def _enqueue(
     upstream_error: str | None,
     parser: str,
     parent_generation_id: str | None,
+    upstream_refreshed: bool = False,
 ) -> SourceIndexUpdate:
     dedupe = _dedupe_key(
         parent_generation_id=parent_generation_id,
@@ -464,6 +465,14 @@ async def _enqueue(
         )
     ).scalar_one_or_none()
     if existing is not None:
+        if upstream_refreshed and upstream_ready and existing.state == BLOCKED:
+            # A successful complete SQL refresh can repair an older identical
+            # blocked intent. Preserve its identity/attempt history. Ordinary
+            # source-only requests cannot authorize failed upstream symbols.
+            existing.upstream_ready = True
+            existing.state = PENDING
+            existing.last_error = None
+            await session.flush()
         return existing
 
     row = SourceIndexUpdate(
@@ -546,8 +555,14 @@ async def enqueue_full_update(
     parsed_files: list[Any] | None = None,
     upstream_ready: bool = True,
     upstream_error: str | None = None,
+    upstream_refreshed: bool = False,
 ) -> SourceIndexUpdate:
-    """Capture a full-reconcile request in the caller's SQL transaction."""
+    """Capture a full-reconcile request in the caller's SQL transaction.
+
+    ``upstream_refreshed`` is reserved for a proven complete SQL symbol
+    refresh in this transaction; it can reopen an identical legacy blocked
+    intent. A derived-index rebuild alone cannot establish that authority.
+    """
 
     if repo_path is None:
         repo_path = (
@@ -583,6 +598,7 @@ async def enqueue_full_update(
         upstream_error=upstream_error,
         parser=parser_fingerprint(),
         parent_generation_id=_active_generation(root),
+        upstream_refreshed=upstream_refreshed,
     )
 
 

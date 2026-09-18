@@ -105,6 +105,7 @@ def _seeded_repo(tmp_path):
 
 
 async def _seed(root):
+    from repowise.core.ingestion.parse_cache import parser_fingerprint
     from repowise.core.persistence.database import (
         create_engine,
         create_session_factory,
@@ -116,7 +117,15 @@ async def _seed(root):
     engine = create_engine(resolve_db_url(root))
     await init_db(engine)
     async with create_session_factory(engine)() as session:
-        session.add(Repository(id="r1", name="repo", local_path=str(root), head_commit="abc"))
+        session.add(
+            Repository(
+                id="r1",
+                name="repo",
+                local_path=str(root),
+                head_commit="abc",
+                symbols_parser_fingerprint=parser_fingerprint(),
+            )
+        )
         session.add(
             WikiSymbol(
                 repository_id="r1",

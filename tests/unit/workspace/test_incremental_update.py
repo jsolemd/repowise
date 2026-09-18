@@ -158,11 +158,20 @@ def test_indexed_repo_takes_incremental_path(tmp_path, forbid_full_pipeline):
     assert (repo / ".repowise" / "wiki.db").stat().st_size > 0
 
 
-def test_no_relevant_changes_still_reports_updated(tmp_path, forbid_full_pipeline):
+def test_no_relevant_changes_still_reports_updated(tmp_path, monkeypatch):
     """An empty commit produces no file diffs; the repo still reports
     updated=True so the caller bumps last_sync_commit instead of
     re-diffing forever."""
+    from repowise.core.pipeline.full_index import index_repo_full
+
     repo = _make_git_repo(tmp_path)
+    # A current SQL parse is required before an empty diff can skip parsing.
+    asyncio.run(index_repo_full(repo))
+
+    async def unexpected_full_index(*_args, **_kwargs):
+        raise AssertionError("full pipeline must not run for indexed repos")
+
+    monkeypatch.setattr("repowise.core.pipeline.run_pipeline", unexpected_full_index)
     base = get_head_commit(repo)
     _mark_indexed(repo, base)
     _git(repo, "commit", "--allow-empty", "-m", "empty")

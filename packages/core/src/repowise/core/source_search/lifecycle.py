@@ -576,6 +576,13 @@ async def _reconcile_source_index_unlocked(
     started = time.perf_counter()
     repo = Path(repo_path).resolve()
     fingerprint = recipe_fingerprint(embedder_identity)
+    from repowise.core.persistence.parser_state import symbol_parser_refresh_required
+
+    if await symbol_parser_refresh_required(repo, db_url=db_url):
+        raise SourceIndexDeferredError(
+            "Persisted SQL symbols need a parser refresh; run 'repowise update' "
+            "before publishing source search."
+        )
     if force_full:
         await _enqueue_manual_full(repo, db_url)
 

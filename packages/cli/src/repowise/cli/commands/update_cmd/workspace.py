@@ -169,18 +169,24 @@ def _workspace_update(
             )
         )
         recipe_changes: tuple[str, ...] = ()
+        from repowise.core.persistence.parser_state import symbol_parser_refresh_required
+
+        parser_stale = indexed and run_async(symbol_parser_refresh_required(abs_path))
+        source_pending = False
         if indexed:
             try:
                 from repowise.cli.source_search_runtime import (
+                    configured_source_pending_updates,
                     configured_source_recipe_changes,
                 )
 
+                source_pending = run_async(configured_source_pending_updates(abs_path))
                 recipe_changes = run_async(configured_source_recipe_changes(abs_path))
             except Exception:
                 # The source lane reports its own unavailable/degraded state;
                 # inability to inspect it must not block the primary update.
                 recipe_changes = ()
-        if recipe_changes:
+        if recipe_changes or parser_stale or source_pending:
             recipe_drift_aliases.add(entry.alias)
         has_uncommitted_changes = (
             include_working_tree and indexed and has_working_tree_changes(abs_path)
@@ -200,6 +206,8 @@ def _workspace_update(
             or has_working_tree_cleanup
             or has_accepted_prune
             or bool(recipe_changes)
+            or parser_stale
+            or source_pending
         )
         if not indexed:
             status = "[dim]not indexed[/dim]"
@@ -216,6 +224,10 @@ def _workspace_update(
             if has_accepted_prune:
                 reasons.append("accepted mass-deletion repair")
             reasons.extend(recipe_changes)
+            if parser_stale:
+                reasons.append("SQL symbol parser refresh required")
+            if source_pending:
+                reasons.append("pending source publication")
             status = f"[yellow]{', '.join(reasons)}[/yellow]"
         else:
             status = "[green]up to date[/green]"

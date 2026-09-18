@@ -14,6 +14,7 @@ from filelock import FileLock
 from sqlalchemy import delete, select
 
 from repowise.core.ingestion import ASTParser, FileTraverser
+from repowise.core.ingestion.parse_cache import parser_fingerprint
 from repowise.core.persistence.database import (
     create_engine,
     create_session_factory,
@@ -236,6 +237,7 @@ async def lifecycle_repo(tmp_path):
     try:
         async with get_session(factory) as session:
             repository = Repository(id="r1", name="repo", local_path=str(repo))
+            repository.symbols_parser_fingerprint = parser_fingerprint()
             session.add(repository)
             await session.flush()
             await _replace_symbols(session, repository.id, repo, "src/app.py")
@@ -271,6 +273,7 @@ async def legacy_repo(tmp_path):
     try:
         async with get_session(factory) as session:
             repository = Repository(id="r1", name="legacy-repo", local_path=str(repo))
+            repository.symbols_parser_fingerprint = parser_fingerprint()
             session.add(repository)
             await session.flush()
             await _replace_symbols(session, repository.id, repo, "src/app.py")

@@ -36,8 +36,13 @@ async def sf():
 
 
 async def _make_repo(sf) -> str:
+    from repowise.core.ingestion.parse_cache import parser_fingerprint
+
     async with get_session(sf) as session:
         repo = await upsert_repository(session, name="r", local_path="/tmp/r")
+        # These ledger tests model a current indexed repository; parser-drift
+        # coverage below explicitly replaces this witness with an old value.
+        repo.symbols_parser_fingerprint = parser_fingerprint()
         return repo.id
 
 

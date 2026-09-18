@@ -431,6 +431,7 @@ async def run_pipeline(
     if resume_controller is not None and not skip_index:
         await resume_controller.checkpoint_index(
             parsed_files=parsed_files,
+            file_infos=file_infos,
             graph_builder=graph_builder,
             git_metadata_list=git_metadata_list,
             git_summary=git_summary,

@@ -91,6 +91,7 @@ async def repo(tmp_path):
 
 
 async def _seed_symbols(root):
+    from repowise.core.ingestion.parse_cache import parser_fingerprint
     from repowise.core.persistence.database import (
         create_engine,
         create_session_factory,
@@ -104,6 +105,7 @@ async def _seed_symbols(root):
     factory = create_session_factory(engine)
     async with factory() as session:
         repository = Repository(id="r1", name="repo", local_path=str(root), head_commit="deadbeef")
+        repository.symbols_parser_fingerprint = parser_fingerprint()
         session.add(repository)
         session.add_all(
             [

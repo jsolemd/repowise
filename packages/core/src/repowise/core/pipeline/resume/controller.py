@@ -84,6 +84,13 @@ class ResumeController:
         """
         if not self._resume:
             return False
+        from repowise.core.ingestion.parse_cache import parser_fingerprint
+        from repowise.core.persistence import get_session
+        from repowise.core.persistence.parser_state import stored_symbol_parser
+
+        async with get_session(self._sf) as session:
+            if await stored_symbol_parser(session, self._repo_id) != parser_fingerprint():
+                return False
         done = await self._completed_phases()
         cutoff = RESUME_PHASE_ORDER.index(phase)
         return all(p in done for p in RESUME_PHASE_ORDER[: cutoff + 1])
@@ -131,6 +138,7 @@ class ResumeController:
         self,
         *,
         parsed_files: list[Any],
+        file_infos: list[Any] | None = None,
         graph_builder: Any,
         git_metadata_list: list[dict],
         git_summary: Any | None = None,
@@ -153,6 +161,7 @@ class ResumeController:
 
         view = SimpleNamespace(
             parsed_files=parsed_files,
+            file_infos=file_infos or [],
             graph_builder=graph_builder,
             git_metadata_list=git_metadata_list,
             git_summary=git_summary,

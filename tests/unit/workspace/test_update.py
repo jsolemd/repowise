@@ -361,6 +361,11 @@ class TestUpdateWorkspace:
                 await engine.dispose()
 
         async def _run():
+            from repowise.core.pipeline.full_index import index_repo_full
+
+            # Start from a real current parse, then make only the row's
+            # freshness metadata stale. A missing parser witness needs work.
+            await index_repo_full(repo)
             await _seed()
             from repowise.core.repo_config import (
                 config_dependency_fingerprints,

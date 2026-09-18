@@ -28,6 +28,7 @@ def _db_url(repo: Path) -> str:
 
 async def _seed(repo: Path, pages: dict[str, str]) -> None:
     """A repository row plus one file page per ``{path: freshness_status}``."""
+    from repowise.core.ingestion.parse_cache import parser_fingerprint
     from repowise.core.persistence import (
         create_engine,
         create_session_factory,
@@ -42,6 +43,8 @@ async def _seed(repo: Path, pages: dict[str, str]) -> None:
     sf = create_session_factory(engine)
     async with get_session(sf) as session:
         row = await upsert_repository(session, name=repo.name, local_path=str(repo))
+        # These fixtures vary page freshness independently of SQL parsing.
+        row.symbols_parser_fingerprint = parser_fingerprint()
         for path, status in pages.items():
             await upsert_page(
                 session,

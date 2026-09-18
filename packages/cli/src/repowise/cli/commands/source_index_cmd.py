@@ -96,6 +96,7 @@ async def _run(repo_path, embedder_name: str, batch_size: int | None) -> None:
         reconcile_configured_source_index,
     )
     from repowise.core.source_search.indexer import EMBED_BATCH_SIZE
+    from repowise.core.source_search.lifecycle import SourceIndexDeferredError
     from repowise.core.source_search.manifest import default_manifest_path, read_manifest
 
     requested = embedder_name
@@ -118,6 +119,8 @@ async def _run(repo_path, embedder_name: str, batch_size: int | None) -> None:
             "or pass --embedder mock to build a deterministic test index. "
             f"({exc})"
         ) from exc
+    except SourceIndexDeferredError as exc:
+        raise click.ClickException(str(exc)) from exc
     if result is None:  # The command checked the same dynamic flag above.
         raise click.ClickException("Source search was disabled before reconciliation started.")
 

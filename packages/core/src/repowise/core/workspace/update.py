@@ -414,7 +414,10 @@ async def _incremental_repo_update(
         detector.get_changed_files(base_ref, head),
         working_tree_diffs,
     )
-    if not file_diffs:
+    from ..persistence.parser_state import symbol_parser_refresh_required
+
+    parser_stale = await symbol_parser_refresh_required(repo_path)
+    if not file_diffs and not parser_stale:
         # New commits but nothing the index cares about changed (merge/empty
         # commits, or every change excluded). Report success so the caller
         # bumps ``last_sync_commit`` instead of re-diffing forever.
@@ -829,6 +832,11 @@ async def update_workspace(
             is_stale = bool(state_prune_refusals(state))
         if not is_stale and force_aliases is not None:
             is_stale = entry.alias in force_aliases
+
+        if not is_stale:
+            from ..persistence.parser_state import symbol_parser_refresh_required
+
+            is_stale = await symbol_parser_refresh_required(abs_path)
 
         if not is_stale:
             # Nothing to regenerate, but the DB freshness stamp can still be

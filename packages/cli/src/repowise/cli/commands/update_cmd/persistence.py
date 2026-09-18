@@ -807,6 +807,7 @@ async def _persist_full_update_async(
     # Same contract, for rows of a page that has been retired outright.
     swept_page_ids: list[str] = []
     source_symbol_error: str | None = None
+    symbol_parser_refresh = None
     prune_outcome = DeletedFilePruneOutcome()
     try:
         with timed(timings, "persist.open"):
@@ -1212,7 +1213,7 @@ async def _persist_full_update_async(
                 from repowise.core.pipeline.persist import persist_incremental_symbols
 
                 with timed(timings, "persist.symbols"):
-                    await persist_incremental_symbols(
+                    symbol_parser_refresh = await persist_incremental_symbols(
                         session,
                         repo_id,
                         parsed_files,
@@ -1223,6 +1224,10 @@ async def _persist_full_update_async(
                         ),
                     )
             except Exception as exc:
+                from repowise.core.persistence.parser_state import SymbolParserRefreshError
+
+                if isinstance(exc, SymbolParserRefreshError):
+                    raise
                 _skip("Symbol persist", exc)
                 source_symbol_error = str(exc)
 
@@ -1360,12 +1365,26 @@ async def _persist_full_update_async(
             except Exception as exc:
                 _skip("Page count", exc)
 
+            if symbol_parser_refresh is not None:
+                from repowise.core.persistence.parser_state import complete_symbol_parser_refresh
+
+                await complete_symbol_parser_refresh(
+                    session,
+                    repo_id,
+                    symbol_parser_refresh,
+                    required_paths=set(getattr(
+                        graph_builder, "traversed_file_paths",
+                        [pf.file_info.path for pf in parsed_files or []],
+                    )),
+                    prune_ready=prune_outcome.attempted and not prune_outcome.refusals,
+                )
+
             # This docs-mode writer duplicates the core incremental symbol
             # path, so it must duplicate the transactional source outbox hook.
             from repowise.core.source_search import source_search_enabled
 
             if source_search_enabled():
-                if exclusion_plan.actionable_paths:
+                if exclusion_plan.actionable_paths or symbol_parser_refresh is not None:
                     from repowise.core.source_search.outbox import enqueue_full_update
 
                     await enqueue_full_update(
@@ -1375,6 +1394,7 @@ async def _persist_full_update_async(
                         parsed_files=parsed_files,
                         upstream_ready=source_symbol_error is None,
                         upstream_error=source_symbol_error,
+                        upstream_refreshed=symbol_parser_refresh is not None,
                     )
                 else:
                     from repowise.core.source_search.outbox import enqueue_incremental_update

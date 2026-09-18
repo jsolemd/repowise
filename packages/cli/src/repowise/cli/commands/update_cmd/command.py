@@ -1005,10 +1005,18 @@ def run_update(
     curr_renderer_fp = _current_renderer_fingerprint(repo_path)
     renderer_changed = prev_renderer_fp is not None and prev_renderer_fp != curr_renderer_fp
 
-    source_recipe_changes: tuple[str, ...] = ()
-    try:
-        from repowise.cli.source_search_runtime import configured_source_recipe_changes
+    from repowise.core.persistence.parser_state import symbol_parser_refresh_required
 
+    parser_refresh_required = run_async(symbol_parser_refresh_required(repo_path))
+    source_recipe_changes: tuple[str, ...] = ()
+    source_pending = False
+    try:
+        from repowise.cli.source_search_runtime import (
+            configured_source_pending_updates,
+            configured_source_recipe_changes,
+        )
+
+        source_pending = run_async(configured_source_pending_updates(repo_path))
         source_recipe_changes = run_async(configured_source_recipe_changes(repo_path))
     except Exception as exc:
         log.debug("source_recipe_drift_check_skipped", error=str(exc))
@@ -1051,6 +1059,8 @@ def run_update(
         and not config_changed
         and not renderer_changed
         and not source_recipe_changes
+        and not source_pending
+        and not parser_refresh_required
         and not prune_retry
         and not working_tree_diffs
     )
@@ -1220,8 +1230,22 @@ def run_update(
     # window. Leaving both behind would cause the augment hook to keep
     # suppressing for the queued-stale-after duration even past a failed run.
     clear_update_queued(repo_path)
-    atexit.register(release_update_lock, repo_path)
-    atexit.register(clear_update_queued, repo_path)
+    run_markers_owned = True
+
+    def release_run_markers() -> None:
+        nonlocal run_markers_owned
+        if not run_markers_owned:
+            return
+        run_markers_owned = False
+        try:
+            clear_update_queued(repo_path)
+        finally:
+            release_update_lock(repo_path)
+
+    # One callback belongs to this invocation. An early return can retire it
+    # without unregistering a sibling repository's cleanup; calling it after
+    # release cannot unlink markers acquired by a successor process.
+    atexit.register(release_run_markers)
 
     # Backfill the docs mode on legacy state files using the same inference
     # the resolver uses, so the post-commit hook and future runs stop relying
@@ -1328,93 +1352,102 @@ def run_update(
 
     if (
         not file_diffs
-        and source_recipe_changes
         and not config_changed
         and not renderer_changed
+        and not parser_refresh_required
         and not prune_retry
         and not stale_db_paths
         and not stale_deterministic_ids
     ):
-        moved = "; ".join(source_recipe_changes)
-        console.print(f"[yellow]Source index recipe changed: {moved}. Rebuilding.[/yellow]")
-        if dry_run:
-            console.print("[yellow]Dry run — source index would be rebuilt.[/yellow]")
+        console.print("[green]No changed files detected.[/green]")
+        source_work = bool(source_recipe_changes or source_pending)
+        if source_recipe_changes:
+            moved = "; ".join(source_recipe_changes)
+            console.print(f"[yellow]Source index recipe changed: {moved}. Rebuilding.[/yellow]")
+        elif source_pending:
+            console.print("[yellow]Retrying pending source index publication.[/yellow]")
+        source_degraded: list[str] = []
+        try:
+            if dry_run:
+                if source_work:
+                    console.print("[yellow]Dry run — source index would be reconciled.[/yellow]")
+                if emitter is not None:
+                    emitter.done(
+                        ok=True,
+                        pages_generated=0,
+                        cost_usd=0.0,
+                        duration_s=time.monotonic() - start,
+                        outcome=UpdateOutcome.DRY_RUN.value,
+                    )
+                return UpdateOutcome.DRY_RUN
+            if source_work:
+                from repowise.cli.source_search_runtime import reconcile_configured_source_index
+
+                try:
+                    source_result = run_async(
+                        reconcile_configured_source_index(
+                            repo_path, force_full=bool(source_recipe_changes)
+                        )
+                    )
+                    if source_result is not None and source_result.status in {"busy", "degraded"}:
+                        message = source_result.error or f"source index is {source_result.status}"
+                        source_degraded.append(f"Source search reconcile: {message}")
+                        console.print(
+                            f"[yellow]Source search reconcile deferred: {message}[/yellow]"
+                        )
+                except Exception as exc:
+                    source_degraded.append(f"Source search reconcile: {exc}")
+                    console.print(f"[yellow]Source search reconcile deferred: {exc}[/yellow]")
+            # Source publication has its own durable retry queue. Its outcome
+            # must not skip metadata heals for an otherwise current SQL/wiki
+            # index, or claim that this command regenerated documentation.
+            # Always advance the sync pointer so the on-disk freshness marker stays
+            # current on no-op syncs. In docs mode, no changed files means no docs
+            # work is pending, so the docs pointer can advance to head too, which
+            # also heals legacy state that never recorded one.
+            persisted = {
+                **state,
+                "last_sync_commit": head,
+                "config_fingerprint": curr_config_fp,
+                "config_dependency_fingerprints": curr_dependency_fps,
+                "renderer_fingerprint": curr_renderer_fp,
+            }
+            # base_ref has already been widened to any unrepaired range by this
+            # point, so no changed files means the range holds nothing left to
+            # re-cover. Clearing here is also what stops a marker whose range is
+            # permanently empty from being carried, and re-announced, forever.
+            # Gated exactly as the widening above is: with --since or in docs mode
+            # this base is a different range that says nothing about the marker's,
+            # and clearing on it would drop a repair that never happened.
+            if since is None and resolved_index_only:
+                persisted.pop("pending_repair", None)
+            if not resolved_index_only and head:
+                persisted["last_docs_commit"] = head
+            timings.stop("run")
+            persisted["phase_timings"] = timings.totals
+            save_state(repo_path, persisted)
+            # Keep the DB freshness stamp in lockstep with state.json: the server's
+            # /repos endpoint reads head_commit from the row, not the state file.
+            stamp_head_commit(repo_path, head)
+            # This path skips the git phase, so its offset backfill never runs.
+            heal_commit_offsets(repo_path)
+            _refresh_editor_stamp(repo_path, agents_md)
+            # We hold the lock and have advanced to head; drop any stale pending
+            # marker a bailed update left behind.
+            consume_update_pending(repo_path, head)
             if emitter is not None:
                 emitter.done(
                     ok=True,
                     pages_generated=0,
                     cost_usd=0.0,
                     duration_s=time.monotonic() - start,
-                    outcome=UpdateOutcome.DRY_RUN.value,
+                    degraded=source_degraded,
+                    outcome=UpdateOutcome.NOOP.value,
                 )
-            return UpdateOutcome.DRY_RUN
-        from repowise.cli.source_search_runtime import reconcile_configured_source_index
-
-        run_async(reconcile_configured_source_index(repo_path, force_full=True))
-        if emitter is not None:
-            emitter.done(
-                ok=True,
-                pages_generated=0,
-                cost_usd=0.0,
-                duration_s=time.monotonic() - start,
-                outcome=UpdateOutcome.REGENERATED.value,
-            )
-        return UpdateOutcome.REGENERATED
-
-    if (
-        not file_diffs
-        and not config_changed
-        and not renderer_changed
-        and not source_recipe_changes
-        and not prune_retry
-        and not stale_db_paths
-        and not stale_deterministic_ids
-    ):
-        console.print("[green]No changed files detected.[/green]")
-        # Always advance the sync pointer so the on-disk freshness marker stays
-        # current on no-op syncs. In docs mode, no changed files means no docs
-        # work is pending, so the docs pointer can advance to head too, which
-        # also heals legacy state that never recorded one.
-        persisted = {
-            **state,
-            "last_sync_commit": head,
-            "config_fingerprint": curr_config_fp,
-            "config_dependency_fingerprints": curr_dependency_fps,
-            "renderer_fingerprint": curr_renderer_fp,
-        }
-        # base_ref has already been widened to any unrepaired range by this
-        # point, so no changed files means the range holds nothing left to
-        # re-cover. Clearing here is also what stops a marker whose range is
-        # permanently empty from being carried, and re-announced, forever.
-        # Gated exactly as the widening above is: with --since or in docs mode
-        # this base is a different range that says nothing about the marker's,
-        # and clearing on it would drop a repair that never happened.
-        if since is None and resolved_index_only:
-            persisted.pop("pending_repair", None)
-        if not resolved_index_only and head:
-            persisted["last_docs_commit"] = head
-        timings.stop("run")
-        persisted["phase_timings"] = timings.totals
-        save_state(repo_path, persisted)
-        # Keep the DB freshness stamp in lockstep with state.json: the server's
-        # /repos endpoint reads head_commit from the row, not the state file.
-        stamp_head_commit(repo_path, head)
-        # This path skips the git phase, so its offset backfill never runs.
-        if not dry_run:
-            heal_commit_offsets(repo_path)
-        _refresh_editor_stamp(repo_path, agents_md)
-        # We hold the lock and have advanced to head; drop any stale pending
-        # marker a bailed update left behind.
-        consume_update_pending(repo_path, head)
-        if emitter is not None:
-            emitter.done(
-                ok=True,
-                pages_generated=0,
-                cost_usd=0.0,
-                duration_s=time.monotonic() - start,
-                outcome=UpdateOutcome.NOOP.value,
-            )
-        return UpdateOutcome.NOOP
+            return UpdateOutcome.NOOP
+        finally:
+            atexit.unregister(release_run_markers)
+            release_run_markers()
 
     if health_config_changed or prune_retry:
         # Full re-score (not the partial update) so unchanged files pick up the
