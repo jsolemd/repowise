@@ -175,6 +175,97 @@ async def test_git_tracked_file_missing_from_disk_survives(async_session, repo_w
     assert await _paths(async_session, GitMetadata, GitMetadata.file_path, repo.id) == {KEPT}
 
 
+async def test_explicit_tracked_deletion_overrides_git_and_graph_hint(
+    async_session, repo_with_kept_file,
+):
+    target = repo_with_kept_file / STALE
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("export const old = 1;\n")
+    _git(repo_with_kept_file, "add", STALE)
+    _git(repo_with_kept_file, "commit", "-q", "-m", "tracked source")
+    target.unlink()
+    repo = await insert_repo(async_session)
+    await _seed(async_session, repo.id)
+
+    pruned, refusals = await prune_deleted_file_rows(
+        async_session, repo.id, repo_with_kept_file,
+        live_hint={KEPT, STALE}, deleted_paths={STALE},
+    )
+    assert (pruned, refusals) == (1, [])
+    for model, column in FILE_SCOPED:
+        assert await _paths(async_session, model, column, repo.id) == {KEPT}
+    assert await _paths(async_session, GraphNode, GraphNode.node_id, repo.id) == {
+        KEPT, f"{KEPT}::main",
+    }
+
+
+@pytest.mark.parametrize("condition", ["restored", "permission", "io_error", "symlink"])
+async def test_explicit_deletion_requires_missing_entry_not_failed_stat(
+    async_session, repo_with_kept_file, monkeypatch, condition,
+):
+    target = repo_with_kept_file / STALE
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("export const old = 1;\n")
+    _git(repo_with_kept_file, "add", STALE)
+    _git(repo_with_kept_file, "commit", "-q", "-m", "tracked source")
+    if condition == "symlink":
+        target.unlink()
+        target.symlink_to("missing-target")
+    elif condition in {"permission", "io_error"}:
+        original_lstat = Path.lstat
+
+        def failed_stat(path):
+            if path == target:
+                if condition == "permission":
+                    raise PermissionError("temporarily inaccessible")
+                raise OSError("transient filesystem failure")
+            return original_lstat(path)
+
+        monkeypatch.setattr(Path, "lstat", failed_stat)
+    repo = await insert_repo(async_session)
+    await _seed(async_session, repo.id)
+
+    outcome = await prune_deleted_file_rows(
+        async_session, repo.id, repo_with_kept_file,
+        live_hint={KEPT}, deleted_paths={STALE},
+    )
+    assert outcome == (0, [])
+    for model, column in FILE_SCOPED:
+        assert await _paths(async_session, model, column, repo.id) == {KEPT, STALE}
+
+
+@pytest.mark.parametrize("accept", [False, True])
+async def test_explicit_tracked_deletions_still_obey_mass_deletion_floor(
+    async_session, repo_with_kept_file, accept,
+):
+    repo = await insert_repo(async_session)
+    deleted = {f"src/deleted_{i}.js" for i in range(30)}
+    kept = {f"src/kept_{i}.js" for i in range(10)}
+    for path in deleted | kept:
+        (repo_with_kept_file / path).write_text("export {};\n")
+        async_session.add(GitMetadata(repository_id=repo.id, file_path=path))
+    _git(repo_with_kept_file, "add", "src")
+    _git(repo_with_kept_file, "commit", "-q", "-m", "tracked corpus")
+    for path in deleted:
+        (repo_with_kept_file / path).unlink()
+    await async_session.flush()
+
+    pruned, refusals = await prune_deleted_file_rows(
+        async_session, repo.id, repo_with_kept_file,
+        live_hint=kept | deleted, deleted_paths=deleted, accept_mass_deletion=accept,
+    )
+    remaining = await _paths(async_session, GitMetadata, GitMetadata.file_path, repo.id)
+    if accept:
+        assert (pruned, refusals) == (30, [])
+        assert remaining == kept
+    else:
+        assert pruned == 0
+        assert [(r.table, r.candidate_paths, r.persisted_paths) for r in refusals] == [
+            ("git_metadata", 30, 40),
+        ]
+        assert remaining == kept | deleted
+
+
 async def test_synthetic_nodes_are_not_deleted_files(async_session, repo_with_kept_file):
     """``external:``/``framework:`` nodes are stored as file nodes and name no file.
 

@@ -1304,7 +1304,10 @@ async def _persist_full_update_async(
             # must have final authority here just as it does on index-only
             # updates.
             try:
-                from repowise.core.pipeline.persist import prune_deleted_file_rows
+                from repowise.core.pipeline.persist import (
+                    prune_deleted_file_rows,
+                    tombstone_candidates,
+                )
 
                 live_hint = {pf.file_info.path for pf in parsed_files or []}
                 graph = graph_builder.graph()
@@ -1318,6 +1321,7 @@ async def _persist_full_update_async(
                     repo_id,
                     repo_path,
                     live_hint=live_hint,
+                    deleted_paths={path for path, _ in tombstone_candidates(file_diffs)},
                     accept_mass_deletion=accept_mass_deletion,
                     exclusion_plan=exclusion_plan,
                 )

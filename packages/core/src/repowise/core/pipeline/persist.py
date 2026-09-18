@@ -1260,8 +1260,10 @@ async def plan_excluded_file_prune(
 class _FileLiveness:
     """Is this path still index-owned, judged without this run's parser.
 
-    Two witnesses, neither of which is the parse: the file is present on disk,
-    or git still tracks it. A path has to fail both to count as deleted.
+    Without an explicit deletion diff, two witnesses protect the path: the
+    file is present on disk, or git still tracks it. A supplied deleted or
+    rename-old path can override the latter only when lstat confirms that the
+    path entry is missing; read/stat failures and recreated entries stay live.
 
     That split is the point. Deriving deletions from ``parsed_files`` alone
     makes every transient read or parse failure look like a deletion, and on
@@ -1283,9 +1285,11 @@ class _FileLiveness:
         repo_path: Any,
         *,
         excluded_paths: set[str] | frozenset[str] = frozenset(),
+        deleted_paths: set[str] | frozenset[str] = frozenset(),
     ) -> None:
         self._root = Path(repo_path)
         self._excluded_paths = excluded_paths
+        self._deleted_paths = deleted_paths
         self._tracked: frozenset[str] | None = None
         # The same path is asked about once per table it has rows in, and a
         # stat under an antivirus scanner is not free.
@@ -1301,6 +1305,16 @@ class _FileLiveness:
     def _is_live(self, path: str) -> bool:
         if path in self._excluded_paths:
             return False
+        if path in self._deleted_paths:
+            try:
+                (self._root / path).lstat()
+            except FileNotFoundError:
+                return False
+            except OSError:
+                # Permission and transient stat failures are not deletions.
+                return True
+            # A restored file or dangling symlink still owns its path entry.
+            return True
         if (self._root / path).exists():
             return True
         if self._tracked is None:
@@ -1314,6 +1328,7 @@ async def prune_deleted_file_rows(
     repo_path: Any,
     *,
     live_hint: set[str] | None = None,
+    deleted_paths: set[str] | frozenset[str] = frozenset(),
     accept_mass_deletion: bool = False,
     exclusion_plan: ExclusionPrunePlan | None = None,
 ) -> tuple[int, list[PruneRefusal]]:
@@ -1339,6 +1354,11 @@ async def prune_deleted_file_rows(
     like ``external:...`` or Spring's ``META-INF/services/<iface>`` names no
     file, so it fails every liveness test there is, and only the fact that the
     graph build just re-minted it says it is not a deletion.
+
+    *deleted_paths* contains explicit deleted/rename-old diff candidates, not
+    paths absent from a parse. A confirmed missing entry overrides the graph
+    hint and Git index (which still lists unstaged deletions). The normal
+    mass-deletion floor applies to these candidates too.
 
     Returns ``(deleted_path_count, refusals)``. ``accept_mass_deletion`` is
     one-run authority to cross the ratio floor; it does not change the default
@@ -1372,7 +1392,7 @@ async def prune_deleted_file_rows(
         WikiSymbol,
     )
 
-    hint = live_hint or set()
+    hint = (live_hint or set()) - deleted_paths
     if exclusion_plan is None:
         exclusion_plan = await plan_excluded_file_prune(
             session,
@@ -1383,6 +1403,7 @@ async def prune_deleted_file_rows(
     liveness = _FileLiveness(
         repo_path,
         excluded_paths=exclusion_plan.actionable_paths,
+        deleted_paths=deleted_paths,
     )
     refusals: list[PruneRefusal] = list(exclusion_plan.refusals)
     deleted: set[str] = set()

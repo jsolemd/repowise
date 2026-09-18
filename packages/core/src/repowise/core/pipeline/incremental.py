@@ -2102,7 +2102,10 @@ async def persist_incremental_index(
             # Running last means the prune has the final say on what the store
             # claims exists.
             try:
-                from repowise.core.pipeline.persist import prune_deleted_file_rows
+                from repowise.core.pipeline.persist import (
+                    prune_deleted_file_rows,
+                    tombstone_candidates,
+                )
 
                 live_hint = set(
                     current_graph_file_paths
@@ -2134,6 +2137,9 @@ async def persist_incremental_index(
                     "live_hint": live_hint,
                     "accept_mass_deletion": accept_mass_deletion,
                 }
+                deleted_paths = {path for path, _ in tombstone_candidates(file_diffs)}
+                if deleted_paths:
+                    prune_kwargs["deleted_paths"] = deleted_paths
                 if exclusion_plan.paths or exclusion_plan.refusals:
                     prune_kwargs["exclusion_plan"] = exclusion_plan
                 with timed(timings, "persist.prune"):
