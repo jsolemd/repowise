@@ -136,13 +136,15 @@ async def test_mcp_caller_explicit_lookups_stay_on_the_stock_resolver(
 
 
 class _Store:
-    """Stands in for either stock leg — both are asked the same way."""
+    """Stock search legs; lexical search also accepts a repository filter."""
 
     def __init__(self) -> None:
-        self.queries: list[str] = []
+        self.queries: list[tuple[str, int, str | None]] = []
 
-    async def search(self, query: str, limit: int = 10) -> list:
-        self.queries.append(query)
+    async def search(
+        self, query: str, limit: int = 10, *, repository_id: str | None = None
+    ) -> list:
+        self.queries.append((query, limit, repository_id))
         return []
 
 
@@ -189,7 +191,7 @@ async def test_rest_flag_off_never_asks_for_a_coordinator(rest_guard):
     )
     assert result == []
     assert asked == []
-    assert vectors.queries == ["how retrieval works"]
+    assert vectors.queries == [("how retrieval works", 10, None)]
 
 
 async def test_rest_flag_on_delegates_and_serves_the_envelope(rest_guard, monkeypatch):
@@ -219,7 +221,8 @@ async def test_rest_flag_on_delegates_and_serves_the_envelope(rest_guard, monkey
     assert fts.queries == [] and vectors.queries == []
 
 
-async def test_rest_fulltext_is_left_alone(rest_guard, monkeypatch):
+@pytest.mark.parametrize("repo_id", [None, "repo-123"])
+async def test_rest_fulltext_is_left_alone(rest_guard, monkeypatch, repo_id):
     """``fulltext`` names one index; a fusion would answer a different question."""
     from repowise.server.routers.search import search
 
@@ -233,13 +236,14 @@ async def test_rest_fulltext_is_left_alone(rest_guard, monkeypatch):
         query="how retrieval works",
         search_type="fulltext",
         limit=10,
-        repo_id=None,
+        repo_id=repo_id,
         fts=fts,
         vector_store=vectors,
     )
     assert result == []
     assert asked == []
-    assert fts.queries == ["how retrieval works"]
+    assert fts.queries == [("how retrieval works", 10, repo_id)]
+    assert vectors.queries == []
 
 
 # ---------------------------------------------------------------------------
