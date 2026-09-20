@@ -60,6 +60,7 @@ from .vector_store import SourceChunkRecord, SourceChunkVectorStore
 from .worktree import build_ingest_record
 
 __all__ = [
+    "SourceFileChangedError",
     "SourceIndexDeferredError",
     "SourceLifecycleResult",
     "reconcile_source_index",
@@ -86,6 +87,14 @@ _FAILURE_STAGES = frozenset(
 
 class SourceIndexDeferredError(RuntimeError):
     """The durable queue is intact, but current inputs are not safe to publish."""
+
+
+class SourceFileChangedError(SourceIndexDeferredError):
+    """A captured file changed or disappeared and needs a fresh SQL capture."""
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        super().__init__(f"{path} changed after its SQL update; source recapture required")
 
 
 @dataclass(frozen=True, slots=True)
@@ -368,6 +377,8 @@ def _read_changed_bytes(repo: Path, change: SourceChange) -> bytes:
     path = repo / change.path
     try:
         data = path.read_bytes()
+    except FileNotFoundError as exc:
+        raise SourceFileChangedError(change.path) from exc
     except OSError as exc:
         raise SourceIndexDeferredError(
             f"{change.path} changed again or is unreadable: {exc}"
@@ -376,9 +387,7 @@ def _read_changed_bytes(repo: Path, change: SourceChange) -> bytes:
 
     actual = compute_content_hash(data)
     if change.content_hash and actual != change.content_hash:
-        raise SourceIndexDeferredError(
-            f"{change.path} changed after its SQL update; waiting for the next saved-file event"
-        )
+        raise SourceFileChangedError(change.path)
     return data
 
 

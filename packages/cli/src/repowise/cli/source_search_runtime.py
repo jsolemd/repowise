@@ -138,6 +138,7 @@ async def reconcile_configured_source_index(
     from repowise.cli.providers.embedders import build_embedder, resolve_embedder_for_repo
     from repowise.core.providers.embedding.base import KeylessEmbedder
     from repowise.core.source_search.lifecycle import (
+        SourceFileChangedError,
         reconcile_source_index,
         record_source_index_error,
     )
@@ -163,14 +164,27 @@ async def reconcile_configured_source_index(
     # recording prefixes before that A3 protocol exists would fingerprint a
     # recipe the reader cannot actually execute.
     identity = identify_embedder(implementation, provider=provider)
-    return await reconcile_source_index(
-        repo,
-        embedder=implementation,
-        embedder_identity=identity,
-        db_url=db_url,
-        force_full=force_full,
-        batch_size=batch_size,
-    )
+
+    async def reconcile():
+        return await reconcile_source_index(
+            repo,
+            embedder=implementation,
+            embedder_identity=identity,
+            db_url=db_url,
+            force_full=force_full,
+            batch_size=batch_size,
+        )
+
+    try:
+        return await reconcile()
+    except SourceFileChangedError as exc:
+        # A slower graph writer can enqueue old bytes after the watcher has
+        # already handled a newer save. Recapture through the native SQL/outbox
+        # transaction; retry once so continuous edits cannot trap this caller.
+        from repowise.core.source_search.fast_update import capture_source_changes
+
+        await capture_source_changes(repo, {exc.path}, db_url=db_url)
+        return await reconcile()
 
 
 async def reconcile_configured_source_indexes(

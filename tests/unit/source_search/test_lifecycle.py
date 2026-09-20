@@ -1053,6 +1053,39 @@ async def test_changed_again_after_capture_defers_without_publishing(lifecycle_r
         assert not fts.query("newnebula")
 
 
+@pytest.mark.parametrize("deleted", [False, True])
+async def test_host_recaptures_changes_after_sql_without_another_save(
+    lifecycle_repo, monkeypatch, deleted
+):
+    from repowise.cli.source_search_runtime import reconcile_configured_source_index
+
+    monkeypatch.setenv("REPOWISE_SOURCE_SEARCH", "1")
+    repo = lifecycle_repo
+    path = repo / "src" / "app.py"
+    path.write_text(_APP_V2)
+    await _capture(repo, path="src/app.py")
+    if deleted:
+        path.unlink()
+    else:
+        path.write_text(_APP_V3)
+
+    result = await reconcile_configured_source_index(
+        repo, embedder=MockEmbedder(), embedder_name="mock", allow_keyless=True
+    )
+
+    assert result.status == "published"
+    current = read_manifest(default_manifest_path(repo))
+    assert current is not None
+    with _fts(repo, current) as fts:
+        assert bool(fts.query("finalpulsar")) is not deleted
+        assert bool(fts.query("stablecomet")) is not deleted
+        assert not fts.query("newnebula")
+        assert not fts.query("oldquasar")
+    status = await inspect_source_index(repo)
+    assert status.pending_updates == 0
+    assert status.stale_files == {}
+
+
 @pytest.mark.parametrize("media_exists", [True, False])
 async def test_obsolete_media_outbox_does_not_block_source_publication(
     lifecycle_repo, media_exists
