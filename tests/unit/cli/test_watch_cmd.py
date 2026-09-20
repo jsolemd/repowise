@@ -145,6 +145,16 @@ class TestSingleRepoTrigger:
         """Start the watcher, touch a file, and return run_update's kwargs."""
         calls: list[dict] = []
         done = threading.Event()
+        passive = tmp_path / "read_only.py"
+        passive.write_text("VALUE = 1\n")
+        observed: list[str] = []
+        original_event_paths = watch_cmd._event_paths
+
+        def observe(event, root):
+            observed.append(event.event_type)
+            return original_event_paths(event, root)
+
+        monkeypatch.setattr(watch_cmd, "_event_paths", observe)
 
         def fake_run_update(**kwargs):
             calls.append(kwargs)
@@ -181,9 +191,12 @@ class TestSingleRepoTrigger:
         watcher.start()
         assert started.wait(5), "watcher never started"
 
+        for _ in range(20):
+            passive.read_text()
         (tmp_path / "touched.py").write_text("def x():\n    return 1\n", encoding="utf-8")
         assert done.wait(10), "no update was triggered by the file change"
         watcher.join(timeout=10)
+        assert not {"opened", "closed_no_write"}.intersection(observed)
         return calls
 
     def test_a_file_save_runs_an_update_over_the_working_tree(
@@ -325,7 +338,7 @@ class TestEventPaths:
         assert watch_cmd._event_paths(event, tmp_path) == set()
 
 
-@pytest.mark.parametrize("second_change", ["save", "rename", "delete"])
+@pytest.mark.parametrize("second_change", ["save", "rename", "delete", "new_directory"])
 @pytest.mark.parametrize("capture_fails", [False, True])
 def test_workspace_watches_repeated_edits_and_publishes_before_graph(
     monkeypatch, tmp_path, second_change, capture_fails
@@ -367,7 +380,12 @@ def test_workspace_watches_repeated_edits_and_publishes_before_graph(
     monkeypatch.setattr(watch_cmd, "_publish_saved_sources", capture)
     monkeypatch.setattr(workspace, "update_workspace", update)
     monkeypatch.setattr(source_search_runtime, "reconcile_configured_source_index", reconcile)
-    watcher = threading.Thread(target=watch_cmd._watch_workspace, args=(tmp_path, 50), daemon=True)
+    # A move into a just-created directory can arrive as create + a delayed
+    # unmatched move-from (watchdog's native pairing window is 500 ms).
+    debounce = 600 if second_change == "new_directory" else 50
+    watcher = threading.Thread(
+        target=watch_cmd._watch_workspace, args=(tmp_path, debounce), daemon=True
+    )
     watcher.start()
     try:
         assert started.wait(5)
@@ -385,6 +403,9 @@ def test_workspace_watches_repeated_edits_and_publishes_before_graph(
             temporary.replace(path)  # editor-style atomic save
         elif second_change == "rename":
             path.rename(repo / "renamed.py")
+        elif second_change == "new_directory":
+            (repo / "nested").mkdir()
+            path.rename(repo / "nested" / "renamed.py")
         else:
             path.unlink()
         assert updated.wait(5), "watcher stopped updating after its first event"
@@ -392,6 +413,8 @@ def test_workspace_watches_repeated_edits_and_publishes_before_graph(
         assert "app.py" in events[2][1]
         if second_change == "rename":
             assert "renamed.py" in events[2][1]
+        elif second_change == "new_directory":
+            assert "nested/renamed.py" in events[2][1]
     finally:
         stop.set()
         watcher.join(timeout=5)

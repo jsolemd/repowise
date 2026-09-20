@@ -45,13 +45,17 @@ from repowise.core.update_lock import (
 )
 
 from ..docs_mode import docs_mode_state_fields
-from ..ingestion.change_detector import has_working_tree_changes
 from ..pipeline.phase_timing import PhaseTimingRecorder
 from ..pipeline.prune_state import (
     DeletedFilePruneOutcome,
     apply_prune_outcome,
     prune_repair_base,
     state_prune_refusals,
+)
+from ..working_tree_state import (
+    capture_working_tree,
+    checkpoint_working_tree,
+    working_tree_update_reason,
 )
 from .config import WorkspaceConfig
 
@@ -623,10 +627,7 @@ async def update_single_repo_index(
     )
     require_health_success = requires_full_reindex and (
         changed_dependencies is None
-        or bool(
-            {"traversal", "git_history", "health", "other"}
-            & (changed_dependencies or set())
-        )
+        or bool({"traversal", "git_history", "health", "other"} & (changed_dependencies or set()))
     )
     if requires_full_reindex and (repo_path / ".repowise" / "wiki.db").is_file():
         _log.info(
@@ -811,15 +812,11 @@ async def update_workspace(
         )
         stored_config_fp = state.get("config_fingerprint")
         config_state_missing = (
-            (abs_path / ".repowise" / "wiki.db").is_file()
-            and stored_config_fp is None
-        )
+            abs_path / ".repowise" / "wiki.db"
+        ).is_file() and stored_config_fp is None
         if not is_stale and (
             config_state_missing
-            or (
-                stored_config_fp is not None
-                and stored_config_fp != config_fingerprint(abs_path)
-            )
+            or (stored_config_fp is not None and stored_config_fp != config_fingerprint(abs_path))
         ):
             is_stale = True
 
@@ -827,7 +824,7 @@ async def update_workspace(
         # indexed by an earlier working-tree run need one final pass after they
         # become clean so stale symbols/pages can be retired.
         if not is_stale and include_working_tree:
-            is_stale = has_working_tree_changes(abs_path) or bool(state.get("working_tree_paths"))
+            is_stale = working_tree_update_reason(abs_path, state) is not None
         if not is_stale and accept_mass_deletion:
             is_stale = bool(state_prune_refusals(state))
         if not is_stale and force_aliases is not None:
@@ -947,6 +944,9 @@ async def update_workspace(
                     )
 
                 try:
+                    working_tree_before = (
+                        capture_working_tree(path) if include_working_tree else None
+                    )
                     update_started = time.monotonic()
                     result = await update_single_repo_index(
                         path,
@@ -981,6 +981,8 @@ async def update_workspace(
                         state["knowledge_graph"] = result.kg_state
                     if result.working_tree_paths is not None:
                         state["working_tree_paths"] = result.working_tree_paths
+                    if include_working_tree:
+                        checkpoint_working_tree(path, state, working_tree_before)
                     apply_prune_outcome(
                         state,
                         prior_state,
@@ -1001,10 +1003,8 @@ async def update_workspace(
                         )
 
                         state["config_fingerprint"] = config_fingerprint(path)
-                        state["config_dependency_fingerprints"] = (
-                            config_dependency_fingerprints(
-                                path, config=load_repo_config(path)
-                            )
+                        state["config_dependency_fingerprints"] = config_dependency_fingerprints(
+                            path, config=load_repo_config(path)
                         )
                     # Mark first-time so downstream tooling (status, doctor) can
                     # distinguish a never-indexed repo from one that's been

@@ -689,6 +689,98 @@ class TestUpdateWorkspace:
         saved_state = json.loads(state_path.read_text(encoding="utf-8"))
         assert saved_state["working_tree_paths"] == []
 
+    @pytest.mark.parametrize("next_change", ["edit", "revert", "delete", "rename"])
+    def test_unchanged_dirty_work_is_not_rebuilt(self, tmp_path: Path, next_change: str) -> None:
+        import asyncio
+
+        repo = _make_git_repo(tmp_path, "backend")
+        head = get_head_commit(repo)
+        _write_state(repo, head)
+        path = repo / "README.md"
+        path.write_text("saved edit")
+        config = WorkspaceConfig(repos=[RepoEntry(path="backend", alias="backend")])
+        result = RepoUpdateResult(alias="backend", updated=True, working_tree_paths=["README.md"])
+
+        async def run():
+            with patch(
+                "repowise.core.workspace.update.update_single_repo_index",
+                new_callable=AsyncMock,
+                return_value=result,
+            ) as rebuild:
+                await update_workspace(tmp_path, config, include_working_tree=True)
+                repeated = await update_workspace(tmp_path, config, include_working_tree=True)
+                assert rebuild.await_count == 1
+                assert repeated[0].skipped_reason == "up_to_date"
+                if next_change == "edit":
+                    path.write_text("next saved edit")
+                elif next_change == "revert":
+                    path.write_text("hello")
+                elif next_change == "delete":
+                    path.unlink()
+                else:
+                    path.rename(repo / "RENAMED.md")
+                await update_workspace(tmp_path, config, include_working_tree=True)
+                assert rebuild.await_count == 2
+
+        asyncio.run(run())
+
+    def test_save_during_graph_update_is_not_checkpointed(self, tmp_path: Path) -> None:
+        import asyncio
+
+        repo = _make_git_repo(tmp_path, "backend")
+        _write_state(repo, get_head_commit(repo))
+        path = repo / "README.md"
+        path.write_text("first save")
+        config = WorkspaceConfig(repos=[RepoEntry(path="backend", alias="backend")])
+        calls = 0
+
+        async def rebuild(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                path.write_text("saved during graph refresh")
+            return RepoUpdateResult(alias="backend", updated=True, working_tree_paths=["README.md"])
+
+        async def run():
+            with patch("repowise.core.workspace.update.update_single_repo_index", rebuild):
+                await update_workspace(tmp_path, config, include_working_tree=True)
+                state = json.loads((repo / ".repowise/state.json").read_text())
+                assert "working_tree_checkpoint" not in state
+                await update_workspace(tmp_path, config, include_working_tree=True)
+                await update_workspace(tmp_path, config, include_working_tree=True)
+                assert calls == 2
+
+        asyncio.run(run())
+
+    def test_failed_graph_update_does_not_checkpoint_dirty_files(self, tmp_path: Path) -> None:
+        import asyncio
+
+        repo = _make_git_repo(tmp_path, "backend")
+        _write_state(repo, get_head_commit(repo))
+        (repo / "README.md").write_text("not yet indexed")
+        config = WorkspaceConfig(repos=[RepoEntry(path="backend", alias="backend")])
+
+        async def run():
+            with patch(
+                "repowise.core.workspace.update.update_single_repo_index",
+                new_callable=AsyncMock,
+                side_effect=[
+                    RepoUpdateResult(alias="backend", updated=False, error="persist failed"),
+                    RepoUpdateResult(
+                        alias="backend", updated=True, working_tree_paths=["README.md"]
+                    ),
+                ],
+            ) as rebuild:
+                failed = await update_workspace(tmp_path, config, include_working_tree=True)
+                assert failed[0].error == "persist failed"
+                state = json.loads((repo / ".repowise/state.json").read_text())
+                assert "working_tree_checkpoint" not in state
+                await update_workspace(tmp_path, config, include_working_tree=True)
+                await update_workspace(tmp_path, config, include_working_tree=True)
+                assert rebuild.await_count == 2
+
+        asyncio.run(run())
+
 
 # ---------------------------------------------------------------------------
 # Workspace-level single-flight (issue #1831)
@@ -716,7 +808,9 @@ class TestWorkspaceSingleFlight:
         # Simulate another workspace update already in flight (same process).
         assert update_workspace_lock(tmp_path) is None
         try:
-            mock_result = RepoUpdateResult(alias="backend", updated=True, file_count=1, symbol_count=1)
+            mock_result = RepoUpdateResult(
+                alias="backend", updated=True, file_count=1, symbol_count=1
+            )
 
             async def _run():
                 with patch(
@@ -727,6 +821,7 @@ class TestWorkspaceSingleFlight:
                     return await update_workspace(tmp_path, ws_config)
 
             import asyncio
+
             results = asyncio.run(_run())
             # No repo should have been updated — the whole pass deferred.
             assert len(results) == 1
@@ -734,7 +829,7 @@ class TestWorkspaceSingleFlight:
             assert results[0].skipped_reason == "in_flight"
             # The running owner should pick up the deferred head via the
             # pending marker written by the defereer.
-            pending = (tmp_path / "backend" / ".repowise" / ".update.pending")
+            pending = tmp_path / "backend" / ".repowise" / ".update.pending"
             assert pending.exists()
             assert pending.read_text(encoding="utf-8") == get_head_commit(tmp_path / "backend")
         finally:
@@ -769,6 +864,7 @@ class TestWorkspaceSingleFlight:
                 return await update_workspace(tmp_path, ws_config)
 
         import asyncio
+
         asyncio.run(_run())
 
         # The workspace lock was created during the pass and released at the end.

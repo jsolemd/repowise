@@ -138,8 +138,8 @@ def _workspace_update(
     """
     from repowise.cli.helpers import load_state
     from repowise.core.docs_mode import resolve_docs_mode
-    from repowise.core.ingestion.change_detector import has_working_tree_changes
     from repowise.core.repo_config import config_fingerprint
+    from repowise.core.working_tree_state import working_tree_update_reason
     from repowise.core.workspace import (
         check_repo_staleness,
         reconcile_repo_head_commit,
@@ -207,11 +207,10 @@ def _workspace_update(
                 recipe_changes = ()
         if recipe_changes or parser_stale or source_pending:
             recipe_drift_aliases.add(entry.alias)
-        has_uncommitted_changes = (
-            include_working_tree and indexed and has_working_tree_changes(abs_path)
-        )
-        has_working_tree_cleanup = bool(
-            include_working_tree and indexed and repo_state and repo_state.get("working_tree_paths")
+        working_tree_reason = (
+            working_tree_update_reason(abs_path, repo_state)
+            if include_working_tree and indexed
+            else None
         )
         from repowise.core.pipeline.prune_state import state_prune_refusals
 
@@ -221,8 +220,7 @@ def _workspace_update(
         is_stale = (
             commit_stale
             or config_stale
-            or has_uncommitted_changes
-            or has_working_tree_cleanup
+            or working_tree_reason is not None
             or has_accepted_prune
             or bool(recipe_changes)
             or parser_stale
@@ -236,10 +234,8 @@ def _workspace_update(
                 reasons.append("config changed")
             if commit_stale:
                 reasons.append(f"{behind} new commit(s)")
-            if has_uncommitted_changes:
-                reasons.append("uncommitted changes")
-            elif has_working_tree_cleanup:
-                reasons.append("working-tree cleanup")
+            if working_tree_reason:
+                reasons.append(working_tree_reason)
             if has_accepted_prune:
                 reasons.append("accepted mass-deletion repair")
             reasons.extend(recipe_changes)
@@ -517,6 +513,8 @@ def _workspace_docs_update(
     from contextlib import suppress
 
     from repowise.cli.commands.workspace_cmd import inherit_workspace_distill_verdict
+    from repowise.cli.helpers import load_state, save_state
+    from repowise.core.working_tree_state import capture_working_tree, checkpoint_working_tree
     from repowise.core.workspace import RepoUpdateResult, update_workspace
     from repowise.core.workspace.update import (
         run_cross_repo_hooks,
@@ -584,6 +582,7 @@ def _workspace_docs_update(
         repo_path = (ws_root / entry.path).resolve()
         console.print(f"  Updating [bold]{entry.alias}[/bold] (docs)...")
         try:
+            working_tree_before = capture_working_tree(repo_path) if include_working_tree else None
             outcome = run_update(
                 path=str(repo_path),
                 provider_name=provider_name,
@@ -624,6 +623,10 @@ def _workspace_docs_update(
         if outcome == UpdateOutcome.DEFERRED:
             docs_deferred += 1
         elif outcome == UpdateOutcome.REGENERATED:
+            if include_working_tree:
+                state = load_state(repo_path)
+                checkpoint_working_tree(repo_path, state, working_tree_before)
+                save_state(repo_path, state)
             docs_updated += 1
             # Only a real regeneration feeds the cross-repo pass; a no-op or a
             # deferral leaves the cross-repo layer untouched.

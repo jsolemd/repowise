@@ -41,6 +41,19 @@ _SELF_WRITTEN_DIRS: frozenset[str] = frozenset({".claude", ".codex", ".cursor", 
 _SOURCE_SLOW_QUIET_SECONDS = 8.0
 
 
+def _source_event_filter() -> list[type]:
+    # Filter at the native subscription, before indexing's reads can flood
+    # watchdog's queues. IN_MODIFY covers saves; IN_MOVE covers atomic saves.
+    from watchdog.events import (
+        FileCreatedEvent,
+        FileDeletedEvent,
+        FileModifiedEvent,
+        FileMovedEvent,
+    )
+
+    return [FileCreatedEvent, FileDeletedEvent, FileModifiedEvent, FileMovedEvent]
+
+
 def _event_paths(event: object, repo_path: Path) -> set[str]:
     """The watchable repo-relative paths a filesystem event touched.
 
@@ -303,7 +316,9 @@ def _watch_single_repo(
                 timer.start()
 
     observer = Observer()
-    observer.schedule(RepowiseHandler(), str(repo_path), recursive=True)
+    observer.schedule(
+        RepowiseHandler(), str(repo_path), recursive=True, event_filter=_source_event_filter()
+    )
     observer.start()
 
     console.print(f"[bold]Watching {repo_path}... Ctrl+C to stop[/bold]")
@@ -510,7 +525,9 @@ def _watch_workspace(
             console.print(f"  [yellow]Skipping {entry.alias}: directory not found[/yellow]")
             continue
         handler = WorkspaceRepoHandler(entry.alias, abs_path)
-        observer.schedule(handler, str(abs_path), recursive=True)
+        observer.schedule(
+            handler, str(abs_path), recursive=True, event_filter=_source_event_filter()
+        )
         scheduled += 1
 
     if scheduled == 0:

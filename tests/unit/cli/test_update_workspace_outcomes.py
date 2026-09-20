@@ -32,6 +32,8 @@ def invoke_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         dry_run: bool = False,
         source_outcome: object = None,
         error_message: str = "primary persist failed",
+        include_working_tree: bool = False,
+        checkpoint: dict | None = None,
     ):
         attempted: list[str] = []
         succeeded: list[str] = []
@@ -48,6 +50,8 @@ def invoke_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
                 from repowise.core.repo_config import config_fingerprint
 
                 state["config_fingerprint"] = config_fingerprint(state_dir.parent)
+            if checkpoint is not None:
+                state["working_tree_checkpoint"] = checkpoint
             (state_dir / "state.json").write_text(json.dumps(state))
         WorkspaceConfig(
             repos=[RepoEntry(alias=alias, path=alias) for alias in members],
@@ -119,6 +123,8 @@ def invoke_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         args = ["update", str(tmp_path), "--workspace", "--no-docs", "--progress", progress]
         if dry_run:
             args.append("--dry-run")
+        if include_working_tree:
+            args.append("--include-working-tree")
         try:
             runner = CliRunner(mix_stderr=False)
         except TypeError:  # Click >= 8.2 always separates the streams.
@@ -130,6 +136,39 @@ def invoke_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         return result, events, attempted, succeeded, hooks, editor_refreshes
 
     return invoke
+
+
+def test_completed_dirty_snapshot_skips_workspace_docs(invoke_workspace, monkeypatch, tmp_path):
+    from repowise.core import working_tree_state
+
+    checkpoint = {"head": "old", "files": {"app.py": ["saved-hash", 1, 2, 3]}}
+    monkeypatch.setattr(working_tree_state, "capture_working_tree", lambda _: checkpoint)
+    result, _, attempted, _, hooks, _ = invoke_workspace(
+        {"app": ("docs", "updated")},
+        current=True,
+        include_working_tree=True,
+        checkpoint=checkpoint,
+    )
+    assert result.exit_code == 0, result.output
+    assert attempted == []
+    assert hooks == []
+
+
+@pytest.mark.parametrize("outcome", ["updated", "deferred", "failed"])
+def test_only_completed_docs_work_checkpoints_dirty_files(
+    invoke_workspace, monkeypatch, tmp_path, outcome
+):
+    from repowise.core import working_tree_state
+
+    checkpoint = {"head": "old", "files": {"app.py": ["saved-hash", 1, 2, 3]}}
+    monkeypatch.setattr(working_tree_state, "capture_working_tree", lambda _: checkpoint)
+    result, _, attempted, _, _, _ = invoke_workspace(
+        {"app": ("docs", outcome)}, include_working_tree=True
+    )
+    assert result.exit_code == (1 if outcome == "failed" else 0), result.output
+    assert attempted == ["app"]
+    state = json.loads((tmp_path / "app/.repowise/state.json").read_text())
+    assert state.get("working_tree_checkpoint") == (checkpoint if outcome == "updated" else None)
 
 
 @pytest.mark.parametrize("progress", ["rich", "json"])
