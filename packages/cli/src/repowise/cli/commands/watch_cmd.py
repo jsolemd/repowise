@@ -6,6 +6,7 @@ import os
 import threading
 import time
 from collections.abc import Callable
+from contextlib import nullcontext
 from pathlib import Path
 
 import click
@@ -119,6 +120,30 @@ def is_watchable_path(rel_path: str) -> bool:
     return is_candidate_source_path(posix)
 
 
+def _publish_saved_sources(repo_path: Path, paths: set[str]) -> None:
+    """Capture saved paths durably, then publish before graph/wiki refresh."""
+    from repowise.cli.source_search_runtime import reconcile_configured_source_index
+    from repowise.core.source_search.fast_update import capture_source_changes
+
+    capture = run_async(capture_source_changes(repo_path, paths))
+    try:
+        outcome = run_async(reconcile_configured_source_index(repo_path))
+    except Exception as exc:
+        # Capture already committed. The durable outbox survives failed
+        # embedding/publication and is retried by the ordinary updater.
+        console.print(f"[yellow]Source search reconcile deferred: {exc}[/yellow]")
+    else:
+        if outcome is not None and outcome.status == "busy":
+            console.print("[yellow]Source search update already running[/yellow]")
+        elif outcome is not None and outcome.status in {"published", "current"}:
+            console.print(
+                f"[green]Source searchable ({repo_path.name}):[/green] {len(capture.paths)} file(s) "
+                f"in {outcome.total_seconds:.3f}s"
+            )
+        elif outcome is not None:
+            console.print(f"[yellow]Source search {outcome.status}: {outcome.error}[/yellow]")
+
+
 # ---------------------------------------------------------------------------
 # Single-repo watch (existing behavior)
 # ---------------------------------------------------------------------------
@@ -166,8 +191,6 @@ def _watch_single_repo(
 
                 context = suppress_incremental_paths(source_captured)
             else:
-                from contextlib import nullcontext
-
                 context = nullcontext()
             with context:
                 run_update(
@@ -191,30 +214,6 @@ def _watch_single_repo(
             console.print(f"[red]Update failed: {e}[/red]")
         finally:
             _release_own_update_lock(repo_path)
-
-    def _run_source_fast_path(paths: set[str]) -> bool:
-        """Capture *paths* durably, then make their generation searchable."""
-
-        from repowise.core.source_search.fast_update import capture_source_changes
-
-        capture = run_async(capture_source_changes(repo_path, paths))
-        try:
-            from repowise.cli.source_search_runtime import reconcile_configured_source_index
-
-            outcome = run_async(reconcile_configured_source_index(repo_path))
-        except Exception as exc:
-            # Capture already committed.  The queue/status surface is the
-            # durable retry signal, so the heavy lane must not duplicate it.
-            console.print(f"[yellow]Source search reconcile deferred: {exc}[/yellow]")
-        else:
-            if outcome is not None and outcome.status == "busy":
-                console.print("[yellow]Source search update already running[/yellow]")
-            elif outcome is not None:
-                console.print(
-                    f"[green]Source searchable:[/green] {len(capture.paths)} file(s) "
-                    f"in {outcome.total_seconds:.3f}s"
-                )
-        return True
 
     def _on_slow_trigger(epoch: int) -> None:
         nonlocal slow_timer
@@ -269,7 +268,8 @@ def _watch_single_repo(
         console.print(f"[cyan]Detected {len(paths)} saved file(s), indexing source...[/cyan]")
         captured = False
         try:
-            captured = _run_source_fast_path(paths)
+            _publish_saved_sources(repo_path, paths)
+            captured = True
         except Exception as e:
             console.print(f"[red]Source fast update failed: {e}[/red]")
 
@@ -330,9 +330,11 @@ def _watch_workspace(
     from watchdog.events import FileSystemEventHandler
     from watchdog.observers import Observer
 
+    from repowise.core.source_search import source_search_enabled
     from repowise.core.workspace import WorkspaceConfig, update_workspace
 
     ws_config = WorkspaceConfig.load(ws_root)
+    source_fast_enabled = source_search_enabled()
 
     if not ws_config.repos:
         console.print("[yellow]No repos in workspace config.[/yellow]")
@@ -351,68 +353,118 @@ def _watch_workspace(
         repo_timers[entry.alias] = None
         repo_update_locks[entry.alias] = threading.Lock()
 
-    def _make_trigger(alias: str) -> Callable[[], None]:
-        """Create a trigger function for a specific repo."""
+    heavy_timers: dict[str, threading.Timer | None] = dict.fromkeys(repo_locks)
+    heavy_epochs: dict[str, int] = dict.fromkeys(repo_locks, 0)
+    captured_paths: dict[str, set[str]] = {alias: set() for alias in repo_locks}
+    stopped = threading.Event()
 
-        def _on_trigger() -> None:
-            with repo_update_locks[alias]:
-                with repo_locks[alias]:
-                    paths = set(repo_changed[alias])
-                    repo_changed[alias].clear()
-                    repo_timers[alias] = None
-
-                if not paths:
+    def _run_heavy(alias: str, epoch: int) -> None:
+        # New saves publish independently while this slower graph refresh runs.
+        # Only the newest quiet-period timer may start another heavy pass.
+        with repo_update_locks[alias]:
+            with repo_locks[alias]:
+                if stopped.is_set() or epoch != heavy_epochs[alias]:
                     return
+                captured = set(captured_paths[alias])
+                captured_paths[alias].clear()
+                heavy_timers[alias] = None
+            try:
+                current_config = WorkspaceConfig.load(ws_root)
+                source_entry = current_config.get_repo(alias)
+                context = nullcontext()
+                if captured:
+                    from repowise.core.source_search.outbox import suppress_incremental_paths
 
-                console.print(f"[cyan]{alias}: {len(paths)} changed file(s), updating...[/cyan]")
-                try:
-                    # Reload config in case it was updated
-                    current_config = WorkspaceConfig.load(ws_root)
+                    context = suppress_incremental_paths(captured)
+                with context:
                     results = run_async(
                         update_workspace(
                             ws_root,
                             current_config,
                             repo_filter=alias,
-                            # Same reason as the single-repo watcher: what the
-                            # watcher saw is uncommitted, and the staleness
-                            # check is otherwise commit-to-commit only.
+                            # Include saved edits before they are committed.
                             include_working_tree=True,
                         )
                     )
-                    from repowise.cli.source_search_runtime import (
-                        reconcile_configured_source_index,
-                    )
+                from repowise.cli.source_search_runtime import (
+                    reconcile_configured_source_index,
+                )
 
-                    source_entry = current_config.get_repo(alias)
-                    if source_entry is not None:
-                        try:
-                            source_outcome = run_async(
-                                reconcile_configured_source_index(
-                                    (ws_root / source_entry.path).resolve()
-                                )
+                if source_entry is not None:
+                    try:
+                        source_outcome = run_async(
+                            reconcile_configured_source_index(
+                                (ws_root / source_entry.path).resolve()
                             )
-                        except Exception as exc:
+                        )
+                    except Exception as exc:
+                        console.print(
+                            f"  [yellow]{alias}: source search reconcile deferred: {exc}[/yellow]"
+                        )
+                    else:
+                        if source_outcome is not None and source_outcome.status == "busy":
                             console.print(
-                                f"  [yellow]{alias}: source search reconcile deferred: "
-                                f"{exc}[/yellow]"
+                                f"  [yellow]{alias}: source search update already running[/yellow]"
                             )
-                        else:
-                            if source_outcome is not None and source_outcome.status == "busy":
-                                console.print(
-                                    f"  [yellow]{alias}: source search update already running[/yellow]"
-                                )
-                    for r in results:
-                        if r.error:
-                            console.print(f"  [red]{alias}: {r.error}[/red]")
-                        elif r.updated:
-                            console.print(
-                                f"  [green]\u2713[/green] {alias}: "
-                                f"{r.file_count} files, {r.symbol_count:,} symbols"
-                            )
-                        elif r.skipped_reason == "up_to_date":
-                            console.print(f"  [dim]{alias}: already up to date[/dim]")
-                except Exception as e:
-                    console.print(f"  [red]{alias} update failed: {e}[/red]")
+                for r in results:
+                    if r.error:
+                        console.print(f"  [red]{alias}: {r.error}[/red]")
+                    elif r.updated:
+                        console.print(
+                            f"  [green]\u2713[/green] {alias}: "
+                            f"{r.file_count} files, {r.symbol_count:,} symbols"
+                        )
+                    elif r.skipped_reason == "up_to_date":
+                        console.print(f"  [dim]{alias}: already up to date[/dim]")
+                if any(r.skipped_reason == "in_flight" for r in results):
+                    # A timer or another repo owns the workspace lock. Keep
+                    # graph catch-up scheduled even if no further save arrives.
+                    _make_trigger(alias, startup=True)()
+            except Exception as e:
+                console.print(f"  [red]{alias} update failed: {e}[/red]")
+
+    def _make_trigger(alias: str, *, startup: bool = False) -> Callable[[], None]:
+        def _on_trigger() -> None:
+            with repo_locks[alias]:
+                if stopped.is_set():
+                    return
+                paths = set(repo_changed[alias])
+                repo_changed[alias].clear()
+                repo_timers[alias] = None
+            if not paths and not startup:
+                return
+            if paths:
+                console.print(
+                    f"[cyan]{alias}: {len(paths)} saved file(s), indexing source...[/cyan]"
+                )
+            captured = False
+            if paths and source_fast_enabled:
+                entry = ws_config.get_repo(alias)
+                if entry is not None:
+                    try:
+                        _publish_saved_sources((ws_root / entry.path).resolve(), paths)
+                        captured = True
+                    except Exception as exc:
+                        console.print(f"[red]{alias}: source capture failed: {exc}[/red]")
+            with repo_locks[alias]:
+                if stopped.is_set():
+                    return
+                if captured:
+                    captured_paths[alias].update(paths)
+                else:
+                    captured_paths[alias].difference_update(paths)
+                heavy_epochs[alias] += 1
+                epoch = heavy_epochs[alias]
+                old_timer = heavy_timers[alias]
+                if old_timer is not None:
+                    old_timer.cancel()
+                # Startup/retry passes also wait when source search is off:
+                # a contended workspace lock must never cause a tight loop.
+                delay = _SOURCE_SLOW_QUIET_SECONDS if source_fast_enabled or startup else 0
+                timer = threading.Timer(delay, _run_heavy, args=(alias, epoch))
+                timer.daemon = True
+                heavy_timers[alias] = timer
+                timer.start()
 
         return _on_trigger
 
@@ -434,6 +486,11 @@ def _watch_workspace(
             alias = self._alias
             with repo_locks[alias]:
                 repo_changed[alias].update(watched)
+                # Defer a graph refresh until the current edit burst settles.
+                if heavy_timers[alias] is not None:
+                    heavy_timers[alias].cancel()
+                    heavy_timers[alias] = None
+                    heavy_epochs[alias] += 1
                 old_timer = repo_timers[alias]
                 if old_timer is not None:
                     old_timer.cancel()
@@ -462,6 +519,40 @@ def _watch_workspace(
 
     observer.start()
 
+    # Attach observers first so a save during catch-up cannot fall between the
+    # initial snapshot and watch registration. Catch-up also retries durable
+    # source work left by an interrupted process, without requiring a new save.
+    def _catch_up() -> None:
+        from repowise.core.ingestion.change_detector import ChangeDetector
+        from repowise.core.workspace.update import read_repo_state
+
+        for entry in ws_config.repos:
+            repo_path = (ws_root / entry.path).resolve()
+            if not repo_path.is_dir():
+                continue
+            try:
+                detector = ChangeDetector(repo_path)
+                changes = detector.get_working_tree_changes()
+                dirty = {change.path for change in changes}
+                changes += detector.stale_working_tree_diffs(
+                    read_repo_state(repo_path).get("working_tree_paths") or [], dirty
+                )
+                paths = {
+                    path
+                    for change in changes
+                    for path in (change.path, change.old_path)
+                    if path and is_watchable_path(path)
+                }
+                with repo_locks[entry.alias]:
+                    repo_changed[entry.alias].update(paths)
+            except Exception as exc:
+                console.print(
+                    f"[yellow]{entry.alias}: startup source scan deferred: {exc}[/yellow]"
+                )
+            _make_trigger(entry.alias, startup=True)()
+
+    threading.Thread(target=_catch_up, name="repowise-watch-catch-up", daemon=True).start()
+
     repo_list = ", ".join(e.alias for e in ws_config.repos)
     console.print(
         f"[bold]Watching workspace ({scheduled} repos: {repo_list})... Ctrl+C to stop[/bold]"
@@ -470,10 +561,17 @@ def _watch_workspace(
     try:
         while True:
             time.sleep(1)
+            if not observer.is_alive():
+                raise RuntimeError("workspace file observer stopped")
     except KeyboardInterrupt:
-        observer.stop()
         console.print("\n[yellow]Stopped watching.[/yellow]")
-    observer.join()
+    finally:
+        stopped.set()
+        observer.stop()
+        for pending_timer in [*repo_timers.values(), *heavy_timers.values()]:
+            if pending_timer is not None:
+                pending_timer.cancel()
+        observer.join()
 
 
 # ---------------------------------------------------------------------------

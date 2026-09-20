@@ -393,12 +393,17 @@ def _chunks_for_replacements(
 
     chunks: list[SourceChunk] = []
     for change in changes:
+        file_symbols = by_file.get(change.path, [])
+        # The SQL outbox can include media and other non-source paths. They
+        # contribute no chunks; an old hash on such a path must not block
+        # publication of the actual source edits beside it.
+        if not file_symbols and not window_eligible(change.path, indexed_symbols=0):
+            continue
         data = _read_changed_bytes(repo, change)
         if looks_binary(data) or len(data) > MAX_WINDOW_FILE_BYTES:
             continue
         text = _decode(data)
         lines = text.splitlines()
-        file_symbols = by_file.get(change.path, [])
         symbol_chunks = [build_symbol_chunk(symbol, lines) for symbol in file_symbols]
         chunks.extend(symbol_chunks)
         if window_eligible(change.path, indexed_symbols=len(symbol_chunks)):

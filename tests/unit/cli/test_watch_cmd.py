@@ -150,9 +150,7 @@ class TestSingleRepoTrigger:
             calls.append(kwargs)
             done.set()
 
-        monkeypatch.setattr(
-            "repowise.cli.commands.update_cmd.command.run_update", fake_run_update
-        )
+        monkeypatch.setattr("repowise.cli.commands.update_cmd.command.run_update", fake_run_update)
         monkeypatch.setattr(watch_cmd, "ensure_repowise_dir", lambda _p: None)
 
         started = threading.Event()
@@ -201,9 +199,7 @@ class TestSingleRepoTrigger:
         assert calls[0]["path"] == str(tmp_path)
         assert calls[0]["index_only"] is False
 
-    def test_index_only_is_passed_through(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path
-    ) -> None:
+    def test_index_only_is_passed_through(self, monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
         calls = self._fire(monkeypatch, tmp_path, index_only=True)
 
         assert calls[0]["index_only"] is True
@@ -327,3 +323,178 @@ class TestEventPaths:
         event = self._Event(str(tmp_path / ".repowise" / "state.json"))
 
         assert watch_cmd._event_paths(event, tmp_path) == set()
+
+
+@pytest.mark.parametrize("second_change", ["save", "rename", "delete"])
+@pytest.mark.parametrize("capture_fails", [False, True])
+def test_workspace_watches_repeated_edits_and_publishes_before_graph(
+    monkeypatch, tmp_path, second_change, capture_fails
+):
+    from repowise.cli import source_search_runtime
+    from repowise.core import workspace
+
+    repo = tmp_path / "app"
+    repo.mkdir()
+    workspace.WorkspaceConfig(repos=[workspace.RepoEntry(path="app", alias="app")]).save(tmp_path)
+    monkeypatch.setenv("REPOWISE_SOURCE_SEARCH", "1")
+    monkeypatch.setattr(watch_cmd, "_SOURCE_SLOW_QUIET_SECONDS", 0.05)
+    started, updated, stop = threading.Event(), threading.Event(), threading.Event()
+    events: list[tuple[str, set[str]]] = []
+
+    def capture(path, paths):
+        assert path == repo
+        events.append(("source", set(paths)))
+        if capture_fails:
+            raise RuntimeError("capture interrupted")
+
+    async def update(_root, _config, **kwargs):
+        assert kwargs == {"repo_filter": "app", "include_working_tree": True}
+        events.append(("graph", set()))
+        updated.set()
+        return []
+
+    async def reconcile(_repo):
+        return None
+
+    class Clock:
+        @staticmethod
+        def sleep(_seconds):
+            started.set()
+            if stop.wait(0.01):
+                raise KeyboardInterrupt
+
+    monkeypatch.setattr(watch_cmd, "time", Clock)
+    monkeypatch.setattr(watch_cmd, "_publish_saved_sources", capture)
+    monkeypatch.setattr(workspace, "update_workspace", update)
+    monkeypatch.setattr(source_search_runtime, "reconcile_configured_source_index", reconcile)
+    watcher = threading.Thread(target=watch_cmd._watch_workspace, args=(tmp_path, 50), daemon=True)
+    watcher.start()
+    try:
+        assert started.wait(5)
+        assert updated.wait(5), "startup did not reconcile edits made while stopped"
+        assert events == [("graph", set())]
+        events.clear()
+        updated.clear()
+        path = repo / "app.py"
+        path.write_text("def first(): return 1\n")
+        assert updated.wait(5), "initial save did not trigger indexing"
+        updated.clear()
+        if second_change == "save":
+            temporary = repo / "app.tmp"
+            temporary.write_text("def second(): return 2\n")
+            temporary.replace(path)  # editor-style atomic save
+        elif second_change == "rename":
+            path.rename(repo / "renamed.py")
+        else:
+            path.unlink()
+        assert updated.wait(5), "watcher stopped updating after its first event"
+        assert [name for name, _ in events] == ["source", "graph", "source", "graph"]
+        assert "app.py" in events[2][1]
+        if second_change == "rename":
+            assert "renamed.py" in events[2][1]
+    finally:
+        stop.set()
+        watcher.join(timeout=5)
+    assert not watcher.is_alive()
+
+
+@pytest.mark.parametrize("source_search_enabled", [False, True])
+def test_workspace_retries_lock_contention_without_a_new_save(
+    monkeypatch, tmp_path, source_search_enabled
+):
+    from repowise.cli import source_search_runtime
+    from repowise.core import workspace
+
+    (tmp_path / "app").mkdir()
+    workspace.WorkspaceConfig(repos=[workspace.RepoEntry(path="app", alias="app")]).save(tmp_path)
+    monkeypatch.setenv("REPOWISE_SOURCE_SEARCH", "1" if source_search_enabled else "0")
+    monkeypatch.setattr(watch_cmd, "_SOURCE_SLOW_QUIET_SECONDS", 0.1)
+    updated, stop = threading.Event(), threading.Event()
+    attempts: list[float] = []
+
+    async def update(*args, **kwargs):
+        attempts.append(time.monotonic())
+        reason = "in_flight" if len(attempts) == 1 else "up_to_date"
+        if reason == "up_to_date":
+            updated.set()
+        return [SimpleNamespace(error=None, updated=False, skipped_reason=reason)]
+
+    async def reconcile(_repo):
+        return None
+
+    class Clock:
+        @staticmethod
+        def sleep(_seconds):
+            if stop.wait(0.01):
+                raise KeyboardInterrupt
+
+    monkeypatch.setattr(watch_cmd, "time", Clock)
+    monkeypatch.setattr(workspace, "update_workspace", update)
+    monkeypatch.setattr(source_search_runtime, "reconcile_configured_source_index", reconcile)
+    watcher = threading.Thread(target=watch_cmd._watch_workspace, args=(tmp_path, 50), daemon=True)
+    watcher.start()
+    try:
+        assert updated.wait(5), "workspace lock contention lost the pending refresh"
+        assert len(attempts) == 2
+        assert attempts[1] - attempts[0] >= 0.09, "workspace contention caused a tight retry loop"
+    finally:
+        stop.set()
+        watcher.join(timeout=5)
+    assert not watcher.is_alive()
+
+
+def test_workspace_source_publication_does_not_wait_for_running_graph_refresh(
+    monkeypatch, tmp_path
+):
+    from repowise.cli import source_search_runtime
+    from repowise.core import workspace
+
+    repo = tmp_path / "app"
+    repo.mkdir()
+    workspace.WorkspaceConfig(repos=[workspace.RepoEntry(path="app", alias="app")]).save(tmp_path)
+    monkeypatch.setenv("REPOWISE_SOURCE_SEARCH", "1")
+    monkeypatch.setattr(watch_cmd, "_SOURCE_SLOW_QUIET_SECONDS", 0.02)
+    graph_started, graph_release, graph_done = (
+        threading.Event(),
+        threading.Event(),
+        threading.Event(),
+    )
+    published, stop = threading.Event(), threading.Event()
+
+    async def update(*args, **kwargs):
+        graph_started.set()
+        graph_release.wait(5)
+        graph_done.set()
+        return []
+
+    async def reconcile(_repo):
+        return None
+
+    def publish(path, paths):
+        assert path == repo
+        assert "during_refresh.py" in paths
+        published.set()
+
+    class Clock:
+        @staticmethod
+        def sleep(_seconds):
+            if stop.wait(0.01):
+                raise KeyboardInterrupt
+
+    monkeypatch.setattr(watch_cmd, "time", Clock)
+    monkeypatch.setattr(watch_cmd, "_publish_saved_sources", publish)
+    monkeypatch.setattr(workspace, "update_workspace", update)
+    monkeypatch.setattr(source_search_runtime, "reconcile_configured_source_index", reconcile)
+    watcher = threading.Thread(target=watch_cmd._watch_workspace, args=(tmp_path, 50), daemon=True)
+    watcher.start()
+    try:
+        assert graph_started.wait(5)
+        (repo / "during_refresh.py").write_text("def current(): return 1\n")
+        assert published.wait(2), "source indexing was held behind the graph update"
+        assert not graph_done.is_set()
+    finally:
+        graph_release.set()
+        assert graph_done.wait(5)
+        stop.set()
+        watcher.join(timeout=5)
+    assert not watcher.is_alive()

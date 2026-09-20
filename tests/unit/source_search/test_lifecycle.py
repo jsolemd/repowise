@@ -1053,6 +1053,52 @@ async def test_changed_again_after_capture_defers_without_publishing(lifecycle_r
         assert not fts.query("newnebula")
 
 
+@pytest.mark.parametrize("media_exists", [True, False])
+async def test_obsolete_media_outbox_does_not_block_source_publication(
+    lifecycle_repo, media_exists
+):
+    repo = lifecycle_repo
+    if media_exists:
+        (repo / "hero.webp").write_bytes(b"RIFF\x00new image bytes")
+    engine, factory = await _factory(repo)
+    try:
+        async with get_session(factory) as session:
+            # Older captures classified this media path as successfully parsed.
+            # It has no symbols or file-window eligibility, and its saved hash
+            # can no longer match (or the image may have been retired).
+            await enqueue_incremental_update(
+                session,
+                "r1",
+                repo,
+                parsed_files=[],
+                file_diffs=[
+                    SimpleNamespace(
+                        path="hero.webp",
+                        status="modified",
+                        old_path=None,
+                        new_parsed=None,
+                        parse_state="parsed",
+                        content_hash="old-image",
+                    )
+                ],
+            )
+    finally:
+        await engine.dispose()
+    (repo / "src" / "app.py").write_text(_APP_V2)
+    await _capture(repo, path="src/app.py")
+
+    result = await reconcile_source_index(
+        repo, embedder=MockEmbedder(), embedder_identity=_IDENTITY
+    )
+    assert result.status == "published"
+    current = read_manifest(default_manifest_path(repo))
+    with _fts(repo, current) as fts:
+        assert fts.query("newnebula")
+        assert not fts.query("oldquasar")
+    status = await inspect_source_index(repo)
+    assert status.pending_updates == 0
+
+
 async def test_model_recipe_change_builds_beside_and_flips_once(lifecycle_repo):
     repo = lifecycle_repo
     old = read_manifest(default_manifest_path(repo))
