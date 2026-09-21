@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from repowise.core.providers.embedding.base import MockEmbedder
@@ -125,6 +127,62 @@ async def test_stored_vectors_are_readable_for_reuse(tmp_path):
         assert entry.content_hash == chunk.content_hash
         assert entry.vector == pytest.approx(list(vector), abs=1e-6)
     await store.close()
+
+
+async def test_reuse_reads_only_requested_hashes_across_files_and_batches(tmp_path):
+    pytest.importorskip("lancedb")
+    embedder = MockEmbedder()
+    store = await _store(tmp_path, embedder)
+    # More hashes than one predicate batch, and more duplicates than one result
+    # batch: neither a query limit nor collecting the entire corpus is needed.
+    chunks = [_chunk(f"symbol_{index}") for index in range(230)]
+    items = await _embed(embedder, chunks)
+    duplicates = [
+        (replace(chunks[0], chunk_id=f"copy-{index}", file_path=f"other/{index}.py"), items[0][1])
+        for index in range(300)
+    ]
+    await store.upsert([*duplicates, *items])
+    requested = [chunk.content_hash for chunk in chunks[::2]]
+    actual = await store.vectors_by_content_hash([*requested, requested[0], "missing'", ""])
+    assert set(actual) == set(requested)
+    for chunk, vector in items[::2]:
+        assert actual[chunk.content_hash] == pytest.approx(vector, abs=1e-6)
+    await store.close()
+
+
+async def test_reuse_respects_bound_generation_during_staging(tmp_path):
+    pytest.importorskip("lancedb")
+    embedder = MockEmbedder()
+    first = GenerationRef("first", 1)
+    second = GenerationRef("second", 2)
+    store = SourceChunkVectorStore(str(tmp_path / "lancedb"), embedder=embedder, generation=first)
+    old = _chunk("alpha", body="def alpha():\n    return 1")
+    new = _chunk("alpha", body="def alpha():\n    return 2")
+    unrelated = _chunk("unrelated")
+    await store.upsert(await _embed(embedder, [old, unrelated]))
+    await store.stage_generation(
+        second,
+        close_paths=[old.file_path],
+        items=await _embed(embedder, [new]),
+        recipe_fingerprint="same-recipe",
+        expected_count=2,
+    )
+    requested = [old.content_hash, new.content_hash]
+    assert set(await store.vectors_by_content_hash(requested)) == {old.content_hash}
+    await store.close()
+    active = SourceChunkVectorStore(str(tmp_path / "lancedb"), embedder=embedder, generation=second)
+    assert set(await active.vectors_by_content_hash(requested)) == {new.content_hash}
+    await active.close()
+
+
+async def test_empty_reuse_does_not_open_the_database(tmp_path, monkeypatch):
+    store = await _store(tmp_path)
+
+    async def unexpected_connection():
+        pytest.fail("empty reuse must not open LanceDB")
+
+    monkeypatch.setattr(store, "_ensure_connected", unexpected_connection)
+    assert await store.vectors_by_content_hash([""]) == {}
 
 
 async def test_delete_by_file_removes_only_that_file(tmp_path):
