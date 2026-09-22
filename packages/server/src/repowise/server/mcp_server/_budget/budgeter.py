@@ -35,8 +35,10 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Any
 
 from repowise.server.mcp_server._budget.collector import OmissionCollector
@@ -164,6 +166,44 @@ def over_budget(
     return response_chars(response) > budget - headroom
 
 
+#: A requested collection keeps whichever of these is larger.
+REQUESTED_MIN_ROWS = 3
+REQUESTED_MIN_SHARE = 0.25
+
+
+def entitled_floor(total: int) -> int:
+    """Rows a caller-requested collection keeps before anything else sheds."""
+    if total <= REQUESTED_MIN_ROWS:
+        return total
+    return min(total, max(REQUESTED_MIN_ROWS, math.ceil(total * REQUESTED_MIN_SHARE)))
+
+
+def shed_stem(key: str) -> str:
+    """The response path a shed-order key names, with the ``[]`` form removed."""
+    return key[:-2] if key.endswith("[]") else key
+
+
+def _rows_to_keep(rows: Any, requested: bool) -> int:
+    """Tail-shed floor for one collection: its entitlement, or one row."""
+    if not requested or not isinstance(rows, (list, dict)):
+        return 1
+    return entitled_floor(len(rows))
+
+
+@dataclass(frozen=True)
+class _ShedLimits:
+    """The knobs every key in one :func:`fit_to_budget` pass shares."""
+
+    headroom: int
+    char_budget: int | None
+    record_counts: bool
+
+    def exceeded(self, response: dict[str, Any]) -> bool:
+        return over_budget(
+            response, headroom=self.headroom, char_budget=self.char_budget
+        )
+
+
 def fit_to_budget(
     response: dict[str, Any],
     order: Sequence[str],
@@ -172,6 +212,7 @@ def fit_to_budget(
     headroom: int = FIT_HEADROOM_CHARS,
     char_budget: int | None = None,
     record_counts: bool = False,
+    entitled: frozenset[str] | None = None,
 ) -> dict[str, Any]:
     """Shed whole blocks named by *order* until *response* fits the budget.
 
@@ -181,12 +222,18 @@ def fit_to_budget(
     first. Shedding stops the moment the response fits, so an under-budget
     response — the common case — is untouched.
 
+    *entitled* names stems the caller asked for; their ``[]`` passes stop at
+    :func:`entitled_floor` instead of one row. The order still decides when a
+    block is reached, and the ceiling still wins.
+
     Drops go to *collector* as expandable ``[repowise#<ref>]`` markers and set
     ``truncated``. Call before the caller's :meth:`OmissionCollector.attach`,
     which is what ``headroom`` reserves for.
     """
+    limits = _ShedLimits(headroom, char_budget, record_counts)
+    requested = entitled or frozenset()
     for key in order:
-        if not over_budget(response, headroom=headroom, char_budget=char_budget):
+        if not limits.exceeded(response):
             break
         container, _, leaf = key.rpartition(".")
         target: Any = response
@@ -195,16 +242,8 @@ def fit_to_budget(
         if not isinstance(target, dict):
             continue
         if leaf.endswith("[]"):
-            _shed_tail(
-                response,
-                target,
-                leaf[:-2],
-                key[:-2],
-                collector,
-                headroom,
-                char_budget,
-                record_counts,
-            )
+            keep = _rows_to_keep(target.get(leaf[:-2]), shed_stem(key) in requested)
+            _shed_tail(response, target, leaf[:-2], key[:-2], collector, limits, keep)
         elif target.get(leaf):
             value = target.pop(leaf)
             collector.add(key, value)
@@ -220,19 +259,16 @@ def _shed_tail(
     leaf: str,
     label: str,
     collector: OmissionCollector,
-    headroom: int,
-    char_budget: int | None,
-    record_counts: bool,
+    limits: _ShedLimits,
+    keep: int = 1,
 ) -> None:
-    """Drop ranked rows from the tail of ``container[leaf]`` until it fits."""
+    """Drop ranked rows from the tail of ``container[leaf]`` down to *keep*."""
     rows = container.get(leaf)
     if not isinstance(rows, (list, dict)):
         return
     total = len(rows)
     dropped: list[Any] = []
-    while len(rows) > 1 and over_budget(
-        response, headroom=headroom, char_budget=char_budget
-    ):
+    while len(rows) > keep and limits.exceeded(response):
         if isinstance(rows, list):
             dropped.append(rows.pop())
         else:
@@ -240,7 +276,7 @@ def _shed_tail(
             dropped.append({name: rows.pop(name)})
     if dropped:
         collector.add(label, list(reversed(dropped)))
-        if record_counts:
+        if limits.record_counts:
             prior_reason = container.get(f"{leaf}_reduced_reason")
             collection_total = max(
                 total, int(container.get(f"{leaf}_total") or 0)
@@ -280,21 +316,24 @@ def _record_reduction(
 
     reductions = response.setdefault("_meta", {}).setdefault("reductions", [])
 
-    def visit(node: Any, node_path: str) -> None:
+    def visit(node: Any, node_path: str, parent: dict[str, Any], name: str) -> None:
         if isinstance(node, list):
+            # An earlier tail-shed may already have trimmed this list and left
+            # the population beside it. Reporting len() here would count only
+            # what the trim left, not what the caller lost overall.
             reductions.append(
                 {
                     "field": node_path,
-                    "total": len(node),
+                    "total": max(len(node), int(parent.get(f"{name}_total") or 0)),
                     "emitted": 0,
                     "reason": "response_budget",
                 }
             )
         elif isinstance(node, dict):
-            for name, child in node.items():
-                visit(child, f"{node_path}.{name}")
+            for child_name, child in node.items():
+                visit(child, f"{node_path}.{child_name}", node, child_name)
 
-    visit(value, path)
+    visit(value, path, container, field)
 
 
 def _with_budget_reason(prior_reason: Any) -> str:

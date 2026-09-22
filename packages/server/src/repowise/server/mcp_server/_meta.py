@@ -18,14 +18,26 @@ Rules of thumb baked into the hint generators:
 
 from __future__ import annotations
 
+import os
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from repowise.core.index_scope import load_index_scope
+from repowise.core.index_scope import (
+    CANONICAL_INDEX_SCOPE_PROJECTION,
+    INDEX_SCOPE_ENV,
+    compact_index_scope,
+    index_scope_fingerprint,
+    load_index_scope,
+)
+from repowise.server.mcp_server._rounding import round_float
 
-MCP_CONTRACT_VERSION = 1
+# 2: index_scope carries the compact projection on routine responses. The key
+# and its version field are unchanged, so a consumer reading the old shape has
+# no way to notice from index_scope itself — the envelope version is where a
+# wire-shape change is announced. REPOWISE_MCP_INDEX_SCOPE=full restores it.
+MCP_CONTRACT_VERSION = 2
 
 # Only warn about age when we have no other signal AND the index is genuinely
 # old. A short threshold here would nag on every call and train the agent to
@@ -109,6 +121,40 @@ def read_index_scope(local_path: str | None) -> dict[str, Any] | None:
     if not local_path:
         return None
     return load_index_scope(local_path)
+
+
+def _canonical_scope_requested() -> bool:
+    """Whether the environment asks for the whole scope on every response.
+
+    The compatibility window, for a reader that parses the full object and has
+    no way yet to ask for it by name. Read per call, so turning it on does not
+    need a restart of a server a client spawned.
+    """
+    return os.environ.get(INDEX_SCOPE_ENV, "").strip().lower() == CANONICAL_INDEX_SCOPE_PROJECTION
+
+
+def _full_scope_hint() -> str:
+    """The call that returns the whole scope, as this server is running.
+
+    In workspace mode ``get_overview()`` returns the repo listing and carries
+    no scope at all, so a digest pointing there would send an agent somewhere
+    the rest of the answer is not. The argument is named rather than filled in
+    because the alias belongs to the caller's own request, not to the
+    repository row this envelope was built from.
+    """
+    from repowise.server.mcp_server import _state
+
+    if getattr(_state, "_registry", None) is not None:
+        return "get_overview(repo=...)"
+    return "get_overview()"
+
+
+def index_scope_for_response(local_path: str | None) -> dict[str, Any] | None:
+    """The scope an ordinary response carries: the digest, unless asked."""
+    scope = read_index_scope(local_path)
+    if scope is None or _canonical_scope_requested():
+        return scope
+    return compact_index_scope(scope, full_hint=_full_scope_hint())
 
 
 def resolve_indexed_commit(head_commit: str | None, local_path: str | None) -> str | None:
@@ -413,6 +459,12 @@ def build_meta(
     serves) to scope ``stale_warning`` to actually-affected content — see
     :func:`freshness_from_repo`.
 
+    ``index_scope`` rides on every response, so it carries the compact
+    projection: the run mode, the provenance, the git tier, one word for
+    whether the index is whole, and a fingerprint identifying the canonical
+    object. See :func:`build_meta_with_full_scope` for the calls that are
+    worth the whole thing.
+
     Stable shape:
       {
         "timing_ms":       float,  # tool wall-time (omitted if None)
@@ -426,14 +478,24 @@ def build_meta(
     """
     out: dict[str, Any] = {"contract_version": MCP_CONTRACT_VERSION}
     if timing_ms is not None:
-        out["timing_ms"] = round(float(timing_ms), 2)
+        # Through the shared quantizer, not ``round(..., 2)``. A wall-clock
+        # duration is a float like any other on this wire, and two decimal
+        # places is not the same rule the rest of the payload follows: a
+        # 1077.85 ms measurement survives ``round`` but the significant-digit
+        # rule wants 1078.0, so the field tripped the no-raw-doubles guard
+        # whenever the run happened to land off an integer. ``round_float``
+        # returns None for a non-finite measurement, which is not valid JSON,
+        # so the key is omitted rather than emitted as null.
+        rounded_ms = round_float(float(timing_ms))
+        if rounded_ms is not None:
+            out["timing_ms"] = rounded_ms
     if hint:
         out["hint"] = hint
     if cached:
         out["cached"] = True
     if repository is not None:
         out.update(freshness_from_repo(repository, targets=targets))
-        scope = read_index_scope(getattr(repository, "local_path", None))
+        scope = index_scope_for_response(getattr(repository, "local_path", None))
         if scope is not None:
             out["index_scope"] = scope
     out.update(_embedder_meta())
@@ -441,6 +503,28 @@ def build_meta(
     if extra:
         out.update(extra)
     return out
+
+
+def build_meta_with_full_scope(**kwargs: Any) -> dict[str, Any]:
+    """:func:`build_meta` for an orientation call: the whole ``index_scope``.
+
+    A separate function rather than a parameter on ``build_meta``, which has
+    68 call sites that all want the digest and one that wants this. A knob
+    every caller must read past to learn it does not apply to them belongs
+    beside the one caller it does.
+    """
+    meta = build_meta(**kwargs)
+    repository = kwargs.get("repository")
+    if repository is not None:
+        scope = read_index_scope(getattr(repository, "local_path", None))
+        if scope is not None:
+            # The fingerprint is what makes a held copy checkable against a
+            # later digest, so the copy being held has to carry it too.
+            meta["index_scope"] = {
+                **scope,
+                "fingerprint": index_scope_fingerprint(scope),
+            }
+    return meta
 
 
 def persisted_analysis_meta(
@@ -526,6 +610,7 @@ def agent_trust(envelope: dict[str, Any]) -> dict[str, Any]:
         "runtime_breakage_proven",
         "existing_verified_code",
     )
+
     def project(member: dict[str, Any]) -> dict[str, Any]:
         facts = {key: member[key] for key in fields if key in member}
         scope = member.get("index_scope")
@@ -558,6 +643,7 @@ def agent_trust(envelope: dict[str, Any]) -> dict[str, Any]:
 
 def _index_scope_trust(scope: dict[str, Any]) -> dict[str, Any]:
     """Bound the achieved coverage facts that must survive dropped protocol metadata."""
+
     def scalars(value: Any, fields: tuple[str, ...]) -> dict[str, Any]:
         if not isinstance(value, dict):
             return {}
@@ -570,13 +656,40 @@ def _index_scope_trust(scope: dict[str, Any]) -> dict[str, Any]:
                 projected[key] = item[:256] if isinstance(item, str) else item
         return projected
 
+    from repowise.core.index_scope import COMPACT_INDEX_SCOPE_PROJECTION
+
+    if scope.get("projection") == COMPACT_INDEX_SCOPE_PROJECTION:
+        facts = scalars(
+            scope,
+            (
+                "version",
+                "projection",
+                "run_mode",
+                "content_provenance",
+                "git_tier",
+                "status",
+                "fingerprint",
+                "full",
+            ),
+        )
+        unavailable = scope.get("degraded_analyses")
+        if isinstance(unavailable, list):
+            facts["degraded_analyses"] = [str(value)[:256] for value in unavailable[:8]]
+            if len(unavailable) > 8:
+                facts["degraded_analyses_omitted"] = len(unavailable) - 8
+        return facts
+
     facts = scalars(
         scope, ("version", "run_mode", "content_provenance", "git_tier", "git_commit_cap")
     )
     groups = {
         "git_history_coverage": (
-            "eligible_files", "files_with_history", "unavailable_files",
-            "retained_commits", "per_file_limit", "complete_through_depth",
+            "eligible_files",
+            "files_with_history",
+            "unavailable_files",
+            "retained_commits",
+            "per_file_limit",
+            "complete_through_depth",
         ),
         "file_pages": ("configured_cap", "effective_cap", "eligible", "generated", "omitted"),
         "upgrade": ("status", "retryable", "next_stage"),
@@ -710,20 +823,6 @@ def _release_meta() -> dict[str, Any]:
             f"{check.current_version}; upgrade and restart the MCP server"
         )
     }
-
-
-def context_hint(targets: list[str], compact: bool, include: set[str] | None = None) -> str | None:
-    """Hint for `get_context` callers.
-
-    Conservative: only fires when the call shape suggests the agent could
-    have used a cheaper tool, AND the suggestion is unambiguously safe.
-    """
-    if not targets:
-        return None
-    # If caller requested source and got a large symbol, nudge toward Read with offset
-    if include and "source" in include and len(targets) == 1:
-        return None  # source mode provides its own truncation info
-    return None
 
 
 def symbol_hint(symbol_id: str, end_line: int, start_line: int) -> str | None:

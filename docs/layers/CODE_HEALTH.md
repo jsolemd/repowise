@@ -387,9 +387,10 @@ Reports:
 
 ## Three health signals: defect risk, maintainability, and performance
 
-The three signals are computed from the same marker stream by one shared scoring
-kernel against independent weight, category and cap tables. They are co-equal
-views, **never blended into a single number**.
+The three scored signals are computed from the same marker stream by one shared
+scoring kernel against independent weight, category and cap tables. They are
+co-equal views, **never blended into a single number**. A fourth dimension,
+`advisory`, carries markers that never score at all. See below.
 
 **Defect risk** is the calibrated headline: the number on the dashboard ring,
 the band, the badge, and every accuracy claim above.
@@ -415,6 +416,75 @@ Every finding carries a `dimension` naming its pillar, and all three surface
 identically: `summary.*_average` on the REST overview, `kpis.*` on MCP
 `get_health`, per-file scores on every metric row, and a line each in `CLAUDE.md`
 and `repowise status`.
+
+### The fourth dimension: `advisory`, which never scores
+
+Some things are worth measuring and impossible to calibrate. No defect corpus
+labels how much of a test is mock setup, so a mock-density marker has no
+calibration story and never will. Weighting it anyway would move a number that
+claims to predict bugs using evidence that says nothing about bugs.
+
+`advisory` is where those markers live. It is deliberately **not** one of the
+three scored dimensions: there is no weight table, category or cap keyed on it,
+so "never deducts" is structural rather than a promise. Its findings carry a
+`health_impact` of exactly `0.0`, are never counted in a change's
+introduced/worsened totals, and can never make a review verdict blocking.
+
+They are also out of every impact-ranked list, which is a statement about
+ranking rather than about existence: a zero-impact row appended to a list
+ordered by impact reads as a deduction that rounded away. Ask for the dimension
+and you get it, and a surface that ranks nothing -- one file's findings in an
+editor, or a list already filtered to one marker -- gets it without asking.
+
+| Marker | Languages | What it measures |
+|---|---|---|
+| `assertion_free_test` | Python · TypeScript / JavaScript | A test case that runs the code under test and checks nothing |
+| `mock_saturated_test` | Python · TypeScript / JavaScript | Mock-setup statements per assertion in a test function |
+
+A marker earns weight by clearing the house precision bar (roughly 70%
+hand-labelled) on a real corpus. `mock_saturated_test` has not, and precision is
+measured per language because it does not transfer: **67%** on Python (32
+findings) and **40%** on TypeScript (30 findings), each the complete population
+at the shipped gate. Both figures predate the assertion count gaining the
+oracle shapes listed in
+[LANGUAGE_SUPPORT.md](LANGUAGE_SUPPORT.md#code-health-coverage), which grew this
+marker's denominator on Python and TypeScript. A larger denominator lowers the
+ratio, so the change can only suppress findings, never add one — but the two
+numbers above were measured against the smaller denominator and are now a
+ceiling rather than a current reading.
+
+It stays advisory until two false-positive families are separated: value-object builders named `Fake*` passed as input to real logic, and
+boundary isolation where the assertion reads a real artifact. Both turn on
+whether an assertion observes a double or production output, which is a dataflow
+question the pass does not ask — and on the TypeScript sample that one question
+accounted for every false positive.
+
+`assertion_free_test` measures at least **71%** on TypeScript — a floor
+rather than a current reading, three false-positive families having been closed
+since the labelling (31 findings, the complete
+population of two corpora; an earlier pass published 51% for the larger
+pre-change population, which re-labels to 43.1% against this rubric) and **86%** on Python (29 hand-labelled, a systematic
+sample of 172), and does not report on Go or Java at all; the per-language
+reasoning is in
+[LANGUAGE_SUPPORT.md](LANGUAGE_SUPPORT.md#code-health-coverage). A test that
+delegates its oracle to a helper is resolved in the same file by name, and in
+another file when the call graph binds the call, which is what closed most of
+the TypeScript gap. The marker stays advisory on both: neither population is large
+enough to settle the bar.
+
+It asks a question with a yes-or-no answer rather than a
+threshold, which is why it can be stated plainly: a test case with no oracle of
+any kind — no assertion, no mock verification, no `raise`/`throw` the author
+wrote by hand, and no call to an assertion helper from a position the statement
+scan cannot classify. Four questions, every one of them yes or no and none of
+them a threshold. A **mock verification counts as an
+assertion here**, the opposite of the marker above it, because a test whose only
+oracle is `verify(...)` does check something. The two markers read the same call
+for two different questions; the tiers that keep them apart are in
+`complexity/assertions.py`.
+
+Per-language coverage, and why Go and Java are blocked for each marker:
+[LANGUAGE_SUPPORT.md](LANGUAGE_SUPPORT.md#code-health-coverage).
 
 ## Performance risk
 

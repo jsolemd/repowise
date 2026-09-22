@@ -5,7 +5,8 @@ text alone (the ``visibility_fn`` shape). Some cannot, because the answer
 depends on surrounding AST context — C/C++ ``public:`` / ``private:``
 access specifier siblings, ``static`` storage class at file scope and
 ``__declspec(dllexport)`` attributes; C#'s no-modifier default, which
-differs by enclosing declaration; TS/JS export position. Each has a
+differs by enclosing declaration; TS/JS export position; Rust's
+trait items, which may not write a modifier of their own. Each has a
 ``refine_*_visibility`` the parser calls after the generic
 ``visibility_fn``.
 """
@@ -372,6 +373,36 @@ def refine_csharp_visibility(def_node: Node, current_visibility: str) -> str:
             break
         node = node.parent
     return current_visibility
+
+
+# ---------------------------------------------------------------------------
+# Rust node-aware visibility refinement
+# ---------------------------------------------------------------------------
+
+
+def refine_rust_visibility(def_node: Node, current_visibility: str, src: str) -> str:
+    """Give a trait's items the visibility the trait itself declares.
+
+    Rust forbids a visibility modifier on a trait item, so ``rust_visibility``
+    reads empty modifier text and calls every method of a ``pub trait``
+    private. The trait's own modifier is the reachable answer: a ``pub trait``
+    is downstream-callable API, and a private trait's methods are not.
+    """
+    if any(c.type == "visibility_modifier" for c in def_node.children):
+        return current_visibility
+    # Trait items sit directly in the trait's ``declaration_list``. Matching
+    # that exact shape rather than walking ancestors keeps an item nested
+    # inside a defaulted method's body out of the trait's bucket.
+    decls = def_node.parent
+    if decls is None or decls.type != "declaration_list":
+        return current_visibility
+    trait = decls.parent
+    if trait is None or trait.type != "trait_item":
+        return current_visibility
+    modifier = next((c for c in trait.children if c.type == "visibility_modifier"), None)
+    if modifier is None:
+        return current_visibility
+    return rust_visibility("", [node_text(modifier, src)])
 
 
 # ---------------------------------------------------------------------------

@@ -85,3 +85,40 @@ def test_indexed_repo_materializes_bounded_store_on_first_call(tmp_path: Path) -
             "saved_tokens": 0,
         }
     ]
+
+
+async def test_middleware_aggregates_once_after_final_budget(tmp_path, monkeypatch):
+    from repowise.core.savings.repository import SavingsRepository
+    from repowise.server.mcp_server import _budget, tool_middleware
+    from repowise.server.mcp_server._savings import wrapper
+
+    calls = []
+    events = []
+
+    async def resolve(*args, **kwargs):
+        return tmp_path
+
+    monkeypatch.setattr(_budget, "resolve_response_budget_repo_root", resolve)
+    monkeypatch.setattr(wrapper.counterfactual, "replaced_tokens_for", lambda *_: 50_000)
+    monkeypatch.setattr(
+        wrapper, "record_mcp_call", lambda *args, **kw: calls.append((args, kw)) or True
+    )
+    monkeypatch.setattr(SavingsRepository, "record_event", lambda *args: events.append(args))
+
+    async def measured_tool() -> dict:
+        return {"answer": "answer " * 10_000, "_meta": {}}
+
+    result = await tool_middleware(measured_tool)()
+    assert len(calls) == 1
+    assert calls[0][0] == (str(tmp_path), "measured_tool")
+    assert calls[0][1]["delivered_tokens"] == wrapper.response_tokens(result)
+    assert calls[0][1]["replaced_tokens"] == 50_000
+    assert set(calls[0][1]) == {
+        "duration_ms",
+        "error",
+        "no_match",
+        "degraded",
+        "replaced_tokens",
+        "delivered_tokens",
+    }
+    assert events == []

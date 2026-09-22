@@ -36,6 +36,19 @@ class FullUpdatePersistResult:
     prune_outcome: DeletedFilePruneOutcome
 
 
+def backfill_docs_pointer(new_state: dict, state: dict) -> None:
+    """Carry ``last_sync_commit`` onto a docs pointer that never got one.
+
+    Falsy, not absent. A store that has never had a docs pass carries
+    ``last_docs_commit`` as an explicit null, so a membership test reads it as
+    "already set" and the repair never runs -- which is what left such a store
+    failing every update with "No previous sync found" (#1507 fixed the same
+    confusion on the write side, in ``generate``).
+    """
+    if not state.get("last_docs_commit") and state.get("last_sync_commit"):
+        new_state["last_docs_commit"] = state["last_sync_commit"]
+
+
 def _repair_module_attribution(repo_path: Path) -> int:
     """Re-derive every health row's ``module`` from the repo layout on disk.
 
@@ -160,15 +173,19 @@ async def _coverage_for_rescore(
     return coverage_map, [], source_format, False
 
 
-async def _persist_partial_health(session: Any, repo_id: str, report: Any) -> None:
+async def _persist_partial_health(
+    session: Any, repo_id: str, report: Any, repo_path: Any = None
+) -> None:
     """Upsert health findings + metrics for the changed-files subset.
 
     Delegates to :mod:`repowise.core.pipeline.incremental` — the logic moved
-    to core so workspace updates can reuse the incremental path.
+    to core so workspace updates can reuse the incremental path. ``repo_path``
+    is what lets it also re-score the git-derived markers on files this run did
+    not walk; without it those markers keep whatever the last full index said.
     """
     from repowise.core.pipeline.incremental import persist_partial_health
 
-    await persist_partial_health(session, repo_id, report)
+    await persist_partial_health(session, repo_id, report, repo_path)
 
 
 async def _persist_incremental_commits(session: Any, repo_id: str, repo_path: Any) -> None:
@@ -199,8 +216,10 @@ def stamp_head_commit(repo_path: Any, head: str | None) -> None:
     # One stamper for both update paths: delegate to the core implementation
     # the workspace updater uses. It touches only head_commit/updated_at on an
     # existing row (the old upsert here clobbered url/default_branch with
-    # defaults), creates the row when missing from an existing wiki.db, and
-    # no-ops when wiki.db itself is absent instead of conjuring an empty DB.
+    # defaults), creates the row when missing from an existing store, and
+    # no-ops when no store exists at all instead of conjuring an empty DB. A
+    # configured database counts as one, which the repo-local file check this
+    # used to make could never see.
     from repowise.core.workspace.update import reconcile_repo_head_commit
 
     run_async(reconcile_repo_head_commit(Path(repo_path), head))
@@ -220,8 +239,10 @@ def heal_commit_offsets(repo_path: Any) -> None:
     once the column is filled, and no git at all in that case. Best-effort — a
     failure here must never turn a clean no-op into an error.
     """
+    from repowise.core.persistence.database import has_db_store
+
     root = Path(repo_path)
-    if not (root / ".repowise" / "wiki.db").is_file():
+    if not has_db_store(root):
         return
 
     async def _run() -> None:
@@ -378,6 +399,7 @@ def _persist_index_only_update(
     head: str | None,
     start: float,
     changed_paths: list[str],
+    doc_drift_report: Any | None = None,
     file_diffs: list | None = None,
     knowledge_graph_result: Any | None = None,
     parsed_files: list | None = None,
@@ -435,6 +457,7 @@ def _persist_index_only_update(
             dead_code_report,
             partial_health_report,
             changed_paths,
+            doc_drift_report=doc_drift_report,
             file_diffs=file_diffs,
             knowledge_graph_result=knowledge_graph_result,
             parsed_files=parsed_files,
@@ -558,8 +581,7 @@ def _persist_index_only_update(
             "[yellow]Some data for this commit range was not persisted; "
             "the next update will re-cover it.[/yellow]"
         )
-    if "last_docs_commit" not in state and "last_sync_commit" in state:
-        new_state["last_docs_commit"] = state["last_sync_commit"]
+    backfill_docs_pointer(new_state, state)
     if knowledge_graph_result is not None:
         try:
             from repowise.cli.state_persistence import build_kg_state, save_knowledge_graph_json
@@ -701,6 +723,7 @@ def _persist_full_update(
     graph_builder: Any,
     knowledge_graph_result: Any | None,
     degraded: list[str],
+    doc_drift_report: Any | None = None,
     decay_paths: list[str] | None = None,
     parsed_files: list | None = None,
     git_decay_map: dict | None = None,
@@ -743,6 +766,7 @@ def _persist_full_update(
             graph_builder=graph_builder,
             knowledge_graph_result=knowledge_graph_result,
             degraded=degraded,
+            doc_drift_report=doc_drift_report,
             decay_paths=decay_paths,
             parsed_files=parsed_files,
             git_decay_map=git_decay_map,
@@ -772,6 +796,7 @@ async def _persist_full_update_async(
     graph_builder: Any,
     knowledge_graph_result: Any | None,
     degraded: list[str],
+    doc_drift_report: Any | None = None,
     decay_paths: list[str] | None = None,
     parsed_files: list | None = None,
     git_decay_map: dict | None = None,
@@ -1050,16 +1075,19 @@ async def _persist_full_update_async(
             if timings is not None:
                 timings.start("persist.decisions")
             try:
-                # The same three store repairs the full-index path runs, in the
-                # same order (see ``pipeline/persist.py``). They live here too
-                # because a user whose workflow is ``repowise update`` never
-                # takes that path, and every one of them is a repair the store
-                # cannot make for itself: ``superseded`` and the retired-source
-                # backlog both survive re-extraction, and ``source_rank`` is a
-                # value copied into rows rather than derived on read.
+                # The same four store repairs the full-index path runs, in
+                # the same order (see ``pipeline/persist.py``). They live here
+                # too because a user whose workflow is ``repowise update``
+                # never takes that path, and every one of them is a repair the
+                # store cannot make for itself: ``superseded`` and the
+                # retired-source backlog both survive re-extraction,
+                # ``source_rank`` is a value copied into rows rather than
+                # derived on read, and a stored confidence carries no mark of
+                # which formula produced it.
                 from repowise.core.analysis.decision_provenance import RETIRED_SOURCES
                 from repowise.core.persistence.crud import (
                     purge_proposed_decisions_by_source,
+                    reconcile_decision_confidence,
                     reconcile_source_ranks,
                     unretire_auto_superseded,
                 )
@@ -1070,6 +1098,7 @@ async def _persist_full_update_async(
                 for _retired in RETIRED_SOURCES:
                     await purge_proposed_decisions_by_source(session, repo_id, _retired)
                 await reconcile_source_ranks(session)
+                await reconcile_decision_confidence(session)
 
                 # Same repairs on the path a ``repowise update`` user takes.
                 # Derived ids come first, so everything after this reads a
@@ -1082,9 +1111,25 @@ async def _persist_full_update_async(
 
                 # The entity split is only coherent once legacy rows are
                 # classified.
-                from repowise.core.persistence.decision_migration import apply_migration
+                from repowise.core.persistence.decision_migration import (
+                    apply_migration,
+                    backfill_decision_node_links,
+                    backfill_scope_basis,
+                    backfill_session_scope_basis,
+                    prune_unindexed_scope_files,
+                )
 
                 await apply_migration(session, repo_id)
+
+                # Run every index, beside the classification repair and for
+                # the same reason: a record written before these rules existed
+                # is only reachable from code that runs on an existing store.
+                # The prune runs first so the basis repairs judge the file
+                # list they will leave behind.
+                await prune_unindexed_scope_files(session, repo_id)
+                await backfill_scope_basis(session, repo_id)
+                await backfill_session_scope_basis(session, repo_id)
+                await backfill_decision_node_links(session, repo_id)
 
                 if require_decision_persist_success:
                     from repowise.core.persistence.crud import (
@@ -1171,7 +1216,9 @@ async def _persist_full_update_async(
             if partial_health_report is not None:
                 try:
                     with timed(timings, "persist.health"):
-                        await _persist_partial_health(session, repo_id, partial_health_report)
+                        await _persist_partial_health(
+                            session, repo_id, partial_health_report, repo_path
+                        )
                 except Exception as exc:
                     _skip("Health persist", exc)
 
@@ -1195,6 +1242,19 @@ async def _persist_full_update_async(
                         )
                 except Exception as exc:
                     _skip("Dead-code persist", exc)
+
+            # Scoped to the documents the pass actually read, so one this run
+            # could not open keeps its rows in both drift tables.
+            if doc_drift_report is not None:
+                try:
+                    from repowise.core.persistence.crud import (
+                        replace_doc_drift_guarded,
+                    )
+
+                    with timed(timings, "persist.doc_drift"):
+                        await replace_doc_drift_guarded(session, repo_id, doc_drift_report)
+                except Exception as exc:
+                    _skip("Doc-drift persist", exc)
 
             # Re-persist graph_nodes so symbol-level PageRank / betweenness /
             # community ids reflect the current build.
@@ -1372,10 +1432,13 @@ async def _persist_full_update_async(
                     session,
                     repo_id,
                     symbol_parser_refresh,
-                    required_paths=set(getattr(
-                        graph_builder, "traversed_file_paths",
-                        [pf.file_info.path for pf in parsed_files or []],
-                    )),
+                    required_paths=set(
+                        getattr(
+                            graph_builder,
+                            "traversed_file_paths",
+                            [pf.file_info.path for pf in parsed_files or []],
+                        )
+                    ),
                     prune_ready=prune_outcome.attempted and not prune_outcome.refusals,
                 )
 

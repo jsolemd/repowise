@@ -105,11 +105,14 @@ class LanguageNodeMap:
     #     assertion *call* (``assertEqual`` / ``expect`` / ``assert_eq!``).
     #     A statement counts as an assertion when its expression is a call
     #     of one of these kinds whose callee name starts with ``assert`` or
-    #     ``expect`` (see ``walker._ASSERT_CALL_PREFIXES``).
+    #     ``expect``, or which the language's row in ``asserts/lexicon.py``
+    #     names. These fields say which nodes to look at; that file says which
+    #     names count (see ``assertions._assertion_tier``).
     #
     # Consumed by ``large_assertion_block`` / ``duplicated_assertion_block``
-    # (both fire only on test files). A language that maps neither field
-    # simply produces no assertion blocks — never a false positive.
+    # (both fire only on test files) and by ``mock_saturated_test``. A language
+    # that maps neither field produces no assertion facts at all — never a
+    # false positive, and no vocabulary row can give it any.
     assert_kinds: frozenset[str] = frozenset()
     assert_call_kinds: frozenset[str] = frozenset()
 
@@ -199,6 +202,15 @@ class LanguageNodeMap:
     #     silently drop), so only truly expression-oriented grammars may map it.
     statement_wrapper_kinds: frozenset[str] = frozenset()
 
+    # -- Decorators / annotations (mock-saturation pass) ---------------------
+    #   * ``decorator_kinds`` -- the node a single ``@thing`` is parsed as.
+    #   * ``decorated_definition_kinds`` -- the wrapper node HOLDING them when
+    #     the grammar puts them outside the function node, as Python does.
+    #     Grammars that keep them inside map the first alone.
+    # Both empty (the default) means no decorator signal.
+    decorator_kinds: frozenset[str] = frozenset()
+    decorated_definition_kinds: frozenset[str] = frozenset()
+
 
 _PY = LanguageNodeMap(
     function_kinds=frozenset({"function_definition", "async_function_definition"}),
@@ -232,6 +244,8 @@ _PY = LanguageNodeMap(
     break_kinds=frozenset({"break_statement"}),
     continue_kinds=frozenset({"continue_statement"}),
     with_kinds=frozenset({"with_statement"}),
+    decorator_kinds=frozenset({"decorator"}),
+    decorated_definition_kinds=frozenset({"decorated_definition"}),
 )
 
 _TS = LanguageNodeMap(

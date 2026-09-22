@@ -34,10 +34,11 @@ from repowise.core.registry import CLIRegistry, LazyCommand
 _EXPECTED_NAMES = frozenset(
     {
         "agents", "ask", "augment", "context", "corrections", "costs", "coverage",
-        "dead-code", "decision", "delete", "distill", "doctor", "expand",
+        "dead-code", "decision", "delete", "distill", "doc-drift", "doctor",
+        "expand",
         "export", "generate", "generate-claude-md", "health", "hook",
         "impacted-tests", "init", "login", "logout", "mcp", "overlap", "reindex",
-        "restyle", "risk", "saved", "search", "security", "serve", "source-index",
+        "restyle", "risk", "saved", "savings", "search", "security", "serve", "source-index",
         "source-quality", "status", "symbol",
         "telemetry", "uninstall", "update", "watch", "whats-new", "whoami", "why",
         "wiki-styles", "workspace",
@@ -77,9 +78,7 @@ def test_list_commands_imports_nothing() -> None:
         "loaded = [x for x in sys.modules if x.startswith('repowise.cli.commands.')]; "
         "print(len(names)); print(loaded)"
     )
-    out = subprocess.run(
-        [sys.executable, "-c", probe], capture_output=True, text=True, check=True
-    )
+    out = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, check=True)
     lines = out.stdout.strip().splitlines()
     assert int(lines[-2]) == len(_OSS_COMMANDS)
     assert lines[-1] == "[]", f"listing command names imported: {lines[-1]}"
@@ -102,9 +101,7 @@ def _dispatch_and_report_loaded(argv: list[str]) -> str:
         "print(sorted({m.split('.')[3] for m in sys.modules "
         "if m.startswith('repowise.cli.commands.')}))"
     )
-    out = subprocess.run(
-        [sys.executable, "-c", probe], capture_output=True, text=True, check=True
-    )
+    out = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, check=True)
     return out.stdout.strip().splitlines()[-1]
 
 
@@ -196,9 +193,7 @@ def test_the_command_registry_pulls_no_structlog() -> None:
         "import sys, repowise.core.registry; "
         "print(sorted(m for m in sys.modules if m.startswith(('structlog', 'rich'))))"
     )
-    out = subprocess.run(
-        [sys.executable, "-c", probe], capture_output=True, text=True, check=True
-    )
+    out = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, check=True)
     assert out.stdout.strip().splitlines()[-1] == "[]", out.stdout
 
 

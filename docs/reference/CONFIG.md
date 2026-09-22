@@ -14,7 +14,8 @@ The `.repowise/` directory, provider setup, API keys, and what's customizable.
 [The `hooks:` block](#the-hooks-block) ·
 [The `mcp:` block](#the-mcp-block) ·
 [The `decisions:` block](#the-decisions-block) ·
-[The `refactoring:` block](#the-refactoring-block)
+[The `refactoring:` block](#the-refactoring-block) ·
+[The `assertions:` block](#the-assertions-block)
 
 **Code health rules**
 [The `health-rules.json` file](#the-health-rulesjson-file)
@@ -126,6 +127,9 @@ mcp:                                 # see "The mcp: block" below
 
 refactoring:                         # see "The refactoring: block" below
   enabled: true
+
+assertions:                          # see "The assertions: block" below
+  extra_names: []
 ```
 
 You can edit this file directly. Changes take effect on the next `init`,
@@ -397,21 +401,50 @@ decisions:
     adr: true               # ADR files
     pr: true                # PR / squash-merge bodies
     comment: false          # comment archaeology on top central files
-    session:                # long form: run the source, skip its model stage
-      enabled: true
+    session:                # off by default; long form runs the deterministic
+      enabled: true         #   parse and skips the model stage
       llm: false
     session_discovery: true # one broad model pass over new transcript prose
     conventions: false      # import patterns the graph proves, no model
   discovery:                # budget for that one pass, per update
     max_sessions: 12        # 1-24
     max_input_tokens: 30000 # 2000-60000
+  harnesses:                # whose transcripts the session lane reads
+    - claude_code           # the default; add codex to read that store too
+  agent_acceptance: false   # may an agent grant a decision authority?
+  capture_prompt: false     # ask the agent to record what it just committed
 ```
+
+`agent_acceptance` is the one key here that is not about capture. Off, an agent
+can propose candidates and withdraw authority but never grant it; on, it may
+accept, and the acceptance is recorded as an agent's — with the session that
+signed it — on every surface, never as yours. It ships off and no preset turns
+it on.
+
+`capture_prompt` is the other. On, a successful `git commit` whose message
+carries two or more decision signals prompts the agent, once per session, to
+run `repowise decision add` — never for a commit a record already cites, and
+never as anything but a proposal. An agent cannot decline a hook, so this also
+ships off and no preset turns it on:
+`repowise decision config capture-prompt --on`.
+
+That command also installs what it needs. The shared PostToolUse matcher
+deliberately excludes the shell tools — measured at 51% of hook invocations
+for 0.7% of emissions — so switching the prompt on adds a separate
+`Bash|PowerShell` PostToolUse entry, and switching it off removes it. The
+entry is per install rather than per repository: other repositories on the
+machine pay a process start on shell calls and emit nothing unless they
+switch it on too, and switching it off here turns it off for all of them.
 
 Every key is optional. **A config with no `decisions:` block behaves exactly as
 it did before these switches existed**: every source that shipped on is on,
 model stages on. That resolved policy is named `default`. A source added after
 those switches existed (`session_discovery` and `conventions`) stays off until you
-ask for it, so upgrading never starts a model call nobody enabled. The same
+ask for it, so upgrading never starts a model call nobody enabled. `session` is
+the one default that has moved: it now ships **off**, because what it captured
+read as working agreements from a transcript rather than decisions the codebase
+had taken. `repowise decision source set session --on` turns it back on, and
+`local_only` still carries it. The same
 holds for a config that names a preset *and* lists its sources: that list is
 what the preset covered when it was written, so a source added to that preset
 later does not join it retroactively. Re-apply the preset to pick it up.
@@ -433,10 +466,10 @@ still loads, it just says which key it ignored.
 
 | Preset | Effect |
 |--------|--------|
-| `default` | What a config with no `decisions:` block resolves to. Every long-standing source on, broad discovery off. |
+| `default` | What a config with no `decisions:` block resolves to. Every long-standing source on; session mining and broad discovery off. |
 | `off` | No automatic capture. Stored decisions and manual entry keep working. |
-| `local_only` | Deterministic capture only. Zero decision-extraction model calls. |
-| `balanced` | The high-signal sources plus session mining and broad session discovery; comment archaeology off. |
+| `local_only` | Deterministic capture only, session mining included — it is the only lane that produces without a key. Zero decision-extraction model calls. |
+| `balanced` | The high-signal sources plus session mining and broad session discovery, which is fed by it; comment archaeology off. |
 | `full` | Every source, every model stage. |
 
 Editing any individual key after applying a preset drops the `preset` line and
@@ -464,8 +497,10 @@ and `--format json` for scripts. Writes are atomic and preserve every unrelated
 key in `config.yaml`.
 
 The legacy `decisions.session_mining: true|false` key is still honoured and
-resolves to the `session` source. The first write through the CLI or the API
-replaces it with `sources.session`.
+resolves to the `session` source, in both directions: since that source now
+ships off, a config that says `true` still switches it on. An explicit
+`sources.session` may narrow that, never widen it. The first write through the
+CLI or the API replaces the legacy key with `sources.session`.
 
 ### `.repowise/decisions.yaml`
 
@@ -477,7 +512,8 @@ reconciles the store to it, with the file as the authority. Its format carries
 its own `version`, and a file written by a newer repowise is refused rather than
 downgraded. See [DECISIONS.md](../layers/DECISIONS.md) for the round trip.
 
-`session` mining lets `repowise update` read coding-agent session transcripts
+`session` mining is **off by default**. Switched on, it lets `repowise update`
+read coding-agent session transcripts
 (Claude Code's `~/.claude/projects/`) for durable decisions: user corrections,
 explicit choices with a stated reason, and failed approaches replaced by working
 ones. Candidates pass deterministic gates first, then one batched LLM
@@ -560,6 +596,35 @@ refactoring:
 - Per-path disables reuse the `.repowise/health-rules.json` glob mechanism (the
   same one markers use).
 - Full reference: [REFACTORING.md](../layers/REFACTORING.md).
+
+### The `assertions:` block
+
+Names your own assertion helpers, for the test-quality markers that divide by a
+test's assertion count.
+
+```yaml
+assertions:
+  extra_names: [ensureInvariant, mustMatch]   # exact callee names, not prefixes
+```
+
+Repowise recognises the xUnit and BDD families out of the box (`assert*`,
+`expect*`) plus a per-language vocabulary for the idioms those miss, such as
+Go's `t.Fatalf` and testify's `require`. A house helper that follows neither
+convention is invisible to it, and a test built entirely of those helpers reads
+as having no assertions at all. This block is the escape hatch, the same one
+SonarQube, Qodana and ESLint's `expect-expect` rule each provide.
+
+- **Names are exact and case-insensitive, never prefixes.** `ensureInvariant`
+  matches `ensureInvariant(...)` and not `ensureConnectionPool(...)`. Prefix
+  matching was measured against three real test corpora and matched production
+  functions under test far more often than assertions.
+- A name matches whether it is the call itself or the receiver of one, so both
+  `ensureInvariant(x)` and `ensureInvariant(x).isTrue()` count.
+- **Nothing here can change a health score.** These names reach only the
+  advisory assertion total; the calibrated `large_assertion_block` and
+  `duplicated_assertion_block` markers read a separate count that takes no
+  configuration. Adding a wrong name costs you signal, never a wrong score.
+- Changing the list re-walks the affected files on the next `init` / `update`.
 
 ---
 

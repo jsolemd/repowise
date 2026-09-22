@@ -39,14 +39,33 @@ export type HealthSeverity = "low" | "medium" | "high" | "critical";
  * a parity test (`__tests__/health.test.ts` here,
  * `tests/unit/health/test_scoring_dimensions.py` in core).
  */
-export type HealthDimension = "defect" | "maintainability" | "performance";
+export type ScoredHealthDimension = "defect" | "maintainability" | "performance";
 
-/** Canonical dimension order (parity-locked against core's `DIMENSIONS`). */
-export const HEALTH_DIMENSIONS: readonly HealthDimension[] = [
+/**
+ * The non-scoring fourth dimension. A marker homes here when it measures
+ * something no defect corpus labels, so it can never be calibrated and never
+ * earns weight. Its findings carry a zero health impact by construction and so
+ * are kept out of every impact-ranked queue, describing without accusing. That
+ * is about ranking, not existence: a surface that ranks nothing, such as one
+ * file's findings in an editor, asks for them and gets them.
+ *
+ * Mirror of `ADVISORY_DIMENSION` in core's `scoring.py`. Deliberately outside
+ * `HEALTH_DIMENSIONS`, which stays exactly the set that carries a score.
+ */
+export type AdvisoryHealthDimension = "advisory";
+
+/** Every dimension label a finding may carry on the wire, scored or not. */
+export type HealthDimension = ScoredHealthDimension | AdvisoryHealthDimension;
+
+/** Canonical SCORED dimension order (parity-locked against core's `DIMENSIONS`). */
+export const HEALTH_DIMENSIONS: readonly ScoredHealthDimension[] = [
   "defect",
   "maintainability",
   "performance",
 ] as const;
+
+/** The dimension whose findings never move a number. */
+export const ADVISORY_DIMENSION: AdvisoryHealthDimension = "advisory";
 
 /**
  * What a code-health figure counts. `everything` is the calibrated score;
@@ -71,6 +90,7 @@ export const HEALTH_DIMENSION_LABEL: Record<HealthDimension, string> = {
   defect: "Code health",
   maintainability: "Maintainability",
   performance: "Performance",
+  advisory: "Advisory",
 };
 
 /**

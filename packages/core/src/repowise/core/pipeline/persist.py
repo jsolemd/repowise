@@ -1397,6 +1397,8 @@ async def prune_deleted_file_rows(
     from repowise.core.analysis.dead_code.analyzer import _is_synthetic_node
     from repowise.core.persistence.models import (
         DeadCodeFinding,
+        DocDriftFinding,
+        DocDriftReference,
         GitMetadata,
         GraphEdge,
         GraphMetric,
@@ -1504,6 +1506,18 @@ async def prune_deleted_file_rows(
     await _prune_table(WikiSymbol, WikiSymbol.file_path, "wiki_symbols")
     await _prune_table(SecurityFinding, SecurityFinding.file_path, "security_findings")
     await _prune_table(DeadCodeFinding, DeadCodeFinding.file_path, "dead_code_findings")
+    # Keyed on the DOCUMENT. The incremental drift pass scopes its write to the
+    # documents it read, so a deleted one is never in scope and its rows would
+    # outlive the file without this. ``_FileLiveness`` asks disk and
+    # ``git ls-files`` rather than the parse, so a ``.md`` path is judged
+    # correctly here. Note the LLM-regenerating update path never reaches this
+    # function, so drift rows for a document deleted there wait for a reindex,
+    # as dead-code and health rows already do.
+    await _prune_table(DocDriftFinding, DocDriftFinding.file_path, "doc_drift_findings")
+    # On the document only. A reference to a deleted *target* is drift, not a
+    # dead row: the next pass re-resolves it into a finding, and pruning by
+    # target here would delete the evidence before anything reported it.
+    await _prune_table(DocDriftReference, DocDriftReference.document_path, "doc_drift_references")
     await _prune_table(HealthFileMetric, HealthFileMetric.file_path, "health_file_metrics")
     await _prune_table(HealthFinding, HealthFinding.file_path, "health_findings")
     # git_metadata is keyed off the git indexer on a full run, but an
@@ -2006,7 +2020,9 @@ async def persist_ingestion(result: Any, session: Any, repo_id: str) -> int:
                 sym.file_path = pf.file_info.path
             all_symbols.append(sym)
     symbol_refresh = await persist_incremental_symbols(
-        session, repo_id, result.parsed_files,
+        session,
+        repo_id,
+        result.parsed_files,
         [pf.file_info.path for pf in result.parsed_files],
     )
     if symbol_refresh is not None:
@@ -2020,9 +2036,8 @@ async def persist_ingestion(result: Any, session: Any, repo_id: str) -> int:
             session,
             repo_id,
             symbol_refresh,
-            required_paths={
-                info.path for info in getattr(result, "file_infos", [])
-            } | {pf.file_info.path for pf in result.parsed_files},
+            required_paths={info.path for info in getattr(result, "file_infos", [])}
+            | {pf.file_info.path for pf in result.parsed_files},
             prune_ready=not (exclusion_plan and exclusion_plan.refusals),
         )
         from repowise.core.source_search import source_search_enabled
@@ -2085,6 +2100,7 @@ async def persist_git(result: Any, session: Any, repo_id: str) -> None:
         prune_fix_events_before,
         update_repo_git_totals,
         upsert_fix_events_bulk,
+        upsert_git_commit_files_bulk,
         upsert_git_commits_bulk,
         upsert_git_metadata_bulk,
     )
@@ -2098,6 +2114,10 @@ async def persist_git(result: Any, session: Any, repo_id: str) -> None:
     commit_rows = getattr(summary, "commit_rows", None)
     if commit_rows:
         await upsert_git_commits_bulk(session, repo_id, commit_rows)
+
+    commit_file_rows = getattr(summary, "commit_file_rows", None)
+    if commit_file_rows:
+        await upsert_git_commit_files_bulk(session, repo_id, commit_file_rows)
 
     # Per fix-commit x file rows (with their SZZ candidates). The prune keeps a
     # re-index of an already-indexed repo from leaving behind events that have
@@ -2154,13 +2174,23 @@ async def replace_git_history(
     from repowise.core.persistence.models import (
         FixEvent,
         GitCommit,
+        GitCommitFile,
+        GitCommitHealthDelta,
+        GitCommitHealthFinding,
         GitMetadata,
     )
 
     # Function blame describes the current source tree and is produced by the
     # health pass, not by persist_git. Preserve it across a history-window
     # replacement; scope reconciliation prunes entries for excluded files.
-    for model in (FixEvent, GitCommit, GitMetadata):
+    for model in (
+        FixEvent,
+        GitCommit,
+        GitCommitFile,
+        GitCommitHealthDelta,
+        GitCommitHealthFinding,
+        GitMetadata,
+    ):
         await session.execute(delete(model).where(model.repository_id == repo_id))
     await persist_git(
         SimpleNamespace(
@@ -2355,24 +2385,40 @@ async def save_full_health_report(
 
 
 async def persist_analysis(result: Any, session: Any, repo_id: str) -> None:
-    """Persist analysis-phase outputs: dead code, health, decisions, governance.
+    """Persist analysis-phase outputs: dead code, health, decisions, drift.
 
-    Dead-code and health writes are repo-wide DELETE-THEN-INSERT (so they
-    converge on re-run but don't support partial-within-phase resume);
+    Dead-code, health and doc-drift writes are repo-wide DELETE-THEN-INSERT (so
+    they converge on re-run but don't support partial-within-phase resume);
     decisions/governance are idempotent. Intended to run once the analysis
     phase has fully completed.
     """
     from repowise.core.persistence.crud import (
         bulk_upsert_decisions,
         recompute_decision_staleness,
+        replace_doc_drift_guarded,
         save_coverage_files,
         save_dead_code_findings,
+        set_repo_function_mod_p80,
         upsert_git_function_blame_bulk,
     )
 
     # ---- Dead code findings --------------------------------------------------
     if result.dead_code_report and result.dead_code_report.findings:
         await save_dead_code_findings(session, repo_id, result.dead_code_report.findings)
+
+    # ---- Documentation drift: findings and resolved references --------------
+    # Both tables, one savepoint, one run. Written even when the finding list
+    # is empty, unlike dead code above: a run that fixed the last drifted
+    # reference must clear the rows, and a guard on ``.findings`` would leave
+    # the old ones standing as though the documents were still wrong.
+    # ``authoritative_paths`` is None on a full run, so the replace is
+    # repo-wide.
+    drift = getattr(result, "doc_drift_report", None)
+    if drift is not None:
+        try:
+            await replace_doc_drift_guarded(session, repo_id, drift)
+        except Exception as exc:
+            logger.warning("doc_drift_persist_skipped", error=str(exc))
 
     # ---- Health findings + per-file metrics ---------------------------------
     if getattr(result, "health_report", None):
@@ -2397,6 +2443,13 @@ async def persist_analysis(result: Any, session: Any, repo_id: str) -> None:
         fn_blame_rows = getattr(hr, "function_blame_rows", None)
         if fn_blame_rows:
             await upsert_git_function_blame_bulk(session, repo_id, fn_blame_rows)
+        # The hotspot gate an incremental update will score against. Written
+        # only by a run that walked the whole repo (the analyzer leaves it None
+        # otherwise), so an incremental run cannot publish its changed-files
+        # subset as the repo-wide percentile.
+        fn_mod_p80 = getattr(hr, "repo_function_mod_p80", None)
+        if fn_mod_p80:
+            await set_repo_function_mod_p80(session, repo_id, fn_mod_p80)
         # Snapshot the run for trend tracking (rolling delete inside). From
         # the rows just written, by the same writer the update path uses.
         await snapshot_health_from_store(session, repo_id)
@@ -2453,6 +2506,16 @@ async def persist_analysis(result: Any, session: Any, repo_id: str) -> None:
     except Exception as _rank_err:
         logger.debug("decision_rank_reconcile_skipped", error=str(_rank_err))
 
+    # The same repair for the scoring formula, which leaves every input valid
+    # and every stored score stale, so no filter can find it. Its own try, so
+    # a failure here is not logged as the rank repair's.
+    try:
+        from repowise.core.persistence.crud import reconcile_decision_confidence
+
+        await reconcile_decision_confidence(session)
+    except Exception as _conf_err:
+        logger.debug("decision_confidence_reconcile_skipped", error=str(_conf_err))
+
     # Move legacy records onto ids derived from their own identity, before
     # anything else reads or writes one. A random id is re-minted whenever a
     # store is rebuilt rather than updated, which strands every reference held
@@ -2473,9 +2536,22 @@ async def persist_analysis(result: Any, session: Any, repo_id: str) -> None:
     # with half the surfaces reading each. Idempotent, and it never reopens a
     # review action somebody already performed.
     try:
-        from repowise.core.persistence.decision_migration import apply_migration
+        from repowise.core.persistence.decision_migration import (
+            apply_migration,
+            backfill_decision_node_links,
+            backfill_scope_basis,
+            backfill_session_scope_basis,
+            prune_unindexed_scope_files,
+        )
 
         await apply_migration(session, repo_id)
+        # Beside it, and for the same reason: these repair rows written before
+        # the rule existed, and nothing re-extracts them. The prune runs first
+        # so the two basis repairs judge the file list they will leave behind.
+        await prune_unindexed_scope_files(session, repo_id)
+        await backfill_scope_basis(session, repo_id)
+        await backfill_session_scope_basis(session, repo_id)
+        await backfill_decision_node_links(session, repo_id)
     except Exception as _migrate_err:
         logger.debug("decision_entity_migration_skipped", error=str(_migrate_err))
 
@@ -2673,6 +2749,7 @@ async def persist_post_index_result(
     swept_page_ids = await sweep_retired_pages(session, repo_id)
 
     await persist_generation(result, session, repo_id)
+    await _refresh_commit_health(result, session, repo_id)
 
     # A full replacement from an empty/degraded parse would erase every site it
     # failed to re-derive. Both routes therefore share the same whole-tree guard.
@@ -2715,6 +2792,22 @@ async def persist_post_index_result(
         )
 
     return swept_page_ids
+
+
+async def _refresh_commit_health(result: Any, session: Any, repo_id: str) -> None:
+    """Seed the per-commit health rows for the commits this run wrote."""
+    repo_path = getattr(result, "repo_path", "")
+    summary = getattr(result, "git_summary", None)
+    if not repo_path or summary is None:
+        return
+    from .commit_health import recent_shas, refresh_commit_health
+
+    await refresh_commit_health(
+        session,
+        repo_id,
+        repo_path,
+        recent_shas(getattr(summary, "commit_rows", None)),
+    )
 
 
 async def persist_pipeline_result(
@@ -2769,7 +2862,10 @@ async def persist_pipeline_result(
     }
     current_git_file_paths.discard("")
     scope_outcome = await reconcile_full_index_scope(
-        session, repo_id, current_graph_file_paths, current_git_file_paths,
+        session,
+        repo_id,
+        current_graph_file_paths,
+        current_git_file_paths,
         exclusion_plan=exclusion_plan,
     )
     swept_page_ids = list(scope_outcome.tombstoned_page_ids)

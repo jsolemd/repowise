@@ -1,7 +1,7 @@
 """Record the parser that completely refreshed persisted symbols.
 
 Revision ID: solemd_0001
-Revises: 0068
+Revises: solemd_0005
 """
 
 from collections.abc import Sequence
@@ -10,7 +10,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "solemd_0001"
-down_revision: str | None = "0068"
+down_revision: str | None = "solemd_0005"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

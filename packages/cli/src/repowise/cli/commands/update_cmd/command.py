@@ -52,6 +52,7 @@ from .incremental import (
     _load_stored_performance_callers,
     _rebuild_graph_and_git,
     _refresh_knowledge_graph,
+    _run_doc_drift_partial,
     _run_partial_analysis,
 )
 from .mode import _resolve_index_only_mode
@@ -869,10 +870,15 @@ def run_update(
             f"{NO_GENERATIVE_ENV}=1 requires --index-only or --no-docs; "
             "model-written updates cannot run under the hard no-generative policy."
         )
+    # ``or``, not ``get``'s default: a repo that has never had a docs pass
+    # carries ``last_docs_commit`` as an explicit null rather than omitting it,
+    # and a default only applies to a missing key. Reading it with a default
+    # handed back that null and the update aborted with "No previous sync
+    # found" against a store holding a perfectly good ``last_sync_commit``.
     base_ref = since or (
         state.get("last_sync_commit")
         if resolved_index_only
-        else state.get("last_docs_commit", state.get("last_sync_commit"))
+        else state.get("last_docs_commit") or state.get("last_sync_commit")
     )
     head = get_head_commit(repo_path)
 
@@ -968,9 +974,7 @@ def run_update(
     legacy_config_change = config_changed and changed_dependencies is None
     dependency_changes = changed_dependencies or set()
     traversal_config_changed = (
-        legacy_config_change
-        or "traversal" in dependency_changes
-        or "other" in dependency_changes
+        legacy_config_change or "traversal" in dependency_changes or "other" in dependency_changes
     )
     git_config_changed = (
         legacy_config_change or traversal_config_changed or "git_history" in dependency_changes
@@ -989,8 +993,7 @@ def run_update(
         or "generation" in dependency_changes
     )
     config_rebuild_required = config_changed and bool(
-        legacy_config_change
-        or dependency_changes - {"state_only"}
+        legacy_config_change or dependency_changes - {"state_only"}
     )
 
     # A structural renderer upgrade is not a code change and not a config
@@ -1669,6 +1672,7 @@ def run_update(
         repo_function_mod_p80=repo_function_mod_p80,
         timings=timings,
     )
+    doc_drift_report = _run_doc_drift_partial(graph_builder, source_map, timings=timings)
 
     # Partial health has consumed the per-file ``BlameIndex``; drop it before
     # the metadata reaches persistence / regeneration so the transient,
@@ -1792,8 +1796,8 @@ def run_update(
                         decay_paths=affected.decay_only,
                         degraded=degraded,
                     )
-            if det_pages:
-                state["last_docs_commit"] = head
+                if head:
+                    state["last_docs_commit"] = head
                 console.print(
                     f"  [green]✓[/green] Re-rendered [bold]{len(det_pages)}[/bold] "
                     "wiki pages from structure"
@@ -1907,6 +1911,7 @@ def run_update(
                 head,
                 start,
                 persisted_changed_paths,
+                doc_drift_report=doc_drift_report,
                 file_diffs=file_diffs,
                 knowledge_graph_result=knowledge_graph_result,
                 parsed_files=parsed_files,
@@ -2097,8 +2102,12 @@ def run_update(
     # Session-sourced decisions: mine agent transcript lines appended since
     # the last update, structure new candidates in one batched LLM pass, and
     # collect the observation-qualified promotions. They ride the same
-    # decision upsert as the marker re-scan below. Everything stays local;
-    # `decisions.session_mining: false` in .repowise/config.yaml disables it.
+    # decision upsert as the marker re-scan below. Everything stays local, and
+    # the lane ships off: `decision source set session --on` enables it.
+    # The indexed file set bounds what a session-mined record may claim to
+    # govern: a transcript names scratch files, plan docs and sibling
+    # checkouts, and only this set knows which paths are this codebase.
+    indexed_files = frozenset(source_map) if source_map else None
     session_decisions: list = []
     try:
         from repowise.core.sessions.miners.decisions import mine_session_decisions
@@ -2109,7 +2118,9 @@ def run_update(
                 mine_session_decisions(
                     repo_path,
                     provider=session_provider,
+                    harnesses=decision_policy.harnesses,
                     collect_discovery_spans=decision_policy.llm_allowed("session_discovery"),
+                    indexed=indexed_files,
                 )
             )
             if session_decisions and verbose:
@@ -2131,6 +2142,7 @@ def run_update(
                     repo_path,
                     provider=provider,
                     policy=decision_policy,
+                    indexed=indexed_files,
                 )
             )
         session_decisions = [*session_decisions, *outcome.decisions]
@@ -2153,6 +2165,13 @@ def run_update(
     # sessions are judged against those sessions' mined corrections (followed
     # -> staleness relaxes, contradicted -> staleness bumps). Pure SQLite over
     # the staging sidecar + decision_records; no LLM.
+    #
+    # Gated on the ``session`` source even though it judges injected decisions
+    # of *every* source: its only evidence is that session's mined user
+    # corrections, which no other lane writes. With the lane off, every row
+    # would be judgeable=False and settle as ``unjudgeable`` — and
+    # ``mark_injection_evaluated`` is terminal, so turning the lane on later
+    # could never recover them. Inert without the lane, like session discovery.
     try:
         from repowise.core.sessions.miners.decisions import apply_injection_feedback
 
@@ -2197,6 +2216,13 @@ def run_update(
     # so they are judged by what the agent did next — which only the transcript
     # knows. Scoped to transcripts touched since the last update; the whole
     # history is a one-off `repowise hook backfill`.
+    #
+    # Gated on the ``session`` source because that switch is documented as what
+    # stops repowise reading your transcripts, and this reads them. It is the
+    # privacy boundary, not a statement about what the rows are for, so it fails
+    # closed: with the lane off the live hook still records its own firings and
+    # only the replay-filled columns are missing, which `repowise hook backfill`
+    # fills on demand.
     try:
         from repowise.core.sessions.efficacy import ingest_transcript_efficacy
 
@@ -2540,6 +2566,7 @@ def run_update(
                 graph_builder=graph_builder,
                 knowledge_graph_result=knowledge_graph_result,
                 degraded=degraded,
+                doc_drift_report=doc_drift_report,
                 decay_paths=affected.decay_only,
                 parsed_files=parsed_files,
                 git_decay_map=git_decay_map,
@@ -2608,8 +2635,13 @@ def run_update(
             degraded.append(f"Knowledge-graph export: {exc}")
 
     prior_prune_state = dict(state)
-    state["last_sync_commit"] = head
-    state["last_docs_commit"] = head
+    # Never write a null pointer. ``get_head_commit`` returns None whenever
+    # ``git rev-parse HEAD`` fails, and erasing a good baseline strands the
+    # store: the next update reads the null as its base and refuses to run.
+    # #1507 guarded the same write in ``generate``; these are the rest of it.
+    if head:
+        state["last_sync_commit"] = head
+        state["last_docs_commit"] = head
     # Real DB total, not an accumulation: regeneration upserts existing pages,
     # so adding len(generated_pages) every run inflated the count forever.
     state["total_pages"] = db_total_pages

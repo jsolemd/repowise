@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -551,12 +552,20 @@ async def load_stored_function_mod_p80(repo_path: Any, *, log: LogFn | None = No
                 repo = await get_repository_by_path(session, str(repo_path))
                 if repo is None:
                     return None
+                # What the last full index measured over every walked function.
+                stored = getattr(repo, "function_mod_p80", None)
+                if stored:
+                    return int(stored)
                 counts = await get_git_function_mod_counts(session, repo.id)
         finally:
             await engine.dispose()
         if not counts:
             return None
-        # Same inclusive-lower p80 as the in-memory path — do not reimplement.
+        # Fallback for a store whose last full index predates the column above.
+        # The rollup is keyed by ``{path}::{name}``, so a file's same-named
+        # functions collapse to one row and this percentile is taken over a
+        # population missing those samples. Closer than the changed-files
+        # subset, still not the number a full index computes.
         from repowise.core.analysis.health.engine import _percentile_p80
 
         return _percentile_p80(counts)
@@ -875,6 +884,48 @@ def run_partial_analysis(
             timings.stop("analysis.dead_code")
 
     return partial_health_report, dead_code_report
+
+
+def run_doc_drift_partial(
+    graph_builder: Any,
+    source_map: dict[str, bytes] | None,
+    *,
+    log: LogFn | None = None,
+    timings: PhaseTimings | None = None,
+) -> Any | None:
+    """Re-check the repository's own markdown on the incremental path.
+
+    Its own function rather than a third member of
+    :func:`run_partial_analysis`'s tuple, mirroring the full path where drift is
+    its own phase. Returns ``None`` when the pass could not run, which the
+    caller must treat as "write nothing".
+    """
+    log = log or _noop_log
+    if not source_map:
+        return None
+
+    with timed(timings, "analysis.doc_drift"):
+        try:
+            from repowise.core.analysis.doc_drift import DocDriftAnalyzer
+
+            # The traversal, not the parse set. ``source_map`` omits files that
+            # failed to read or parse, and resolving against that narrower tree
+            # turns a live path into a fabricated "missing" finding.
+            tracked_paths = getattr(graph_builder, "traversed_file_paths", None)
+            if not tracked_paths:
+                return None
+
+            report = DocDriftAnalyzer(
+                source_map=source_map,
+                tracked_paths=tracked_paths,
+            ).analyze()
+            report.authoritative_paths = report.documents
+            if report.total_findings:
+                log(f"Doc drift findings: [yellow]{report.total_findings}[/yellow]")
+            return report
+        except Exception as exc:
+            log(f"[yellow]Doc drift analysis skipped: {exc}[/yellow]")
+            return None
 
 
 async def refresh_knowledge_graph(
@@ -1303,6 +1354,7 @@ async def persist_incremental_commits(
         get_latest_commit_committed_at,
         get_repository,
         update_repo_git_totals,
+        upsert_git_commit_files_bulk,
         upsert_git_commits_bulk,
     )
     from repowise.core.repo_config import load_repo_config
@@ -1329,9 +1381,28 @@ async def persist_incremental_commits(
         dt = newest if newest.tzinfo is not None else newest.replace(tzinfo=UTC)
         since_ts = int(dt.timestamp())
     with timed(timings, "persist.commits.capture"):
-        rows = await asyncio.to_thread(indexer.capture_new_commit_rows, since_ts=since_ts)
+        # One walk fills both, so they describe the same commit set.
+        file_rows: list[dict] = []
+        rows = await asyncio.to_thread(
+            partial(
+                indexer.capture_new_commit_rows,
+                since_ts=since_ts,
+                file_rows_sink=file_rows,
+            )
+        )
         if rows:
             await upsert_git_commits_bulk(session, repo_id, rows)
+        if file_rows:
+            await upsert_git_commit_files_bulk(session, repo_id, file_rows)
+
+    # What the new commits did to health. An update is a handful of commits, so
+    # this is seconds; the same budget still applies if a long gap made it many.
+    with timed(timings, "persist.commits.health"):
+        from .commit_health import recent_shas, refresh_commit_health
+
+        await refresh_commit_health(
+            session, repo_id, str(repo_path), recent_shas(rows)
+        )
 
     with timed(timings, "persist.commits.experience"):
         await reconcile_commit_experience(session, repo_id, indexer)
@@ -1417,6 +1488,8 @@ async def reconcile_commit_experience(session: Any, repo_id: str, indexer: Any) 
     failure-isolated like the rest of the git-phase refreshes.
     """
     from repowise.core.persistence.crud import (
+        delete_commit_health_by_sha,
+        delete_git_commit_files_by_sha,
         delete_git_commits_by_sha,
         get_commit_experience_inputs,
         upsert_git_commits_bulk,
@@ -1432,6 +1505,9 @@ async def reconcile_commit_experience(session: Any, repo_id: str, indexer: Any) 
             orphans = [r["sha"] for r in stored if r["sha"] not in reachable]
             if orphans:
                 await delete_git_commits_by_sha(session, repo_id, orphans)
+                # Per-commit rows leave with their commit; nothing cascades them.
+                await delete_git_commit_files_by_sha(session, repo_id, orphans)
+                await delete_commit_health_by_sha(session, repo_id, orphans)
                 stored = [r for r in stored if r["sha"] in reachable]
                 logger.info("commit_orphans_pruned", repo_id=repo_id, count=len(orphans))
 
@@ -1678,6 +1754,7 @@ async def persist_incremental_index(
     partial_health_report: Any,
     changed_paths: list[str],
     *,
+    doc_drift_report: Any | None = None,
     current_graph_file_paths: set[str] | None = None,
     file_diffs: list[Any] | None = None,
     knowledge_graph_result: Any | None = None,
@@ -1961,6 +2038,21 @@ async def persist_incremental_index(
                         )
                 except Exception as exc:
                     _skip("Dead-code persist", exc, range_scoped=True)
+
+            if doc_drift_report is not None:
+                try:
+                    from repowise.core.persistence.crud import (
+                        replace_doc_drift_guarded,
+                    )
+
+                    with timed(timings, "persist.doc_drift"):
+                        await replace_doc_drift_guarded(
+                            session, repo_id, doc_drift_report
+                        )
+                except Exception as exc:
+                    # Not range_scoped: the pass re-derives every document each
+                    # run, so a skipped write heals itself on the next update.
+                    _skip("Doc-drift persist", exc)
 
             if partial_health_report is not None:
                 try:

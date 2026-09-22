@@ -34,10 +34,9 @@ import logging
 from collections.abc import Callable
 from typing import Any
 
-from repowise.core.distill.budget import estimate_tokens
 from repowise.server.mcp_server._signature import preserve
 
-from . import counterfactual
+from . import counterfactual, interaction
 from .recorder import record_mcp_call
 
 logger = logging.getLogger(__name__)
@@ -187,13 +186,17 @@ def _declared_tokens(result: Any) -> int | None:
     return value if isinstance(value, int) and value > 0 else None
 
 
-def _delivered_tokens(result: Any) -> int:
-    """Estimate tokens the agent actually received for *result*."""
-    try:
-        text = json.dumps(result, default=str)
-    except Exception:
-        return 0
-    return estimate_tokens(text)
+def response_tokens(result: Any) -> int:
+    """Tokens the agent actually received for *result*.
+
+    Reads the budgeter's own compact serialization, which is the measurement
+    the budget decisions were made against. The old helper here serialized with
+    default separators instead, so the ledger's delivered size and the
+    telemetry's response size disagreed for the same call, and the ledger's was
+    systematically the larger of the two.
+    """
+    size = _response_size(result)
+    return size[1] if size is not None else 0
 
 
 def _result_signals(result: Any) -> tuple[bool, bool, bool]:
@@ -235,7 +238,10 @@ async def _record(
     replaced = (
         declared if declared is not None else counterfactual.replaced_tokens_for(tool, result)
     )
-    delivered = _delivered_tokens(result)
+    live = interaction.current()
+    if live is not None:
+        live.baseline_input_tokens = replaced if replaced > 0 else None
+    delivered = response_tokens(result)
     error, no_match, degraded = _result_signals(result)
 
     # Resolve the actual workspace alias selected by this invocation. Using
@@ -246,6 +252,16 @@ async def _record(
     repo_root = await resolve_response_budget_repo_root(
         signature, args, kwargs, fallback_to_default=False
     )
+    if live is not None:
+        # The outer middleware owns the final delivered measurement. Keep only
+        # transient counters here; no per-interaction identity is persisted.
+        live.repo_root = str(repo_root) if repo_root is not None else None
+        if replaced > delivered and isinstance(result, dict):
+            meta = result.setdefault("_meta", {})
+            if isinstance(meta, dict):
+                meta["replaced_tokens"] = replaced
+                meta["tokens_saved"] = replaced - delivered
+        return
     written = record_mcp_call(
         repo_root,
         tool,
@@ -259,8 +275,26 @@ async def _record(
     if written and replaced > delivered and isinstance(result, dict):
         meta = result.setdefault("_meta", {})
         if isinstance(meta, dict):
+            # Stamped before the outer budget runs, so these bytes are budgeted
+            # and counted. An agent-facing hint, not the ledger: the canonical
+            # event's delivered size is measured after this.
             meta["replaced_tokens"] = replaced
             meta["tokens_saved"] = replaced - delivered
+
+
+def record_final(live: interaction.Interaction, result: Any, duration_ms: int) -> None:
+    """Aggregate final payload counts without persisting invocation identity."""
+    error, no_match, degraded = _result_signals(result)
+    record_mcp_call(
+        live.repo_root,
+        live.tool,
+        duration_ms=duration_ms,
+        error=error,
+        no_match=no_match,
+        degraded=degraded,
+        replaced_tokens=live.baseline_input_tokens or 0,
+        delivered_tokens=response_tokens(result),
+    )
 
 
 def instrument(fn: Callable[..., Any]) -> Callable[..., Any]:

@@ -15,12 +15,15 @@ import hashlib
 import sqlite3
 import time
 import zlib
+from collections.abc import Sequence
 from pathlib import Path
 
 import structlog
 
 from repowise.core.distill import tracking
 from repowise.core.distill.markers import REF_LENGTH, is_valid_ref
+from repowise.core.savings import schema as savings_schema
+from repowise.core.savings.repository import SavingsRepository
 from repowise.core.sqlite_pragmas import apply_sqlite_pragmas
 
 logger = structlog.get_logger(__name__)
@@ -99,6 +102,31 @@ def default_store_path(start: Path | None = None) -> Path:
     return home / ".repowise" / OMISSIONS_DIRNAME / OMISSIONS_DB_FILENAME
 
 
+#: Kept under SQLite's 999-variable ceiling with room to spare.
+_REF_QUERY_BATCH = 400
+
+
+def omission_sources(conn: sqlite3.Connection, refs: Sequence[str]) -> dict[str, str]:
+    """``ref -> source`` for the refs *conn* still holds, batched.
+
+    ``source`` reads ``"<origin>:<filter>"`` -- ``cli:git_diff``,
+    ``hook-codex:test_output`` -- and is the only record of which filter
+    produced a ref. Rows are TTL-pruned, so a ref may legitimately be absent.
+    """
+    found: dict[str, str] = {}
+    for start in range(0, len(refs), _REF_QUERY_BATCH):
+        batch = refs[start : start + _REF_QUERY_BATCH]
+        placeholders = ",".join("?" for _ in batch)
+        found.update(
+            (ref, str(source))
+            for ref, source in conn.execute(
+                f"SELECT ref, source FROM omissions WHERE ref IN ({placeholders})",
+                list(batch),
+            )
+        )
+    return found
+
+
 def content_ref(content: str) -> str:
     """Stable 12-hex ref for *content* (truncated SHA-256)."""
     return hashlib.sha256(content.encode("utf-8")).hexdigest()[:REF_LENGTH]
@@ -122,13 +150,10 @@ class OmissionStore:
         self.ttl_days = ttl_days
         self.max_mb = max_mb
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(db_path)
+        self._conn = sqlite3.connect(db_path, isolation_level=None)
         apply_sqlite_pragmas(self._conn, _BUSY_TIMEOUT_MS)
+        savings_schema.initialize_savings_schema(self._conn)
         self._conn.executescript(_SCHEMA)
-        self._conn.commit()
-        # MCP instrumentation used to append one row per call to ``savings``.
-        # Collapse those legacy rows once, transactionally, into the bounded
-        # daily table before any new write can be recorded.
         tracking.migrate_legacy_mcp_savings(self._conn)
 
     @classmethod
@@ -332,6 +357,19 @@ class OmissionStore:
     def mcp_usage_summary(self, *, since: float | None = None) -> dict:
         """Return the retained MCP usage window without per-call history."""
         return tracking.mcp_usage_summary(self._conn, since=since)
+
+    def omission_sources(self, refs: Sequence[str]) -> dict[str, str]:
+        """``ref -> source`` for the refs still held. Pruned refs are absent."""
+        return omission_sources(self._conn, refs)
+
+    def savings(self) -> SavingsRepository:
+        """The canonical event ledger, sharing this store's connection.
+
+        The event tables live in this same file, installed by the same schema
+        upgrade the constructor runs, so they are reached through the store that
+        already owns the connection rather than by opening a second one.
+        """
+        return SavingsRepository(self._conn)
 
     # -- lifecycle ---------------------------------------------------------
 

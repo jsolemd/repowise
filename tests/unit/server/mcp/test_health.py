@@ -557,6 +557,62 @@ async def test_get_health_unmatched_module_stays_scoped(setup_mcp, health_data):
 
 
 @pytest.mark.asyncio
+async def test_unmatched_module_does_not_serve_repo_wide_refactoring(
+    session, setup_mcp, health_data
+):
+    """The opportunity queue has to respect a scope that resolved to nothing.
+
+    ``file_paths`` reaches the queue as a tuple, and an empty tuple is falsy, so
+    it was read as "no scope" and answered with the repository's worst files.
+    The neighbouring queues do not have that hole: plans and coverage are gated
+    on ``nothing_resolved``, the dashboard directive on ``not scoped``, and the
+    performance queue passes its tuple through to an ``IN ()`` that matches
+    nothing.
+
+    The rollup beside the queue cannot be filtered the same way — it is read by
+    repository id — so it is withheld instead, along with the facets it carries.
+    Both halves are asserted here: a call that resolved nothing must not be
+    answered with the repository, by either route.
+    """
+    from repowise.core.analysis.health.refactoring.identity import (
+        REFACTORING_MODEL_VERSION,
+    )
+    from repowise.core.persistence.models import RefactoringOpportunity
+    from repowise.server.mcp_server import get_health
+
+    session.add(
+        RefactoringOpportunity(
+            repository_id=setup_mcp,
+            opportunity_id="refop-elsewhere",
+            refactoring_model_version=REFACTORING_MODEL_VERSION,
+            status="open",
+            file_path="src/db/models.py",
+            lead_refactoring_type="extract_method",
+            details_json=json.dumps({}),
+        )
+    )
+    await session.flush()
+
+    leaked = await get_health(targets=["module:nope"], include=["refactoring"])
+
+    assert leaked["unresolved"] == [{"target": "module:nope", "reason": "no_such_module"}]
+    # Indexed, not ``.get``: a renamed key must fail here rather than pass by
+    # defaulting to the value the assertion wants.
+    assert leaked["refactoring_opportunities"] == []
+    assert leaked["refactoring_opportunities_total"] == 0
+    # The rollup carries the repository's worst file as its ``lead``, which is
+    # the same answer the queue was giving, by another route.
+    assert "refactoring_summary" not in leaked
+
+    # The same seed is reachable when the scope does resolve to that file, so
+    # the assertion above is about the scope and not about an empty table.
+    scoped = await get_health(targets=["src/db/models.py"], include=["refactoring"])
+    assert [o["file_path"] for o in scoped["refactoring_opportunities"]] == [
+        "src/db/models.py"
+    ]
+
+
+@pytest.mark.asyncio
 async def test_get_health_module_target_resolves_to_its_files(setup_mcp, health_data):
     from repowise.server.mcp_server import get_health
 

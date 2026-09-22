@@ -61,6 +61,7 @@ from .extractors.synthetic_symbols import extract_synthetic_symbols
 from .extractors.visibility import (
     refine_cpp_visibility,
     refine_csharp_visibility,
+    refine_rust_visibility,
     refine_ts_visibility,
     ts_deferred_export_names,
     ts_export_aliases,
@@ -106,6 +107,7 @@ from .parser_helpers import (
     _qualified_cpp_parent,
     _qualified_pascal_parent,
     _run_query,
+    _rust_shadowed_by_type_param,
 )
 from .python_local_refs import extract_python_local_refs
 from .sfc_source import component_call_sites, prepare_source
@@ -941,6 +943,21 @@ def _get_language(tag: str) -> Language | None:
     return _LANGUAGE_REGISTRY.get(tag)
 
 
+def grammar_tag_for(language: str, path: str) -> str:
+    """The grammar a file is read with, which is not always its language tag.
+
+    A ``.tsx`` file arrives tagged ``typescript``, and tree-sitter-typescript's
+    default grammar errors on every ``<Component />``. Only the grammar moves:
+    the language tag keeps selecting dialects and vocabularies, several of
+    which (``mocks/lexicon.py`` among them) carry no ``tsx`` row and would
+    silently degrade if handed one.
+    """
+    # Case-folded, because the extension table that tagged the file is.
+    if language == "typescript" and path.lower().endswith(".tsx"):
+        return "tsx"
+    return language
+
+
 # Private alias for internal use (kept for compatibility with _find_parent)
 _node_text = node_text
 
@@ -994,11 +1011,10 @@ class ASTParser:
             return parsed
 
         config = LANGUAGE_CONFIGS.get(lang)
-        # .tsx files need the JSX-aware grammar; tree-sitter-typescript's
-        # default `language_typescript` errors out on every `<Component />`
-        # and the resulting ERROR-node recovery hoists nested helpers
-        # (handlers defined inside component bodies) to the top level.
-        grammar_tag = "tsx" if lang == "typescript" and file_info.path.endswith(".tsx") else lang
+        # .tsx needs the JSX-aware grammar: the default one's ERROR-node
+        # recovery hoists nested helpers (handlers defined inside component
+        # bodies) to the top level.
+        grammar_tag = grammar_tag_for(lang, file_info.path)
         language = _get_language(grammar_tag)
 
         # tree-sitter-fsharp ships a second grammar (``language_signature``)
@@ -1553,6 +1569,10 @@ class ASTParser:
             # inline, via ``export { x }`` lists, or ``export default x``.
             elif file_info.language in _TS_JS_LANGUAGES:
                 visibility = refine_ts_visibility(def_node, visibility, name, ts_deferred_exports)
+            # Rust: a trait's items may not write ``pub`` of their own, so the
+            # trait's modifier is the only place their visibility is stated.
+            elif file_info.language == "rust":
+                visibility = refine_rust_visibility(def_node, visibility, src)
 
             # Parent class detection
             parent_name = self._find_parent(def_node, config, receiver_nodes, src)
@@ -2661,6 +2681,13 @@ class ASTParser:
             for type_node in type_nodes:
                 head = head_of(type_node, src)
                 if not head:
+                    continue
+                # ``struct Wrapper<Item> { value: Item }`` binds Item as a type
+                # parameter, and the capture cannot tell that from a reference
+                # to a real ``struct Item``. The head extractor drops a
+                # single-letter ``T`` but not a named one, so the shadow has to
+                # be read off the enclosing item's ``type_parameters``.
+                if lang == "rust" and _rust_shadowed_by_type_param(type_node, head, src):
                     continue
                 line = type_node.start_point[0] + 1
                 key = (head, line)

@@ -7,6 +7,7 @@ orchestrator.py) imports these phase functions. No CLI/click/rich imports.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Container
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -104,6 +105,62 @@ async def _run_dead_code_analysis(
         if progress:
             progress.on_message("warning", f"Dead code detection skipped: {exc}")
         _phase_done(progress, "dead_code")
+        return None
+
+
+async def _run_doc_drift_analysis(
+    source_map: dict[str, bytes] | None,
+    *,
+    file_infos: list[Any] | None = None,
+    repo_id: str = "",
+    progress: ProgressCallback | None,
+) -> Any | None:
+    """Check the repository's own markdown against the tree (no LLM).
+
+    Reads bytes ingestion already decoded rather than re-walking the tree: this
+    runs on every ``init``, and the update path runs the same analyzer through
+    :func:`~repowise.core.pipeline.incremental.run_doc_drift_partial`, so a
+    second pass over the repository would be a real regression.
+    """
+    try:
+        from repowise.core.analysis.doc_drift import DocDriftAnalyzer
+
+        # analyze() drives three stages: collect, index, resolve.
+        if progress:
+            progress.on_phase_start("doc_drift", 3)
+
+        # Built here rather than at the call site: the gather has no
+        # per-member exception wrapper, so an argument expression evaluated in
+        # the caller's frame would raise outside this try and abort the whole
+        # index run.
+        tracked_paths = {fi.path for fi in file_infos} if file_infos else None
+
+        analyzer = DocDriftAnalyzer(
+            repo_id,
+            source_map=source_map,
+            tracked_paths=tracked_paths,
+        )
+
+        def _step(_stage: str) -> None:
+            if progress:
+                progress.on_item_done("doc_drift")
+
+        report = await asyncio.to_thread(analyzer.analyze, None, on_step=_step)
+
+        if progress and report.documents_scanned:
+            progress.on_message(
+                "info",
+                f"→ {report.total_findings} drift findings across "
+                f"{report.documents_scanned} documents "
+                f"({report.references_checked:,} references checked)",
+            )
+
+        _phase_done(progress, "doc_drift")
+        return report
+    except Exception as exc:
+        if progress:
+            progress.on_message("warning", f"Documentation drift check skipped: {exc}")
+        _phase_done(progress, "doc_drift")
         return None
 
 
@@ -307,6 +364,7 @@ async def _run_session_discovery(
     llm_client: Any | None,
     policy: Any,
     report: Any,
+    indexed: Container[str] | None = None,
 ) -> DiscoveryOutcome:
     """The one broad session-discovery call, folded into the decision report.
 
@@ -319,6 +377,7 @@ async def _run_session_discovery(
                 repo_path,
                 provider=llm_client,
                 policy=policy,
+                indexed=indexed,
             ),
             timeout=DECISION_EXTRACTION_TIMEOUT_SECS,
         )
@@ -355,6 +414,11 @@ async def _run_decision_extraction(
         enabled = policy.enabled_index_sources()
         if progress:
             progress.on_phase_start("decisions", len(enabled))
+
+        # The indexed file set bounds what a session-mined record may claim
+        # to govern: a transcript names scratch files, plan docs and sibling
+        # checkouts, and only this set knows which paths are this codebase.
+        indexed = frozenset(source_map) if source_map else None
 
         extractor = DecisionExtractor(
             repo_path=repo_path,
@@ -395,7 +459,9 @@ async def _run_decision_extraction(
                     mine_session_decisions(
                         repo_path,
                         provider=session_provider,
+                        harnesses=policy.harnesses,
                         collect_discovery_spans=policy.llm_allowed("session_discovery"),
+                        indexed=indexed,
                     ),
                     timeout=DECISION_EXTRACTION_TIMEOUT_SECS,
                 )
@@ -411,7 +477,7 @@ async def _run_decision_extraction(
         # what filled its span queue. At most one call, and it reports its own
         # zero so a switched-off source never reads as an empty repository.
         discovery = await _run_session_discovery(
-            repo_path, llm_client=llm_client, policy=policy, report=report
+            repo_path, llm_client=llm_client, policy=policy, report=report, indexed=indexed
         )
 
         if progress:

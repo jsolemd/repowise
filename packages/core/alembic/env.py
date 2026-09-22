@@ -15,6 +15,7 @@ import os
 from logging.config import fileConfig
 
 from alembic import context
+from sqlalchemy import inspect, text
 from sqlalchemy.ext.asyncio import create_async_engine
 
 # Import the Base so Alembic can detect schema changes for autogenerate.
@@ -61,9 +62,24 @@ def run_migrations_offline() -> None:
 
 
 def do_run_migrations(connection) -> None:  # type: ignore[no-untyped-def]
-    context.configure(connection=connection, target_metadata=target_metadata)
-    with context.begin_transaction():
-        context.run_migrations()
+    with connection.begin():
+        # v0.52 reused the fork's intermediate numeric revisions. The shipped
+        # solemd_0001 head remains an ancestor, but an older intermediate stamp
+        # must never be mistaken for upstream DDL that has not actually run.
+        tables = set(inspect(connection).get_table_names())
+        if "alembic_version" in tables and "source_index_updates" in tables:
+            revisions = set(
+                connection.execute(text("SELECT version_num FROM alembic_version")).scalars()
+            )
+            if revisions & {"0065", "0066", "0067", "0068"} and "doc_drift_findings" not in tables:
+                raise RuntimeError(
+                    "Ambiguous pre-v0.52 fork migration stamp: verify the stored schema "
+                    "and map fork 0065/0066/0067/0068 to solemd_0002/0003/0004/0005 "
+                    "before upgrading. No revision was changed."
+                )
+        context.configure(connection=connection, target_metadata=target_metadata)
+        with context.begin_transaction():
+            context.run_migrations()
 
 
 async def run_async_migrations() -> None:

@@ -6,13 +6,13 @@ export { CostHeatmap } from "./cost-heatmap";
 export type { CostHeatmapProps } from "./cost-heatmap";
 export { DailySpendChart } from "./daily-spend-chart";
 export type { DailySpendChartProps } from "./daily-spend-chart";
-export { DistillSavingsCard } from "./distill-savings-card";
+export { SavingsCard } from "./savings-card";
 export type {
-  DistillSavingsCardProps,
-  DistillSavingsData,
-  DistillSavingsGroup,
-  McpDropGroup,
-} from "./distill-savings-card";
+  SavingsAgentRow,
+  SavingsBreakdownRow,
+  SavingsCardProps,
+  SavingsData,
+} from "./savings-card";
 export { McpUsageCard } from "./mcp-usage-card";
 export type { McpUsageCardProps, McpUsageData, McpUsageTool } from "./mcp-usage-card";
 export { RoiCard } from "./roi-card";

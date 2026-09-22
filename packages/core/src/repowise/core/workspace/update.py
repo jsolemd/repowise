@@ -318,16 +318,20 @@ async def reconcile_repo_head_commit(repo_path: Path, head: str | None) -> None:
     advances ``updated_at`` so the freshness time reflects the latest
     sync-check — a routine ``repowise update`` that finds nothing to do still
     counts as "verified current now". Creates the row when it is missing from
-    an existing ``wiki.db`` (self-heals a corrupt/blank store — the policy the
-    CLI's ``stamp_head_commit``, now a thin wrapper over this, always had);
-    still a no-op when ``wiki.db`` itself is absent, so a stamp can never
-    conjure an empty database.
+    an existing store (self-heals a corrupt/blank store — the policy the CLI's
+    ``stamp_head_commit``, now a thin wrapper over this, always had); still a
+    no-op when no store exists at all, so a stamp can never conjure an empty
+    database. A configured database counts as existing: it is shared, and the
+    repo-local file it replaces is absent by design, so gating on the file
+    alone skipped every stamp under one.
 
     This is the single head-commit stamper for both update paths — the CLI
     fast paths and the workspace updater used to run two implementations with
     different creation semantics.
     """
-    if not head or not (repo_path / ".repowise" / "wiki.db").is_file():
+    from ..persistence.database import has_db_store, resolve_db_url
+
+    if not head or not has_db_store(repo_path):
         return
     from ..persistence import (
         create_engine,
@@ -337,7 +341,6 @@ async def reconcile_repo_head_commit(repo_path: Path, head: str | None) -> None:
         upsert_repository,
     )
     from ..persistence.crud import get_repository_by_path
-    from ..persistence.database import resolve_db_url
 
     url = resolve_db_url(repo_path)
     engine = create_engine(url)
@@ -393,6 +396,7 @@ async def _incremental_repo_update(
     from ..pipeline.incremental import (
         persist_incremental_index,
         rebuild_graph_and_git,
+        run_doc_drift_partial,
         run_partial_analysis,
     )
     from ..pipeline.phases.git import drop_transient_git_signals
@@ -498,6 +502,7 @@ async def _incremental_repo_update(
         coverage_map=stored_coverage_map,
         log=_log.info,
     )
+    doc_drift_report = run_doc_drift_partial(graph_builder, source_map, log=_log.info)
 
     # Partial health has consumed the per-file ``BlameIndex``; drop it before
     # the metadata reaches persistence so the transient, non-serializable
@@ -527,6 +532,7 @@ async def _incremental_repo_update(
         dead_code_report,
         partial_health_report,
         [fd.path for fd in file_diffs],
+        doc_drift_report=doc_drift_report,
         current_graph_file_paths={pf.file_info.path for pf in parsed_files},
         # Tombstones pages for deleted/renamed paths, mirroring the single-repo
         # path — without this a page for a removed file misleads retrieval
@@ -973,7 +979,9 @@ async def update_workspace(
                             state = _json.loads(state_path.read_text(encoding="utf-8"))
                     prior_state = dict(state)
 
-                    if "last_docs_commit" not in state and "last_sync_commit" in state:
+                    # Falsy, not absent: an explicit null survives a
+                    # membership test and strands the pointer permanently.
+                    if not state.get("last_docs_commit") and state.get("last_sync_commit"):
                         state["last_docs_commit"] = state["last_sync_commit"]
 
                     state["last_sync_commit"] = new_head

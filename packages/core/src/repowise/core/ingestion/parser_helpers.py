@@ -823,16 +823,60 @@ _OBJC_BARE_MACRO_LINE_RE = re.compile(
 )
 
 
+# Availability / naming attributes written *call-shaped* after a declaration
+# (``@property (...) Foo *bar AF_API_AVAILABLE(ios(10));``,
+# ``- (void)done NS_SWIFT_NAME(done())``). The bare whole-line pass above
+# cannot see these: the macro is the last token of a declaration the grammar
+# otherwise reads fine, and it reads as a declarator or attribute list the
+# grammar cannot close. Error recovery then fails to resync at the ``;`` and
+# the damage runs past the declaration into the rest of the file, so the
+# enclosing method of every call after it is lost and those calls are credited
+# to ``__module__`` instead of their real caller. Measured on AFNetworking's
+# ``AFURLSessionManager.m``: 822 ERROR nodes before, 2 after.
+#
+# Enumerated by name, the same shape as the list above, because the grammar
+# cannot tell an attribute from a call on its own. ``NS_ENUM(NSInteger, Kind)``
+# after a ``typedef`` and ``NSLog(@"%@", x)`` both look like
+# ``IDENT(...)``; a general rule would blank real code and a match-everything
+# rule for these names is no safer. Only a form that *terminates* a declaration
+# qualifies: the macro must be followed by the closing ``;``, the ``{`` opening
+# a method body, or the end of the line (a definition may put the brace on the
+# next one). The same name inside an argument list or a comparison sits before
+# a ``,``/``)`` and is left alone.
+_OBJC_TRAILING_MACRO_RE = re.compile(
+    rb"(?<![A-Za-z0-9_])(?:AF_API_AVAILABLE|API_AVAILABLE|API_DEPRECATED"
+    rb"|NS_SWIFT_NAME|NS_AVAILABLE|NS_DEPRECATED)"
+    rb"\((?:[^()\r\n]|\([^()\r\n]*\))*\)[ \t]*(?=[;{]|\r?$)",
+    re.MULTILINE,
+)
+
+
+def _blank_objc_trailing_macros(source: bytes) -> bytes:
+    """Blank trailing call-shaped attribute macros, keeping the terminator.
+
+    The ``;``/``{`` the pattern looks ahead to stays in place so the
+    declaration itself still ends where it always did; only the macro's own
+    span is overwritten. Same offset contract as every other sanitizer here.
+    """
+    return _blank_matches(source, _OBJC_TRAILING_MACRO_RE)
+
+
 def prepare_objectivec_source(source: bytes) -> bytes:
-    """Blank whole-line nullability-audit macros, preserving every offset.
+    """Blank nullability-audit macros, bare and call-shaped, preserving offsets.
 
     ``NS_ASSUME_NONNULL_BEGIN`` is not a preprocessor directive and this
     grammar has no rule for it, so it parses as the opening of a C declaration
     and error recovery folds the whole ``@interface … @end`` block after it
     into one ERROR node. The macro wraps almost every modern Objective-C
     header, so this is the dominant parse failure in real source.
+
+    The same failure has a second shape: a declaration whose *last* token is a
+    call-shaped availability attribute (``AF_API_AVAILABLE(ios(10), ...)``,
+    ``NS_SWIFT_NAME(...)``). There the recovery never resyncs at the closing
+    ``;``, so one trailing attribute derails the remainder of the file. Both
+    passes blank in place, so every offset outside a match is unchanged.
     """
-    return _blank_matches(source, _OBJC_BARE_MACRO_LINE_RE)
+    return _blank_objc_trailing_macros(_blank_matches(source, _OBJC_BARE_MACRO_LINE_RE))
 
 
 # ---------------------------------------------------------------------------
@@ -1708,6 +1752,44 @@ def _count_arguments(arg_node: Node) -> int:
         for child in arg_node.children
         if child.type not in skip_types and "comment" not in child.type
     )
+
+
+def _rust_type_param_name(param: Node, src: str) -> str | None:
+    """Return the bound name of a ``type_parameter``/``const_parameter`` node.
+
+    Both node types put the binding name first, before any trait bound or
+    default (``T: Clone``, ``D = Foo``, ``const N: usize``) — later
+    ``type_identifier`` children are constraints, not the binding itself.
+    """
+    for child in param.children:
+        if child.type in ("type_identifier", "identifier"):
+            return node_text(child, src).strip()
+    return None
+
+
+def _rust_shadowed_by_type_param(node: Node, target_name: str, src: str) -> bool:
+    """True if *target_name* is bound as a generic type parameter by an
+    ancestor item of *node* (``struct Wrapper<Item> { value: Item }``).
+
+    Rust's field/generic-argument type captures can't distinguish a type
+    parameter's own name from a real type reference — both are plain
+    ``type_identifier`` nodes. Without this check, a type parameter that
+    happens to share a name with a real struct/enum produces a false
+    "used" edge to that struct, hiding it from dead-code detection even
+    when it is genuinely unreferenced.
+    """
+    ancestor = node.parent
+    while ancestor is not None:
+        for child in ancestor.children:
+            if child.type != "type_parameters":
+                continue
+            for param in child.children:
+                if param.type not in ("type_parameter", "const_parameter"):
+                    continue
+                if _rust_type_param_name(param, src) == target_name:
+                    return True
+        ancestor = ancestor.parent
+    return False
 
 
 def _find_enclosing_symbol(

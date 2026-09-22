@@ -62,6 +62,9 @@ from repowise.server.mcp_server._helpers import (
     is_excluded,
 )
 from repowise.server.mcp_server._meta import build_meta as _build_meta
+from repowise.server.mcp_server._meta import (
+    build_meta_with_full_scope as _build_meta_with_full_scope,
+)
 from repowise.server.mcp_server._repo_stats import build_repo_stats
 from repowise.server.mcp_server._tool_selection import registry_tool_rows, selected_tool_names
 
@@ -86,9 +89,7 @@ def _tool_surface_guide(
     """The selected surface and valid recipes, projected from registry metadata."""
     rows = registry_tool_rows() if rows is None else rows
     enabled = (
-        selected_tool_names(is_workspace=is_workspace)
-        if enabled_names is None
-        else enabled_names
+        selected_tool_names(is_workspace=is_workspace) if enabled_names is None else enabled_names
     )
     default_key = "default_workspace" if is_workspace else "default_single_repo"
     eligible_key = "eligible_workspace" if is_workspace else "eligible_single_repo"
@@ -1120,7 +1121,10 @@ async def get_overview(repo: str | None = None, include: list[str] | None = None
 
         result["tool_surface"] = _tool_surface_guide(is_workspace=_state._registry is not None)
 
-        result["_meta"] = _build_meta(repository=repository)
+        # The orientation call, and the one place the whole scope is worth its
+        # bytes: it is made once per session and it is what the compact
+        # projection on every other response points at.
+        result["_meta"] = _build_meta_with_full_scope(repository=repository)
         collector.attach(result)
         return result
 

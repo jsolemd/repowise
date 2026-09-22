@@ -73,7 +73,9 @@ STORE_FORMAT_VERSION: int = 2
 #: or Markdown content. Cached symbols from v4 carry missing or damaged docs,
 #: changing source chunks derived from otherwise identical files. Keep this
 #: invalidation distinct from the next upstream parser-schema bump.
-PARSER_SCHEMA_VERSION: int = 5
+#: v6: v0.52 adds Rust trait visibility/type-parameter shadow handling and
+#: case-insensitive TSX grammar selection. Keep old extraction caches invalid.
+PARSER_SCHEMA_VERSION: int = 6
 
 #: state.json key holding the store format version that wrote the store.
 STORE_FORMAT_VERSION_KEY = "store_format_version"

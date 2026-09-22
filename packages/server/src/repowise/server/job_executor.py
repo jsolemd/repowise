@@ -251,7 +251,7 @@ class JobProgressCallback:
                     self._job_id,
                     "running",
                     completed_pages=self._completed,
-                    total_pages=self._total,
+                    total_pages=self._total if self._total is not None else 0,
                     current_level=_PHASE_LEVELS.get(self._phase, 0),
                 )
         except Exception as exc:

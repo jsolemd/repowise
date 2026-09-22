@@ -20,7 +20,7 @@ those moments into ``decision_records`` rows via three stages:
    from surrounding tool activity.
 
 2. **One batched LLM structuring pass** per ``repowise update``
-   (config-gated ``decisions.session_mining``, default on): candidates to
+   (config-gated ``decisions.sources.session``, off by default): candidates to
    ``{title, decision, rationale, affected_files, source_quote}``. Every
    produced field is then grounded against the verbatim quotes with the
    shared :func:`~repowise.core.analysis.decisions.provenance.verify_quote`
@@ -37,8 +37,9 @@ those moments into ``decision_records`` rows via three stages:
 
 Privacy: transcripts never leave the machine. Mining is local and the only
 thing stored is distilled decision text about the codebase, with verbatim
-quotes as evidence. Kill switch: ``decisions.session_mining: false`` in
-``.repowise/config.yaml``.
+quotes as evidence. The lane ships off; ``repowise decision source set
+session --on`` (or ``decisions.sources.session: true`` in
+``.repowise/config.yaml``) turns it back on.
 """
 
 from __future__ import annotations
@@ -48,7 +49,7 @@ import json
 import re
 import time
 from collections import deque
-from collections.abc import Iterable
+from collections.abc import Container, Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -57,24 +58,32 @@ import structlog
 
 from repowise.core.analysis.decisions.discovery.spans import SpanCollector
 from repowise.core.analysis.decisions.extractor import ExtractedDecision
-from repowise.core.analysis.decisions.policy import resolve_policy
+from repowise.core.analysis.decisions.kinds import classify_kind
+from repowise.core.analysis.decisions.lifecycle import AGREEMENT_KIND, bundles_decisions
+from repowise.core.analysis.decisions.policy import DEFAULT_HARNESSES, resolve_policy
 from repowise.core.analysis.decisions.provenance import (
+    completeness,
     compute_confidence,
     rank_for_source,
     verify_quote,
 )
 from repowise.core.analysis.decisions.rationale_comments import CAUSAL_MARKERS
-from repowise.core.analysis.decisions.scope import resolve_module_nodes
+from repowise.core.analysis.decisions.scope import (
+    bind_scope_files,
+    resolve_module_nodes,
+    session_scope_basis,
+)
 from repowise.core.distill.corrections import command_anchor
 from repowise.core.precedent.transcript_episodes import (
     TranscriptEpisodeRecorder,
     record_transcript_episodes,
 )
 from repowise.core.sessions import INTENT_TURNS, Event, get_adapter
+from repowise.core.sessions.adapters.registry import DEFAULT_ADAPTER, registered_adapters
 from repowise.core.sessions.cursor import iter_new_events
 from repowise.core.sessions.events import (
     FILE_INPUT_KEYS,
-    event_files,
+    event_file_touches,
     is_prose_user_text,
     relative_files,
 )
@@ -187,6 +196,11 @@ class SessionCandidate:
     kind: str  # user_correction | explicit_choice | dead_end
     quotes: list[str]
     files: list[str] = field(default_factory=list)
+    #: Which of ``files`` this candidate saw changed rather than only read.
+    #: Ordering input only, never staged: staging keeps ``files`` and an
+    #: already-staged row is never rewritten, so the order must be right the
+    #: first time.
+    edited: set[str] = field(default_factory=set)
     session_id: str | None = None
     ts: float | None = None
 
@@ -318,15 +332,53 @@ def _result_anchor(name: str, use_input: dict[str, Any]) -> str:
     return name.lower()
 
 
-def mine_events(events: Iterable[Event], repo_prefix: str) -> list[SessionCandidate]:
+def _repo_relative_touches(
+    touches: list[tuple[str, str]], repo_root: Any
+) -> list[tuple[str, str]]:
+    """``(path, intent)`` with each path repo-relative POSIX, outsiders dropped.
+
+    A transcript records the path the tool call was given, which for every
+    agent this reads is an absolute one. Staging that verbatim writes a
+    machine's directory layout into a row the index later has to match
+    against repo-relative paths, so it is normalized here, at the single
+    point a touch enters the miner, rather than by each reader guessing.
+    """
+    out: list[tuple[str, str]] = []
+    for path, intent in touches:
+        relative = relative_files([path], repo_root)
+        if relative:
+            out.append((relative[0], intent))
+    return out
+
+
+def mine_events(
+    events: Iterable[Event],
+    repo_root: Any,
+    *,
+    edit_tools: Container[str] = frozenset(),
+) -> list[SessionCandidate]:
     """Run the deterministic candidate gates over one session's events.
 
-    *repo_prefix* is the lowercased resolved repo root; only events whose
-    ``cwd`` sits inside it count (same scoping as the distill miners). Pure
-    and streaming: state is bounded regardless of transcript size.
+    *repo_root* is the resolved repository root; only events whose ``cwd``
+    sits inside it count (same scoping as the distill miners), and every file
+    a candidate carries is stated relative to it. Pure and streaming: state
+    is bounded regardless of transcript size.
+
+    A file the session touched outside the root is dropped rather than kept
+    absolute. It names another checkout, a scratch directory, or the agent's
+    own state, none of which this index can resolve, and a scope built from
+    paths that resolve to nothing is worse than an empty one.
+
+    *edit_tools* is the producing adapter's edit vocabulary. It orders each
+    candidate's files, putting the ones the session changed ahead of the ones
+    it only opened, because a decision is about the code that moved and the
+    surrounding reads are how it got there.
     """
+    repo_prefix = str(repo_root).lower().rstrip("\\/")
     candidates: list[SessionCandidate] = []
-    trailing_files: deque[str] = deque(maxlen=_TRAILING_FILES)
+    #: (path, intent) for the recent file-touching calls, so a candidate opened
+    #: here knows which of the files in play were being changed at the time.
+    trailing_files: deque[tuple[str, str]] = deque(maxlen=_TRAILING_FILES)
     #: Candidates still collecting forward files, with their remaining budget.
     open_candidates: list[list[Any]] = []  # [candidate, remaining_tool_events]
     #: tool_use id -> (tool name, input) awaiting its result.
@@ -346,11 +398,15 @@ def mine_events(events: Iterable[Event], repo_prefix: str) -> list[SessionCandid
             continue
 
         if event.kind == "assistant" and event.tool_uses:
-            files = event_files(event)
-            for f in files:
-                trailing_files.append(f)
+            touches = _repo_relative_touches(
+                event_file_touches(event, edit_tools=edit_tools), repo_root
+            )
+            files = [path for path, _ in touches]
+            trailing_files.extend(touches)
+            changed = {path for path, intent in touches if intent == "edit"}
             for entry in open_candidates:
                 entry[0].files.extend(f for f in files if f not in entry[0].files)
+                entry[0].edited |= changed
                 entry[1] -= 1
             open_candidates = [e for e in open_candidates if e[1] > 0]
             for use in event.tool_uses:
@@ -399,7 +455,8 @@ def mine_events(events: Iterable[Event], repo_prefix: str) -> list[SessionCandid
                             SessionCandidate(
                                 kind="dead_end",
                                 quotes=[q for q in (attempt, error, pivot) if q],
-                                files=list(dict.fromkeys(trailing_files)),
+                                files=list(dict.fromkeys(p for p, _ in trailing_files)),
+                                edited={p for p, i in trailing_files if i == "edit"},
                                 session_id=event.session_id,
                                 ts=event.ts,
                             )
@@ -424,7 +481,8 @@ def mine_events(events: Iterable[Event], repo_prefix: str) -> list[SessionCandid
                     SessionCandidate(
                         kind="user_correction",
                         quotes=quotes,
-                        files=list(dict.fromkeys(trailing_files)),
+                        files=list(dict.fromkeys(p for p, _ in trailing_files)),
+                        edited={p for p, i in trailing_files if i == "edit"},
                         session_id=event.session_id,
                         ts=event.ts,
                     )
@@ -450,11 +508,15 @@ def mine_events(events: Iterable[Event], repo_prefix: str) -> list[SessionCandid
                     SessionCandidate(
                         kind="explicit_choice",
                         quotes=[_clip(s) for s in sentences],
-                        files=list(dict.fromkeys(trailing_files)),
+                        files=list(dict.fromkeys(p for p, _ in trailing_files)),
+                        edited={p for p, i in trailing_files if i == "edit"},
                         session_id=event.session_id,
                         ts=event.ts,
                     )
                 )
+
+    for candidate in candidates:
+        candidate.files.sort(key=lambda f: f not in candidate.edited)
 
     # A choice with no code in play is a conversation, not a decision record.
     return [c for c in candidates if c.kind != "explicit_choice" or c.files]
@@ -507,6 +569,111 @@ def session_mining_enabled(repo_config: dict[str, Any] | None) -> bool:
     """
     return resolve_policy(repo_config).policy.source_enabled("session")
 
+
+def harnesses_for(repo_path: Path) -> tuple[str, ...]:
+    """Harnesses this repo reads transcripts from, from its own config.
+
+    The fallback for a caller that holds no resolved policy. Both pipelines
+    do hold one and pass it, so this is not the usual path: two readings of
+    the same setting that can disagree is the drift worth avoiding.
+    """
+    from repowise.core.repo_config import load_repo_config
+
+    try:
+        policy = resolve_policy(load_repo_config(repo_path)).policy
+    except Exception:
+        return DEFAULT_HARNESSES
+    return registered_harnesses(policy.harnesses)
+
+
+def registered_harnesses(names: Sequence[str]) -> tuple[str, ...]:
+    """*names* that name a registered adapter, never empty.
+
+    An unregistered name is dropped rather than raised on: a config written
+    against a newer repowise must not stop this one from indexing. Falling
+    back is deliberate too, because an empty reader list and a repository
+    with no sessions produce the same silence.
+    """
+    known = set(registered_adapters())
+    return tuple(name for name in names if name in known) or DEFAULT_HARNESSES
+
+
+def _sweep_harness(
+    harness: str,
+    *,
+    repo_root: Path,
+    projects_root: Path | None,
+    store: SessionStagingStore,
+    recorder: TranscriptEpisodeRecorder,
+    collector: SpanCollector | None,
+    budget: float,
+    now: float | None,
+) -> dict[str, int]:
+    """Read one harness's new transcript lines, and report what it did.
+
+    The counts are the harness's own, and they are separate on purpose:
+    *read* is transcripts opened, so a reader that has stopped reading shows
+    a zero there next to a non-zero *discovered*, which one total cannot say.
+    """
+    adapter = get_adapter(harness)
+    # This miner needs user prose, assistant prose, tool uses and results:
+    # everything the conversation carries, minus the fat non-dialog lines.
+    prefilter = adapter.prefilter(INTENT_TURNS)
+    deadline = time.monotonic() + budget
+    discovered = adapter.discover(repo_root, projects_root=_root_for(harness, projects_root))
+    counts = {"discovered": len(discovered), "read": 0, "found": 0, "staged": 0, "deferred": 0}
+    # Every discovered transcript is present whether or not this run gets to
+    # read it; the episode writer notes absence on the row it can no longer
+    # point at, and keeps the episode.
+    recorder.note_present(discovered)
+    for index, path in enumerate(discovered):
+        if time.monotonic() > deadline:
+            # A first index on a machine with a long agent history reads the
+            # whole corpus from byte 0, and that corpus is bounded by how much
+            # the user has worked, not by the size of the repo. Stopping is
+            # safe and self-healing rather than lossy, because the cursor is
+            # per file and saved by the caller, so the next run resumes
+            # exactly where this one stopped. Steady state never reaches it.
+            counts["deferred"] = len(discovered) - index
+            break
+        try:
+            events = iter_new_events(adapter, path, store.cursors, prefilter=prefilter)
+            stream = recorder.observe(path, events)
+            if collector is not None:
+                stream = collector.observe(stream)
+            for candidate in mine_events(
+                stream, repo_root, edit_tools=adapter.edit_tool_names
+            ):
+                counts["found"] += 1
+                if store.add_raw(
+                    hash_=candidate.hash,
+                    kind=candidate.kind,
+                    quotes=candidate.quotes,
+                    files=candidate.files,
+                    session_id=candidate.session_id,
+                    harness=harness,
+                    now=now,
+                ):
+                    counts["staged"] += 1
+            counts["read"] += 1
+        except OSError:
+            continue
+    return counts
+
+
+def _root_for(harness: str, projects_root: Path | None) -> Path | None:
+    """The transcript-root override, per harness.
+
+    The override is a sandbox, so nothing may read outside it: a caller that
+    passes one and gets a harness reading the real home directory has been
+    given the machine's whole history for that agent without asking. The
+    default harness keeps the root itself, so existing callers are unchanged,
+    and every other harness gets a subdirectory that is simply absent unless
+    the caller made one.
+    """
+    if projects_root is None:
+        return None
+    return projects_root if harness == DEFAULT_ADAPTER else projects_root / harness
 
 
 def _candidates_block(raws: list[dict[str, Any]]) -> str:
@@ -577,7 +744,9 @@ def _gate_structured(item: dict[str, Any], raw: dict[str, Any]) -> dict[str, Any
         if verify_quote(plain_rationale, plain_source, fuzzy_threshold=0.5) == "unverified":
             rationale = ""
     claimed = item.get("affected_files")
-    files = [f for f in claimed if f in raw["files"]] if isinstance(claimed, list) else []
+    # Iterate the mined list rather than the model's: same set either way,
+    # and the mined order is the one carrying what the session edited.
+    files = [f for f in raw["files"] if f in claimed] if isinstance(claimed, list) else []
     if not files and raw["kind"] != "user_correction":
         # A choice/dead end is about the code in play; a correction with no
         # named files is a repo-wide rule, and linking it to whatever files
@@ -601,7 +770,25 @@ def _gate_structured(item: dict[str, Any], raw: dict[str, Any]) -> dict[str, Any
 _MAX_EVIDENCE_SESSIONS = 5
 
 
-def promotion_decisions(row: dict[str, Any], repo_root: Path) -> list[ExtractedDecision]:
+def _staged_files(structured: dict[str, Any], row: dict[str, Any]) -> list[str]:
+    """The files a staged row claims, distinguishing empty from absent.
+
+    ``_gate_structured`` leaves the list empty on purpose for a correction the
+    model named no files for, because a repo-wide rule linked to whatever was
+    open governs the wrong code. Only a row with no structured claim at all
+    falls back to the gate hits, which staging accretes across observations:
+    the latest structuring pass wins over what earlier ones had in play.
+    """
+    claimed = structured.get("affected_files")
+    return list(claimed) if claimed is not None else list(row["files"])
+
+
+def promotion_decisions(
+    row: dict[str, Any],
+    repo_root: Path,
+    *,
+    indexed: Container[str] | None = None,
+) -> list[ExtractedDecision]:
     """decision_records-ready members for one promotable staging row.
 
     One member per observing session (capped) so each session becomes its own
@@ -612,19 +799,53 @@ def promotion_decisions(row: dict[str, Any], repo_root: Path) -> list[ExtractedD
     acceptance event: authority comes from a person confirming the record.
     ``first_promotion`` still gates re-emission in the staging store, so a
     recurring candidate accretes evidence without re-proposing itself.
+
+    *indexed* is the indexed file set, and binding happens here rather than at
+    staging so a candidate staged before the set was threaded is repaired on
+    its way out rather than staying wrong.
     """
     structured = row["structured"]
     # Both session lanes store source="session"; the staging kind is what tells
     # a reviewer which one raised the candidate.
     lane = DISCOVERY_KIND if row.get("kind") == DISCOVERY_KIND else "session"
-    files = relative_files(structured.get("affected_files") or row["files"], repo_root)
+    files = bind_scope_files(
+        relative_files(_staged_files(structured, row), repo_root),
+        indexed,
+    )
     modules = resolve_module_nodes(files)
+    # Staging carries a decision and a rationale and no more, so a promoted
+    # record is thin by construction and is scored as such.
     confidence = compute_confidence(
         rank_for_source("session"),
         row["observations"],
         structured.get("verification", "unverified"),
+        filled_fields=completeness(
+            decision=structured.get("decision"),
+            rationale=structured.get("rationale"),
+        ),
     )
     sessions = row["sessions"][-_MAX_EVIDENCE_SESSIONS:] or [None]
+    # Flagged here rather than at staging, for the same reason binding and
+    # classification are: a row staged before the flag existed is judged on
+    # its way out instead of staying unflagged forever, which is the whole
+    # backlog. The discovery lane already decides this at grounding time, so
+    # its answer is kept and only ever raised -- the two lanes ask the same
+    # question of the same text and must not disagree by which ran first.
+    needs_split = bool(structured.get("needs_split")) or bundles_decisions(
+        structured.get("decision", "") or ""
+    )
+    # Classified here rather than at staging, for the same reason binding is:
+    # a candidate staged before the split existed is classified on its way out
+    # instead of staying one noun forever.
+    kind = classify_kind(
+        row["title"],
+        structured.get("decision", ""),
+        structured.get("rationale", "") or "",
+        source="session",
+    )
+    # The files stay on the record; whether they are a claim about those files
+    # is a separate question, and this is where both answers are known.
+    scope_basis = session_scope_basis(files, is_agreement=kind == AGREEMENT_KIND)
     return [
         ExtractedDecision(
             title=row["title"],
@@ -632,14 +853,16 @@ def promotion_decisions(row: dict[str, Any], repo_root: Path) -> list[ExtractedD
             rationale=structured.get("rationale", ""),
             affected_files=files,
             affected_modules=modules,
+            scope_basis=scope_basis,
             source="session",
             evidence_commits=[sid] if sid else [],
             confidence=confidence,
             status="proposed",
+            kind=kind,
             source_quote=structured.get("source_quote", ""),
             verification=structured.get("verification", "unverified"),
             lane=lane,
-            needs_split=bool(structured.get("needs_split")),
+            needs_split=needs_split,
         )
         for sid in sessions
     ]
@@ -652,6 +875,41 @@ def promotion_decisions(row: dict[str, Any], repo_root: Path) -> list[ExtractedD
 #: An injection is judged only after this long: the showing session must have
 #: had time to react (or end) before "no contradiction" reads as "followed".
 INJECTION_EVAL_MIN_AGE_SECONDS = 3600.0
+
+
+async def _records_by_alias(
+    db_session: Any, repository_id: str, alias_ids: list[str]
+) -> dict[str, Any]:
+    """Live records for retired ids, keyed by the **retired** id.
+
+    Keyed by the alias so the caller can look a sidecar row up under the id it
+    stored.
+
+    One hop, because re-keying does not chain: ``decision_aliases.decision_id``
+    is in ``_DEPENDENT_COLUMNS``, so re-keying a record that is already some
+    id's target repoints the existing alias rather than writing a hop beside
+    it. A merge *can* chain, since a merged candidate keeps its record, so
+    ``A -> B -> C`` is reachable with ``B`` live. One hop is still the right
+    answer there: ``A`` has no record, ``B`` has a real one, and ``B``'s text
+    is what was shown.
+    """
+    if not alias_ids:
+        return {}
+
+    from sqlalchemy import select
+
+    from repowise.core.persistence.models import DecisionAlias, DecisionRecord
+
+    rows = await db_session.execute(
+        select(DecisionAlias.alias_id, DecisionRecord)
+        .join(DecisionRecord, DecisionRecord.id == DecisionAlias.decision_id)
+        .where(
+            DecisionAlias.alias_id.in_(alias_ids),
+            DecisionAlias.repository_id == repository_id,
+            DecisionRecord.repository_id == repository_id,
+        )
+    )
+    return {alias_id: rec for alias_id, rec in rows.all()}
 
 
 async def apply_injection_feedback(
@@ -709,6 +967,11 @@ async def apply_injection_feedback(
         # would never reach them otherwise and the reported rate would stay
         # pinned at whatever the else branch produced.
         retired = store.retire_unjudgeable_verdicts()
+        # Beside it: rows another session's match settled, handed back to the
+        # judge below. **This order is load-bearing** -- both repairs ride one
+        # `PRAGMA user_version` and this one writes the higher number, so
+        # reversing them skips the retirement for good.
+        reopened = store.reopen_smeared_contradictions()
         # Commit even when nothing matched, because what is being persisted is
         # the "already repaired" mark, not the rows. Without this the mark is
         # rolled back by the early return below on any store with nothing to
@@ -716,8 +979,12 @@ async def apply_injection_feedback(
         # RAW_TTL_DAYS has pruned the corrections, it would fire on verdicts
         # that were earned. That is the exact decay the one-shot prevents.
         store.commit()
-        if retired:
-            logger.info("session_mining.injection_verdicts_retired", rows=retired)
+        if retired or reopened:
+            logger.info(
+                "session_mining.injection_verdicts_repaired",
+                retired=retired,
+                reopened=reopened,
+            )
 
         injections = store.unevaluated_injections(before=ts - INJECTION_EVAL_MIN_AGE_SECONDS)
         if not injections:
@@ -731,16 +998,20 @@ async def apply_injection_feedback(
             )
         )
         records = {rec.id: rec for rec in rows.scalars().all()}
+        # A record's id moves when its scope does and nothing rewrites the
+        # sidecar, so without the aliases those rows read as "the decision is
+        # gone" and are drained, discarding feedback already earned -- 372 of
+        # 421 settled rows on this store.
+        records |= await _records_by_alias(
+            db_session, repository_id, [d for d in decision_ids if d not in records]
+        )
 
         quotes_by_session: dict[str, list[str]] = {}
-        verdicts: dict[str, bool] = {}  # decision_id -> contradicted anywhere
-        #: (session_id, decision_id, this session had a correction to test it
-        #: against) for every row settled here. Judgeability is per *row*, not
-        #: per decision, because the totals count rows: one session that
-        #: happened to hold a correction would otherwise hand a free verdict
-        #: to every other session the same decision was shown to, which is the
-        #: bug this whole change is about, one level up.
-        judged: list[tuple[str, str, bool]] = []
+        #: (session_id, decision_id, judgeable, this session's own verdict).
+        #: **Both flags are per row**, because the totals count rows: a verdict
+        #: shared across every session a decision was shown to is multiplied by
+        #: however many that was.
+        judged: list[tuple[str, str, bool, bool]] = []
         for inj in injections:
             rec = records.get(inj["decision_id"])
             if rec is None:
@@ -754,18 +1025,12 @@ async def apply_injection_feedback(
             quotes = quotes_by_session[session_id]
             decision_text = f"{rec.title}. {rec.decision}"
             contradicted = any(contradicts(decision_text, quote)[0] for quote in quotes)
-            verdicts[rec.id] = verdicts.get(rec.id, False) or contradicted
-            judged.append((session_id, inj["decision_id"], bool(quotes)))
+            judged.append((session_id, inj["decision_id"], bool(quotes), contradicted))
 
-        # Settle the ledger after the aggregation, not during it: the verdict
-        # *value* is per decision across every session that saw it, so a row's
-        # own judgement is not final until the last of them has been read.
-        # Whether a row gets that value at all is per row, and the two are
-        # different questions — a decision contradicted in one session says
-        # nothing about a session that mined no correction at all. Storing it
-        # is what lets `repowise hook stats` report the split — until now the
-        # numbers existed only in one update run's console output.
-        for session_id, decision_id, judgeable in judged:
+        # Each row settles on its own session's corrections: a decision
+        # contradicted in one session says nothing about a session that mined
+        # different corrections, or none. Stored so `hook stats` can report it.
+        for session_id, decision_id, judgeable, contradicted in judged:
             if not judgeable:
                 # Settled, so it is not re-read every update, but with no
                 # verdict: this session mined nothing that could have
@@ -773,7 +1038,6 @@ async def apply_injection_feedback(
                 store.mark_injection_evaluated(session_id, decision_id)
                 summary["unjudgeable"] += 1
                 continue
-            contradicted = bool(verdicts.get(decision_id))
             store.mark_injection_evaluated(
                 session_id,
                 decision_id,
@@ -795,8 +1059,10 @@ async def mine_session_decisions(
     *,
     provider: Any | None,
     projects_root: Path | None = None,
+    harnesses: Sequence[str] | None = None,
     max_structured: int = MAX_STRUCTURED_PER_UPDATE,
     collect_discovery_spans: bool = False,
+    indexed: Container[str] | None = None,
     now: float | None = None,
 ) -> list[ExtractedDecision]:
     """Read this repo's new transcript lines once, and serve both consumers.
@@ -822,13 +1088,19 @@ async def mine_session_decisions(
     assistant prose that the broad discovery lane consumes. It rides this pass
     for the same reason the episode recorder does: the cursor advances as the
     bytes are read, so a second reader would find an empty file.
+
+    *indexed* is the indexed file set, which bounds what a promoted record may
+    claim to govern. Omitting it keeps the previous behaviour, so a caller that
+    has no set does not start binding scope it cannot check.
     """
     repo_root = Path(repo_path).resolve()
-    repo_prefix = str(repo_root).lower().rstrip("\\/")
-    adapter = get_adapter()
-    # This miner needs user prose, assistant prose, tool uses and results:
-    # everything the conversation carries, minus the fat non-dialog lines.
-    prefilter = adapter.prefilter(INTENT_TURNS)
+    # The caller's resolved policy wins; reading config again here would be a
+    # second answer to a question it has already asked.
+    names = registered_harnesses(harnesses) if harnesses is not None else harnesses_for(repo_path)
+    # One recorder across every harness, and one write at the end. The episode
+    # writer resolves absence by negation over the tier, so a second write
+    # carrying only the second harness's subjects would mark the first's as
+    # sources that had gone away.
     recorder = TranscriptEpisodeRecorder(repo_root)
 
     store = SessionStagingStore.open_default(repo_root)
@@ -836,41 +1108,33 @@ async def mine_session_decisions(
     try:
         # Stage new gate hits from transcript lines appended since last run.
         staged = 0
-        deadline = time.monotonic() + SWEEP_BUDGET_S
         deferred = 0
-        discovered = adapter.discover(repo_root, projects_root=projects_root)
-        # Every discovered transcript is present whether or not this run gets
-        # to read it; the episode writer notes absence on the row it can no
-        # longer point at, and keeps the episode.
-        recorder.note_present(discovered)
-        for index, path in enumerate(discovered):
-            if time.monotonic() > deadline:
-                # A first index on a machine with a long agent history reads
-                # the whole corpus from byte 0, and that corpus is bounded by
-                # how much the user has worked, not by the size of the repo:
-                # 857 MB across 426 sessions here. Stopping is safe and
-                # self-healing rather than lossy, because the cursor is per
-                # file and saved below, so the next run resumes exactly where
-                # this one stopped. Steady state never reaches the budget.
-                deferred = len(discovered) - index
-                break
+        yields: dict[str, dict[str, int]] = {}
+        # Split the sweep rather than sharing it. Under one deadline the
+        # harness iterated first spends the whole budget on a cold corpus and
+        # the next is deferred on its first file every run, which is
+        # indistinguishable from a harness with nothing to read.
+        budget = SWEEP_BUDGET_S / len(names)
+        for name in names:
             try:
-                events = iter_new_events(adapter, path, store.cursors, prefilter=prefilter)
-                stream = recorder.observe(path, events)
-                if collector is not None:
-                    stream = collector.observe(stream)
-                for candidate in mine_events(stream, repo_prefix):
-                    if store.add_raw(
-                        hash_=candidate.hash,
-                        kind=candidate.kind,
-                        quotes=candidate.quotes,
-                        files=candidate.files,
-                        session_id=candidate.session_id,
-                        now=now,
-                    ):
-                        staged += 1
-            except OSError:
+                yields[name] = _sweep_harness(
+                    name,
+                    repo_root=repo_root,
+                    projects_root=projects_root,
+                    store=store,
+                    recorder=recorder,
+                    collector=collector,
+                    budget=budget,
+                    now=now,
+                )
+            except Exception as exc:
+                # One harness must not cost another's committed progress: the
+                # cursor save below is shared, so an escape here would discard
+                # every harness's advances and re-read them next run.
+                logger.warning("session_mining.harness_failed", harness=name, error=str(exc))
                 continue
+            staged += yields[name]["staged"]
+            deferred += yields[name]["deferred"]
         store.prune(now=now)
         store.cursors.save()  # commits the staged raws atomically with the cursors
 
@@ -928,7 +1192,7 @@ async def mine_session_decisions(
         for row in store.promotable():
             if row["kind"] == DISCOVERY_KIND:
                 continue  # the broad lane runs its own promotion, under its own rules
-            decisions.extend(promotion_decisions(row, repo_root))
+            decisions.extend(promotion_decisions(row, repo_root, indexed=indexed))
             store.mark_emitted(row["key"], observations=row["observations"], now=now)
         store.commit()
 
@@ -938,6 +1202,11 @@ async def mine_session_decisions(
             structured=structured_count,
             pending_backlog=max(0, len(pending) - processed),
             discovery_spans=collector.queued if collector else 0,
+            # Per harness, so a reader that stops reading is visible. A
+            # harness that did not run, or failed, has no key at all; one that
+            # ran reports what it discovered, read and found separately, so an
+            # empty corpus and an unread one do not share a number.
+            yields=yields,
             promoted=len(decisions),
             episodes=episodes,
             transcripts_deferred=deferred,

@@ -448,3 +448,37 @@ async def test_the_tool_function_itself_still_carries_meta_in_its_payload(setup_
 
     assert isinstance(payload, dict)
     assert payload["_meta"]["contract_version"] == MCP_CONTRACT_VERSION
+
+
+def test_compact_index_scope_remains_visible_when_protocol_metadata_is_dropped():
+    from repowise.core.index_scope import compact_index_scope, resolve_index_scope
+    from repowise.server.mcp_server._meta import finalize_trust_envelope
+    from repowise.server.mcp_server._wire import as_call_tool_result
+
+    scope = compact_index_scope(
+        resolve_index_scope(
+            {
+                "run_mode": "fast",
+                "index_scope": {"analysis": {"unavailable": [f"analysis-{n}" for n in range(12)]}},
+            }
+        )
+    )
+    result = as_call_tool_result(
+        finalize_trust_envelope(
+            {
+                "answer": "bounded evidence",
+                "_meta": {"index_scope": scope, "repo_freshness": {"web": {"index_scope": scope}}},
+            }
+        )
+    )
+    # A host that discards protocol _meta still receives the same disclosure in
+    # both SDK representations; neither can imply full analysis coverage.
+    flat = result.structuredContent
+    assert "_meta" not in flat
+    assert json.loads(result.content[0].text) == flat
+    visible = flat["trust"]["index_scope"]
+    for key in ("status", "projection", "fingerprint", "full"):
+        assert visible[key] == scope[key]
+    assert visible["degraded_analyses"] == scope["degraded_analyses"][:8]
+    assert visible["degraded_analyses_omitted"] == 4
+    assert flat["trust"]["repo_freshness"]["web"]["index_scope"] == visible

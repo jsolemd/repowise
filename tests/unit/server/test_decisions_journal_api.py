@@ -205,6 +205,18 @@ async def test_noncanonical_mutations_are_visibly_disabled(
         },
     )
 
+    agreement = await client.post(
+        f"/api/repos/{repo['id']}/decisions",
+        json={
+            "title": "Agreement",
+            "decision": "Preserve scope",
+            "rationale": "No lossy writes",
+            "affected_files": ["src/service.py"],
+            "kind": "agreement",
+        },
+    )
+    assert agreement.status_code == 409
+    assert "kind" in agreement.json()["detail"]
     assert deprecated.status_code == 409
     assert "canonical journal representation" in deprecated.json()["detail"]
     assert modules.status_code == 409

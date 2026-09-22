@@ -265,6 +265,7 @@ _UNIVERSAL_NON_IMPORTABLE: frozenset[str] = frozenset(
         "type_alias",
         "namespace",
         "module",
+        "impl",
     }
 )
 
@@ -354,6 +355,7 @@ _UNCALLABLE_TYPE_KINDS: frozenset[str] = frozenset(
         "interface",
         "enum",
         "type_alias",
+        "impl",
     }
 )
 
@@ -1562,9 +1564,9 @@ class DeadCodeAnalyzer:
         for node, node_data in self.graph.nodes(data=True):
             if node_data.get("node_type") != "symbol":
                 continue
-            # Rust: the graph builder does not yet emit intra-file call
-            # edges, so every private Rust function appears "uncalled".
-            # Skip the entire language until call-edge support lands.
+            # Rust: rustc's own `dead_code` lint already reports unused
+            # private items, with the macro expansion and type information a
+            # static graph cannot match. Nothing here it would not find first.
             if node_data.get("language") == "rust":
                 continue
             # Go's call resolver now resolves same-package (sibling-file) and
