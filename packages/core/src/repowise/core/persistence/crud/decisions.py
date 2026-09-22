@@ -947,7 +947,13 @@ async def reconcile_source_ranks(session: AsyncSession) -> int:
     reconciled, which is the steady state after the first run).
     """
     moved = (
-        (await session.execute(select(DecisionEvidence).where(_stale_rank_filter())))
+        (
+            await session.execute(
+                select(DecisionEvidence)
+                .join(DecisionRecord)
+                .where(_stale_rank_filter(), DecisionRecord.source != "journal")
+            )
+        )
         .scalars()
         .all()
     )
@@ -1001,14 +1007,28 @@ async def reconcile_decision_confidence(session: AsyncSession) -> int:
     themselves where they are created.
     """
     evidence_by_id: dict[str, list[DecisionEvidence]] = {}
-    for row in (await session.execute(select(DecisionEvidence))).scalars().all():
+    for row in (
+        (
+            await session.execute(
+                select(DecisionEvidence)
+                .join(DecisionRecord)
+                .where(DecisionRecord.source != "journal")
+            )
+        )
+        .scalars()
+        .all()
+    ):
         evidence_by_id.setdefault(row.decision_id, []).append(row)
     if not evidence_by_id:
         return 0
 
     now = _now_utc()
     rescored = 0
-    for rec in (await session.execute(select(DecisionRecord))).scalars().all():
+    for rec in (
+        (await session.execute(select(DecisionRecord).where(DecisionRecord.source != "journal")))
+        .scalars()
+        .all()
+    ):
         evidence = evidence_by_id.get(rec.id)
         if not evidence:
             continue  # see the docstring: re-derive, never invent
@@ -1080,12 +1100,17 @@ async def unretire_auto_superseded(session: AsyncSession) -> int:
     if _journal_mode_enabled():
         return 0
 
+    # Journal projection owns both endpoints and their lineage, independently
+    # of the caller's ambient journal configuration.
+    journal_ids = select(DecisionRecord.id).where(DecisionRecord.source == "journal")
     auto_edges = (
         (
             await session.execute(
                 select(DecisionEdge).where(
                     DecisionEdge.kind.in_(("supersedes", "conflicts_with")),
                     DecisionEdge.evidence.startswith(_AUTO_EDGE_EVIDENCE_PREFIX),
+                    DecisionEdge.src_decision_id.not_in(journal_ids),
+                    DecisionEdge.dst_decision_id.not_in(journal_ids),
                 )
             )
         )
@@ -1665,6 +1690,7 @@ async def purge_proposed_decisions_by_source(
         select(DecisionRecord.id).where(
             DecisionRecord.repository_id == repository_id,
             DecisionRecord.source == source,
+            DecisionRecord.source != "journal",
             DecisionRecord.status == "proposed",
             ~accepted_predicate(),
         )
@@ -1700,6 +1726,7 @@ async def purge_proposed_decisions_outside_files(
             DecisionRecord.repository_id == repository_id,
             DecisionRecord.status == "proposed",
             DecisionRecord.evidence_file.is_not(None),
+            DecisionRecord.source != "journal",
             ~accepted_predicate(),
         )
     )

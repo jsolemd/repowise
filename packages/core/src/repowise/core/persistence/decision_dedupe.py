@@ -194,7 +194,10 @@ def _canonical_key(rec: DecisionRecord) -> tuple:
 async def _foldable(session: AsyncSession, repository_id: str) -> list[DecisionRecord]:
     """The records this sweep is allowed to fold. See the module docstring."""
     result = await session.execute(
-        select(DecisionRecord).where(DecisionRecord.repository_id == repository_id)
+        select(DecisionRecord).where(
+            DecisionRecord.repository_id == repository_id,
+            DecisionRecord.source != "journal",
+        )
     )
     accepted = await accepted_decision_ids(session, repository_id)
     reviewed = {

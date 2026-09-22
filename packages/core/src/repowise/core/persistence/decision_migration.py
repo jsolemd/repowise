@@ -11,6 +11,9 @@ almost none of them can show an acceptance event. Demoting them is the point:
 authority the user did not grant should never have been authority. What the
 migration owes them is an exact account of what it did and why, which is what
 :func:`plan_migration` produces before anything is written.
+
+Journal projections are excluded by their persisted source, independently of
+the current process configuration. JSONL owns their IDs, scope and authority.
 """
 
 from __future__ import annotations
@@ -168,7 +171,10 @@ async def plan_migration(
         (
             await session.execute(
                 select(DecisionRecord)
-                .where(DecisionRecord.repository_id == repository_id)
+                .where(
+                    DecisionRecord.repository_id == repository_id,
+                    DecisionRecord.source != "journal",
+                )
                 .order_by(DecisionRecord.created_at)
             )
         )
@@ -352,7 +358,8 @@ async def apply_migration(
             (
                 await session.execute(
                     select(DecisionRecord).where(
-                        DecisionRecord.repository_id == repository_id
+                        DecisionRecord.repository_id == repository_id,
+                        DecisionRecord.source != "journal",
                     )
                 )
             )
@@ -560,7 +567,10 @@ async def backfill_decision_node_links(
     rows = (
         (
             await session.execute(
-                select(DecisionRecord).where(DecisionRecord.repository_id == repository_id)
+                select(DecisionRecord).where(
+                    DecisionRecord.repository_id == repository_id,
+                    DecisionRecord.source != "journal",
+                )
             )
         )
         .scalars()
@@ -634,7 +644,8 @@ async def prune_unindexed_scope_files(
         (
             await session.execute(
                 select(DecisionRecord).where(
-                    DecisionRecord.repository_id == repository_id
+                    DecisionRecord.repository_id == repository_id,
+                    DecisionRecord.source != "journal",
                 )
             )
         )

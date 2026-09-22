@@ -17,6 +17,9 @@ every dependent row repointed at the copy, and only then releasing the id it
 came from; an alias records where it went, so an id already written down
 somewhere keeps resolving. Idempotent: a second run finds every id already
 derived and does nothing.
+
+Journal projections are excluded by their persisted source, independently of
+the current process configuration. JSONL owns their IDs, scope and authority.
 """
 
 from __future__ import annotations
@@ -157,7 +160,10 @@ async def plan_id_migration(session: AsyncSession, repository_id: str) -> IdMigr
     """
     result = await session.execute(
         select(DecisionRecord)
-        .where(DecisionRecord.repository_id == repository_id)
+        .where(
+            DecisionRecord.repository_id == repository_id,
+            DecisionRecord.source != "journal",
+        )
         .order_by(DecisionRecord.created_at, DecisionRecord.id)
     )
     records = list(result.scalars().all())
@@ -544,6 +550,29 @@ async def apply_id_migration(
     rewrites and no folds, and touches nothing.
     """
     plan = plan or await plan_id_migration(session, repository_id)
+    # JSONL owns these identities even when this process has no journal setting.
+    # Recheck supplied plans as well: a plan made before projection is stale.
+    journal_ids = set(
+        (
+            await session.scalars(
+                select(DecisionRecord.id).where(
+                    DecisionRecord.repository_id == repository_id,
+                    DecisionRecord.source == "journal",
+                )
+            )
+        ).all()
+    )
+    if journal_ids:
+        plan = IdMigrationPlan(
+            rows=[
+                row
+                for row in plan.rows
+                if row.old_id not in journal_ids and row.new_id not in journal_ids
+            ],
+            pinned_quotes={
+                key: value for key, value in plan.pinned_quotes.items() if key not in journal_ids
+            },
+        )
     rewrites = plan.rewrites()
     folds = plan.folds()
 
