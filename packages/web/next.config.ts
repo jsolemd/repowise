@@ -7,6 +7,9 @@ const nextConfig: NextConfig = {
   transpilePackages: ["@repowise-dev/ui", "@repowise-dev/types", "@repowise-dev/api-client"],
   experimental: {
     optimizePackageImports: ["lucide-react", "recharts"],
+    // Our extension aliases disable Next's automatic build worker. Restore
+    // it so the compiler's heap is released before type checking/rendering.
+    webpackBuildWorker: true,
   },
   // The workspace packages (@repowise-dev/types, @repowise-dev/ui,
   // @repowise-dev/api-client) are ESM
