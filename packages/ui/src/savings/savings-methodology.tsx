@@ -25,10 +25,9 @@ export interface SavingsResetNoticeProps {
 /**
  * Said once, when a repository's reader has not yet seen it.
  *
- * Restarting savings history is a methodology change, not silent data loss,
- * so it is disclosed rather than absorbed. Three things the copy has to do:
- * name what restarted, say plainly that nothing else was deleted, and avoid
- * calling itself a cost reset -- no money moved and no spend record changed.
+ * Distillation and hook savings use the upstream event ledger. This fork keeps
+ * MCP usage as bounded daily aggregates and preserves older savings records;
+ * the notice must distinguish those stores without claiming a history reset.
  *
  * The host decides whether this renders and remembers the dismissal. This
  * component only knows how to say it.
@@ -60,10 +59,9 @@ export function SavingsResetNotice({
       <span className="font-medium text-[var(--color-text-primary)]">
         Savings accounting has been upgraded.
       </span>{" "}
-      Savings are now recorded one event per interaction, with the evidence behind each
-      figure kept alongside it. Estimates produced by the earlier method could not be
-      converted, so they were restarted rather than carried over. Your omission history and
-      everything else in this repository were not deleted.
+      New distillation and hook savings are recorded per interaction. Earlier estimates
+      were not deleted, but are excluded from these new totals. MCP usage remains a
+      separate rolling 30-day total by tool; individual MCP calls are not stored.
     </DismissibleNotice>
   );
 }
@@ -88,8 +86,9 @@ export function SavingsMethodology({ href, LinkComponent }: SavingsMethodologyPr
       <div className="flex max-w-[72ch] flex-col gap-3 text-[13px] leading-relaxed text-[var(--color-text-secondary)]">
         <p>
           A saving is input tokens your agent never had to read. One logical interaction
-          produces one event and contributes to the total once, whether it passed through{" "}
-          <code>repowise distill</code>, a replacement hook, or an MCP call.
+          through <code>repowise distill</code> or a replacement hook produces one event
+          and contributes to the total once. In this fork, MCP calls contribute only to
+          the separate daily usage aggregates, with no individual call history.
         </p>
         <p>
           <strong className="font-medium text-[var(--color-text-primary)]">Measured</strong>{" "}

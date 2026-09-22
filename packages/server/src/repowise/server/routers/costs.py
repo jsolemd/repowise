@@ -161,10 +161,21 @@ async def get_savings(
         ) as conn:
             usage = tracking.mcp_usage_summary(conn)
 
+    # The fork's bounded MCP aggregates exist independently of the upstream
+    # event ledger, including before an existing sidecar has been upgraded.
+    usage_fields = dict(
+        mcp_usage_calls=usage["calls"],
+        mcp_usage_error_calls=usage["error_calls"],
+        mcp_usage_no_match_calls=usage["no_match_calls"],
+        mcp_usage_degraded_calls=usage["degraded_calls"],
+        mcp_usage_avg_duration_ms=usage["avg_duration_ms"],
+        mcp_usage_window_days=usage["window_days"],
+        mcp_usage_per_tool=[McpUsageGroup(**row) for row in usage["per_tool"]],
+    )
     as_of = datetime.now(UTC)
     report = load_report(repo.local_path, as_of=as_of, days=days)
     if report is None:
-        return SavingsResponse(available=False)
+        return SavingsResponse(available=False, **usage_fields)
 
     # Best-effort transcript scans; both degrade to an empty report and never
     # raise. Kept out of the ledger entirely -- they are estimates of what was
@@ -210,13 +221,7 @@ async def get_savings(
         opportunity_count=report.opportunity_count,
         opportunity_tokens_excluded=report.opportunity_tokens_excluded,
         per_opportunity_kind=[SavingsOpportunityRow(**row) for row in report.per_opportunity_kind],
-        mcp_usage_calls=usage["calls"],
-        mcp_usage_error_calls=usage["error_calls"],
-        mcp_usage_no_match_calls=usage["no_match_calls"],
-        mcp_usage_degraded_calls=usage["degraded_calls"],
-        mcp_usage_avg_duration_ms=usage["avg_duration_ms"],
-        mcp_usage_window_days=usage["window_days"],
-        mcp_usage_per_tool=[McpUsageGroup(**row) for row in usage["per_tool"]],
+        **usage_fields,
         missed_events=missed["events"],
         missed_tokens_est=missed["est_saved_tokens"],
         missed_window_days=missed["window_days"],
