@@ -61,6 +61,13 @@ beforeAll(() => {
 function makeSavings(overrides: Partial<Savings> = {}): Savings {
   return {
     available: true,
+    mcp_usage_calls: 0,
+    mcp_usage_error_calls: 0,
+    mcp_usage_no_match_calls: 0,
+    mcp_usage_degraded_calls: 0,
+    mcp_usage_avg_duration_ms: 0,
+    mcp_usage_window_days: 30,
+    mcp_usage_per_tool: [],
     window_days: null,
     as_of: "2026-09-19T00:00:00Z",
     first_event_at: "2026-09-01T00:00:00Z",
