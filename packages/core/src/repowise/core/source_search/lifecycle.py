@@ -748,7 +748,11 @@ async def _reconcile_source_index_unlocked(
 
         embed_started = time.perf_counter()
         try:
-            reusable = await prior_store.vectors_by_content_hash() if same_recipe and chunks else {}
+            reusable = (
+                await prior_store.vectors_by_content_hash([chunk.content_hash for chunk in chunks])
+                if same_recipe and chunks
+                else {}
+            )
         except Exception:
             log.warning("source_index_vector_reuse_skipped", exc_info=True)
             reusable = {}

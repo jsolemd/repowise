@@ -38,6 +38,9 @@ SOURCE_CHUNKS_TABLE = "source_chunks"
 SOURCE_GENERATIONS_TABLE = "source_chunk_generations"
 STORED_SNIPPET_CHARS = 2000
 _IN_CHUNK = 500
+# Keep DataFusion filter planning and Python vector conversion bounded separately.
+_REUSE_HASH_BATCH = 100
+_REUSE_ROW_BATCH = 128
 _REQUIRED_COLUMNS = frozenset(
     {
         "row_key",
@@ -483,14 +486,36 @@ class SourceChunkVectorStore:
             if row.get("vector") is not None
         }
 
-    async def vectors_by_content_hash(self) -> dict[str, list[float]]:
-        """One active vector per content hash, for recipe-safe reuse."""
+    async def vectors_by_content_hash(
+        self, content_hashes: Sequence[str]
+    ) -> dict[str, list[float]]:
+        """Read only requested active vectors for recipe-safe reuse.
 
-        return {
-            stored.content_hash: stored.vector
-            for stored in (await self.stored_vectors()).values()
-            if stored.content_hash
-        }
+        A saved file usually needs a handful of hashes, not the entire corpus.
+        Bound both predicate size and result batches: repeated content can match
+        many rows even for a single requested hash.
+        """
+
+        hashes = sorted({value for value in content_hashes if value})
+        if not hashes:
+            return {}
+        await self._ensure_connected()
+        if self._table is None:
+            return {}
+        vectors: dict[str, list[float]] = {}
+        visibility = self._visibility()
+        for start in range(0, len(hashes), _REUSE_HASH_BATCH):
+            where = _quoted_in("content_hash", hashes[start : start + _REUSE_HASH_BATCH])
+            if visibility is not None:
+                # Older LanceDB releases replace, rather than combine, .where().
+                where = f"{where} AND {visibility}"
+            query = self._table.query().where(where).select(["content_hash", "vector"])
+            batches = await query.to_batches(max_batch_length=_REUSE_ROW_BATCH)
+            async for batch in batches:
+                for row in batch.to_pylist():
+                    if row["vector"] is not None:
+                        vectors[str(row["content_hash"])] = row["vector"]
+        return vectors
 
     async def active_file_paths(self) -> list[str]:
         """Distinct file paths visible at the bound generation."""
