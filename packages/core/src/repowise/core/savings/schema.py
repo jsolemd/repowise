@@ -174,10 +174,10 @@ def _has_current_schema(conn: sqlite3.Connection) -> bool:
 def _apply_schema(conn: sqlite3.Connection) -> None:
     """Reset obsolete telemetry and install the current schema.
 
-    Caller owns the transaction. There is no row translation here by design:
-    the savings tables carry no data worth migrating, because no producer has
-    ever written one outside a test. The clean-reset policy is the plan's, not
-    an oversight -- see docs/architecture/savings-accounting.md.
+    Caller owns the transaction. Obsolete event tables follow the upstream
+    reset policy; the fork's legacy savings and bounded MCP daily aggregates
+    remain intact and are not translated into per-interaction events. See
+    docs/architecture/savings-accounting.md.
     """
     for statement in _PRESERVED_TABLES:
         conn.execute(statement)

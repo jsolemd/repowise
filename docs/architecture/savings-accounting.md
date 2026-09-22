@@ -1,5 +1,13 @@
 # Savings accounting contract
 
+> **SoleMD fork:** MCP calls retain only rolling 30-day aggregates by tool and
+> day, including final delivered token counts. They do not write the upstream
+> per-interaction event ledger described below. Distillation and replacement
+> hooks can use that ledger. Existing legacy savings rows and MCP aggregates
+> are preserved during schema upgrade; legacy estimates are not converted into
+> new event totals. The dashboard reads MCP usage independently, including when
+> an older sidecar has no event tables yet, and never upgrades a store on read.
+
 How Repowise decides what it saved an agent, and what it refuses to claim.
 Binding on every capture surface, the report, and anything that renders a total.
 

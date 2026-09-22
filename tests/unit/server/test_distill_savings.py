@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
+import pytest
 from httpx import AsyncClient
 
 from repowise.core.distill.store import OmissionStore
@@ -11,8 +13,9 @@ from repowise.core.distill.store import OmissionStore
 from .conftest import create_test_repo
 
 
+@pytest.mark.parametrize("legacy_store", [False, True])
 async def test_savings_endpoint_surfaces_bounded_mcp_usage_counts(
-    client: AsyncClient, tmp_path: Path
+    client: AsyncClient, tmp_path: Path, legacy_store: bool
 ) -> None:
     repo = await create_test_repo(client, tmp_path)
     repo_dir = Path(repo["local_path"])
@@ -45,10 +48,18 @@ async def test_savings_endpoint_surfaces_bounded_mcp_usage_counts(
         delivered_tokens=50,
     )
     store.close()
+    db_path = repo_dir / ".repowise" / "omissions" / "omissions.db"
+    if legacy_store:
+        # Existing fork stores have daily MCP aggregates but no upstream ledger.
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("DROP TABLE savings_events")
+    before = db_path.read_bytes()
 
     resp = await client.get(f"/api/repos/{repo['id']}/savings")
     assert resp.status_code == 200
     data = resp.json()
+    assert data["available"] is not legacy_store
+    assert db_path.read_bytes() == before  # Reporting must not upgrade/write the sidecar.
     assert data["mcp_usage_calls"] == 3
     assert data["mcp_usage_error_calls"] == 1
     assert data["mcp_usage_no_match_calls"] == 1
