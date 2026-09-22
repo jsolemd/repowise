@@ -20,6 +20,7 @@ from pathlib import Path
 import structlog
 from sqlalchemy import event, inspect, literal
 from sqlalchemy.ext.asyncio import (
+    AsyncConnection,
     AsyncEngine,
     AsyncSession,
     async_sessionmaker,
@@ -501,6 +502,48 @@ def _reconcile_schema(connection: object) -> None:
         raise failures[0][1]
 
 
+async def _repair_local_credential_snippets(conn: AsyncConnection) -> None:
+    """Apply upstream 0075 once to local stores, which never run Alembic.
+
+    No local data-repair ledger exists: schema reconciliation only adds DDL.
+    The claim and cleanup share the caller's transaction, so failures roll
+    both back and concurrent initializers serialize at the INSERT. Keeping a
+    semantic versioned marker preserves masked snippets from later scans.
+    """
+    await conn.execute(
+        text(
+            "CREATE TABLE IF NOT EXISTS repowise_local_data_repairs ("
+            "repair_id TEXT PRIMARY KEY NOT NULL, "
+            "completed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+        )
+    )
+    # The steady state must stay read-only: initializing another reader while
+    # the watcher publishes should not acquire SQLite's single writer lock.
+    completed = await conn.execute(
+        text(
+            "SELECT 1 FROM repowise_local_data_repairs "
+            "WHERE repair_id = '0075_clear_legacy_credential_snippets_v1'"
+        )
+    )
+    if completed.scalar_one_or_none() is not None:
+        return
+    claimed = await conn.execute(
+        text(
+            "INSERT INTO repowise_local_data_repairs (repair_id) "
+            "VALUES ('0075_clear_legacy_credential_snippets_v1') "
+            "ON CONFLICT (repair_id) DO NOTHING RETURNING repair_id"
+        )
+    )
+    if claimed.scalar_one_or_none() is None:
+        return
+    await conn.execute(
+        text(
+            "UPDATE security_findings SET snippet = '' "
+            "WHERE kind IN ('hardcoded_password', 'hardcoded_secret')"
+        )
+    )
+
+
 async def init_db(engine: AsyncEngine) -> None:
     """Create all SQLAlchemy tables and the FTS index for the given engine.
 
@@ -526,3 +569,4 @@ async def init_db(engine: AsyncEngine) -> None:
             from repowise.core.persistence.search import PAGE_FTS_DDL
 
             await conn.execute(text(PAGE_FTS_DDL))
+            await _repair_local_credential_snippets(conn)
