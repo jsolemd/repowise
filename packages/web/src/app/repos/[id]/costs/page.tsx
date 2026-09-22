@@ -31,7 +31,7 @@ import type { CostSummary, Savings } from "@/lib/api/costs";
 /** Where the accounting is written down. One constant, used by the lede, the
  *  reset notice and the methodology section, so the three cannot drift. */
 const METHODOLOGY_HREF =
-  "https://github.com/repowise-dev/repowise/blob/main/docs/architecture/savings-accounting.md";
+  "https://github.com/jsolemd/repowise/blob/solemd-source-search/docs/architecture/savings-accounting.md";
 
 const DISTILL_DOCS_HREF =
   "https://github.com/repowise-dev/repowise/blob/main/docs/agent/DISTILL.md";
