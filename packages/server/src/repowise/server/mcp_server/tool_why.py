@@ -188,17 +188,16 @@ async def get_why(
     ("why is auth using JWT?"), a file path (governing decisions + origin
     story + alignment score), a question anchored to targets, or no query
     (decision health dashboard). Falls back to git archaeology when no
-    decisions exist for a path — never empty. Evidence-bearing rows carry an
-    explicit ``provenance`` and self-contained ``evidence_refs``; matching ids
-    mean shared evidence, not independent corroboration. Every decision row
+    decisions exist for a path. Evidence rows carry ``provenance`` and
+    ``evidence_refs``; matching ids name the same evidence. Every decision row
     carries ``authority``: ``accepted`` means somebody signed it, ``candidate``
     means nobody has yet. ``answer_basis`` names the strongest lane the response
     rests on (decision, episode, rationale, archaeology, documentation,
     candidate); only ``decision`` is a ruling, and ``candidate`` is the weakest
     -- it means nothing cleared that bar.
-    Natural-language search returns the single strongest decision first, plus compact decision ids and structured expansion handles.
-    Pass ``include=["supporting"]`` only when the broader documentation,
-    episode, target-context, and secondary-decision lanes are needed.
+    Search returns one primary decision and expansion handles. Use
+    ``include=["supporting"]`` for secondary decisions, documentation, episodes
+    and target context.
 
     Args:
         query: question, file/module path, or omit for the dashboard.

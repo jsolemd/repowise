@@ -929,3 +929,29 @@ def test_a_tool_with_no_graph_counts_claims_no_floor() -> None:
     result = _enforce("get_overview", _payload("get_overview", 0))
 
     assert "floor" not in result["_meta"]
+
+
+@pytest.mark.parametrize(
+    ("include", "tier", "limit"),
+    [
+        (None, "default", DEFAULT_RESPONSE_CHARS),
+        (["supporting"], "expanded", EXPANDED_RESPONSE_CHARS),
+    ],
+)
+def test_get_why_expansion_keeps_the_fork_budget_contract(
+    setup_mcp: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    include: list[str] | None,
+    tier: str,
+    limit: int,
+) -> None:
+    import repowise.server.mcp_server as mcp_mod
+
+    (tmp_path / ".repowise").mkdir()
+    monkeypatch.setattr(mcp_mod, "_repo_path", str(tmp_path))
+    result = _enforce("get_why", _payload("get_why", 8_000), include)
+    accounting = result["_meta"]["response_budget"]
+    assert accounting["tier"] == tier
+    assert accounting["limit_chars"] == limit
+    assert accounting["serialized_chars"] <= limit

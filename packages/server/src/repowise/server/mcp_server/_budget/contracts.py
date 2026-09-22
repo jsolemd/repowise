@@ -236,7 +236,7 @@ _CONTRACTS: dict[str, ResponseBudgetContract] = {
             ("id", ("decisions[]",)),
             ("reference", ("decisions[]",)),
         ),
-        expansion_argument=None,
+        expansion_argument="include",
         protected=(
             "mode",
             "query",
