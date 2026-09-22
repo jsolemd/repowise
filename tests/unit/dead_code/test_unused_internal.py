@@ -413,4 +413,3 @@ def test_unused_internal_rust_impl_uncallable():
     )
     names = {f.symbol_name for f in report.findings if f.kind == DeadCodeKind.UNUSED_INTERNAL}
     assert "MyStruct" not in names
-

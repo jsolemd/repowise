@@ -152,4 +152,3 @@ export function RemoveWorkspaceRepoButton({
     </button>
   );
 }
-

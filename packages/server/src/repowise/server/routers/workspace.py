@@ -1145,4 +1145,3 @@ async def remove_workspace_repo(
         alias=alias,
         remaining_repos=len(ws_config.repos),
     )
-

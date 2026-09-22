@@ -346,4 +346,3 @@ def test_unused_export_rust_impl_non_importable():
     )
     names = {f.symbol_name for f in report.findings if f.kind == DeadCodeKind.UNUSED_EXPORT}
     assert "MyStruct" not in names
-

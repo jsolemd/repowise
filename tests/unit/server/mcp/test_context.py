@@ -865,4 +865,3 @@ async def test_get_context_meta_envelope(setup_mcp):
     assert "timing_ms" in meta
     # hint was dead/always None and has been removed; no empty or spurious hint field
     assert "hint" not in meta
-
