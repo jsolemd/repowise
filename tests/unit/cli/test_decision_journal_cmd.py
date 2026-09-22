@@ -30,6 +30,7 @@ def test_interactive_add_writes_journal_then_list_reads_projection(
     journal_cli_repo: Path,
 ) -> None:
     answers = (
+        "architectural\n"
         "Use the journal\n"
         "\n"
         "Write canonical JSONL first\n"
@@ -171,9 +172,10 @@ def test_a_flag_driven_add_still_needs_a_why_and_an_anchor(journal_cli_repo: Pat
 
 def test_the_interactive_path_still_records_confirmed(journal_cli_repo: Path) -> None:
     answers = (
+        "architectural\n"
         "Ratified at authoring\n"
         "\n"
-        "Answer eight prompts and it is reviewed\n"
+        "Complete the prompts and it is reviewed\n"
         "a person read this one\n"
         "\n"
         "\n"
