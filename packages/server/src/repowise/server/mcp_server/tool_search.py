@@ -1416,9 +1416,8 @@ async def search_codebase(
     enabled, unfiltered auto/concept/hybrid queries retain source-owner evidence,
     including bare identifiers. Without it, auto classifies identifiers as native
     symbol lookups. Native rows need not carry source-owner confidence.
-    Verbose queries are served whole by default; query_plan appears only when
-    the optional query-focus planner is enabled. Budgeted excerpts carry
-    snippet_truncated; open the symbol, file or omission ref for the full text.
+    Verbose queries are served whole. Budgeted excerpts carry snippet_truncated;
+    open the symbol, file or omission ref for the full text.
     Read visible `trust` for stale generations and degraded retrieval.
 
     Args:

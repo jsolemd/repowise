@@ -388,7 +388,6 @@ _CONTRACTS: dict[str, ResponseBudgetContract] = {
             "selected_owner",
             "competing_owners",
             "note",
-            "query_plan",
             "status",
             "error",
             "trust",

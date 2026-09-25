@@ -601,7 +601,6 @@ def test_an_oversized_source_lane_answer_keeps_its_owner_claim() -> None:
         "note": "one owner, two near-ties",
         "selected_owner": {"file": "src/pack.py", "reason": "exact_name"},
         "competing_owners": [{"file": "src/other.py", "margin": 0.02}],
-        "query_plan": {"strategy": "automatic_focus", "retrieval_query": "pack budget"},
         "trust": {"index_behind": False, "source_search": {"status": "ok"}},
         "results": [
             {
@@ -630,7 +629,6 @@ def test_an_oversized_source_lane_answer_keeps_its_owner_claim() -> None:
         "note",
         "selected_owner",
         "competing_owners",
-        "query_plan",
         "trust",
     ):
         assert key in result, key
