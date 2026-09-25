@@ -364,6 +364,47 @@ class SourceFTSIndex:
             )
         self._invalidate_read_caches()
 
+    def retire_before(self, floor: int) -> int:
+        """Physically remove rows no reader at generation *floor* or later can see.
+
+        A row closed at or before *floor* is invisible to *floor* and every
+        later generation. Generation records below *floor* go with them. The
+        freed pages are reused by later staging; the file is rewritten only
+        when more than half of it is free, which is the one-time state of a
+        store that accumulated history before retention existed.
+        """
+
+        if not self._versioned:
+            return 0
+        with self._conn:
+            keys = [
+                str(row[0])
+                for row in self._conn.execute(
+                    f"SELECT row_key FROM {_VERSIONS} WHERE valid_to <= ?", (floor,)
+                ).fetchall()
+            ]
+            self._delete_row_keys(keys)
+            self._conn.execute(
+                f"DELETE FROM {_GENERATIONS} WHERE generation_sequence < ?", (floor,)
+            )
+        self._invalidate_read_caches()
+        pages = int(self._conn.execute("PRAGMA page_count").fetchone()[0])
+        free = int(self._conn.execute("PRAGMA freelist_count").fetchone()[0])
+        if free * 2 > pages:
+            self._conn.execute("VACUUM")
+        return len(keys)
+
+    def dead_row_count(self, floor: int) -> int:
+        """Rows closed at or before *floor*, which :meth:`retire_before` would remove."""
+
+        if not self._versioned:
+            return 0
+        return int(
+            self._conn.execute(
+                f"SELECT count(*) FROM {_VERSIONS} WHERE valid_to <= ?", (floor,)
+            ).fetchone()[0]
+        )
+
     def _delete_row_keys(self, row_keys: Sequence[str]) -> None:
         for start in range(0, len(row_keys), _IN_CHUNK):
             batch = row_keys[start : start + _IN_CHUNK]

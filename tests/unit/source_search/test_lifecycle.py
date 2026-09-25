@@ -6,6 +6,7 @@ import asyncio
 import json
 import subprocess
 from dataclasses import replace
+from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -339,7 +340,8 @@ async def test_identical_full_snapshots_publish_receipts_without_appending_rows(
     await reconcile_source_index(repo, embedder=MockEmbedder(), embedder_identity=_IDENTITY)
     old = read_manifest(default_manifest_path(repo))
     assert old is not None and "src/app.py" in old.working_tree_ingest
-    before = await _physical_counts(repo, old)
+    # The edit closed the two rows it replaced; they are history, not corpus.
+    assert await _physical_counts(repo, old) == (5, 5)
     counter = _CountingEmbedder()
 
     for offset in range(1, 4):
@@ -357,7 +359,9 @@ async def test_identical_full_snapshots_publish_receipts_without_appending_rows(
             0,
             3,
         )
-        assert await _physical_counts(repo, current) == before
+        # Identical snapshots append nothing, and retention removes the rows
+        # the edit closed once no kept generation can see them.
+        assert await _physical_counts(repo, current) == (3, 3)
         generation = GenerationRef(current.generation_id, current.generation_sequence)
         with _fts(repo, current) as fts:
             assert fts.verify_generation(
@@ -1194,10 +1198,16 @@ async def test_recipe_change_retries_with_fresh_fts_and_keeps_old_readers(lifecy
         assert updated is not None and updated.fts_path == current.fts_path
         with _fts(repo, updated) as fresh:
             assert fresh.query("newnebula") and not fresh.query("oldquasar")
+        # A handle already open on the old recipe finishes its reads. Two
+        # publications on, neither manifest names that recipe, so its FTS file
+        # and Lance table are retired and nothing can reopen them.
         assert prior.query("oldquasar") and not prior.query("newnebula")
-        with _fts(repo, old) as reopened:
-            assert reopened.query("oldquasar") and not reopened.query("newnebula")
-        assert await _physical_counts(repo, old) == (3, 3)
+        assert not (repo / old.fts_path).exists()
+        import lancedb
+
+        db = await lancedb.connect_async(str(repo / ".repowise" / "lancedb"))
+        assert old.lance_table not in await db.table_names()
+        assert updated.lance_table in await db.table_names()
 
 
 async def test_outbox_row_rolls_back_with_its_symbol_transaction(lifecycle_repo):
@@ -1329,3 +1339,109 @@ async def test_a_generation_embedded_by_another_model_is_refused(lifecycle_repo)
         assert await wiring.context_coordinator(_workspace_ctx(repo, _WikiVectors())) is not None
     finally:
         wiring.reset_for_tests()
+
+
+# -- retention ---------------------------------------------------------------
+# Publication keeps what the published and previous generations read, and
+# retention removes everything else.
+
+
+async def _tables(repo) -> set[str]:
+    import lancedb
+
+    db = await lancedb.connect_async(str(repo / ".repowise" / "lancedb"))
+    return {name for name in await db.table_names() if name.startswith("source_chunks")}
+
+
+def _fts_files(repo) -> set[str]:
+    return {path.name for path in (repo / ".repowise" / "source_search").glob("source_fts*.db")}
+
+
+async def _edit(repo, text, embedder=None, identity=_IDENTITY) -> None:
+    (repo / "src" / "app.py").write_text(text)
+    await _capture(repo, path="src/app.py")
+    result = await reconcile_source_index(
+        repo, embedder=embedder or MockEmbedder(), embedder_identity=identity
+    )
+    assert result.status == "published"
+
+
+async def test_publish_leaves_one_live_table_and_one_fts_database(lifecycle_repo):
+    repo = lifecycle_repo
+    first = read_manifest(default_manifest_path(repo))
+    assert first is not None
+
+    # Leftovers from earlier recipes and the pre-generation default path.
+    import lancedb
+
+    db = await lancedb.connect_async(str(repo / ".repowise" / "lancedb"))
+    await db.create_table("source_chunks_deadbeefdeadbeef", data=[{"x": 1}])
+    stray = repo / ".repowise" / "source_search" / "source_fts_v2.db"
+    stray.write_bytes(b"")
+    (repo / ".repowise" / "source_search" / "source_fts_v2.db-wal").write_bytes(b"")
+
+    wide = _WideEmbedder()
+    wide_identity = EmbedderIdentity(provider="mock", model="WideMock", dims=16)
+    await _edit(repo, _APP_V2, wide, wide_identity)
+    rebuilt = read_manifest(default_manifest_path(repo))
+    assert rebuilt is not None and rebuilt.lance_table != first.lance_table
+
+    # A recipe change keeps the previous generation for readers mid-request.
+    assert await _tables(repo) == {first.lance_table, rebuilt.lance_table}
+    assert _fts_files(repo) == {
+        (repo / first.fts_path).name,
+        (repo / rebuilt.fts_path).name,
+    }
+
+    await _edit(repo, _APP_V3, wide, wide_identity)
+    current = read_manifest(default_manifest_path(repo))
+    assert current is not None and current.lance_table == rebuilt.lance_table
+
+    assert await _tables(repo) == {current.lance_table}
+    assert _fts_files(repo) == {(repo / current.fts_path).name}
+    with _fts(repo, current) as fts:
+        assert fts.query("finalpulsar")
+
+
+async def test_closed_rows_are_retired_once_no_kept_generation_sees_them(lifecycle_repo):
+    repo = lifecycle_repo
+    await _edit(repo, _APP_V2)
+    edited = read_manifest(default_manifest_path(repo))
+    assert edited is not None
+    # The previous generation still reads the two rows this edit closed.
+    assert await _physical_counts(repo, edited) == (5, 5)
+
+    await _edit(repo, _APP_V3)
+    current = read_manifest(default_manifest_path(repo))
+    assert current is not None
+    visible = current.symbol_chunks + current.file_window_chunks
+    # Rows closed by the first edit are gone; rows closed by the second stay
+    # for readers of the generation just replaced.
+    assert await _physical_counts(repo, current) == (visible + 2, visible + 2)
+    with _fts(repo, edited) as previous:
+        assert previous.query("newnebula")
+
+
+async def test_version_cleanup_keeps_versions_inside_the_window(lifecycle_repo):
+    repo = lifecycle_repo
+    await _edit(repo, _APP_V2)
+    await _edit(repo, _APP_V3)
+    current = read_manifest(default_manifest_path(repo))
+    assert current is not None
+
+    store = _vector(repo, current)
+    try:
+        await store._ensure_connected()
+        before = len(await store._table.list_versions())
+        assert before > 1
+        await store.retire_before(
+            current.generation_sequence - 1, keep_versions_since=timedelta(hours=1)
+        )
+        # Everything is younger than an hour: compaction adds versions and
+        # cleanup removes none.
+        assert len(await store._table.list_versions()) >= before
+        await store.retire_before(current.generation_sequence - 1, keep_versions_since=timedelta(0))
+        assert len(await store._table.list_versions()) == 1
+        assert await store.count() == current.symbol_chunks + current.file_window_chunks
+    finally:
+        await store.close()

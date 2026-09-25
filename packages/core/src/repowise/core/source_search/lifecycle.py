@@ -56,6 +56,7 @@ from .outbox import (
     mark_update_state,
     mark_updates_ready,
 )
+from .retention import retire_unreachable
 from .vector_store import SourceChunkRecord, SourceChunkVectorStore
 from .worktree import build_ingest_record
 
@@ -562,7 +563,8 @@ async def reconcile_source_index(
             error="another source-index reconciler is already running",
         )
     try:
-        return await _reconcile_source_index_unlocked(
+        previous = read_manifest(default_manifest_path(repo))
+        result = await _reconcile_source_index_unlocked(
             repo,
             embedder=embedder,
             embedder_identity=embedder_identity,
@@ -571,6 +573,15 @@ async def reconcile_source_index(
             batch_size=batch_size,
             failure_injector=failure_injector,
         )
+        published = read_manifest(default_manifest_path(repo))
+        if result.status == "published" and published is not None:
+            try:
+                await retire_unreachable(repo, published=published, previous=previous)
+            except Exception:
+                # The generation is already live. Unretired storage costs only
+                # disk, and the next publication retries against the same rule.
+                log.warning("source_index_retention_deferred", exc_info=True)
+        return result
     finally:
         lock.release()
 

@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, fields
+from datetime import timedelta
 from typing import Any
 
 from repowise.core.providers.embedding.base import Embedder
@@ -451,6 +452,49 @@ class SourceChunkVectorStore:
             return
         for start in range(0, len(file_paths), _IN_CHUNK):
             await self._table.delete(_quoted_in("file_path", file_paths[start : start + _IN_CHUNK]))
+
+    async def retire_before(
+        self,
+        floor: int,
+        *,
+        keep_versions_since: timedelta,
+    ) -> int:
+        """Physically remove rows no reader at generation *floor* or later can see.
+
+        Deleting in Lance only writes deletion vectors; the space returns when
+        compaction rewrites the fragments and version cleanup drops the files
+        the old versions referenced. Readers pin the table version they opened,
+        so versions committed within *keep_versions_since* survive, and the
+        caller sizes that window to cover every reader of the generations it
+        keeps. The window is required: LanceDB reads a missing one as seven days.
+
+        Returns the number of chunk rows removed.
+        """
+
+        await self._ensure_connected()
+        removed = 0
+        if self._table is not None and self._versioned:
+            removed = int(await self._table.count_rows(f"valid_to <= {floor}"))
+            if removed:
+                await self._table.delete(f"valid_to <= {floor}")
+            await self._table.optimize(cleanup_older_than=keep_versions_since)
+        if self._generation_table is not None:
+            await self._generation_table.delete(f"generation_sequence < {floor}")
+            await self._generation_table.optimize(cleanup_older_than=keep_versions_since)
+        return removed
+
+    async def retention_pressure(self, floor: int) -> tuple[int, int, int]:
+        """(rows closed at or before *floor*, rows visible now, table versions)."""
+
+        await self._ensure_connected()
+        if self._table is None or not self._versioned:
+            return 0, 0, 0
+        dead = int(await self._table.count_rows(f"valid_to <= {floor}"))
+        visible = await self.count()
+        versions = len(await self._table.list_versions())
+        if self._generation_table is not None:
+            versions = max(versions, len(await self._generation_table.list_versions()))
+        return dead, visible, versions
 
     # -- reading and verification ---------------------------------------
 
