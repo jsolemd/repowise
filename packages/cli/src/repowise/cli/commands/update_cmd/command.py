@@ -875,10 +875,17 @@ def run_update(
     # and a default only applies to a missing key. Reading it with a default
     # handed back that null and the update aborted with "No previous sync
     # found" against a store holding a perfectly good ``last_sync_commit``.
+    deterministic_docs = resolved_index_only and resolve_docs_mode(state) == "deterministic"
+    from .working_tree import documentation_base_ref
+
     base_ref = since or (
-        state.get("last_sync_commit")
-        if resolved_index_only
-        else state.get("last_docs_commit") or state.get("last_sync_commit")
+        documentation_base_ref(state)
+        if deterministic_docs
+        else (
+            state.get("last_sync_commit")
+            if resolved_index_only
+            else state.get("last_docs_commit") or state.get("last_sync_commit")
+        )
     )
     head = get_head_commit(repo_path)
 
@@ -1031,8 +1038,18 @@ def run_update(
     from repowise.core.ingestion import ChangeDetector
 
     detector = ChangeDetector(repo_path)
+    docs_working_tree_before = None
     working_tree_diffs: list = []
     if include_working_tree:
+        from repowise.core.working_tree_state import capture_working_tree
+
+        from .working_tree import (
+            filter_documentation_diffs,
+            previous_documentation_paths,
+        )
+
+        if deterministic_docs:
+            docs_working_tree_before = capture_working_tree(repo_path)
         working_tree_diffs = detector.get_working_tree_changes()
         dirty_paths = {fd.path for fd in working_tree_diffs}
         # Work the last working-tree run indexed that is no longer diverging
@@ -1040,8 +1057,14 @@ def run_update(
         # untracked. Nothing else would ever mention those paths again, so
         # without this the index keeps serving content that is gone.
         working_tree_diffs += detector.stale_working_tree_diffs(
-            state.get("working_tree_paths") or [], dirty_paths
+            set(state.get("working_tree_paths") or [])
+            | (previous_documentation_paths(state) if deterministic_docs else set()),
+            dirty_paths,
         )
+        if deterministic_docs and since is None:
+            working_tree_diffs = filter_documentation_diffs(
+                working_tree_diffs, state, docs_working_tree_before
+            )
         # Carried on ``state`` from here so every save_state below persists it,
         # including the early-return paths.
         state["working_tree_paths"] = sorted(dirty_paths)
@@ -1424,8 +1447,12 @@ def run_update(
             # and clearing on it would drop a repair that never happened.
             if since is None and resolved_index_only:
                 persisted.pop("pending_repair", None)
-            if not resolved_index_only and head:
+            if (not resolved_index_only or deterministic_docs) and head:
                 persisted["last_docs_commit"] = head
+            if deterministic_docs and include_working_tree and not source_degraded:
+                from .working_tree import checkpoint_documentation
+
+                checkpoint_documentation(repo_path, persisted, docs_working_tree_before)
             timings.stop("run")
             persisted["phase_timings"] = timings.totals
             save_state(repo_path, persisted)
@@ -1944,6 +1971,16 @@ def run_update(
             if emitter is not None:
                 emitter.error(str(exc))
             raise
+        if deterministic_docs and include_working_tree and not degraded:
+            from .working_tree import checkpoint_documentation
+
+            # The watcher advances source/graph state independently. Only a
+            # successful documentation pass may acknowledge this content.
+            # Stale pages are durable retry work; their presence does not mean
+            # this same revision should invalidate already-refreshed pages again.
+            persisted = load_state(repo_path)
+            if checkpoint_documentation(repo_path, persisted, docs_working_tree_before):
+                save_state(repo_path, persisted)
         _refresh_editor_stamp(repo_path, agents_md, degraded)
         # Index-only is the post-commit hook's hot path; clear any stale pending
         # marker here too, not just on the full-docs path.

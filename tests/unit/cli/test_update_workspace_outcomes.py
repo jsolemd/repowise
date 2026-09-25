@@ -34,6 +34,7 @@ def invoke_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         error_message: str = "primary persist failed",
         include_working_tree: bool = False,
         checkpoint: dict | None = None,
+        docs_checkpoint: dict | None = None,
     ):
         attempted: list[str] = []
         succeeded: list[str] = []
@@ -52,6 +53,8 @@ def invoke_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
                 state["config_fingerprint"] = config_fingerprint(state_dir.parent)
             if checkpoint is not None:
                 state["working_tree_checkpoint"] = checkpoint
+            if docs_checkpoint is not None:
+                state["docs_working_tree_checkpoint"] = docs_checkpoint
             (state_dir / "state.json").write_text(json.dumps(state))
         WorkspaceConfig(
             repos=[RepoEntry(alias=alias, path=alias) for alias in members],
@@ -138,7 +141,10 @@ def invoke_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     return invoke
 
 
-def test_completed_dirty_snapshot_skips_workspace_docs(invoke_workspace, monkeypatch, tmp_path):
+@pytest.mark.parametrize("docs_complete", [False, True])
+def test_only_documented_dirty_snapshot_skips_workspace_docs(
+    invoke_workspace, monkeypatch, docs_complete
+):
     from repowise.core import working_tree_state
 
     checkpoint = {"head": "old", "files": {"app.py": ["saved-hash", 1, 2, 3]}}
@@ -148,10 +154,11 @@ def test_completed_dirty_snapshot_skips_workspace_docs(invoke_workspace, monkeyp
         current=True,
         include_working_tree=True,
         checkpoint=checkpoint,
+        docs_checkpoint=checkpoint if docs_complete else None,
     )
     assert result.exit_code == 0, result.output
-    assert attempted == []
-    assert hooks == []
+    assert attempted == ([] if docs_complete else ["app"])
+    assert hooks == []  # A single-member workspace has no cross-repo hooks.
 
 
 @pytest.mark.parametrize("outcome", ["updated", "deferred", "failed"])

@@ -6,11 +6,11 @@ surface is deliberately small and these five are one workflow: propose a
 decision, read what is already proposed, confirm it, retire it when something
 replaces it.
 
-The verb that writes cannot confirm. ``record`` lands a proposal an agent
-inferred; ``confirm`` is the separate act of a person saying it is a rule. That
-split is the whole reason this tool is safe to expose, so it is enforced in the
-service layer rather than in this tool's arguments — there is no parameter here
-that promotes a record on the way in.
+Recording cannot implicitly confirm. ``record`` lands a proposal;
+``confirm`` is a separate, authorized review act. The caller must establish
+authority from the user's explicit instruction or applicable standing delegation,
+not from the existence of a record or its implementation. The service preserves
+that lifecycle split — there is no parameter that confirms a record on creation.
 """
 
 from __future__ import annotations
@@ -115,14 +115,18 @@ async def manage_decision(
 ) -> dict[str, Any]:
     """Record, review, confirm, and retire this repository's architectural decisions.
 
-    Backed by a git-tracked JSONL journal, so every write lands as a diff a
-    person reviews and commits.
+    Backed by a git-tracked JSONL journal, so every write lands as a reviewable
+    diff; recording does not commit it.
 
     ``record`` always lands ``proposed`` — call it for a non-obvious choice the
     next reader would otherwise re-derive, not to restate what the code says.
-    ``confirm`` promotes it to a rule and is a person's call; only do it when
-    asked. ``supersede`` retires a decision for another already recorded, and
-    both stay readable. Writes refuse visibly when the journal is off.
+    ``confirm`` promotes it to a rule only after review under explicit user
+    instruction or applicable standing delegation. An authorized implementation
+    is not itself confirmation; review-only tasks authorize no writes. Preserve
+    the actual actor and the source and scope of authority in ``why`` when
+    recording: ``actor`` is logged but is not stored in the journal row.
+    ``supersede`` retires a decision for another already recorded, and both stay
+    readable. Writes refuse visibly when the journal is off.
 
     Args:
         action: record, list, get, confirm, or supersede.
@@ -414,9 +418,11 @@ async def _dispatch(
             "recorded": True,
             "journal_created": not existed_before,
             "next": (
-                "Landed as 'proposed'. A person confirms it — either "
-                f"`manage_decision(action='confirm', decision_id='{record.id}')` when "
-                "asked to, or by committing the journal diff."
+                "Landed as 'proposed'. Committing preserves the record but does not "
+                "confirm it. After verification, use "
+                f"`manage_decision(action='confirm', decision_id='{record.id}', "
+                "actor='<actual actor>')` only with explicit user instruction or "
+                "applicable standing delegation; otherwise leave it proposed."
             ),
         }
 

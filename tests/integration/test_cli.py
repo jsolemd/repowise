@@ -896,6 +896,11 @@ class TestUpdateWorkingTree:
         self._dirty(git_work_repo)
         self._wt_update(git_work_repo, release_lock=False)
 
+        # An unchanged snapshot now correctly no-ops before taking the lock.
+        # A new save still requires work and must defer while it is held.
+        (git_work_repo / "new_module.py").write_text(
+            "def uncommitted_addition():\n    return 2\n", encoding="utf-8"
+        )
         assert self._wt_update(git_work_repo) is UpdateOutcome.DEFERRED
 
     def test_commit_anchored_update_is_unchanged(self, runner, git_work_repo):

@@ -212,6 +212,12 @@ def _workspace_update(
             if include_working_tree and indexed
             else None
         )
+        if include_working_tree and indexed and resolve_docs_mode(repo_state) == "deterministic":
+            from .working_tree import documentation_update_reason
+
+            working_tree_reason = working_tree_reason or documentation_update_reason(
+                abs_path, repo_state
+            )
         from repowise.core.pipeline.prune_state import state_prune_refusals
 
         has_accepted_prune = bool(

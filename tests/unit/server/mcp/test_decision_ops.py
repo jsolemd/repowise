@@ -162,6 +162,31 @@ async def _record(title="Route reads through the projection", anchors=("src/serv
 # ---------------------------------------------------------------------------
 
 
+def test_tool_guidance_preserves_explicit_authority_and_review_boundaries():
+    from repowise.server.mcp_server.tool_decisions import manage_decision
+
+    guidance = " ".join((manage_decision.__doc__ or "").split())
+    assert "always lands ``proposed``" in guidance
+    assert "explicit user instruction or applicable standing delegation" in guidance
+    assert "review-only tasks authorize no writes" in guidance
+    assert "actual actor" in guidance
+    assert "not stored in the journal row" in guidance
+
+
+@pytest.mark.asyncio
+async def test_record_next_step_requires_explicit_authorized_confirmation(journal_repo):
+    result = await _record()
+
+    guidance = result["next"]
+    assert "Committing preserves the record but does not confirm it" in guidance
+    assert "action='confirm'" in guidance
+    assert result["decision"]["id"] in guidance
+    assert "actor='<actual actor>'" in guidance
+    assert "explicit user instruction or applicable standing delegation" in guidance
+    assert result["decision"]["confirmed"] is False
+    assert _read_journal(journal_repo[0])[0]["confirmed_at"] is None
+
+
 @pytest.mark.asyncio
 async def test_record_lands_proposed(journal_repo):
     result = await _record()
