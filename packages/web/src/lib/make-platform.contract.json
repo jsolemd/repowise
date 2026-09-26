@@ -1,0 +1,692 @@
+{
+ "_note": "Responses captured from make-api (SoleMD.Make integ/w8-make, schema 048) on 2026-09-26 against a copy of the production catalog; text redacted, shapes kept.",
+ "reports": {
+  "/v1/report/summary": {
+   "schema_version": 1,
+   "catalog_revision": 62203,
+   "as_of": "2026-09-25T23:06:56.875641-07:00",
+   "media": {
+    "selected": 603,
+    "pending": 4,
+    "accepted": 496,
+    "rejected": 103,
+    "revised": 0,
+    "legacy_approvals": 136,
+    "stale": 7,
+    "ambiguous_dispatches": 0,
+    "interrupted_dispatches": 1
+   },
+   "evidence": {
+    "works": 34931,
+    "citation_edges": 9245,
+    "research_runs": 22,
+    "search_executions": 234,
+    "claims": 319,
+    "screening_conflicts": 0
+   },
+   "meetings": {
+    "recordings": 29,
+    "summarized": 26,
+    "awaiting_summary": 3
+   },
+   "operations": {
+    "failed": 3,
+    "running": 2,
+    "cancelled": 70,
+    "completed": 726
+   },
+   "spend_24h_micros": 888084,
+   "objects": {
+    "count": 8545,
+    "bytes": 25329733882,
+    "unavailable": 3534
+   },
+   "backup_health": [
+    {
+     "stream": "database",
+     "healthy": true,
+     "state": "ok",
+     "last_success_at": "2026-09-26T05:34:00Z",
+     "bytes_total": 17057767
+    }
+   ]
+  },
+  "/v1/report/operations": {
+   "schema_version": 1,
+   "catalog_revision": 62203,
+   "items": [
+    {
+     "id": "redacted",
+     "kind": "build.adopt",
+     "status": "completed",
+     "created_at": "2026-09-25T22:14:29.000688-07:00",
+     "updated_at": "2026-09-25T22:14:45.037739-07:00",
+     "attempt_no": 1,
+     "provider": null,
+     "error_code": null,
+     "error_type": null
+    },
+    {
+     "id": "redacted",
+     "kind": "build.slides",
+     "status": "completed",
+     "created_at": "2026-09-25T19:14:20.231770-07:00",
+     "updated_at": "2026-09-25T19:14:26.505378-07:00",
+     "attempt_no": 1,
+     "provider": null,
+     "error_code": null,
+     "error_type": null
+    },
+    {
+     "id": "redacted",
+     "kind": "build.slides",
+     "status": "completed",
+     "created_at": "2026-09-25T19:13:42.300734-07:00",
+     "updated_at": "2026-09-25T19:13:47.459831-07:00",
+     "attempt_no": 1,
+     "provider": null,
+     "error_code": null,
+     "error_type": null
+    }
+   ],
+   "next_cursor": "redacted"
+  },
+  "/v1/report/spend": {
+   "schema_version": 1,
+   "catalog_revision": 62203,
+   "days": 7,
+   "time_zone": "America/Los_Angeles",
+   "total_micros": 8507637,
+   "daily": [
+    {
+     "day": "2026-09-19",
+     "micros": 0,
+     "attempts": 0
+    },
+    {
+     "day": "2026-09-20",
+     "micros": 3960500,
+     "attempts": 47
+    },
+    {
+     "day": "2026-09-21",
+     "micros": 0,
+     "attempts": 0
+    }
+   ],
+   "by_kind": [
+    {
+     "kind": "media.legacy-authoring",
+     "micros": 3960500,
+     "attempts": 47
+    },
+    {
+     "kind": "media.generate",
+     "micros": 3106331,
+     "attempts": 23
+    },
+    {
+     "kind": "media.edit",
+     "micros": 1099604,
+     "attempts": 7
+    }
+   ],
+   "by_provider": [
+    {
+     "provider": "openai",
+     "micros": 6107637,
+     "attempts": 65
+    },
+    {
+     "provider": "gemini",
+     "micros": 2400000,
+     "attempts": 10
+    },
+    {
+     "provider": "local",
+     "micros": 0,
+     "attempts": 5
+    }
+   ]
+  },
+  "/v1/report/operations/mix": {
+   "schema_version": 1,
+   "catalog_revision": 62203,
+   "days": 30,
+   "by_kind": [
+    {
+     "kind": "media.legacy-authoring",
+     "total": 382,
+     "statuses": {
+      "cancelled": 59,
+      "completed": 321,
+      "failed": 2
+     }
+    },
+    {
+     "kind": "media.generate",
+     "total": 56,
+     "statuses": {
+      "cancelled": 1,
+      "completed": 54,
+      "running": 1
+     }
+    },
+    {
+     "kind": "media.video",
+     "total": 55,
+     "statuses": {
+      "cancelled": 4,
+      "completed": 51
+     }
+    }
+   ],
+   "failures": [],
+   "durations": [
+    {
+     "kind": "brand.export-prune",
+     "count": 1,
+     "median_seconds": 0.017,
+     "p90_seconds": 0.017,
+     "max_seconds": 0.017
+    },
+    {
+     "kind": "build.adopt",
+     "count": 1,
+     "median_seconds": 16.028,
+     "p90_seconds": 16.028,
+     "max_seconds": 16.028
+    },
+    {
+     "kind": "build.html",
+     "count": 1,
+     "median_seconds": 4.113,
+     "p90_seconds": 4.113,
+     "max_seconds": 4.113
+    }
+   ]
+  },
+  "/v1/report/builds": {
+   "schema_version": 1,
+   "catalog_revision": 62203,
+   "items": [
+    {
+     "document_id": "redacted",
+     "locator": "redacted",
+     "project": "redacted",
+     "project_status": "redacted",
+     "topic": "redacted",
+     "topic_title": "redacted",
+     "engine": "slides",
+     "status": "completed",
+     "built_at": "2026-09-25T19:14:20.231770-07:00",
+     "finished_at": "2026-09-25T19:14:26.503985-07:00",
+     "error_code": null,
+     "builds": 2,
+     "outputs": [
+      {
+       "name": "redacted",
+       "bytes": 26343251
+      }
+     ]
+    },
+    {
+     "document_id": "redacted",
+     "locator": "redacted",
+     "project": "redacted",
+     "project_status": "redacted",
+     "topic": "redacted",
+     "topic_title": "redacted",
+     "engine": "slides",
+     "status": "completed",
+     "built_at": "2026-09-25T19:13:42.300734-07:00",
+     "finished_at": "2026-09-25T19:13:47.457550-07:00",
+     "error_code": null,
+     "builds": 1,
+     "outputs": [
+      {
+       "name": "redacted",
+       "bytes": 22443847
+      }
+     ]
+    },
+    {
+     "document_id": "redacted",
+     "locator": "redacted",
+     "project": "redacted",
+     "project_status": "redacted",
+     "topic": "redacted",
+     "topic_title": "redacted",
+     "engine": "slides",
+     "status": "completed",
+     "built_at": "2026-09-25T19:13:34.391824-07:00",
+     "finished_at": "2026-09-25T19:13:40.420689-07:00",
+     "error_code": null,
+     "builds": 1,
+     "outputs": [
+      {
+       "name": "redacted",
+       "bytes": 23103229
+      }
+     ]
+    }
+   ],
+   "next_cursor": "redacted",
+   "topics": [
+    {
+     "topic": "redacted",
+     "title": "redacted",
+     "documents": 6,
+     "failed": 0,
+     "latest_built_at": "2026-09-25T19:14:20.231770-07:00"
+    },
+    {
+     "topic": "redacted",
+     "title": "redacted",
+     "documents": 2,
+     "failed": 0,
+     "latest_built_at": "2026-09-25T19:13:34.391824-07:00"
+    },
+    {
+     "topic": "redacted",
+     "title": "redacted",
+     "documents": 2,
+     "failed": 0,
+     "latest_built_at": "2026-09-25T19:12:45.712613-07:00"
+    }
+   ]
+  },
+  "/v1/report/evidence": {
+   "schema_version": 1,
+   "catalog_revision": 62203,
+   "runs": {
+    "total": 22,
+    "recent": [
+     {
+      "run_slug": "redacted",
+      "question": "redacted",
+      "created_at": "2026-09-24T19:01:52.703354-07:00",
+      "updated_at": "2026-09-24T19:03:52.717497-07:00",
+      "searches": 8,
+      "references": 75,
+      "abstracts_screened": 22,
+      "abstracts_included": 7,
+      "abstracts_uncertain": 5,
+      "fulltexts_screened": 0,
+      "fulltexts_included": 0,
+      "fulltexts_uncertain": 0,
+      "stage": "screening"
+     },
+     {
+      "run_slug": "redacted",
+      "question": "redacted",
+      "created_at": "2026-09-23T11:04:02.328207-07:00",
+      "updated_at": "2026-09-23T11:04:02.328207-07:00",
+      "searches": 8,
+      "references": 0,
+      "abstracts_screened": 9,
+      "abstracts_included": 9,
+      "abstracts_uncertain": 0,
+      "fulltexts_screened": 0,
+      "fulltexts_included": 0,
+      "fulltexts_uncertain": 0,
+      "stage": "screening"
+     },
+     {
+      "run_slug": "redacted",
+      "question": "redacted",
+      "created_at": "2026-09-23T11:04:02.328207-07:00",
+      "updated_at": "2026-09-23T11:04:02.328207-07:00",
+      "searches": 19,
+      "references": 0,
+      "abstracts_screened": 13,
+      "abstracts_included": 3,
+      "abstracts_uncertain": 0,
+      "fulltexts_screened": 0,
+      "fulltexts_included": 0,
+      "fulltexts_uncertain": 0,
+      "stage": "screening"
+     }
+    ]
+   },
+   "claims": {
+    "total": 319,
+    "by_status": {
+     "proposed": 131,
+     "ratified": 188
+    },
+    "quotes": 887,
+    "quotes_reviewed": 662,
+    "quotes_independent": 0,
+    "review_queue": {
+     "claims": 284,
+     "oldest": [
+      {
+       "slug": "redacted",
+       "status": "ratified",
+       "quotes": 6,
+       "quotes_independent": 0,
+       "committed_at": "2026-09-23T11:04:02.328207-07:00"
+      },
+      {
+       "slug": "redacted",
+       "status": "ratified",
+       "quotes": 3,
+       "quotes_independent": 0,
+       "committed_at": "2026-09-23T11:04:02.328207-07:00"
+      },
+      {
+       "slug": "redacted",
+       "status": "ratified",
+       "quotes": 1,
+       "quotes_independent": 0,
+       "committed_at": "2026-09-23T11:04:02.328207-07:00"
+      }
+     ]
+    }
+   },
+   "quotas": [
+    {
+     "provider": "openalex",
+     "day": "2026-09-19",
+     "daily_limit": 10000,
+     "spent": 5,
+     "reserved": 0
+    }
+   ]
+  },
+  "/v1/report/media": {
+   "schema_version": 1,
+   "catalog_revision": 62203,
+   "cards": {
+    "reject": 27,
+    "accept": 484,
+    "pending": 4
+   },
+   "queue": {
+    "pending": 4,
+    "under_a_day": 4,
+    "under_a_week": 0,
+    "older": 0,
+    "oldest_seconds": 84594.784996
+   },
+   "owners": [
+    {
+     "owner": "lab:cv",
+     "owner_kind": "lab",
+     "owner_title": "redacted",
+     "project": null,
+     "cards": 4,
+     "pending": 2,
+     "rejected": 0,
+     "blocked": 2,
+     "oldest_pending_at": "2026-09-24T23:37:02.302251-07:00"
+    },
+    {
+     "owner": "page:home",
+     "owner_kind": "page",
+     "owner_title": "redacted",
+     "project": null,
+     "cards": 60,
+     "pending": 1,
+     "rejected": 3,
+     "blocked": 0,
+     "oldest_pending_at": "2026-09-24T23:41:46.824260-07:00"
+    },
+    {
+     "owner": "lab:delirium",
+     "owner_kind": "lab",
+     "owner_title": "redacted",
+     "project": null,
+     "cards": 21,
+     "pending": 1,
+     "rejected": 4,
+     "blocked": 1,
+     "oldest_pending_at": "2026-09-24T23:37:02.302251-07:00"
+    }
+   ],
+   "retention": {
+    "grace_days": 14,
+    "expiring": {
+     "files": 96,
+     "bytes": 472415374,
+     "by_day": [
+      {
+       "day": "2026-10-07",
+       "files": 70,
+       "bytes": 350130033
+      },
+      {
+       "day": "2026-10-08",
+       "files": 8,
+       "bytes": 18544352
+      },
+      {
+       "day": "2026-10-09",
+       "files": 18,
+       "bytes": 103740989
+      }
+     ]
+    },
+    "reclaimed": {
+     "days": 30,
+     "files": 700,
+     "bytes": 3529111931,
+     "by_day": [
+      {
+       "day": "2026-09-24",
+       "files": 282,
+       "bytes": 1394216444
+      },
+      {
+       "day": "2026-09-25",
+       "files": 418,
+       "bytes": 2134895487
+      }
+     ]
+    }
+   }
+  },
+  "/v1/report/meetings": {
+   "schema_version": 1,
+   "catalog_revision": 62203,
+   "recordings": {
+    "total": 29,
+    "summarized": 26,
+    "awaiting_summary": 3,
+    "in_pipeline": 0,
+    "released": 0
+   },
+   "last_admitted_at": "2026-09-25T15:00:25.974787-07:00",
+   "stages": [
+    {
+     "stage": "validate",
+     "statuses": {
+      "completed": 29
+     }
+    },
+    {
+     "stage": "normalize",
+     "statuses": {
+      "completed": 29
+     }
+    },
+    {
+     "stage": "transcribe",
+     "statuses": {
+      "completed": 29
+     }
+    }
+   ],
+   "stuck": [],
+   "stuck_after_seconds": 7200,
+   "poll": {
+    "unit": "solemd-meeting-poll.service",
+    "active_state": "inactive",
+    "result": "success",
+    "failed": false,
+    "last_started_at": "2026-09-26T06:05:20.565006Z",
+    "last_finished_at": "2026-09-26T06:05:30.052373Z"
+   }
+  },
+  "/v1/report/storage": {
+   "schema_version": 1,
+   "catalog_revision": 62203,
+   "tiers": [
+    {
+     "tier": "drive",
+     "files": 4055,
+     "bytes": 10804280197
+    },
+    {
+     "tier": "meeting-spool",
+     "files": 145,
+     "bytes": 1256970443
+    },
+    {
+     "tier": "vault",
+     "files": 393,
+     "bytes": 11854199
+    }
+   ],
+   "classes": [
+    {
+     "tier": "drive",
+     "file_class": "unowned",
+     "files": 1622,
+     "bytes": 5062782824,
+     "kept": 85,
+     "kept_bytes": 227036623,
+     "expiring": 1499,
+     "expiring_bytes": 4791850376,
+     "gone": 3093,
+     "owner": "file_locations"
+    },
+    {
+     "tier": "drive",
+     "file_class": "media-render",
+     "files": 537,
+     "bytes": 3076521299,
+     "kept": 0,
+     "kept_bytes": 0,
+     "expiring": 84,
+     "expiring_bytes": 460264367,
+     "gone": 336,
+     "owner": "artifact_revisions"
+    },
+    {
+     "tier": "drive",
+     "file_class": "document-output",
+     "files": 210,
+     "bytes": 1343663550,
+     "kept": 0,
+     "kept_bytes": 0,
+     "expiring": 1,
+     "expiring_bytes": 3161801,
+     "gone": 22,
+     "owner": "artifact_revisions"
+    }
+   ],
+   "ledger": {
+    "document-output": "redacted",
+    "media-render": "redacted",
+    "evidence-cache": "redacted",
+    "graph-publish": "redacted",
+    "website-export": "redacted",
+    "media-receipt": "redacted",
+    "media-check": "redacted",
+    "operation-receipt": "redacted",
+    "operation-file": "redacted",
+    "fulltext": "redacted",
+    "extracted-text": "redacted",
+    "claim-source": "redacted",
+    "search-export": "redacted",
+    "pubtator-annotation": "redacted",
+    "meeting-context": "redacted",
+    "meeting-spool": "redacted",
+    "unowned": "redacted"
+   },
+   "retention": {
+    "grace_days": 14,
+    "expiring": {
+     "files": 1888,
+     "bytes": 6198650848,
+     "by_day": [
+      {
+       "day": "2026-10-07",
+       "files": 1283,
+       "bytes": 5407547037
+      },
+      {
+       "day": "2026-10-08",
+       "files": 8,
+       "bytes": 18544352
+      },
+      {
+       "day": "2026-10-09",
+       "files": 597,
+       "bytes": 772559459
+      }
+     ]
+    },
+    "reclaimed": {
+     "days": 30,
+     "files": 4602,
+     "bytes": 16133578478,
+     "by_day": [
+      {
+       "day": "2026-09-24",
+       "files": 403,
+       "bytes": 1448858704
+      },
+      {
+       "day": "2026-09-25",
+       "files": 4199,
+       "bytes": 14684719774
+      }
+     ]
+    }
+   },
+   "last_retention": {
+    "status": "completed",
+    "started_at": "2026-09-25T18:28:16.494565-07:00",
+    "finished_at": "2026-09-25T18:31:15.055116-07:00",
+    "deleted": 4169,
+    "deleted_bytes": 14497102583
+   },
+   "unregistered": null
+  },
+  "/v1/report/doctor": {
+   "schema_version": 1,
+   "catalog_revision": 62203,
+   "findings": [
+    {
+     "area": "catalog",
+     "check": "Make catalog",
+     "severity": "ok",
+     "detail": "redacted",
+     "action": null
+    },
+    {
+     "area": "meetings",
+     "check": "Meeting snapshot",
+     "severity": "fail",
+     "detail": "redacted",
+     "action": "redacted"
+    },
+    {
+     "area": "media",
+     "check": "Paid generations",
+     "severity": "fail",
+     "detail": "redacted",
+     "action": "redacted"
+    }
+   ],
+   "counts": {
+    "ok": 7,
+    "warn": 5,
+    "fail": 2
+   }
+  }
+ }
+}
