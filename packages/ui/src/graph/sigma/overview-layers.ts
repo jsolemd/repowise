@@ -360,4 +360,3 @@ export function attachOverviewLayers(
     }
   };
 }
-

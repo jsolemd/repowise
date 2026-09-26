@@ -318,7 +318,7 @@ def test_fork_migration_has_one_head_and_postgresql_additive_ddl():
     root = Path(__file__).resolve().parents[3] / "packages/core"
     config = Config()
     config.set_main_option("script_location", str(root / "alembic"))
-    assert ScriptDirectory.from_config(config).get_heads() == ["0076"]
+    assert ScriptDirectory.from_config(config).get_heads() == ["0077"]
     path = root / "alembic/versions/solemd_0001_symbol_parser.py"
     spec = importlib.util.spec_from_file_location("symbol_parser_migration", path)
     migration = importlib.util.module_from_spec(spec)

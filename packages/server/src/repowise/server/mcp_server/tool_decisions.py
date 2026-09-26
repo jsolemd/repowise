@@ -115,18 +115,14 @@ async def manage_decision(
 ) -> dict[str, Any]:
     """Record, review, confirm, and retire this repository's architectural decisions.
 
-    Backed by a git-tracked JSONL journal, so every write lands as a reviewable
-    diff; recording does not commit it.
-
-    ``record`` always lands ``proposed`` — call it for a non-obvious choice the
-    next reader would otherwise re-derive, not to restate what the code says.
-    ``confirm`` promotes it to a rule only after review under explicit user
-    instruction or applicable standing delegation. An authorized implementation
-    is not itself confirmation; review-only tasks authorize no writes. Preserve
-    the actual actor and the source and scope of authority in ``why`` when
-    recording: ``actor`` is logged but is not stored in the journal row.
-    ``supersede`` retires a decision for another already recorded, and both stay
-    readable. Writes refuse visibly when the journal is off.
+    Git-tracked JSONL writes create reviewable diffs; recording does not commit.
+    ``record`` creates ``proposed`` for durable, non-obvious rationale.
+    ``confirm`` grants authority after review under explicit user instruction
+    or applicable standing delegation. Implementation authorization alone is not
+    confirmation; review-only tasks permit no writes. In ``why``, preserve the
+    actual actor and authority source/scope; ``actor`` is logged, not stored.
+    ``supersede`` replaces a decision with an existing successor; both remain
+    readable. Writes fail visibly when journal mode is off.
 
     Args:
         action: record, list, get, confirm, or supersede.
@@ -139,7 +135,7 @@ async def manage_decision(
         supersedes: id this record replaces, retired in the same write (record).
         superseded_by: id of the successor (supersede).
         actor: who is asking. Required on every write.
-        status: filter — proposed, active, superseded (list).
+        status: filter: proposed, active, superseded (list).
         query: case-insensitive match over title, decision, why (list).
         recorded_after / recorded_before: ISO-8601 bounds (list).
         limit: page size, capped at 200 (list).
