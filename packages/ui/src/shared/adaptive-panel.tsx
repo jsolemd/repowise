@@ -55,6 +55,8 @@ export function AdaptivePanel({
   className,
 }: AdaptivePanelProps) {
   const contentRef = React.useRef<HTMLDivElement>(null);
+  const returnFocusRef = React.useRef<HTMLElement | null>(null);
+  const interactedOutsideRef = React.useRef(false);
   const dragStartY = React.useRef<number | null>(null);
 
   const onTouchStart = (e: React.TouchEvent) => {
@@ -94,7 +96,24 @@ export function AdaptivePanel({
         <DialogPrimitive.Content
           ref={contentRef}
           aria-describedby={undefined}
-          {...(onInteractOutside ? { onInteractOutside } : {})}
+          onOpenAutoFocus={() => {
+            // Callers open panels from rows/graph nodes, without a Radix Trigger.
+            returnFocusRef.current = document.activeElement instanceof HTMLElement
+              ? document.activeElement
+              : null;
+            interactedOutsideRef.current = false;
+          }}
+          onCloseAutoFocus={(event) => {
+            event.preventDefault();
+            if ((modal || !interactedOutsideRef.current) && returnFocusRef.current?.isConnected) {
+              returnFocusRef.current.focus({ preventScroll: true });
+            }
+            returnFocusRef.current = null;
+          }}
+          onInteractOutside={(event) => {
+            onInteractOutside?.(event);
+            if (!event.defaultPrevented) interactedOutsideRef.current = true;
+          }}
           className={cn(
             "fixed z-[var(--z-modal)] flex flex-col bg-[var(--color-bg-surface)] shadow-2xl",
             "data-[state=open]:animate-in data-[state=closed]:animate-out",
