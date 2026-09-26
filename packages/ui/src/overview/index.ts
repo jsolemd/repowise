@@ -35,9 +35,9 @@ export { CommitRows, DecisionRows } from "./activity-lists";
 export type { CommitRow, DecisionRow } from "./activity-lists";
 
 export { AttentionAreas } from "./attention-areas";
-export { AttentionRows } from "./attention-rows";
+export { AttentionRows, SeverityRows } from "./attention-rows";
 export { AttentionSources } from "./attention-sources";
-export type { AttentionRowItem } from "./attention-rows";
+export type { AttentionRowItem, SeverityRowItem } from "./attention-rows";
 
 export { HotspotTable } from "./hotspot-table";
 export { ExploreList } from "./explore-list";

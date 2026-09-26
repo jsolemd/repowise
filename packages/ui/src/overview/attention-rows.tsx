@@ -32,6 +32,18 @@ function typeLabel(item: AttentionItem): string {
   return ATTENTION_TYPE_LABEL[item.type] ?? item.type;
 }
 
+/** One row of {@link SeverityRows}: a severity dot, a kind chip, a title and
+ *  a line of detail. Plain data, so a server page can build it. */
+export interface SeverityRowItem {
+  id: string;
+  severity: string;
+  /** The kind chip on the left: where the item comes from. */
+  label: string;
+  title: string;
+  description: string;
+  href?: string | null | undefined;
+}
+
 /**
  * Triage items as full-width rows.
  *
@@ -54,11 +66,40 @@ export function AttentionRows({
   hrefFor: (item: AttentionRowItem) => string | null;
   LinkComponent?: React.ElementType | undefined;
 }) {
+  return (
+    <SeverityRows
+      items={items.map((item) => ({
+        id: item.id,
+        severity: item.severity,
+        label: typeLabel(item),
+        title: item.title,
+        description: item.description,
+        href: hrefFor(item),
+      }))}
+      LinkComponent={LinkComponent}
+    />
+  );
+}
+
+/**
+ * The attention rows' shape for any source that grades its items on the same
+ * four-level ladder: the code-health attention list above, and reports from
+ * outside the index, such as the Make platform's doctor findings.
+ */
+export function SeverityRows({
+  items,
+  LinkComponent,
+  emptyText = "Nothing needs attention right now.",
+}: {
+  items: SeverityRowItem[];
+  LinkComponent?: React.ElementType | undefined;
+  emptyText?: string;
+}) {
   const A = LinkComponent ?? "a";
   if (items.length === 0) {
     return (
       <p className="text-xs text-[var(--color-success)]">
-        Nothing needs attention right now.
+        {emptyText}
       </p>
     );
   }
@@ -66,7 +107,7 @@ export function AttentionRows({
   return (
     <ul className="m-0 list-none divide-y divide-[var(--color-border-default)] border-t border-[var(--color-border-default)] p-0">
       {items.map((item) => {
-        const href = hrefFor(item);
+        const href = item.href;
         const body = (
           <>
             <span className="flex shrink-0 items-center gap-1.5 sm:w-40">
@@ -81,7 +122,7 @@ export function AttentionRows({
                   `title`, which assistive tech reads inconsistently. */}
               <span className="sr-only">{item.severity} severity. </span>
               <span className="font-mono text-[9.5px] uppercase tracking-[0.1em] text-[var(--color-text-tertiary)]">
-                {typeLabel(item)}
+                {item.label}
               </span>
             </span>
             <span className="min-w-0 flex-1">
