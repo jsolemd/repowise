@@ -71,6 +71,7 @@ _EXPORTS: dict[str, str] = {
     "save_system_graph": "system_graph",
     "RepoUpdateResult": "update",
     "check_repo_staleness": "update",
+    "reconcile_idle_repo_head_commit": "update",
     "reconcile_repo_head_commit": "update",
     "run_cross_repo_hooks": "update",
     "update_single_repo_index": "update",

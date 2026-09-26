@@ -32,6 +32,9 @@ from repowise.core.update_lock import (
     lock_age_seconds as _lock_age_seconds,
 )
 from repowise.core.update_lock import (
+    read_update_lock as _read_lock,
+)
+from repowise.core.update_lock import (
     release_update_lock as _release_lock,
 )
 from repowise.core.update_lock import (
@@ -363,6 +366,35 @@ async def reconcile_repo_head_commit(repo_path: Path, head: str | None) -> None:
                 await session.flush()
     finally:
         await engine.dispose()
+
+
+async def reconcile_idle_repo_head_commit(repo_path: Path, head: str | None) -> bool:
+    """Stamp an up-to-date repo's freshness unless another update is writing it.
+
+    The up-to-date check runs without the per-repo update lock, but the stamp
+    is a write. When a live update holds that lock it is mid-transaction on the
+    same store, and a docs pass re-rendering hundreds of pages outlasts
+    SQLite's busy timeout: the watcher's stamp then raised "database is
+    locked" and aborted its whole step for the repo. The update in flight
+    stamps HEAD itself when it finishes, so the stamp is skipped. An update
+    that starts after the check is caught the same way.
+
+    The lock is read, never taken: holding it for the stamp would make a real
+    update that starts in that instant defer to a pending mark nobody consumes.
+    Returns ``True`` when the stamp was written.
+    """
+    if _read_lock(repo_path) is not None:
+        return False
+    from sqlalchemy.exc import OperationalError
+
+    try:
+        await reconcile_repo_head_commit(repo_path, head)
+    except OperationalError as exc:
+        if "database is locked" not in str(exc):
+            raise
+        _log.info("workspace_update: freshness stamp for %s deferred: store busy", repo_path)
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -845,7 +877,7 @@ async def update_workspace(
             # Nothing to regenerate, but the DB freshness stamp can still be
             # behind (e.g. a row left drifted by a pre-fix run). Reconcile it so
             # the server's /api/repos no longer reports "index behind checkout".
-            await reconcile_repo_head_commit(abs_path, current_head)
+            await reconcile_idle_repo_head_commit(abs_path, current_head)
             results.append(
                 RepoUpdateResult(
                     alias=entry.alias,

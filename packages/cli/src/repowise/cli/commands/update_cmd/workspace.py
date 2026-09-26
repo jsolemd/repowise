@@ -142,7 +142,7 @@ def _workspace_update(
     from repowise.core.working_tree_state import working_tree_update_reason
     from repowise.core.workspace import (
         check_repo_staleness,
-        reconcile_repo_head_commit,
+        reconcile_idle_repo_head_commit,
         update_workspace,
     )
 
@@ -293,7 +293,7 @@ def _workspace_update(
 
         async def _reconcile_up_to_date() -> None:
             for repo_path, head in up_to_date_repos:
-                await reconcile_repo_head_commit(repo_path, head)
+                await reconcile_idle_repo_head_commit(repo_path, head)
 
         run_async(_reconcile_up_to_date())
 
