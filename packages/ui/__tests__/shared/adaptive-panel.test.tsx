@@ -76,6 +76,30 @@ describe("AdaptivePanel focus return", () => {
     expect(document.body).toHaveFocus();
   });
 
+  it("returns to a replacement invoker when the host keeps the panel mounted", async () => {
+    const onOpenChange = vi.fn();
+    function Controlled({ open }: { open: boolean }) {
+      return <>
+        <button>First selection</button>
+        <button>Second selection</button>
+        <AdaptivePanel open={open} onOpenChange={onOpenChange} title="Selected details" modal={false}>
+          <button>Panel action</button>
+        </AdaptivePanel>
+      </>;
+    }
+    const { rerender } = render(<Controlled open={false} />);
+    act(() => screen.getByRole("button", { name: "First selection" }).focus());
+    rerender(<Controlled open />);
+    const second = screen.getByRole("button", { name: "Second selection" });
+    act(() => second.focus());
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+    // Route-driven selection can coalesce close+open into a still-open panel.
+    act(() => screen.getByRole("button", { name: "Panel action" }).focus());
+    fireEvent.keyDown(document.activeElement!, { key: "Escape" });
+    rerender(<Controlled open={false} />);
+    await waitFor(() => expect(second).toHaveFocus());
+  });
+
   it("returns from a nested panel to its parent invoker, then to the page", async () => {
     function Nested() {
       const [parent, setParent] = React.useState(false);

@@ -112,8 +112,17 @@ export function AdaptivePanel({
           }}
           onInteractOutside={(event) => {
             onInteractOutside?.(event);
-            if (!event.defaultPrevented) interactedOutsideRef.current = true;
+            if (!event.defaultPrevented) {
+              interactedOutsideRef.current = true;
+              // A host may replace the selection without unmounting the panel.
+              // Remember that external control if the user then re-enters it.
+              if (!modal && event.detail.originalEvent.type === "focusin" &&
+                  event.target instanceof HTMLElement && event.target !== document.body) {
+                returnFocusRef.current = event.target;
+              }
+            }
           }}
+          onFocusCapture={() => { interactedOutsideRef.current = false; }}
           className={cn(
             "fixed z-[var(--z-modal)] flex flex-col bg-[var(--color-bg-surface)] shadow-2xl",
             "data-[state=open]:animate-in data-[state=closed]:animate-out",
