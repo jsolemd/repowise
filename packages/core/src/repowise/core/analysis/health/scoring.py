@@ -262,6 +262,8 @@ _BIOMARKER_DIMENSIONS: dict[str, set[str]] = {
     "resource_construction_in_loop": {"performance"},
     "lock_in_loop": {"performance"},
     "serial_await_in_loop": {"performance"},
+    "unbounded_read_reduced_in_memory": {"performance"},
+    "lazy_load_in_loop": {"performance"},
     "membership_test_against_list_in_loop": {"performance"},
     # Phase 7b centrality-gated moat markers - performance-only.
     "nested_loop_with_io": {"performance"},
@@ -429,6 +431,10 @@ _PERFORMANCE_WEIGHT_MULTIPLIER: dict[str, float] = {
     # SQL comma-join with no predicate: high-precision by AST shape, advisory
     # weight pending a corpus spot-check like every new perf marker.
     "sql_cartesian_join": 0.6,
+    # Advisory pending a corpus precision gate, like every new perf marker.
+    "unbounded_read_reduced_in_memory": 0.4,
+    # Advisory until the pre-registered precision tiers are measured (2026-09-26).
+    "lazy_load_in_loop": 0.4,
 }
 
 # All perf biomarkers share one ``performance`` category, so the single cap
@@ -454,6 +460,8 @@ _PERFORMANCE_CATEGORY: dict[str, str] = {
     "array_spread_in_reduce": "performance",
     "goroutine_in_unbounded_loop": "performance",
     "sql_cartesian_join": "performance",
+    "unbounded_read_reduced_in_memory": "performance",
+    "lazy_load_in_loop": "performance",
 }
 
 # One bounded performance category cap. 2.0 is a deliberately conservative
@@ -488,6 +496,8 @@ _PERFORMANCE_HOME: frozenset[str] = frozenset(
         "array_spread_in_reduce",
         "goroutine_in_unbounded_loop",
         "sql_cartesian_join",
+        "unbounded_read_reduced_in_memory",
+        "lazy_load_in_loop",
     }
 )
 

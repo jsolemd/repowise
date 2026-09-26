@@ -1900,3 +1900,33 @@ async def test_a_single_token_name_with_path_carried_subject_still_declares(monk
     )
 
     assert resp["selected_owner"]["file"] == "apps/api/app/routes/health.py"
+
+
+@pytest.mark.parametrize("workspace", [False, True])
+@pytest.mark.asyncio
+async def test_source_routes_disclose_unknown_mode_before_return(monkeypatch, workspace):
+    from repowise.server.mcp_server import _state, tool_search
+
+    response = {"results": [], "confidence": "caution", "_meta": {}}
+    seen = []
+
+    async def search(query, **kwargs):
+        seen.append(kwargs["mode"])
+        return response
+
+    from types import SimpleNamespace
+
+    async def coordinator():
+        return SimpleNamespace(search=search)
+
+    monkeypatch.setattr(tool_search, "source_search_enabled", lambda: True)
+    monkeypatch.setattr(tool_search, "mcp_coordinator", coordinator)
+    monkeypatch.setattr(tool_search, "_build_meta", lambda **kwargs: {})
+    monkeypatch.setattr(_state, "_registry", _StubRegistry(["alpha"], default="alpha") if workspace else None)
+    monkeypatch.setattr("repowise.server.mcp_server._source_federation.workspace_source_search", search)
+
+    result = await tool_search.search_codebase("how does the retry queue drain?", mode="conecpt")
+    assert result is response
+    assert seen == ["concept"]
+    assert result["ignored_arguments"][0]["argument"] == "mode"
+    assert result["ignored_arguments"][0]["values"] == ["conecpt"]

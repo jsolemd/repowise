@@ -21,9 +21,9 @@ def _config(path: Path) -> Config:
 
 def test_shipped_fork_head_is_ancestor_of_upstream_tail():
     scripts = ScriptDirectory.from_config(_config(Path("unused.db")))
-    assert scripts.get_heads() == ["0076"]
+    assert scripts.get_heads() == ["0077"]
     revisions = list(scripts.iterate_revisions("head", "solemd_0001"))
-    assert [r.revision for r in reversed(revisions)] == [f"{r:04}" for r in range(65, 77)]
+    assert [r.revision for r in reversed(revisions)] == [f"{r:04}" for r in range(65, 78)]
     assert scripts.get_revision("solemd_0001").down_revision == "solemd_0005"
 
 
@@ -45,7 +45,7 @@ def test_existing_fork_head_gets_upstream_ddl(tmp_path, monkeypatch):
             )
         command.upgrade(config, "head")
     with sqlite3.connect(db) as conn:
-        assert conn.execute("SELECT version_num FROM alembic_version").fetchone() == ("0076",)
+        assert conn.execute("SELECT version_num FROM alembic_version").fetchone() == ("0077",)
         assert conn.execute("SELECT name FROM repositories WHERE id='repo'").fetchone() == ("repo",)
         columns = {r[1] for r in conn.execute("PRAGMA table_info(repositories)")}
         assert "symbols_parser_fingerprint" in columns

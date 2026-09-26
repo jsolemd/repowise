@@ -75,7 +75,9 @@ STORE_FORMAT_VERSION: int = 2
 #: invalidation distinct from the next upstream parser-schema bump.
 #: v6: v0.52 adds Rust trait visibility/type-parameter shadow handling and
 #: case-insensitive TSX grammar selection. Keep old extraction caches invalid.
-PARSER_SCHEMA_VERSION: int = 6
+#: v7: v0.53 expands PHP grouped imports and Rust extraction helpers.
+#: Python helper bodies are not covered by the query/dataclass fingerprint.
+PARSER_SCHEMA_VERSION: int = 7
 
 #: state.json key holding the store format version that wrote the store.
 STORE_FORMAT_VERSION_KEY = "store_format_version"

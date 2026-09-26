@@ -106,7 +106,7 @@ def test_strategy_preconditions_distinguish_proven_advisory_and_no_plan():
                 "async.py",
                 5,
                 marker="serial_await_in_loop",
-                boundary="network",
+                boundary="filesystem",
                 dataflow_verified=True,
             )
         ]
@@ -236,7 +236,7 @@ def test_performance_fix_plan_carries_closed_strategy_and_true_totals():
         ],
         evidence_limit=1,
     )[0]
-    plans = performance_fix_suggestions([opportunity], nloc_by_file={"shared.py": 80})
+    plans = performance_fix_suggestions([opportunity])
     assert len(plans) == 1
     plan = plans[0]
     assert plan.refactoring_type == "performance_fix"
@@ -247,14 +247,16 @@ def test_performance_fix_plan_carries_closed_strategy_and_true_totals():
     assert plan.plan["affected_locations_total"] == 2
     assert plan.plan["paths_total"] == 2
     assert plan.plan["evidence_truncated"] is True
+    # Two call sites plus the batched form: effort counts edits, not file size.
+    assert plan.effort_bucket == "M"
     assert performance_fix_suggestions([opportunity], min_confidence="high") == []
 
 
 def test_a_proven_strategy_on_an_unreliable_path_is_not_offered_as_proven():
     """The demotion has to reach the plan, not just the label.
 
-    Dataflow can prove resource construction invariant and still be proving
-    it about the wrong loop if the grouping call path was guessed.
+    A concrete bulk API can preserve results and still be grouped against
+    the wrong loop if the call path was guessed.
 
     No detector emits this shape today: the marker carrying a proven
     strategy never travel with a call path, so their provenance is always
@@ -266,10 +268,11 @@ def test_a_proven_strategy_on_an_unreliable_path_is_not_offered_as_proven():
             _finding(
                 "async.py",
                 5,
-                marker="resource_construction_in_loop",
+                marker="io_in_loop",
                 boundary="network",
                 call_path=("async.py::run", "http.py::send", "http.py::_write"),
-                resource_invariant=True,
+                batch_form="fetch_many(keys)",
+                batch_equivalent=True,
                 resolution_basis="name-fallback",
             )
         ]
@@ -290,7 +293,7 @@ def test_a_reliable_path_does_not_prove_io_effect_safety():
                 "async.py",
                 5,
                 marker="serial_await_in_loop",
-                boundary="network",
+                boundary="filesystem",
                 dataflow_verified=True,
             )
         ]
@@ -321,3 +324,112 @@ def test_a_cross_function_group_always_shares_its_last_two_path_nodes():
         opportunity.intervention_symbol,
         opportunity.terminal_sink,
     )
+
+
+def test_pooled_fan_out_requires_resource_effect_and_capacity_contracts():
+    opportunity = build_performance_opportunities(
+        [_finding("async.py", 5, marker="serial_await_in_loop", dataflow_verified=True)]
+    )[0]
+
+    assert opportunity.fix and opportunity.fix.strategy == "parallelize_independent_awaits"
+    assert opportunity.fix.safety == "advisory"
+    assert opportunity.prerequisites == (
+        "resource_concurrency_contract", "effect_and_failure_ordering", "bounded_concurrency",
+    )
+    assert opportunity.actionability_state == "advisory"
+
+
+def test_a_loop_that_already_chunks_is_not_told_to_batch():
+    opportunity = build_performance_opportunities(
+        [_finding("sync.py", 5, chunked_iteration=True)]
+    )[0]
+
+    assert opportunity.fix is None
+    assert opportunity.actionability_state == "expected"
+    assert opportunity.actionability_reason == "loop_already_chunked"
+    assert opportunity.prerequisites == ()
+
+
+def test_a_repeated_call_at_a_non_batchable_boundary_is_expected_not_investigate():
+    """Filesystem/subprocess repetition is real, but no detector could ever
+
+    supply a batch API for it, so it is a fact to read rather than a queued
+    investigation.
+    """
+    opportunity = build_performance_opportunities(
+        [_finding("fs.py", 8, boundary="filesystem", call_path=("fs.py::run", "fs.py::read"))]
+    )[0]
+
+    assert opportunity.fix is None
+    assert opportunity.actionability_state == "expected"
+    assert opportunity.actionability_reason == "inherent_to_boundary"
+    assert opportunity.prerequisites == ()
+
+
+def test_expected_sorts_after_investigate_regardless_of_raw_rank():
+    """``ACTIONABILITY_ORDER`` is compared before ``rank_score``, so an
+    ``expected`` fact never leads an ``investigate`` cause, whichever one this
+    corpus would otherwise score higher.
+    """
+    opportunities = build_performance_opportunities(
+        [
+            _finding("sync.py", 5, chunked_iteration=True),
+            _finding(
+                "a.py",
+                3,
+                marker="blocking_io_under_lock",
+                call_path=("a.py::critical", "store.py::flush", "db.py::fetch"),
+            ),
+            _finding(
+                "b.py",
+                4,
+                marker="blocking_io_under_lock",
+                call_path=("b.py::critical", "store.py::flush", "db.py::fetch"),
+            ),
+        ]
+    )
+    states = [item.actionability_state for item in opportunities]
+    assert states.index("investigate") < states.index("expected")
+
+
+def test_two_causes_on_one_line_name_each_other_and_the_stronger_fix_leads():
+    rows = [
+        _finding("jobs.py", 5, marker="serial_await_in_loop", dataflow_verified=True),
+        _finding("jobs.py", 5),
+        _finding("other.py", 9, marker="serial_await_in_loop", dataflow_verified=True),
+    ]
+    opportunities = build_performance_opportunities(rows)
+    by_marker = {
+        (item.biomarker_type, item.evidence[0]["file_path"]): item for item in opportunities
+    }
+    batch = by_marker[("io_in_loop", "jobs.py")]
+    parallel = by_marker[("serial_await_in_loop", "jobs.py")]
+
+    assert [s["relation"] for s in batch.siblings] == ["alternative"]
+    assert parallel.siblings[0]["opportunity_id"] == batch.opportunity_id
+    assert parallel.siblings[0]["relation"] == "preferred"
+    assert by_marker[("serial_await_in_loop", "other.py")].siblings == ()
+    order = [item.opportunity_id for item in opportunities]
+    assert order.index(parallel.opportunity_id) == order.index(batch.opportunity_id) + 1
+
+
+def test_a_plan_lists_its_edits_and_marks_only_proven_ones_mechanical():
+    advisory = build_performance_opportunities(
+        [_finding("a.py", 2, call_path=("a.py::run", "db.py::fetch"))]
+    )
+    proven = build_performance_opportunities(
+        [
+            _finding(
+                "f.py", 3, marker="io_in_loop", boundary="db",
+                batch_form="fetch_many(keys)", batch_equivalent=True,
+            )
+        ]
+    )
+    batch_plan = performance_fix_suggestions(advisory)[0].plan
+    parallel_plan = performance_fix_suggestions(proven)[0].plan
+
+    assert [step["order"] for step in batch_plan["steps"]] == [1, 2]
+    assert batch_plan["steps"][0]["symbol"] == "a.py::run"
+    assert batch_plan["steps"][1]["line"] == 2
+    assert (batch_plan["mechanical_steps"], batch_plan["judgment_steps"]) == (0, 2)
+    assert (parallel_plan["mechanical_steps"], parallel_plan["judgment_steps"]) == (1, 0)

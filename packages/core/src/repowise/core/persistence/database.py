@@ -503,12 +503,12 @@ def _reconcile_schema(connection: object) -> None:
 
 
 async def _repair_local_credential_snippets(conn: AsyncConnection) -> None:
-    """Apply upstream 0075 once to local stores, which never run Alembic.
+    """Apply upstream credential repairs once to stores that never run Alembic.
 
-    No local data-repair ledger exists: schema reconciliation only adds DDL.
-    The claim and cleanup share the caller's transaction, so failures roll
-    both back and concurrent initializers serialize at the INSERT. Keeping a
-    semantic versioned marker preserves masked snippets from later scans.
+    Each claim and cleanup share the caller's transaction, so failures roll
+    both back and concurrent initializers serialize at the INSERT. Separate
+    versioned markers make new repairs reach stores that completed older ones,
+    while preserving masked snippets produced after each repair.
     """
     await conn.execute(
         text(
@@ -517,31 +517,38 @@ async def _repair_local_credential_snippets(conn: AsyncConnection) -> None:
             "completed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
         )
     )
-    # The steady state must stay read-only: initializing another reader while
-    # the watcher publishes should not acquire SQLite's single writer lock.
-    completed = await conn.execute(
-        text(
-            "SELECT 1 FROM repowise_local_data_repairs "
-            "WHERE repair_id = '0075_clear_legacy_credential_snippets_v1'"
-        )
+    repairs = (
+        (
+            "0075_clear_legacy_credential_snippets_v1",
+            "'hardcoded_password', 'hardcoded_secret'",
+        ),
+        (
+            "0077_clear_unmasked_credential_snippets_v1",
+            "'hardcoded_password', 'hardcoded_secret', 'public_env_secret', "
+            "'aws_access_key', 'github_token', 'slack_token', 'google_api_key', "
+            "'stripe_key', 'private_key_pem'",
+        ),
     )
-    if completed.scalar_one_or_none() is not None:
-        return
-    claimed = await conn.execute(
-        text(
-            "INSERT INTO repowise_local_data_repairs (repair_id) "
-            "VALUES ('0075_clear_legacy_credential_snippets_v1') "
-            "ON CONFLICT (repair_id) DO NOTHING RETURNING repair_id"
+    for repair_id, kinds in repairs:
+        # Completed repairs must not acquire SQLite's single writer lock.
+        completed = await conn.execute(
+            text("SELECT 1 FROM repowise_local_data_repairs WHERE repair_id = :repair_id"),
+            {"repair_id": repair_id},
         )
-    )
-    if claimed.scalar_one_or_none() is None:
-        return
-    await conn.execute(
-        text(
-            "UPDATE security_findings SET snippet = '' "
-            "WHERE kind IN ('hardcoded_password', 'hardcoded_secret')"
+        if completed.scalar_one_or_none() is not None:
+            continue
+        claimed = await conn.execute(
+            text(
+                "INSERT INTO repowise_local_data_repairs (repair_id) VALUES (:repair_id) "
+                "ON CONFLICT (repair_id) DO NOTHING RETURNING repair_id"
+            ),
+            {"repair_id": repair_id},
         )
-    )
+        if claimed.scalar_one_or_none() is None:
+            continue
+        await conn.execute(
+            text(f"UPDATE security_findings SET snippet = '' WHERE kind IN ({kinds})")
+        )
 
 
 async def init_db(engine: AsyncEngine) -> None:

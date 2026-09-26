@@ -40,7 +40,7 @@ class SerialAwaitInLoopDetector:
             phrasing = _BOUNDARY_PHRASING.get(hit.detail, "an awaited I/O call")
             # A cached promoted flag establishes at most local-variable flow.
             # It cannot establish the safety of shared connections or I/O effects.
-            details = {"boundary_kind": hit.detail}
+            details = {"boundary_kind": hit.detail, **hit.loop_facts()}
             reason = (
                 f"{phrasing} is awaited serially in a loop; if the iterations are "
                 "independent, validate resource concurrency, transaction and failure "
