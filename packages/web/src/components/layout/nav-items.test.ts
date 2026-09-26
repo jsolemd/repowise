@@ -47,6 +47,9 @@ describe("repo navigation under the deployment policy", () => {
  * a URL nobody can reach by navigating.
  */
 describe("global navigation", () => {
+  it("offers the read-only Make platform report", () => {
+    expect(GLOBAL_NAV.find((item) => item.href === "/make-platform")?.label).toBe("Make platform");
+  });
   it("offers the docs library index", () => {
     const entry = GLOBAL_NAV.find((i) => i.href === "/docs-libraries");
     expect(entry).toBeDefined();

@@ -21,6 +21,7 @@ import { ContractTypeBadge } from "@repowise-dev/ui/workspace/contract-type-badg
 import { formatNumber } from "@repowise-dev/ui/lib/format";
 import { getWorkspace, getWorkspaceCoChanges } from "@/lib/api/workspace";
 import { RemoveWorkspaceRepoButton, SyncButton } from "./sync-buttons";
+import { MakePlatformSummary } from "@/components/dashboard/make-platform-summary";
 
 export const metadata: Metadata = { title: "Workspace" };
 
@@ -167,6 +168,7 @@ export default async function WorkspaceDashboardPage() {
       </PageLede>
 
       <StatRibbon stats={ribbon} LinkComponent={Link} />
+      <MakePlatformSummary />
 
       <OverviewSection
         title="Repositories"

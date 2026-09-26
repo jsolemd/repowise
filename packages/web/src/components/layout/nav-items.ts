@@ -48,6 +48,7 @@ export interface NavGroup {
 export const GLOBAL_NAV: NavItem[] = [
   { label: "Dashboard", href: "/", icon: LayoutDashboard },
   { label: "Docs Libraries", href: "/docs-libraries", icon: BookOpen },
+  { label: "Make platform", href: "/make-platform", icon: Activity },
   { label: "Settings", href: "/settings", icon: Settings },
 ];
 

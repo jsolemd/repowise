@@ -18,6 +18,7 @@ import { attentionSentence, byAttention } from "@/lib/repo-attention";
 import { DeleteRepoButton } from "@/components/repos/delete-repo-button";
 import { EmptyReposState } from "@/components/repos/empty-repos-state";
 import { JobRows } from "@/components/jobs/job-rows";
+import { MakePlatformSummary } from "@/components/dashboard/make-platform-summary";
 
 export const metadata: Metadata = { title: "Dashboard" };
 
@@ -141,6 +142,7 @@ export default async function DashboardPage() {
       </PageLede>
 
       <StatRibbon stats={ribbon} />
+      <MakePlatformSummary />
 
       {activeJobs.length > 0 && (
         <OverviewSection
