@@ -4,10 +4,13 @@ from __future__ import annotations
 
 from .discovery import (
     COMMON_DOCS_PATHS,
+    EXPLICIT_ROOT_DOCS_PATH,
+    describe_pattern_base,
     discover_docs_path,
     discover_docs_path_from_git,
     get_related_docs_repos,
     list_doc_files,
+    resolve_doc_search_root,
 )
 from .git_exec import GitError, _is_permanent_error, _is_transient_error
 from .remote import get_remote_head_sha, resolve_default_branch
@@ -27,12 +30,14 @@ from .repository import (
 
 __all__ = [
     "COMMON_DOCS_PATHS",
+    "EXPLICIT_ROOT_DOCS_PATH",
     "GitError",
     "RepoInfo",
     "_is_permanent_error",
     "_is_transient_error",
     "clone_repo",
     "delete_repo_cache",
+    "describe_pattern_base",
     "discover_docs_path",
     "discover_docs_path_from_git",
     "fetch_latest",
@@ -46,5 +51,6 @@ __all__ = [
     "list_doc_files",
     "prepare_repo",
     "resolve_default_branch",
+    "resolve_doc_search_root",
     "resolve_repo_docs_path",
 ]

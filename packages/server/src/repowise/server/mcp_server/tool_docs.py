@@ -207,7 +207,15 @@ async def add_doc_library(
     exclude_patterns: list[str] | None = None,
     output: Literal["json"] = "json",
 ) -> dict[str, Any]:
-    """Register a new documentation library and queue its initial index."""
+    """Register a new documentation library and queue its initial index.
+
+    Pattern base: include_patterns are relative to docs_path when it is set;
+    docs_path "." means the repository root. With no docs_path, patterns that
+    name a path (``docs/**/*.md``, ``README.md``) match from the repository
+    root, and only a set of ``**/`` patterns searches an auto-discovered docs
+    directory. The response's ``pattern_base`` says which applies. A library
+    whose patterns match no files ends in status ``error``, never ``ready``.
+    """
     return await _call("add_doc_library", locals())
 
 

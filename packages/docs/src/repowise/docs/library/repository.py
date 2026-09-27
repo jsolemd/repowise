@@ -8,7 +8,12 @@ from pathlib import Path
 
 from repowise.docs.config import get_settings
 
-from .discovery import discover_docs_path, discover_docs_path_from_git, list_doc_files
+from .discovery import (
+    EXPLICIT_ROOT_DOCS_PATH,
+    discover_docs_path,
+    discover_docs_path_from_git,
+    list_doc_files,
+)
 from .git_exec import GitError, run_git
 
 logger = logging.getLogger(__name__)
@@ -70,7 +75,12 @@ async def clone_repo(
         shutil.rmtree(repo_dir)
 
     url = _get_repo_url(repo)
-    use_sparse_checkout = bool(docs_path) and not source_subpath and not prefer_full_checkout
+    use_sparse_checkout = (
+        bool(docs_path)
+        and docs_path != EXPLICIT_ROOT_DOCS_PATH
+        and not source_subpath
+        and not prefer_full_checkout
+    )
     logger.info(
         "Cloning %s (branch=%s, sparse=%s, source_subpath=%s)",
         repo,

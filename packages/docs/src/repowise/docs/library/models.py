@@ -93,7 +93,7 @@ class LibraryConfig(BaseModel):
         self.repo = _normalize_repo(self.repo)
         self.legacy_ids = _normalize_library_ids(self.legacy_ids)
         self.source_subpath = _normalize_rel_path(self.source_subpath)
-        self.docs_path = _normalize_rel_path(self.docs_path)
+        self.docs_path = _normalize_docs_path(self.docs_path)
         if self.source_type == LibrarySourceType.SNAPSHOT and not (self.library_id or "").strip():
             raise ValueError("library_id is required for snapshot-backed documentation libraries")
         self.library_id = _normalize_library_id(self.library_id, self.repo, self.source_subpath)
@@ -180,7 +180,7 @@ class LibraryState(BaseModel):
     def _normalize(self) -> "LibraryState":
         self.repo = _normalize_repo(self.repo)
         self.source_subpath = _normalize_rel_path(self.source_subpath)
-        self.docs_path = _normalize_rel_path(self.docs_path)
+        self.docs_path = _normalize_docs_path(self.docs_path)
         self.library_id = _normalize_library_id(self.library_id, self.repo, self.source_subpath)
         if self.source_type == LibrarySourceType.GIT and not self.repo:
             raise ValueError("repo is required for git-backed documentation libraries")
@@ -271,6 +271,19 @@ def _normalize_rel_path(path: str | None) -> str:
     if value in {"", "."}:
         return ""
     return value.strip("/")
+
+
+def _normalize_docs_path(path: str | None) -> str:
+    """Keep ``"."`` distinct from ``""``: an explicit library root versus "not given".
+
+    Auto-discovery may narrow an empty docs_path to a docs directory; ``"."`` never
+    narrows. See ``repowise.docs.library.discovery.resolve_doc_search_root``.
+    """
+    value = (path or "").strip().replace("\\", "/")
+    if not value:
+        return ""
+    parts = [part for part in value.split("/") if part not in {"", "."}]
+    return "/".join(parts) or "."
 
 
 def _normalize_library_id(

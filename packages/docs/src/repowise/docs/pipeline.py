@@ -33,6 +33,7 @@ from repowise.docs.library.git_manager import (
     get_library_root_path_from_repo_dir,
     list_doc_files,
     resolve_default_branch,
+    resolve_doc_search_root,
     resolve_repo_docs_path,
 )
 from repowise.docs.library.models import LibraryConfig, LibraryStatus
@@ -49,6 +50,27 @@ logger = logging.getLogger(__name__)
 def _partial_index_warning(errors: list[str]) -> str:
     preview = ", ".join(sorted(errors)[:5])
     return f"Skipped {len(errors)} file(s) during indexing: {preview}"
+
+
+def _empty_scope_message(
+    library_root: Path,
+    docs_path: str,
+    include_patterns: list[str],
+) -> str:
+    """Explain an index that matched no files, naming the root and patterns that missed.
+
+    A library that indexes nothing is a configuration error, never ``ready``: raising
+    before scope reconciliation also keeps whatever an earlier good run indexed.
+    """
+    root = resolve_doc_search_root(library_root, docs_path, include_patterns)
+    where = (
+        "because no documentation directory was found" if root is None else f"under '{root or '.'}'"
+    )
+    return (
+        f"Indexed 0 files: include_patterns {include_patterns} matched nothing {where} "
+        f"(docs_path={docs_path!r}). Set docs_path to the directory the patterns are "
+        "written against, or '.' for the repository root."
+    )
 
 
 def _next_freshness_check(library_id: str, priority: int, checked_at: datetime) -> datetime:
@@ -205,6 +227,14 @@ async def index_library(library_id: str, force: bool = False) -> dict:
                 library.exclude_patterns,
             )
             logger.info(f"Found {len(doc_files)} doc files")
+            if not doc_files:
+                raise ValueError(
+                    _empty_scope_message(
+                        library_root,
+                        resolved_docs_path,
+                        library.include_patterns,
+                    )
+                )
 
         stored_files = None
         doc_file_paths = {

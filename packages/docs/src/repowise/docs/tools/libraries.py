@@ -17,6 +17,7 @@ from repowise.docs.indexer import delete_by_library as qdrant_delete_by_library
 from repowise.docs.jobs import JobType, clear_freshness_cache, enqueue_job
 from repowise.docs.library.git_manager import (
     delete_repo_cache,
+    describe_pattern_base,
     get_remote_head_sha,
     resolve_default_branch,
 )
@@ -358,14 +359,19 @@ async def handle_add_library(
     }
     if config.source_subpath:
         result["source_subpath"] = config.source_subpath
-    if docs_path:
-        result["docs_path"] = docs_path
+    if config.docs_path:
+        result["docs_path"] = config.docs_path
+    result["pattern_base"] = describe_pattern_base(config.docs_path, config.include_patterns)
     result["job"] = {
         "id": job_result.job.id,
         "type": job_result.job.job_type.value,
         "priority": job_result.job.priority,
         "disposition": job_result.disposition.value,
     }
+    result["next_step"] = (
+        "Indexing runs in the background. list_doc_libraries shows status 'ready' with a "
+        "file_count, or 'error' with an error_message when the patterns matched no files."
+    )
     return result
 
 

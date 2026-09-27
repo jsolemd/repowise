@@ -163,13 +163,106 @@ def get_related_docs_repos(repo: str) -> list[str]:
     return [p for p in patterns if p != repo]
 
 
+EXPLICIT_ROOT_DOCS_PATH = "."
+"""Stored ``docs_path`` meaning "the library root, chosen on purpose".
+
+An empty ``docs_path`` means "not given" and may auto-discover a docs directory;
+``"."`` pins the search to the root even when every include pattern is ``**/``-prefixed.
+"""
+
+
+def is_anchored_pattern(pattern: str) -> bool:
+    """Whether an include pattern names a location relative to the search root.
+
+    ``docs/**/*.md``, ``src/**/*.ts`` and ``README.md`` are anchored: they only
+    mean something against a known base. ``**/*.md`` matches at any depth and
+    carries no base, so it stays valid under an auto-discovered docs directory.
+    """
+    return pattern != "**" and not pattern.startswith("**/")
+
+
+def describe_pattern_base(docs_path: str, include_patterns: list[str] | None) -> str:
+    """Say, before any clone, what base ``resolve_doc_search_root`` will match patterns against."""
+    if docs_path == EXPLICIT_ROOT_DOCS_PATH:
+        return "library root (docs_path '.')"
+    if docs_path:
+        return f"'{docs_path}' (docs_path)"
+    if include_patterns and any(is_anchored_pattern(pattern) for pattern in include_patterns):
+        return "library root (include_patterns name root-relative paths)"
+    return "auto-discovered docs directory (no docs_path; every include pattern starts with **/)"
+
+
+def resolve_doc_search_root(
+    repo_dir: Path,
+    docs_path: str = "",
+    include_patterns: list[str] | None = None,
+) -> str | None:
+    """Choose the directory, relative to ``repo_dir``, that include patterns match against.
+
+    The contract:
+
+    - ``docs_path`` set: patterns are relative to it. A configured directory that no
+      longer exists falls back to auto-discovery near its old name.
+    - ``docs_path`` ``"."``: patterns are relative to the library root.
+    - ``docs_path`` empty and any include pattern anchored: patterns were written
+      against the library root, so they match from there. Narrowing to a discovered
+      ``docs/`` would silently turn ``docs/**/*.md`` into ``docs/docs/**/*.md``.
+    - ``docs_path`` empty and every pattern ``**/``-prefixed (the defaults included):
+      auto-discover the docs directory; with source patterns and no docs directory,
+      use the root.
+
+    Returns ``""`` for the root, a relative directory, or ``None`` when nothing
+    that looks like documentation exists to search.
+    """
+    if include_patterns is None:
+        include_patterns = list(DEFAULT_INCLUDE_PATTERNS)
+
+    if docs_path == EXPLICIT_ROOT_DOCS_PATH:
+        return ""
+    if docs_path:
+        if (repo_dir / docs_path).exists():
+            return docs_path
+        logger.info("Docs path '%s' not found, attempting auto-discovery...", docs_path)
+        discovered = discover_docs_path(repo_dir, docs_path)
+        if discovered is None:
+            logger.warning("No documentation found in %s", repo_dir)
+        return discovered
+    if any(is_anchored_pattern(pattern) for pattern in include_patterns):
+        logger.info("Include patterns name root-relative paths; matching from the library root")
+        return ""
+
+    def _pattern_has_source_extension(pattern: str) -> bool:
+        pattern_lower = pattern.lower()
+        if pattern_lower.endswith(".gradle.kts"):
+            return False
+        return any(
+            pattern_lower.endswith(ext) or pattern_lower.endswith(f"*{ext}")
+            for ext in SOURCE_EXTENSIONS
+        )
+
+    discovered = discover_docs_path(repo_dir)
+    if discovered is None:
+        if any(_pattern_has_source_extension(pattern) for pattern in include_patterns):
+            logger.info("No docs path discovered; source patterns present, using repo root")
+            return ""
+        logger.warning("No documentation found in %s", repo_dir)
+        return None
+    if discovered:
+        logger.info("Auto-discovered docs at: %s", discovered)
+    return discovered
+
+
 def list_doc_files(
     repo_dir: Path,
     docs_path: str = "",
     include_patterns: list[str] | None = None,
     exclude_patterns: list[str] | None = None,
 ) -> list[Path]:
-    """List documentation files in a repository."""
+    """List documentation files in a repository.
+
+    Include patterns match against the root chosen by ``resolve_doc_search_root``;
+    returned paths are relative to ``repo_dir``.
+    """
     if include_patterns is None:
         include_patterns = list(DEFAULT_INCLUDE_PATTERNS)
     if exclude_patterns is None:
@@ -195,51 +288,10 @@ def list_doc_files(
     else:
         exclude_patterns = list(exclude_patterns) + default_excludes
 
-    def _pattern_has_source_extension(pattern: str) -> bool:
-        pattern_lower = pattern.lower()
-        if pattern_lower.endswith(".gradle.kts"):
-            return False
-        return any(
-            pattern_lower.endswith(ext) or pattern_lower.endswith(f"*{ext}")
-            for ext in SOURCE_EXTENSIONS
-        )
-
-    has_source_patterns = any(
-        _pattern_has_source_extension(pattern) for pattern in include_patterns
-    )
-
-    search_root = repo_dir
-    if docs_path:
-        search_root = repo_dir / docs_path
-        if not search_root.exists():
-            logger.info("Docs path '%s' not found, attempting auto-discovery...", docs_path)
-            discovered = discover_docs_path(repo_dir, docs_path)
-            if discovered is None:
-                logger.warning("No documentation found in %s", repo_dir)
-                return []
-            if discovered == "":
-                search_root = repo_dir
-                logger.info("Using repo root for documentation")
-            else:
-                search_root = repo_dir / discovered
-                logger.info("Auto-discovered docs at: %s", discovered)
-    elif has_source_patterns:
-        discovered = discover_docs_path(repo_dir)
-        if discovered is None:
-            logger.info("No docs path discovered; source patterns present, using repo root")
-        elif discovered == "":
-            logger.info("Using repo root for documentation and source patterns")
-        else:
-            search_root = repo_dir / discovered
-            logger.info("Auto-discovered docs at: %s", discovered)
-    else:
-        discovered = discover_docs_path(repo_dir)
-        if discovered is None:
-            logger.warning("No documentation found in %s", repo_dir)
-            return []
-        if discovered != "":
-            search_root = repo_dir / discovered
-            logger.info("Auto-discovered docs at: %s", discovered)
+    search_root_rel = resolve_doc_search_root(repo_dir, docs_path, include_patterns)
+    if search_root_rel is None:
+        return []
+    search_root = repo_dir / search_root_rel if search_root_rel else repo_dir
 
     found_files: set[Path] = set()
     for pattern in include_patterns:
