@@ -66,8 +66,11 @@ def _empty_scope_message(
     where = (
         "because no documentation directory was found" if root is None else f"under '{root or '.'}'"
     )
+    shown = ", ".join(include_patterns[:6])
+    if len(include_patterns) > 6:
+        shown += f", ... (+{len(include_patterns) - 6} more)"
     return (
-        f"Indexed 0 files: include_patterns {include_patterns} matched nothing {where} "
+        f"Indexed 0 files: include_patterns [{shown}] matched nothing {where} "
         f"(docs_path={docs_path!r}). Set docs_path to the directory the patterns are "
         "written against, or '.' for the repository root."
     )

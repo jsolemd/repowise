@@ -215,3 +215,15 @@ async def test_index_matching_no_files_is_an_error_not_ready(tmp_path: Path):
     )
     # The earlier good index survives a misconfigured run.
     prune.assert_not_awaited()
+
+
+@pytest.mark.unit
+def test_empty_scope_message_stays_readable_with_default_patterns(tmp_path: Path):
+    from repowise.docs.formats import DEFAULT_INCLUDE_PATTERNS
+    from repowise.docs.pipeline import _empty_scope_message
+
+    message = _empty_scope_message(tmp_path, ".", list(DEFAULT_INCLUDE_PATTERNS))
+
+    assert f"(+{len(DEFAULT_INCLUDE_PATTERNS) - 6} more)" in message
+    assert "under '.'" in message
+    assert len(message) < 400
