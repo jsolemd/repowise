@@ -13,6 +13,7 @@ CONFIG_FILENAME = "config.yaml"
 #: Named here rather than imported from the manifest module, which imports yaml
 #: and the analysis package; this file is on the cheap config path.
 MANIFEST_BASENAME = "decisions.yaml"
+JOURNAL_BASENAME = "decisions.jsonl"
 
 # Persisted config consumers.  Keep this matrix here, beside the canonical
 # loader, so CLI and workspace update paths do not grow competing ideas of what
@@ -54,6 +55,26 @@ class RepoConfigError(ValueError):
 def get_repowise_dir(repo_path: Path | str) -> Path:
     """Return the repo-local ``.repowise`` directory."""
     return Path(repo_path) / ".repowise"
+
+
+def authored_decision_files(repowise_dir: Path) -> tuple[Path, ...]:
+    """Authored records that a cache replacement or removal must preserve.
+
+    Accept a state directory so interrupted seed backups get the same check.
+    The standard filenames remain protected when a CLI process has no journal
+    environment setting. A configured journal below .repowise is protected too.
+    """
+    from repowise.core.analysis.decisions.journal import decisions_journal_path
+
+    relative_paths = {Path(MANIFEST_BASENAME), Path(JOURNAL_BASENAME)}
+    configured = decisions_journal_path()
+    if configured is not None and configured.parts[0] == ".repowise":
+        relative_paths.add(configured.relative_to(".repowise"))
+    return tuple(
+        path
+        for relative in sorted(relative_paths)
+        if (path := repowise_dir / relative).exists() or path.is_symlink()
+    )
 
 
 def load_repo_config(repo_path: Path | str) -> dict[str, Any]:
@@ -355,13 +376,13 @@ def save_repo_env_key(
 
 
 def ensure_manifest_tracked(repo_path: Path | str) -> bool:
-    """Let ``.repowise/decisions.yaml`` be committed. Returns whether it changed.
+    """Let authored decision files be committed. Returns whether it changed.
 
-    The manifest is the only thing under ``.repowise/`` meant to travel with the
-    repository, and a ``.repowise/`` rule blocks it: git does not descend into an
+    The manifest and journal travel with the repository. A ``.repowise/`` rule
+    blocks both: git does not descend into an
     excluded directory, so a negation for a file inside one never fires.
 
-    The existing rule is left in place and three anchored lines are appended
+    The existing rule is left in place and four anchored lines are appended
     after it. Rewriting ``.repowise/`` to ``.repowise/*`` would look equivalent
     and is not: the first has no internal slash and so matches a ``.repowise``
     directory at *any* depth, while the second is anchored to this file's own
@@ -381,16 +402,17 @@ def ensure_manifest_tracked(repo_path: Path | str) -> bool:
     raw = gitignore.read_bytes()
     content = raw.decode("utf-8", errors="replace")
     lines = content.splitlines()
-    if f"!/.repowise/{MANIFEST_BASENAME}" in {line.strip() for line in lines}:
+    exceptions = [f"!/.repowise/{name}" for name in (MANIFEST_BASENAME, JOURNAL_BASENAME)]
+    if set(exceptions).issubset({line.strip() for line in lines}):
         return False
 
     newline = "\r\n" if b"\r\n" in raw else "\n"
     addition = [
         "",
-        "# repowise: the decisions manifest is meant to be committed",
+        "# repowise: authored decisions are meant to be committed",
         "!/.repowise/",
         "/.repowise/*",
-        f"!/.repowise/{MANIFEST_BASENAME}",
+        *exceptions,
     ]
     atomic_write_text(gitignore, newline.join([*lines, *addition]) + newline, newline="")
     return True

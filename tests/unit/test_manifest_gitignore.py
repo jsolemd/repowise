@@ -17,9 +17,7 @@ from repowise.core.repo_config import ensure_manifest_tracked
 
 
 def _git(repo, *args) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        ["git", *args], cwd=repo, capture_output=True, text=True, check=False
-    )
+    return subprocess.run(["git", *args], cwd=repo, capture_output=True, text=True, check=False)
 
 
 @pytest.fixture
@@ -29,6 +27,7 @@ def repo(tmp_path):
         (tmp_path / rel).mkdir(parents=True)
         (tmp_path / rel / "wiki.db").write_text("x", encoding="utf-8")
     (tmp_path / ".repowise" / "decisions.yaml").write_text("version: 1\n", encoding="utf-8")
+    (tmp_path / ".repowise" / "decisions.jsonl").write_text("{}\n", encoding="utf-8")
     return tmp_path
 
 
@@ -42,6 +41,7 @@ def test_the_manifest_becomes_committable(repo):
     assert ensure_manifest_tracked(repo) is True
 
     assert not _ignored(repo, ".repowise/decisions.yaml")
+    assert not _ignored(repo, ".repowise/decisions.jsonl")
     assert _ignored(repo, ".repowise/wiki.db")
 
 
@@ -89,3 +89,36 @@ def test_a_repo_without_a_gitignore_is_left_alone(tmp_path):
     """Creating one would take over ignoring decisions this tool does not own."""
     assert ensure_manifest_tracked(tmp_path) is False
     assert not (tmp_path / ".gitignore").exists()
+
+
+def test_manifest_setup_preserves_an_existing_journal_exception(repo):
+    (repo / ".gitignore").write_text(
+        ".repowise/\n!/.repowise/\n/.repowise/*\n!/.repowise/decisions.jsonl\n", encoding="utf-8"
+    )
+    assert not _ignored(repo, ".repowise/decisions.jsonl")
+    assert ensure_manifest_tracked(repo)
+    assert not _ignored(repo, ".repowise/decisions.jsonl")
+    assert not _ignored(repo, ".repowise/decisions.yaml")
+    assert _ignored(repo, ".repowise/wiki.db")
+
+
+def test_existing_manifest_setup_gains_the_journal_exception(repo):
+    (repo / ".gitignore").write_text(
+        ".repowise/\n!/.repowise/\n/.repowise/*\n!/.repowise/decisions.yaml\n", encoding="utf-8"
+    )
+    assert ensure_manifest_tracked(repo)
+    assert not _ignored(repo, ".repowise/decisions.jsonl")
+    assert ensure_manifest_tracked(repo) is False
+
+
+def test_local_directory_exclusion_does_not_hide_authored_decisions(repo):
+    local_exclude = repo / ".git/info/exclude"
+    local_exclude.write_text(".repowise/\n", encoding="utf-8")
+    (repo / ".gitignore").write_text("# repository rules\n", encoding="utf-8")
+
+    assert ensure_manifest_tracked(repo)
+    assert not _ignored(repo, ".repowise/decisions.jsonl")
+    assert not _ignored(repo, ".repowise/decisions.yaml")
+    assert _ignored(repo, ".repowise/wiki.db")
+    assert _ignored(repo, "pkg/.repowise/wiki.db")
+    assert local_exclude.read_text(encoding="utf-8") == ".repowise/\n"

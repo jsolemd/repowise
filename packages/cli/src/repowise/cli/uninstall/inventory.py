@@ -160,10 +160,17 @@ def _size_of(path: Path) -> int | None:
 def _index_blocked(repo_path: Path) -> str | None:
     """Why the index cannot be deleted right now, or ``None``.
 
-    Two live-process checks, both cheap, both about deleting a directory out
-    from under something that is currently reading and writing it.
+    Authored decisions survive index removal. The live-process checks also
+    prevent deleting a directory while something is reading and writing it.
     """
     from repowise.cli.helpers import get_repowise_dir
+    from repowise.core.repo_config import authored_decision_files
+
+    authored = authored_decision_files(get_repowise_dir(repo_path))
+    if authored:
+        return (
+            f"contains authored decisions at {authored[0]}; preserve them before removing the index"
+        )
 
     try:
         from repowise.core.update_lock import read_update_lock
@@ -440,7 +447,11 @@ def _package_uninstall_hint() -> str:
     parts = {part.lower() for part in executable.parts}
     if "pipx" in parts:
         return "pipx uninstall repowise"
-    if "uv" in parts or (executable.parent / "uv.exe").exists() or (executable.parent / "uv").exists():
+    if (
+        "uv" in parts
+        or (executable.parent / "uv.exe").exists()
+        or (executable.parent / "uv").exists()
+    ):
         return "uv tool uninstall repowise"
     return "pip uninstall repowise"
 

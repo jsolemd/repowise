@@ -14,7 +14,7 @@ from pathlib import Path
 
 from repowise.cli.agent_targets.types import FileAction
 
-from .inventory import Group, Item, Plan
+from .inventory import Group, Item, Plan, _index_blocked
 
 #: Ran fine, everything chosen is gone.
 EXIT_CLEAN = 0
@@ -197,21 +197,23 @@ def _is_link(path: Path) -> bool:
 def _remove_tree(item: Item) -> Result:
     """Delete a directory whose name is ours, and refuse anything else.
 
-    Ownership is the path, not the contents. ``.repowise/`` and ``~/.repowise/``
-    are named by us and created by us, so removing them needs no inspection of
-    what is inside and therefore has no invariant to get wrong. That is the only
-    tier of ownership on which this command deletes a whole tree.
+    The repo's .repowise directory can contain authored decisions as well as
+    generated state. Recheck it at execution time, since records may have been
+    added after the inventory was displayed.
 
     A symlink is refused rather than followed. Deleting through a junction
     reaches somewhere this command never enumerated and never showed the user.
     """
-    if item.blocked:
+    blocked = item.blocked
+    if not blocked and item.group is Group.INDEX:
+        blocked = _index_blocked(item.path.parent)
+    if blocked:
         return Result(
             group=item.group,
             path=item.path,
             action=FileAction.KEPT,
             label=item.label,
-            reason=item.blocked,
+            reason=blocked,
         )
     if not item.path.exists():
         return Result(

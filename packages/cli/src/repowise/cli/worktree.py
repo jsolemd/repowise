@@ -17,6 +17,7 @@ import uuid
 from pathlib import Path
 
 from repowise.cli.helpers import console, warn
+from repowise.core.repo_config import authored_decision_files
 
 _SEED_TEMPDIR_STALENESS_SECS = 3600
 
@@ -61,6 +62,14 @@ def base_is_seedable(base: Path) -> bool:
     ).exists()
 
 
+def _remove_seed_directory(path: Path) -> None:
+    """Retire generated seed state while retaining any authored records."""
+    if authored_decision_files(path):
+        warn(f"Keeping seed directory {path}: it contains authored decisions.")
+        return
+    shutil.rmtree(path, ignore_errors=True)
+
+
 def sweep_stale_seed_backups(paths: list[Path]) -> None:
     """Remove leftovers from previously disrupted seeds."""
     now = time.time()
@@ -70,11 +79,11 @@ def sweep_stale_seed_backups(paths: list[Path]) -> None:
                 if p.is_dir():
                     try:
                         if ".repowise.bak." in p.name:
-                            shutil.rmtree(p, ignore_errors=True)
+                            _remove_seed_directory(p)
                         else:
                             mtime = p.stat().st_mtime
                             if now - mtime > _SEED_TEMPDIR_STALENESS_SECS:
-                                shutil.rmtree(p, ignore_errors=True)
+                                _remove_seed_directory(p)
                     except OSError:
                         pass
 
@@ -143,7 +152,8 @@ def seed_index_from_base(
     ``include_submodules`` is the caller's CLI flag; pass None to skip the
     conflict warning (update has no such flag).
     """
-    sweep_stale_seed_backups([root, *repo_paths])
+    if not dry_run:
+        sweep_stale_seed_backups([root, *repo_paths])
 
     temp_dirs: list[tuple[Path, Path]] = []
     success = True
@@ -151,6 +161,17 @@ def seed_index_from_base(
     for r_path in repo_paths:
         r_rel = r_path.relative_to(root)
         src_repo = seed_base / r_rel
+
+        authored = authored_decision_files(src_repo / ".repowise") + authored_decision_files(
+            r_path / ".repowise"
+        )
+        if authored:
+            warn(
+                f"Skipping index seed: {authored[0]} contains authored decisions. "
+                "Falling back to full init so this checkout keeps its own records."
+            )
+            success = False
+            break
 
         if not base_is_seedable(src_repo):
             console.print(
@@ -236,11 +257,22 @@ def seed_index_from_base(
 
     if not success:
         for _, temp_dir in temp_dirs:
-            shutil.rmtree(temp_dir, ignore_errors=True)
+            _remove_seed_directory(temp_dir)
         return False
 
     if dry_run:
         return True
+
+    # A journal may have appeared while a large index was being copied. Check
+    # both the staged source and the destination before the first rename.
+    if any(
+        authored_decision_files(temp_dir) or authored_decision_files(r_path / ".repowise")
+        for r_path, temp_dir in temp_dirs
+    ):
+        warn("Authored decisions appeared during index seeding; falling back to full init.")
+        for _, temp_dir in temp_dirs:
+            _remove_seed_directory(temp_dir)
+        return False
 
     backups_created: list[tuple[Path, Path]] = []
     renamed_targets: list[Path] = []
@@ -262,18 +294,18 @@ def seed_index_from_base(
 
         # Pass 3: clean backups
         for _, backup in backups_created:
-            shutil.rmtree(backup, ignore_errors=True)
+            _remove_seed_directory(backup)
     except Exception:
         # Rollback target renames
         for target in renamed_targets:
-            shutil.rmtree(target, ignore_errors=True)
+            _remove_seed_directory(target)
         # Rollback backups
         for target, backup in backups_created:
             if backup.exists():
                 backup.rename(target)
         # Clean temp dirs
         for _, temp_dir in temp_dirs:
-            shutil.rmtree(temp_dir, ignore_errors=True)
+            _remove_seed_directory(temp_dir)
         raise
 
     return True
