@@ -14,6 +14,7 @@ import json
 import os
 import threading
 import time
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -144,6 +145,40 @@ def try_acquire_update_lock(repo_path: Path, target_commit: str | None) -> dict[
     Callers must still call ``release_update_lock`` in a finally block.
     """
     return _try_acquire_lock_at(update_lock_path(repo_path), target_commit)
+
+
+class UpdateLockUnavailableError(RuntimeError):
+    """An index writer could not establish exclusive update ownership."""
+
+
+@contextlib.contextmanager
+def strict_update_lock(repo_path: Path, target_commit: str | None = None) -> Iterator[None]:
+    """Require verified native ownership for writes that cannot run concurrently.
+
+    The legacy acquisition API intentionally tolerates filesystem errors. A
+    destructive cleanup or server job must instead prove it owns the lock, and
+    must not remove a replacement lock when it finishes.
+    """
+    from repowise.core.procutils import process_create_token
+
+    existing = try_acquire_update_lock(repo_path, target_commit)
+    if existing is not None:
+        raise UpdateLockUnavailableError(f"Repository update already running (PID {existing.get('pid')})")
+    owner = read_update_lock(repo_path)
+    pid = os.getpid()
+    token = process_create_token(pid)
+    if (
+        owner is None
+        or owner.get("pid") != pid
+        or token is None
+        or owner.get("pid_create_token") != token
+    ):
+        raise UpdateLockUnavailableError("update lock ownership could not be verified")
+    try:
+        yield
+    finally:
+        if read_update_lock(repo_path) == owner:
+            release_update_lock(repo_path)
 
 
 def update_workspace_lock(workspace_root: Path) -> dict[str, Any] | None:
