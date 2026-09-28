@@ -320,42 +320,6 @@ async def migrate_library_alias(
             )
 
             await conn.execute(
-                """
-                INSERT INTO doc_search.graph_sync_jobs (
-                    library_id, action, status, attempts, next_attempt_at, last_error, created_at, updated_at
-                )
-                SELECT
-                    $2,
-                    action,
-                    'pending',
-                    0,
-                    NOW(),
-                    NULL,
-                    created_at,
-                    NOW()
-                FROM doc_search.graph_sync_jobs
-                WHERE library_id = $1
-                ON CONFLICT (library_id) DO UPDATE SET
-                    action = CASE
-                        WHEN doc_search.graph_sync_jobs.action = 'delete' OR EXCLUDED.action = 'delete'
-                            THEN 'delete'
-                        ELSE 'upsert'
-                    END,
-                    status = 'pending',
-                    attempts = 0,
-                    next_attempt_at = NOW(),
-                    last_error = NULL,
-                    updated_at = NOW()
-                """,
-                legacy_library_id,
-                library_id,
-            )
-
-            await conn.execute(
-                "DELETE FROM doc_search.graph_sync_jobs WHERE library_id = $1",
-                legacy_library_id,
-            )
-            await conn.execute(
                 "DELETE FROM doc_search.libraries WHERE library_id = $1",
                 legacy_library_id,
             )

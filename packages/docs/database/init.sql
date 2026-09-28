@@ -140,25 +140,6 @@ CREATE INDEX idx_jobs_stale
     WHERE status = 'running';
 
 -- ============================================================================
--- doc_search.graph_sync_jobs - Durable docs->Neo4j replay queue
--- ============================================================================
-CREATE TABLE IF NOT EXISTS doc_search.graph_sync_jobs (
-    library_id TEXT PRIMARY KEY,
-    action TEXT NOT NULL
-        CHECK (action IN ('upsert', 'delete')),
-    status TEXT NOT NULL DEFAULT 'pending'
-        CHECK (status IN ('pending', 'running', 'failed')),
-    attempts INT NOT NULL DEFAULT 0,
-    next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    last_error TEXT,
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    updated_at TIMESTAMPTZ DEFAULT NOW()
-);
-
-CREATE INDEX idx_graph_sync_jobs_claim
-    ON doc_search.graph_sync_jobs (status, next_attempt_at, updated_at);
-
--- ============================================================================
 -- updated_at triggers
 -- ============================================================================
 CREATE OR REPLACE FUNCTION doc_search.update_updated_at()
@@ -187,10 +168,6 @@ CREATE TRIGGER snapshot_files_updated_at
 
 CREATE TRIGGER index_jobs_updated_at
     BEFORE UPDATE ON doc_search.index_jobs
-    FOR EACH ROW EXECUTE FUNCTION doc_search.update_updated_at();
-
-CREATE TRIGGER graph_sync_jobs_updated_at
-    BEFORE UPDATE ON doc_search.graph_sync_jobs
     FOR EACH ROW EXECUTE FUNCTION doc_search.update_updated_at();
 
 COMMENT ON SCHEMA doc_search IS 'Documentation search MCP server';
