@@ -363,26 +363,95 @@ def test_update_persist_deletes_vectors_for_tombstoned_and_swept_pages(empty_rep
     )
 
 
-def test_workspace_vector_delete_covers_swept_pages(empty_repo, monkeypatch):
-    """The workspace pass takes the same union, for repos on the core path."""
-    from repowise.cli.commands.update_cmd import incremental as update_incremental
-    from repowise.cli.commands.update_cmd.workspace import _remove_tombstoned_page_vectors
-    from repowise.core.pipeline.prune_state import DeletedFilePruneOutcome
+@pytest.mark.parametrize("producer", ["incremental", "full"])
+def test_workspace_vector_delete_covers_swept_pages(empty_repo, monkeypatch, producer):
+    """The real core producers publish debt before the host retries cleanup."""
+    import networkx as nx
 
-    store = _RecordingStore()
+    from repowise.cli.commands.update_cmd import incremental as update_incremental
+    from repowise.cli.commands.update_cmd.workspace import _retry_workspace_page_cleanup
+    from repowise.core.persistence import upsert_page
+    from repowise.core.pipeline.cleanup_debt import load_cleanup_debt
+    from repowise.core.pipeline.full_index import index_repo_full
+    from repowise.core.pipeline.incremental import persist_incremental_index
+    from repowise.core.update_lock import (
+        read_update_lock,
+        release_update_lock,
+        try_acquire_update_lock,
+    )
+    from tests.unit.persistence.helpers import make_page_kwargs
+
+    page_id = "layer_page:retired"
+    (empty_repo / "app.py").write_text("value = 1\n")
+
+    async def seed():
+        engine, factory, repo_id = await open_repo_db(empty_repo, repo_name="test")
+        try:
+            async with get_session(factory) as session:
+                await upsert_page(
+                    session,
+                    **make_page_kwargs(
+                        repo_id,
+                        page_id=page_id,
+                        page_type="layer_page",
+                    ),
+                )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(seed())
+
+    class Store(_RecordingStore):
+        async def delete_many(self, page_ids):
+            assert read_update_lock(empty_repo) is not None
+            assert load_cleanup_debt(empty_repo)["vectors"] == {page_id}
+            await super().delete_many(page_ids)
+
+    store = Store()
     monkeypatch.setattr(update_incremental, "_build_update_vector_store", lambda *_a, **_kw: store)
+    assert try_acquire_update_lock(empty_repo, None) is None
+    try:
+        if producer == "incremental":
+            graph = nx.DiGraph()
+            graph.add_node("app.py", node_type="file")
+            outcome = asyncio.run(
+                persist_incremental_index(
+                    empty_repo,
+                    SimpleNamespace(graph=lambda: graph),
+                    {},
+                    None,
+                    None,
+                    [],
+                    log=lambda message: None,
+                    parsed_files=[],
+                    vector_store=None,
+                )
+            )
+            assert page_id in outcome.swept_page_ids
+            assert load_cleanup_debt(empty_repo)["vectors"] == {page_id}
+            assert store.deleted == []
+        else:
+            # Full fallback consumes its own debt while it still owns the
+            # lock. The later workspace hook must find no work left to do.
+            (empty_repo / ".repowise/lancedb").mkdir()
+            monkeypatch.setattr(
+                "repowise.core.persistence.vector_store.LanceDBVectorStore",
+                lambda *_a, **_kw: store,
+            )
+            asyncio.run(index_repo_full(empty_repo))
+            assert store.deleted == [[page_id]]
+            assert load_cleanup_debt(empty_repo)["vectors"] == set()
+    finally:
+        release_update_lock(empty_repo)
 
     result = SimpleNamespace(
         alias="a",
         updated=True,
-        prune_outcome=DeletedFilePruneOutcome(
-            attempted=True,
-            tombstoned_page_ids=("file_page:a.py",),
-            swept_page_ids=("scc_page:cycle-1",),
-        ),
     )
     ws_config = SimpleNamespace(repos=[SimpleNamespace(alias="a", path=empty_repo.name)])
 
-    _remove_tombstoned_page_vectors(empty_repo.parent, ws_config, [result])
+    _retry_workspace_page_cleanup(empty_repo.parent, ws_config, [result])
 
-    assert store.deleted == [["file_page:a.py", "scc_page:cycle-1"]]
+    assert store.deleted == [[page_id]]
+    assert load_cleanup_debt(empty_repo) == {"fts": set(), "vectors": set()}
+    assert read_update_lock(empty_repo) is None

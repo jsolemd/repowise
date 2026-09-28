@@ -7,7 +7,6 @@ routing core log output through the CLI ``console``.
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Any
 
@@ -109,40 +108,58 @@ def cleanup_retired_page_vectors(
         clear_cleanup_debt(root, "vectors", cleanup_ids)
 
 
-def retry_idle_page_vector_cleanup(repo_path: Path, head: str | None) -> None:
-    """Finish failed deletions without requiring another content-changing update."""
-    from repowise.core.pipeline.cleanup_debt import load_cleanup_debt
-    from repowise.core.procutils import process_create_token
+def retry_retired_page_cleanup(repo_path: Path, head: str | None = None) -> None:
+    """Drain producer-recorded index cleanup under fresh native ownership."""
+    from repowise.core.pipeline.cleanup_debt import (
+        clear_cleanup_debt,
+        exclude_live_cleanup_ids,
+        load_cleanup_debt,
+    )
     from repowise.core.update_lock import (
-        read_update_lock,
-        release_update_lock,
-        try_acquire_update_lock,
+        UpdateLockUnavailableError,
+        strict_update_lock,
     )
 
-    if not load_cleanup_debt(repo_path)["vectors"]:
+    debt = load_cleanup_debt(repo_path)
+    if not any(debt.values()):
         return
-    if try_acquire_update_lock(repo_path, head) is not None:
-        return
-    owner = read_update_lock(repo_path)
-    pid = os.getpid()
-    if (
-        owner is None
-        or owner.get("pid") != pid
-        or owner.get("pid_create_token") != process_create_token(pid)
-    ):
-        console.print(
-            f"[yellow]{repo_path.name}: retired page vector removal deferred: "
-            "update lock ownership could not be verified[/yellow]"
-        )
-        return
+
+    async def remove_fts() -> None:
+        from repowise.core.persistence.database import create_engine, has_db_store, resolve_db_url
+        from repowise.core.persistence.search import FullTextSearch
+
+        if not has_db_store(repo_path):
+            raise RuntimeError("page authority is unavailable; FTS cleanup deferred")
+        engine = create_engine(resolve_db_url(repo_path))
+        try:
+            ids = await exclude_live_cleanup_ids(repo_path, engine, debt["fts"])
+            if ids:
+                fts = FullTextSearch(engine)
+                await fts.ensure_index()
+                await fts.delete_many(sorted(ids))
+                clear_cleanup_debt(repo_path, "fts", ids)
+        finally:
+            await engine.dispose()
+
     try:
-        cleanup_retired_page_vectors(repo_path, [])
-    except Exception as exc:
-        console.print(
-            f"[yellow]{repo_path.name}: retired page vector removal deferred: {exc}[/yellow]"
-        )
-    finally:
-        release_update_lock(repo_path)
+        with strict_update_lock(repo_path, head):
+            if debt["fts"]:
+                try:
+                    run_async(remove_fts())
+                except Exception as exc:
+                    console.print(
+                        f"[yellow]{repo_path.name}: retired page FTS removal deferred: {exc}[/yellow]"
+                    )
+            # Each index can recover independently; an FTS failure must not strand
+            # vectors. The vector body reloads debt after the live-page recheck.
+            try:
+                cleanup_retired_page_vectors(repo_path, [])
+            except Exception as exc:
+                console.print(
+                    f"[yellow]{repo_path.name}: retired page vector removal deferred: {exc}[/yellow]"
+                )
+    except UpdateLockUnavailableError as exc:
+        console.print(f"[yellow]{repo_path.name}: retired page cleanup deferred: {exc}[/yellow]")
 
 
 def _build_filtered_changed_paths(file_diffs: list, exclude_patterns: list[str]) -> list[str]:

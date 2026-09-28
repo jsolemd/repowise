@@ -183,3 +183,56 @@ def test_no_debt_opens_no_database_or_vector_store(tmp_path) -> None:
         cleanup_retired_page_vectors(tmp_path, [])
     engine.assert_not_called()
     store.assert_not_called()
+
+
+def test_workspace_cleanup_excludes_competing_native_writer(page_catalog, monkeypatch):
+    from repowise.cli._repo_session import open_repo_db
+    from repowise.cli.commands.update_cmd import incremental, workspace
+    from repowise.core.persistence import get_session, upsert_page
+    from repowise.core.pipeline.prune_state import DeletedFilePruneOutcome
+    from repowise.core.update_lock import release_update_lock, try_acquire_update_lock
+    from tests.unit.persistence.helpers import make_page_kwargs
+
+    page_id = "file_page:restored.py"
+    record_cleanup_debt(page_catalog, "vectors", {page_id})
+    vectors = {page_id: "old"}
+    writer_admitted = []
+
+    async def restore():
+        engine, factory, repo_id = await open_repo_db(page_catalog, repo_name="test")
+        try:
+            async with get_session(factory) as session:
+                await upsert_page(session, **make_page_kwargs(repo_id, page_id=page_id))
+            vectors[page_id] = "regenerated"
+        finally:
+            await engine.dispose()
+
+    async def delete(ids):
+        for value in ids:
+            assert vectors[value] != "regenerated", "cleanup deleted the restored page's new vector"
+            del vectors[value]
+
+    def build(*args, **kwargs):
+        # Adapter construction is after the SQL recheck. A real writer that
+        # enters here can commit a fresh page and vector before deletion.
+        acquired = try_acquire_update_lock(page_catalog, "new-head") is None
+        writer_admitted.append(acquired)
+        if acquired:
+            try:
+                asyncio.run(restore())
+            finally:
+                release_update_lock(page_catalog)
+        return SimpleNamespace(delete_many=AsyncMock(side_effect=delete), close=AsyncMock())
+
+    monkeypatch.setattr(incremental, "_build_update_vector_store", build)
+    result = SimpleNamespace(
+        alias="repo",
+        updated=True,
+        prune_outcome=DeletedFilePruneOutcome(attempted=True, swept_page_ids=(page_id,)),
+    )
+    config = SimpleNamespace(repos=[SimpleNamespace(alias="repo", path=page_catalog.name)])
+    workspace._retry_workspace_page_cleanup(page_catalog.parent, config, [result])
+
+    assert writer_admitted == [False]
+    assert vectors == {}
+    assert load_cleanup_debt(page_catalog)["vectors"] == set()

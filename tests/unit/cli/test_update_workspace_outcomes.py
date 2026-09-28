@@ -114,7 +114,7 @@ def invoke_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.setattr(core_workspace, "update_workspace", update_core)
         monkeypatch.setattr(command, "run_update", update_docs)
         monkeypatch.setattr(source_search_runtime, "reconcile_configured_source_indexes", reconcile)
-        monkeypatch.setattr(workspace, "_remove_tombstoned_page_vectors", lambda *_: None)
+        monkeypatch.setattr(workspace, "_retry_workspace_page_cleanup", lambda *_: None)
         monkeypatch.setattr(
             workspace,
             "_refresh_workspace_editor_project_files",

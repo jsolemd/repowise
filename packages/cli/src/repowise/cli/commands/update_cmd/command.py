@@ -54,7 +54,7 @@ from .incremental import (
     _refresh_knowledge_graph,
     _run_doc_drift_partial,
     _run_partial_analysis,
-    retry_idle_page_vector_cleanup,
+    retry_retired_page_cleanup,
 )
 from .mode import _resolve_index_only_mode
 from .persistence import (
@@ -1105,7 +1105,7 @@ def run_update(
 
     if git_is_current and not stale_db_paths and not stale_deterministic_ids:
         if not dry_run:
-            retry_idle_page_vector_cleanup(repo_path, head)
+            retry_retired_page_cleanup(repo_path, head)
         console.print("[green]Already up to date.[/green]")
         # D7: on a template (index-only) wiki, "up to date" is true of the code
         # but the pages are still unwritten. Point at the command that writes

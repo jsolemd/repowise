@@ -71,37 +71,17 @@ def _print_repo_result(result: Any) -> None:
             console.print(f"      [yellow]{refusal.message}[/yellow]")
 
 
-def _remove_tombstoned_page_vectors(ws_root: Path, ws_config: Any, results: list[Any]) -> None:
-    """Let the CLI host apply core persistence's page-vector delete contract."""
-    from .incremental import cleanup_retired_page_vectors
+def _retry_workspace_page_cleanup(ws_root: Path, ws_config: Any, results: list[Any]) -> None:
+    """Core producers record debt before releasing their update ownership."""
+    from .incremental import retry_retired_page_cleanup
 
     by_alias = {result.alias: result for result in results}
     for entry in ws_config.repos:
         result = by_alias.get(entry.alias)
-        # A swept page is deleted outright, so its vector orphans harder than a
-        # tombstone's: search hydrates its title and snippet from the store and
-        # serves an answer for a page that no longer exists.
-        page_ids = (
-            list(
-                dict.fromkeys(
-                    [
-                        *result.prune_outcome.tombstoned_page_ids,
-                        *result.prune_outcome.swept_page_ids,
-                    ]
-                )
-            )
-            if result is not None and result.updated
-            else []
-        )
         if result is None or not result.updated:
             continue
         repo_path = (ws_root / entry.path).resolve()
-        try:
-            cleanup_retired_page_vectors(repo_path, page_ids)
-        except Exception as exc:
-            console.print(
-                f"  [yellow]{entry.alias}: retired page vector removal deferred: {exc}[/yellow]"
-            )
+        retry_retired_page_cleanup(repo_path)
 
 
 def _workspace_update(
@@ -296,10 +276,10 @@ def _workspace_update(
                 await reconcile_idle_repo_head_commit(repo_path, head)
 
         run_async(_reconcile_up_to_date())
-        from .incremental import retry_idle_page_vector_cleanup
+        from .incremental import retry_retired_page_cleanup
 
         for repo_path, head in up_to_date_repos:
-            retry_idle_page_vector_cleanup(repo_path, head)
+            retry_retired_page_cleanup(repo_path, head)
 
     if stale_count == 0:
         console.print("[green]All repos are up to date.[/green]")
@@ -363,7 +343,7 @@ def _workspace_update(
             force_aliases=recipe_drift_aliases,
         )
     )
-    _remove_tombstoned_page_vectors(ws_root, ws_config, results)
+    _retry_workspace_page_cleanup(ws_root, ws_config, results)
 
     # Each member committed its own transactional source outbox. Drain those
     # queues after the parallel SQL updates complete; one unavailable backend
@@ -567,7 +547,7 @@ def _workspace_docs_update(
                 force_aliases=recipe_drift_aliases,
             )
         )
-        _remove_tombstoned_page_vectors(ws_root, ws_config, core_results)
+        _retry_workspace_page_cleanup(ws_root, ws_config, core_results)
         errors.extend(f"{r.alias}: {r.error}" for r in core_results if r.error is not None)
         changed_aliases.extend(r.alias for r in core_results if r.updated)
         from repowise.cli.source_search_runtime import reconcile_configured_source_indexes

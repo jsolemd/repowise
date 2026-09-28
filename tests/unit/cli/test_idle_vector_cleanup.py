@@ -1,4 +1,4 @@
-"""An idle update must finish failed vector deletion without reindexing."""
+"""An idle update must finish failed index deletion without reindexing."""
 
 from __future__ import annotations
 
@@ -102,16 +102,17 @@ def test_idle_update_retries_cleanup_and_releases_its_store(idle_update, monkeyp
 
 
 @pytest.mark.parametrize("mode", ["dry_run", "busy"])
-def test_idle_cleanup_preserves_debt_when_not_allowed(idle_update, monkeypatch, mode):
+@pytest.mark.parametrize("kind", ["fts", "vectors"])
+def test_idle_cleanup_preserves_debt_when_not_allowed(idle_update, monkeypatch, mode, kind):
     repo, head, run = idle_update
-    record_cleanup_debt(repo, "vectors", {"retired"})
+    record_cleanup_debt(repo, kind, {"retired"})
     build = Mock(side_effect=AssertionError("must not open the vector store"))
     monkeypatch.setattr(incremental, "_build_update_vector_store", build)
     if mode == "busy":
         assert try_acquire_update_lock(repo, head) is None
     try:
         run(dry_run=mode == "dry_run")
-        assert load_cleanup_debt(repo)["vectors"] == {"retired"}
+        assert load_cleanup_debt(repo)[kind] == {"retired"}
         build.assert_not_called()
         if mode == "busy":
             assert read_update_lock(repo) is not None
@@ -137,11 +138,14 @@ def test_idle_cleanup_failure_stays_retryable(idle_update, monkeypatch):
     assert store.close.await_count == 2
 
 
-def test_idle_cleanup_defers_when_native_lock_creation_fails(idle_update, monkeypatch, capsys):
+@pytest.mark.parametrize("kind", ["fts", "vectors"])
+def test_idle_cleanup_defers_when_native_lock_creation_fails(
+    idle_update, monkeypatch, capsys, kind
+):
     from repowise.core import update_lock
 
     repo, _head, run = idle_update
-    record_cleanup_debt(repo, "vectors", {"retired"})
+    record_cleanup_debt(repo, kind, {"retired"})
     build = Mock(side_effect=AssertionError("must not open the vector store"))
     monkeypatch.setattr(incremental, "_build_update_vector_store", build)
     # The native lock API intentionally returns None on unexpected OSError.
@@ -151,6 +155,105 @@ def test_idle_cleanup_defers_when_native_lock_creation_fails(idle_update, monkey
     output = run() or capsys.readouterr().out
 
     assert "update lock ownership could not be verified" in output
-    assert load_cleanup_debt(repo)["vectors"] == {"retired"}
+    assert load_cleanup_debt(repo)[kind] == {"retired"}
     assert read_update_lock(repo) is None
+    build.assert_not_called()
+
+
+def test_idle_update_retries_fts_only_debt(idle_update, monkeypatch):
+    from repowise.cli._repo_session import open_repo_db
+    from repowise.core.persistence import FullTextSearch, get_session, upsert_page
+    from tests.unit.persistence.helpers import make_page_kwargs
+
+    repo, _head, run = idle_update
+    page_id = "file_page:removed.py"
+
+    async def indexed_ids(*, seed=False):
+        engine, factory, repo_id = await open_repo_db(repo, repo_name="test")
+        try:
+            fts = FullTextSearch(engine)
+            if seed:
+                async with get_session(factory) as session:
+                    await upsert_page(
+                        session,
+                        **make_page_kwargs(
+                            repo_id,
+                            page_id=page_id,
+                            freshness_status="tombstone",
+                        ),
+                    )
+                await fts.ensure_index()
+                await fts.index(
+                    page_id, "Removed", "xylophone", summary="Removed", target_path="removed.py"
+                )
+            return await fts.list_indexed_ids()
+        finally:
+            await engine.dispose()
+
+    assert page_id in asyncio.run(indexed_ids(seed=True))
+    record_cleanup_debt(repo, "fts", {page_id})
+    build = Mock(side_effect=AssertionError("FTS cleanup must not construct vectors"))
+    monkeypatch.setattr(incremental, "_build_update_vector_store", build)
+
+    run()
+
+    assert load_cleanup_debt(repo)["fts"] == set()
+    assert page_id not in asyncio.run(indexed_ids())
+    assert read_update_lock(repo) is None
+    build.assert_not_called()
+
+
+def test_idle_fts_failure_does_not_block_vector_cleanup(idle_update, monkeypatch, capsys):
+    from repowise.core.persistence.search import FullTextSearch
+
+    repo, _head, run = idle_update
+    for kind in ("fts", "vectors"):
+        record_cleanup_debt(repo, kind, {"retired"})
+    store = SimpleNamespace(delete_many=AsyncMock(), close=AsyncMock())
+    monkeypatch.setattr(incremental, "_build_update_vector_store", Mock(return_value=store))
+    monkeypatch.setattr(
+        FullTextSearch, "delete_many", AsyncMock(side_effect=OSError("FTS offline"))
+    )
+
+    output = run() or capsys.readouterr().out
+
+    assert "FTS offline" in output
+    assert load_cleanup_debt(repo) == {"fts": {"retired"}, "vectors": set()}
+    store.delete_many.assert_awaited_once_with(["retired"])
+    store.close.assert_awaited_once()
+    assert read_update_lock(repo) is None
+
+
+def test_empty_retry_opens_no_resources_or_lock(tmp_path, monkeypatch):
+    from repowise.core import update_lock
+    from repowise.core.persistence import database
+
+    acquire = Mock(side_effect=AssertionError("must not acquire an idle lock"))
+    engine = Mock(side_effect=AssertionError("must not open SQL"))
+    adapter = Mock(side_effect=AssertionError("must not open vectors"))
+    monkeypatch.setattr(update_lock, "try_acquire_update_lock", acquire)
+    monkeypatch.setattr(database, "create_engine", engine)
+    monkeypatch.setattr(incremental, "_build_update_vector_store", adapter)
+
+    incremental.retry_retired_page_cleanup(tmp_path)
+
+    acquire.assert_not_called()
+    engine.assert_not_called()
+    adapter.assert_not_called()
+
+
+def test_unavailable_authority_discloses_both_pending_indexes(tmp_path, monkeypatch, capsys):
+    for kind in ("fts", "vectors"):
+        record_cleanup_debt(tmp_path, kind, {"retired"})
+    build = Mock(side_effect=AssertionError("must not open vectors without SQL authority"))
+    monkeypatch.setattr(incremental, "_build_update_vector_store", build)
+
+    incremental.retry_retired_page_cleanup(tmp_path)
+
+    output = capsys.readouterr().out
+    assert "FTS removal deferred" in output
+    assert "vector removal deferred" in output
+    assert output.count("page authority is unavailable") == 2
+    assert load_cleanup_debt(tmp_path) == {"fts": {"retired"}, "vectors": {"retired"}}
+    assert read_update_lock(tmp_path) is None
     build.assert_not_called()
