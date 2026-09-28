@@ -8,13 +8,14 @@ with ``LookupError: Repository not found: <alias>`` for every repo.
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import select
+from sqlalchemy import event, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 import repowise.server.mcp_server as mcp_mod
@@ -145,3 +146,109 @@ async def test_lifespan_publishes_the_repo_registry(workspace, monkeypatch, sche
     # Shutdown puts the globals back so a later single-repo server is clean.
     assert mcp_mod._registry is None
     assert mcp_mod._workspace_root is None
+
+
+async def test_lifespan_drains_jobs_before_closing_stores(workspace, monkeypatch):
+    from repowise.core.persistence import crud
+    from repowise.server.services.job_queue import launch_job_task
+
+    monkeypatch.setenv("REPOWISE_SCHEDULER_ENABLED", "0")
+    await _make_repo(workspace, "boot")
+    app = create_app()
+    context = lifespan(app)
+    await context.__aenter__()
+    factory = app.state.session_factory
+    async with factory() as session:
+        job = await crud.upsert_generation_job(session, repository_id="boot-id", status="pending")
+        await session.commit()
+    started, cleanup, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def execute(*_args, **_kwargs):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cleanup.set()
+            await release.wait()
+
+    vector_store = app.state.vector_store
+    original_close = vector_store.close
+    close_observations = []
+
+    async def close_after_terminal():
+        async with factory() as session:
+            finished = await session.get(GenerationJob, job.id)
+            close_observations.append((
+                len(app.state.background_tasks), finished.status, finished.error_message,
+            ))
+        await original_close()
+
+    close = AsyncMock(side_effect=close_after_terminal)
+    monkeypatch.setattr(vector_store, "close", close)
+    registry_close = AsyncMock(wraps=app.state.repo_registry.close)
+    monkeypatch.setattr(app.state.repo_registry, "close", registry_close)
+    disposed = []
+    event.listen(app.state.engine.sync_engine, "engine_disposed", lambda _: disposed.append(True))
+    launch_job_task(
+        app_state=app.state, job_id=job.id, session_factory=factory, executor=execute,
+    )
+    await started.wait()
+    stopped = asyncio.create_task(context.__aexit__(None, None, None))
+    try:
+        await asyncio.wait_for(cleanup.wait(), timeout=5)
+        assert not stopped.done()
+        close.assert_not_awaited()
+        registry_close.assert_not_awaited()
+        assert disposed == []
+    finally:
+        release.set()
+        await asyncio.wait_for(stopped, timeout=5)
+    close.assert_awaited_once()
+    assert close_observations == [(0, "cancelled", "Server shutdown")]
+    registry_close.assert_awaited_once()
+    assert disposed == [True]
+
+
+@pytest.mark.parametrize("callback_id", ["staleness_check", "polling_fallback"])
+async def test_lifespan_waits_for_native_scheduler_sql_cleanup(workspace, monkeypatch, callback_id):
+    from repowise.core.persistence import database
+
+    monkeypatch.setenv("REPOWISE_SCHEDULER_ENABLED", "1")
+    await _make_repo(workspace, "boot")
+    app = create_app()
+    context = lifespan(app)
+    await context.__aenter__()
+    entered, cleanup, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    original_session = database.get_session
+
+    @asynccontextmanager
+    async def hold_session(factory):
+        async with original_session(factory) as session:
+            entered.set()
+            try:
+                yield session
+                await asyncio.Event().wait()
+            finally:
+                cleanup.set()
+                await release.wait()
+
+    monkeypatch.setattr(database, "get_session", hold_session)
+    disposed = []
+    event.listen(app.state.engine.sync_engine, "engine_disposed", lambda _: disposed.append(True))
+    scheduler = app.state.scheduler
+    # Run through the installed scheduler/executor, including its asynchronous
+    # shutdown, rather than calling the callback directly from this test task.
+    scheduler.modify_job(callback_id, next_run_time=datetime.now(UTC))
+    await asyncio.wait_for(entered.wait(), timeout=5)
+    assert app.state.job_tasks == {}
+    assert len(app.state.background_tasks) == 1
+    stopped = asyncio.create_task(context.__aexit__(None, None, None))
+    try:
+        await asyncio.wait_for(cleanup.wait(), timeout=5)
+        assert not stopped.done()
+        assert disposed == []
+    finally:
+        release.set()
+        await asyncio.wait_for(stopped, timeout=5)
+    assert app.state.background_tasks == set()
+    assert disposed == [True]

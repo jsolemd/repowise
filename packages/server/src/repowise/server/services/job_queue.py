@@ -123,6 +123,35 @@ def repository_job_lock(session_factory: Any, repository_id: str) -> asyncio.Loc
     return entry.locks.setdefault(repository_id, asyncio.Lock())
 
 
+def job_cancellation_reason(app_state: Any) -> str:
+    return (
+        "Server shutdown"
+        if getattr(app_state, "job_shutdown_requested", False)
+        else "Cancelled by user"
+    )
+
+
+async def shutdown_job_tasks(app_state: Any) -> None:
+    """Stop accepted jobs and finish their terminal writes before stores close.
+
+    The runtime first stops request/scheduler admission. Its process supervisor
+    owns the hard-stop deadline; timing out here must not close stores while a
+    job still uses them. CPU workers with job-local inputs can unwind separately.
+    """
+    app_state.job_shutdown_requested = True
+    for token in getattr(app_state, "job_cancel_tokens", {}).values():
+        token.cancel()
+    for task in getattr(app_state, "job_tasks", {}).values():
+        # A second cancellation can interrupt an executor already recording
+        # the terminal state for a user's cancellation.
+        if not task.done() and not task.cancelling():
+            task.cancel()
+    while tasks := list(getattr(app_state, "background_tasks", ())):
+        await asyncio.gather(*tasks, return_exceptions=True)
+        # Done callbacks can add the final SQL write or return a runtime lease.
+        await asyncio.sleep(0)
+
+
 def launch_job_task(
     *,
     app_state: Any,
@@ -171,6 +200,8 @@ def launch_job_task(
 
     coro = None
     try:
+        if getattr(app_state, "job_shutdown_requested", False):
+            raise RuntimeError("Server is shutting down")
         coro = executor(job_id, app_state, session_factory_override=session_factory)
         task: asyncio.Task[None] = asyncio.create_task(
             coro,
@@ -204,7 +235,7 @@ def launch_job_task(
         bg_tasks.discard(done)
         job_tasks.pop(job_id, None)
         if done.cancelled():
-            _fire_and_track(_finish("cancelled", "Cancelled by user"))
+            _fire_and_track(_finish("cancelled", job_cancellation_reason(app_state)))
             return
         exc = done.exception()
         if exc is not None:
@@ -317,7 +348,9 @@ async def queue_index_only_job(
 
 __all__ = [
     "IndexJobQueueResult",
+    "job_cancellation_reason",
     "launch_job_task",
     "queue_index_only_job",
     "repository_job_lock",
+    "shutdown_job_tasks",
 ]

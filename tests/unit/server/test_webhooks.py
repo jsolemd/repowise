@@ -6,13 +6,36 @@ import hashlib
 import hmac
 import json
 import os
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from httpx import AsyncClient
 from sqlalchemy import select
 
 from repowise.core.persistence.models import GenerationJob, Repository
+
+
+async def test_webhook_job_joins_shutdown_before_executor_starts(app, session, tmp_path):
+    from repowise.core.persistence import crud
+    from repowise.server.routers.webhooks import _launch_webhook_job
+    from repowise.server.services.job_queue import shutdown_job_tasks
+
+    repo = await crud.upsert_repository(session, name="repo", local_path=str(tmp_path))
+    job = await crud.upsert_generation_job(session, repository_id=repo.id, status="pending")
+    await session.commit()
+    execute = AsyncMock()
+    with patch("repowise.server.job_executor.execute_job", execute):
+        _launch_webhook_job(SimpleNamespace(app=app), job.id)
+        assert job.id in app.state.job_tasks
+        await shutdown_job_tasks(app.state)
+
+    execute.assert_not_awaited()
+    assert execute.call_args.kwargs["session_factory_override"] is app.state.session_factory
+    assert app.state.background_tasks == set()
+    await session.refresh(job)
+    assert job.status == "cancelled"
+    assert job.error_message == "Server shutdown"
 
 
 @pytest.mark.asyncio

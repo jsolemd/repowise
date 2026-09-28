@@ -425,3 +425,83 @@ async def test_job_completion_callback_error_is_observed(session, session_factor
 
     release.assert_awaited_once()
     assert "job_resource_release_failed" in caplog.text
+
+
+async def test_shutdown_before_executor_starts_persists_terminal_status(
+    session, session_factory, tmp_path,
+):
+    repo = await _repo(session, tmp_path)
+    job = await crud.upsert_generation_job(session, repository_id=repo.id, status="pending")
+    await session.commit()
+    runtime = _runtime()
+    executor = AsyncMock()
+    job_queue_module.launch_job_task(
+        app_state=runtime, job_id=job.id, session_factory=session_factory, executor=executor,
+    )
+
+    await job_queue_module.shutdown_job_tasks(runtime)
+
+    executor.assert_not_awaited()
+    assert runtime.background_tasks == set()
+    assert runtime.job_tasks == {}
+    await session.refresh(job)
+    assert job.status == "cancelled"
+    assert job.error_message == "Server shutdown"
+
+
+@pytest.mark.parametrize("already_cancelling", [False, True])
+async def test_shutdown_waits_for_cleanup_and_refuses_launch_during_drain(
+    session, session_factory, tmp_path, already_cancelling,
+):
+    from repowise.core.cancellation import CancellationToken
+
+    repo = await _repo(session, tmp_path)
+    jobs = [await crud.upsert_generation_job(
+        session, repository_id=repo.id, status="pending",
+    ) for _ in range(2)]
+    await session.commit()
+    runtime = _runtime()
+    token = CancellationToken()
+    runtime.job_cancel_tokens = {jobs[0].id: token}
+    started, cleanup, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def execute(*_args, **_kwargs):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            assert token.cancelled
+            cleanup.set()
+            await release.wait()
+
+    job_queue_module.launch_job_task(
+        app_state=runtime, job_id=jobs[0].id, session_factory=session_factory, executor=execute,
+    )
+    await started.wait()
+    if already_cancelling:
+        token.cancel()
+        runtime.job_tasks[jobs[0].id].cancel()
+        await cleanup.wait()
+    stopped = asyncio.create_task(job_queue_module.shutdown_job_tasks(runtime))
+    try:
+        await asyncio.wait_for(cleanup.wait(), timeout=5)
+        await asyncio.sleep(0)
+        assert not stopped.done()
+        late_executor = AsyncMock()
+        job_queue_module.launch_job_task(
+            app_state=runtime, job_id=jobs[1].id, session_factory=session_factory,
+            executor=late_executor,
+        )
+    finally:
+        release.set()
+        await asyncio.wait_for(stopped, timeout=5)
+
+    late_executor.assert_not_called()
+    assert runtime.background_tasks == set()
+    assert runtime.job_tasks == {}
+    for job in jobs:
+        await session.refresh(job)
+    assert jobs[0].status == "cancelled"
+    assert jobs[0].error_message == "Server shutdown"
+    assert jobs[1].status == "failed"
+    assert "Server is shutting down" in jobs[1].error_message

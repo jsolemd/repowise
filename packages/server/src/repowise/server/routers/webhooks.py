@@ -132,21 +132,15 @@ def _verify_gitlab_token(request: Request, token_header: str) -> None:
 
 def _launch_webhook_job(request: Request, job_id: str) -> None:
     """Launch a webhook-triggered job as a background task."""
-    import asyncio
-
     from repowise.server.job_executor import execute_job
+    from repowise.server.services.job_queue import launch_job_task
 
-    task = asyncio.create_task(
-        execute_job(job_id, request.app.state),
-        name=f"webhook-job-{job_id}",
+    launch_job_task(
+        app_state=request.app.state,
+        job_id=job_id,
+        session_factory=request.app.state.session_factory,
+        executor=execute_job,
     )
-    bg_tasks: set = request.app.state.background_tasks
-    bg_tasks.add(task)
-
-    def _on_done(t: asyncio.Task) -> None:
-        bg_tasks.discard(t)
-
-    task.add_done_callback(_on_done)
 
 
 @router.post("/github", response_model=WebhookResponse)

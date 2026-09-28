@@ -65,15 +65,22 @@ async def _seed_repo_and_job(
     return job.id
 
 
-@pytest.mark.parametrize("failure, expected", [(RuntimeError, "failed"), (asyncio.CancelledError, "cancelled")])
+@pytest.mark.parametrize("failure, expected, shutdown", [
+    (RuntimeError, "failed", False),
+    (asyncio.CancelledError, "cancelled", False),
+    (asyncio.CancelledError, "cancelled", True),
+])
 async def test_executor_restores_its_callers_token_after_unwind(
-    session_factory, tmp_path, monkeypatch, failure, expected,
+    session_factory, tmp_path, monkeypatch, failure, expected, shutdown,
 ):
     from repowise.core.cancellation import CancellationToken, get_active_token, set_active_token
 
     monkeypatch.setenv("REPOWISE_TOOLS_NO_GENERATIVE", "1")
     job_id = await _seed_repo_and_job(session_factory, tmp_path, mode="index_only")
-    app_state = SimpleNamespace(session_factory=session_factory, fts=None, vector_store=None)
+    app_state = SimpleNamespace(
+        session_factory=session_factory, fts=None, vector_store=None,
+        job_shutdown_requested=shutdown,
+    )
     parent_token = CancellationToken()
 
     async def fail_pipeline(*args, **kwargs):
@@ -96,6 +103,8 @@ async def test_executor_restores_its_callers_token_after_unwind(
     async with session_factory() as session:
         job = await get_generation_job(session, job_id)
         assert job.status == expected
+        if expected == "cancelled":
+            assert job.error_message == ("Server shutdown" if shutdown else "Cancelled by user")
 
 
 @pytest.mark.asyncio

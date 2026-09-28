@@ -269,6 +269,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     app.state.job_tasks = {}  # job_id → asyncio.Task (cancel endpoint)
     app.state.job_cancel_tokens = {}  # job_id → CancellationToken
     app.state.job_events = {}  # job_id → JobEventBuffer (SSE message frames)
+    app.state.job_shutdown_requested = False
 
     # A native watcher or external timer may already own automatic refresh.
     # Disabling this scheduler leaves explicit API sync requests available.
@@ -499,6 +500,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         # would leave the tool layer pointing at disposed engines.
         if scheduler is not None:
             scheduler.shutdown(wait=False)
+        from repowise.server.services.job_queue import shutdown_job_tasks
+
+        await shutdown_job_tasks(app.state)
         with suppress(Exception):
             await vector_store.close()
         # Close cached per-repo vector stores (LanceDB connections).

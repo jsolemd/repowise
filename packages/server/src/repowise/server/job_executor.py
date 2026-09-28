@@ -666,9 +666,10 @@ async def execute_job(
         )
 
     except (PipelineCancelled, asyncio.CancelledError):
-        # User-requested cancel: the endpoint flipped our token and/or
-        # cancelled the task. Record the terminal state and swallow — this is
-        # the top of a background task, nothing above us awaits the result.
+        # The cancel endpoint or runtime shutdown flipped the token and/or
+        # cancelled the task. Finish the terminal write before releasing stores.
+        from repowise.server.services.job_queue import job_cancellation_reason
+
         logger.info("job_cancelled", job_id=job_id)
         await _finalize_job_status(
             app_state,
@@ -676,7 +677,7 @@ async def execute_job(
             progress,
             job_id,
             status="cancelled",
-            error_message="Cancelled by user",
+            error_message=job_cancellation_reason(app_state),
         )
     except Exception as exc:
         logger.exception("job_failed", job_id=job_id, error=str(exc))

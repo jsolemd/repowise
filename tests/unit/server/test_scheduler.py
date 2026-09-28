@@ -7,6 +7,7 @@ import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+import pytest
 from sqlalchemy import select
 
 from repowise.core.persistence import crud
@@ -47,6 +48,7 @@ async def test_polling_fallback_launches_persisted_job(session_factory, tmp_path
     execute_job.assert_awaited_once()
     job_id, launched_state = execute_job.await_args.args
     assert launched_state is app_state
+    assert execute_job.await_args.kwargs["session_factory_override"] is session_factory
 
     async with get_session(session_factory) as session:
         result = await session.execute(
@@ -81,3 +83,49 @@ async def test_polling_fallback_offloads_repository_inspection(session_factory, 
         await polling_job.func()
 
     to_thread.assert_awaited_once_with(_inspect_repository, str(tmp_path))
+
+
+async def test_scheduled_job_cancelled_before_start_gets_terminal_status(
+    session_factory, tmp_path,
+):
+    from repowise.server.services.job_queue import shutdown_job_tasks
+
+    async with get_session(session_factory) as session:
+        await crud.upsert_repository(session, name="repo", local_path=str(tmp_path))
+    app_state = SimpleNamespace(background_tasks=set())
+    scheduler = setup_scheduler(session_factory, app_state=app_state)
+    polling_job = next(job for job in scheduler.get_jobs() if job.id == "polling_fallback")
+    executor = AsyncMock()
+    shutdown = []
+
+    def stop_before_start(*args, **kwargs):
+        # The shutdown task is runnable before the executor gets its first
+        # turn, but launch_job_task registers the executor before yielding.
+        shutdown.append(asyncio.create_task(shutdown_job_tasks(app_state)))
+        return executor(*args, **kwargs)
+
+    with (
+        patch("repowise.server.scheduler._inspect_repository", return_value=("old", "new")),
+        patch("repowise.server.job_executor.execute_job", stop_before_start),
+    ):
+        await asyncio.create_task(polling_job.func())
+        await asyncio.gather(*shutdown)
+
+    executor.assert_not_awaited()
+    assert app_state.background_tasks == set()
+    assert app_state.job_tasks == {}
+    async with get_session(session_factory) as session:
+        job = (await session.scalars(select(GenerationJob))).one()
+        assert job.status == "cancelled"
+        assert job.error_message == "Server shutdown"
+
+
+@pytest.mark.parametrize("callback_id", ["staleness_check", "polling_fallback"])
+async def test_scheduler_callback_cannot_enter_sql_after_shutdown(session_factory, callback_id):
+    app_state = SimpleNamespace(background_tasks=set(), job_shutdown_requested=True)
+    scheduler = setup_scheduler(session_factory, app_state=app_state)
+    callback = next(job for job in scheduler.get_jobs() if job.id == callback_id)
+    with patch("repowise.core.persistence.database.get_session") as open_session:
+        await callback.func()
+    open_session.assert_not_called()
+    assert app_state.background_tasks == set()

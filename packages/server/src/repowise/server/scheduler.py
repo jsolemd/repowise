@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from functools import wraps
 from typing import TYPE_CHECKING, Any
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -71,6 +72,24 @@ def setup_scheduler(
     """
     scheduler = AsyncIOScheduler()
 
+    def tracked(callback):
+        @wraps(callback)
+        async def run():
+            if app_state is None:
+                return await callback()
+            if getattr(app_state, "job_shutdown_requested", False):
+                return
+            task = asyncio.current_task()
+            # APScheduler cancels its callbacks on shutdown but does not wait
+            # for their SQL contexts to unwind. The app's existing drain does.
+            app_state.background_tasks.add(task)
+            try:
+                await callback()
+            finally:
+                app_state.background_tasks.discard(task)
+        return run
+
+    @tracked
     async def check_staleness() -> None:
         """Find stale pages and log them for regeneration."""
         from sqlalchemy import select
@@ -103,6 +122,7 @@ def setup_scheduler(
         except Exception:
             logger.exception("staleness_check_failed")
 
+    @tracked
     async def polling_fallback() -> None:
         """Check if repos have diverged from their last_sync_commit.
 
@@ -172,14 +192,14 @@ def setup_scheduler(
                     # Launch the job in the background if app_state is available
                     if app_state is not None:
                         from repowise.server.job_executor import execute_job
+                        from repowise.server.services.job_queue import launch_job_task
 
-                        task = asyncio.create_task(
-                            execute_job(job.id, app_state),
-                            name=f"poll-job-{job.id}",
+                        launch_job_task(
+                            app_state=app_state,
+                            job_id=job.id,
+                            session_factory=session_factory,
+                            executor=execute_job,
                         )
-                        bg_tasks: set = getattr(app_state, "background_tasks", set())
-                        bg_tasks.add(task)
-                        task.add_done_callback(bg_tasks.discard)
         except Exception:
             logger.exception("polling_fallback_failed")
 
