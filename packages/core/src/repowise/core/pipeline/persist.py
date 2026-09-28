@@ -703,8 +703,13 @@ async def persist_reference_sites(
     repo_id: str,
     parsed_files: list[Any],
     repo_path: Path | str | None = None,
+    *,
+    extraction: Any | None = None,
 ) -> int:
     """Refresh the reference-site store from the parse this run already did.
+
+    *extraction* is :func:`extract_reference_sites` computed earlier from the
+    same *parsed_files*; without it the extraction runs here.
 
     Rides the pipeline's own ``ParsedFile`` list through the
     ``build_universe``/``extract_sites`` seams, so the store never pays for a
@@ -731,9 +736,22 @@ async def persist_reference_sites(
 
     Returns the number of sites written.
     """
+    from repowise.core.refsites.store import SqlReferenceSiteStore
+
+    result = extraction or extract_reference_sites(parsed_files, repo_path)
+    await SqlReferenceSiteStore(session).replace_repository(repo_id, result)
+    return len(result.sites)
+
+
+def extract_reference_sites(parsed_files: list[Any], repo_path: Path | str | None = None) -> Any:
+    """The CPU half of :func:`persist_reference_sites`: sources, universe, sites.
+
+    Split out so a caller holding a write transaction can do this first. On the
+    update path it is most of the step's time, and computed inside the
+    transaction it held the store's write lock for all of it.
+    """
     from repowise.core.refsites.pipeline import extract_sites, measure_coverage
     from repowise.core.refsites.records import ExtractionResult
-    from repowise.core.refsites.store import SqlReferenceSiteStore
     from repowise.core.refsites.universe import build_universe
 
     root = Path(repo_path) if repo_path is not None else _repo_root_from_parsed(parsed_files)
@@ -753,9 +771,7 @@ async def persist_reference_sites(
 
     universe = build_universe(root, parsed_files)
     sites = extract_sites(parsed_files, sources, universe)
-    result = ExtractionResult(sites=sites, coverage=measure_coverage(parsed_files, sites))
-    await SqlReferenceSiteStore(session).replace_repository(repo_id, result)
-    return len(sites)
+    return ExtractionResult(sites=sites, coverage=measure_coverage(parsed_files, sites))
 
 
 async def persist_symbol_analysis(

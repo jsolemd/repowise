@@ -52,9 +52,9 @@ async def test_nothing_to_scan_is_not_an_error(async_session) -> None:
     repo = await insert_repo(async_session)
 
     assert (await refresh_commit_health(async_session, repo.id, "/repo", []))["scanned"] == 0
-    assert (
-        await refresh_commit_health(async_session, repo.id, "/repo", ["aaa"], limit=0)
-    )["scanned"] == 0
+    assert (await refresh_commit_health(async_session, repo.id, "/repo", ["aaa"], limit=0))[
+        "scanned"
+    ] == 0
     assert await get_commit_health(async_session, repo.id, "aaa") is None
 
 
@@ -69,3 +69,45 @@ def test_shas_are_spent_newest_first() -> None:
 
     assert recent_shas(rows) == ["new", "mid", "old"]
     assert recent_shas(None) == []
+
+
+@pytest.mark.asyncio
+async def test_the_unlocked_refresh_holds_no_write_lock_while_it_scans(
+    tmp_path, monkeypatch
+) -> None:
+    """The scan's budget runs to minutes. Inside the update's write transaction
+    it held the store's only write lock past every other writer's busy
+    timeout, so the watcher's source capture and decision writes failed."""
+    import sqlite3
+
+    import repowise.core.analysis.change_health.commit_scan as scan_mod
+    from repowise.core.persistence import create_engine, create_session_factory, init_db
+    from repowise.core.pipeline.commit_health import refresh_commit_health_unlocked
+
+    db_path = tmp_path / "wiki.db"
+    engine = create_engine(f"sqlite+aiosqlite:///{db_path}", busy_timeout_ms=100)
+    await init_db(engine)
+    factory = create_session_factory(engine)
+    async with factory() as session:
+        repo = await insert_repo(session)
+        repo_id = repo.id
+    lock_free: list[bool] = []
+
+    def _scan(*args, **kwargs):
+        other = sqlite3.connect(db_path, timeout=0, isolation_level=None)
+        try:
+            other.execute("BEGIN IMMEDIATE")
+            other.execute("ROLLBACK")
+            lock_free.append(True)
+        except sqlite3.OperationalError:
+            lock_free.append(False)
+        finally:
+            other.close()
+        return CommitHealthScan(delta_rows=[], finding_rows=[], scanned=1)
+
+    monkeypatch.setattr(scan_mod, "scan_commits", _scan)
+    stats = await refresh_commit_health_unlocked(factory, repo_id, str(tmp_path), ["aaa"], limit=5)
+    await engine.dispose()
+
+    assert lock_free == [True]
+    assert stats["scanned"] == 1

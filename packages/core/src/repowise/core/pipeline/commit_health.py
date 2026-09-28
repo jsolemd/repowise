@@ -138,3 +138,57 @@ async def refresh_commit_health(
     except Exception as exc:
         logger.debug("commit_health_refresh_failed", error=str(exc))
         return nothing
+
+
+async def refresh_commit_health_unlocked(
+    session_factory: Any,
+    repo_id: str,
+    repo_path: str,
+    shas: list[str],
+    *,
+    limit: int | None = None,
+    budget: float | None = None,
+) -> dict[str, int]:
+    """:func:`refresh_commit_health` with no transaction open during the scan.
+
+    SoleMD fork: for a store other processes write while this runs (the
+    watcher, the refresh timer and decision writes share one SQLite write
+    lock). The pending-set read and the write are two short transactions, and
+    the scan between them, which a long gap between updates can stretch to the
+    full budget, holds no lock. A read transaction kept open across the scan
+    would not help: in WAL mode it cannot be upgraded to a write once another
+    writer has committed. Never raises, for the same reason as
+    :func:`refresh_commit_health`.
+    """
+    from repowise.core.analysis.change_health.commit_scan import scan_commits
+    from repowise.core.persistence import get_session
+    from repowise.core.persistence.crud import upsert_commit_health_bulk
+
+    limit = commit_limit() if limit is None else limit
+    budget = budget_seconds() if budget is None else budget
+    nothing = dict.fromkeys(("candidates", "scanned", "skipped", "stored", "findings"), 0)
+    if not shas or limit <= 0:
+        return nothing
+    try:
+        async with get_session(session_factory) as session:
+            pending = await _pending_shas(session, repo_id, repo_path, shas, limit)
+        if not pending:
+            return nothing
+        scan = await asyncio.to_thread(scan_commits, repo_path, pending, budget_seconds=budget)
+        if scan.exhausted_budget:
+            logger.info("commit_health_budget_exhausted", scanned=scan.scanned, budget=budget)
+        if scan.delta_rows:
+            async with get_session(session_factory) as session:
+                await upsert_commit_health_bulk(
+                    session, repo_id, scan.delta_rows, scan.finding_rows
+                )
+        return {
+            "candidates": len(pending),
+            "scanned": scan.scanned,
+            "skipped": scan.skipped,
+            "stored": len(scan.delta_rows),
+            "findings": len(scan.finding_rows),
+        }
+    except Exception as exc:
+        logger.debug("commit_health_refresh_failed", error=str(exc))
+        return nothing

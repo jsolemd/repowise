@@ -164,3 +164,36 @@ async def test_deleting_the_repository_cascades(stored, async_session, repo_id):
     await async_session.commit()
 
     assert await store.count(repo_id) == 0
+
+
+async def test_replace_writes_only_the_difference(stored, async_session, repo_id):
+    """Every update re-derives the whole repository, so an unchanged site must
+    keep its row: rewriting all of them held the update's write lock for tens
+    of seconds to land a handful of changes."""
+    from dataclasses import replace as dc_replace
+
+    store, _, result = stored
+
+    async def row_ids() -> set[str]:
+        rows = await async_session.execute(
+            select(ReferenceSite.id).where(ReferenceSite.repository_id == repo_id)
+        )
+        return set(rows.scalars())
+
+    before = await row_ids()
+    await store.replace_repository(repo_id, result)
+    await async_session.commit()
+    assert await row_ids() == before
+
+    moved = dc_replace(result.sites[0], start_line=result.sites[0].start_line + 1000)
+    # Same unique position, different binding: the old row must go before the
+    # new one lands, or the (file, line, col, name, kind) key collides.
+    rebound = dc_replace(result.sites[1], target_symbol_id="elsewhere::Name")
+    changed = ExtractionResult(sites=(moved, rebound, *result.sites[2:]), coverage=result.coverage)
+    await store.replace_repository(repo_id, changed)
+    await async_session.commit()
+    after = await row_ids()
+
+    assert len(before - after) == 2  # the moved and the rebound sites' old rows
+    assert len(after - before) == 2  # and their replacements
+    assert await store.count(repo_id) == len(changed.sites)

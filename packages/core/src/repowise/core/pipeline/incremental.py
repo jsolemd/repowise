@@ -1341,7 +1341,7 @@ async def persist_partial_health(
 
 async def persist_incremental_commits(
     session: Any, repo_id: str, repo_path: Any, *, timings: PhaseTimings | None = None
-) -> None:
+) -> list[str]:
     """Capture + upsert ``git_commits`` rows for commits new since the last index.
 
     Foundation 1 only populated the per-commit table on the full orchestrator
@@ -1395,15 +1395,6 @@ async def persist_incremental_commits(
         if file_rows:
             await upsert_git_commit_files_bulk(session, repo_id, file_rows)
 
-    # What the new commits did to health. An update is a handful of commits, so
-    # this is seconds; the same budget still applies if a long gap made it many.
-    with timed(timings, "persist.commits.health"):
-        from .commit_health import recent_shas, refresh_commit_health
-
-        await refresh_commit_health(
-            session, repo_id, str(repo_path), recent_shas(rows)
-        )
-
     with timed(timings, "persist.commits.experience"):
         await reconcile_commit_experience(session, repo_id, indexer)
     # Fills the commit-offset column on indexes written before it existed, so a
@@ -1435,6 +1426,12 @@ async def persist_incremental_commits(
 
     with timed(timings, "persist.commits.fix_events"):
         await persist_incremental_fix_events(session, repo_id, indexer)
+
+    # What the new commits did to health is scanned after this transaction
+    # commits (see refresh_commit_health_unlocked), so hand back the shas.
+    from .commit_health import recent_shas
+
+    return recent_shas(rows)
 
 
 def _churn_prior(repo_row: Any) -> Any:
@@ -1852,6 +1849,23 @@ async def persist_incremental_index(
             await init_db(engine)
             sf = create_session_factory(engine)
 
+        health_shas: list[str] = []
+
+        # CPU work goes before the write transaction opens. The store has one
+        # SQLite write lock that the watcher, the timer and decision writes all
+        # share, each waiting at most the busy timeout for it.
+        refsite_extraction = None
+        if parsed_files:
+            try:
+                from repowise.core.pipeline.persist import extract_reference_sites
+
+                with timed(timings, "persist.reference_sites.extract"):
+                    refsite_extraction = await asyncio.to_thread(
+                        extract_reference_sites, parsed_files, repo_path
+                    )
+            except Exception as exc:
+                _skip("Reference sites persist", exc)
+
         async with get_session(sf) as session:
             with timed(timings, "persist.open"):
                 repo = await upsert_repository(
@@ -1866,7 +1880,6 @@ async def persist_incremental_index(
                 repo_path,
                 accept_mass_deletion=accept_mass_deletion,
             )
-
             if reconcile_full_scope:
                 try:
                     from repowise.core.pipeline.persist import (
@@ -2012,7 +2025,7 @@ async def persist_incremental_index(
                 try:
                     with timed(timings, "persist.commits"):
                         if full_git_summary is None:
-                            await persist_incremental_commits(
+                            health_shas = await persist_incremental_commits(
                                 session, repo_id, repo_path, timings=timings
                             )
                 except Exception as exc:
@@ -2102,13 +2115,18 @@ async def persist_incremental_index(
             # definition re-binds sites in files that did not themselves
             # change. Whole-repo re-derive, so it heals on the next update and
             # is not range-scoped.
-            if parsed_files and not exclusion_plan.refusals:
+            if refsite_extraction is not None and not exclusion_plan.refusals:
                 try:
                     from repowise.core.pipeline.persist import persist_reference_sites
 
-                    await persist_reference_sites(
-                        session, repo_id, parsed_files, repo_path=repo_path
-                    )
+                    with timed(timings, "persist.reference_sites"):
+                        await persist_reference_sites(
+                            session,
+                            repo_id,
+                            parsed_files,
+                            repo_path=repo_path,
+                            extraction=refsite_extraction,
+                        )
                 except Exception as exc:
                     _skip("Reference sites persist", exc)
 
@@ -2343,6 +2361,23 @@ async def persist_incremental_index(
                         upstream_ready=source_symbol_error is None,
                         upstream_error=source_symbol_error,
                     )
+
+            # Explicit so the table shows what the single write transaction
+            # costs to land; get_session's own commit is then a no-op.
+            with timed(timings, "persist.commit"):
+                await session.commit()
+
+        # After the commit, never inside it. Scanning what each new commit did
+        # to health is analyzer work bounded by a budget of minutes, and inside
+        # the transaction it held the store's single write lock for all of it,
+        # past the busy timeout of every other writer (the watcher's source
+        # capture, decision writes). Best-effort and idempotent: a commit left
+        # unscanned is picked up by the next run.
+        if health_shas:
+            from .commit_health import refresh_commit_health_unlocked
+
+            with timed(timings, "persist.commits.health"):
+                await refresh_commit_health_unlocked(sf, repo_id, str(repo_path), health_shas)
 
         # After the session closes: on SQLite the full-text index shares the
         # database file, so writing to it while the session holds a write lock

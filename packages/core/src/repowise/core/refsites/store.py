@@ -65,6 +65,49 @@ def _to_record(row: ReferenceSite) -> ReferenceSiteRecord:
     )
 
 
+#: Every stored field of a site but its row id, repository and created_at, in
+#: the order :func:`_site_key` builds; together they are a site's identity.
+_SITE_COLUMNS = (
+    ReferenceSite.file_path,
+    ReferenceSite.language,
+    ReferenceSite.name,
+    ReferenceSite.kind,
+    ReferenceSite.start_line,
+    ReferenceSite.end_line,
+    ReferenceSite.start_col,
+    ReferenceSite.end_col,
+    ReferenceSite.range_exact,
+    ReferenceSite.target_symbol_id,
+    ReferenceSite.enclosing_symbol_id,
+    ReferenceSite.resolution_origin,
+    ReferenceSite.confidence,
+    ReferenceSite.tier,
+    ReferenceSite.occurrence_index,
+    ReferenceSite.extractor_version,
+)
+
+
+def _site_key(site: ReferenceSiteRecord) -> tuple:
+    return (
+        site.file_path,
+        site.language,
+        site.name,
+        str(site.kind),
+        site.start_line,
+        site.end_line,
+        site.start_col,
+        site.end_col,
+        site.range_exact,
+        site.target_symbol_id,
+        site.enclosing_symbol_id,
+        str(site.origin),
+        site.confidence,
+        site.tier,
+        site.occurrence_index,
+        site.extractor_version,
+    )
+
+
 def _to_row(repository_id: str, site: ReferenceSiteRecord) -> dict:
     return {
         "id": _new_uuid(),
@@ -120,11 +163,38 @@ class SqlReferenceSiteStore:
         await self._session.flush()
 
     async def replace_repository(self, repository_id: str, result: ExtractionResult) -> None:
-        """Make the stored sites for *repository_id* exactly ``result``."""
-        await self._session.execute(
-            delete(ReferenceSite).where(ReferenceSite.repository_id == repository_id)
+        """Make the stored sites for *repository_id* exactly ``result``.
+
+        Writes the difference, not the whole set. Every update re-derives the
+        full repository, so a delete-and-reinsert rewrote every row (157k on a
+        mid-sized repo, about 48 s) to land the few hundred an edit changes,
+        inside the update's write transaction. Sites are compared on every
+        stored field but the row id and ``created_at``, as a multiset, so
+        duplicate occurrences survive in the right number.
+        """
+        stored: dict[tuple, list[str]] = {}
+        rows = await self._session.execute(
+            select(ReferenceSite.id, *_SITE_COLUMNS).where(
+                ReferenceSite.repository_id == repository_id
+            )
         )
-        await self._insert(repository_id, result.sites)
+        for row in rows:
+            stored.setdefault(tuple(row[1:]), []).append(row[0])
+        added: list[ReferenceSiteRecord] = []
+        for site in result.sites:
+            ids = stored.get(_site_key(site))
+            if ids:
+                ids.pop()
+            else:
+                added.append(site)
+        removed = [row_id for ids in stored.values() for row_id in ids]
+        for start in range(0, len(removed), _BATCH_SIZE):
+            await self._session.execute(
+                delete(ReferenceSite).where(
+                    ReferenceSite.id.in_(removed[start : start + _BATCH_SIZE])
+                )
+            )
+        await self._insert(repository_id, added)
         await self.replace_coverage(repository_id, result.coverage)
 
     async def replace_files(
