@@ -45,8 +45,10 @@ def deterministic_embedder_name(cfg: dict) -> str:
         return str(chosen)
     # Nothing was chosen, so whatever resolve_embedder returns was inferred
     # from a key. Only the ones that cannot bill survive that.
+    from repowise.core.providers.embedding.registry import LOCAL_EMBEDDERS
+
     resolved = resolve_embedder(None)
-    return resolved if resolved in ("mock", "ollama") else "mock"
+    return resolved if resolved in LOCAL_EMBEDDERS else "mock"
 
 
 def load_prior_page_ids(repo_path: Path) -> dict:

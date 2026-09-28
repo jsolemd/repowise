@@ -29,7 +29,7 @@ from repowise.core.source_search import SOURCE_SEARCH_ENV, source_search_enabled
 @click.option(
     "--embedder",
     "embedder_name",
-    type=click.Choice(["gemini", "openai", "openrouter", "ollama", "mock", "auto"]),
+    type=click.Choice(["gemini", "openai", "openrouter", "ollama", "llamacpp", "mock", "auto"]),
     default="auto",
     help="Embedder to use. 'auto' detects from config / env vars.",
 )

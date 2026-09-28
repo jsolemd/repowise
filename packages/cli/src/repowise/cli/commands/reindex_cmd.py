@@ -23,7 +23,7 @@ _INPUT_TOO_LONG_RETRIES = 4
 @click.argument("path", required=False, default=None)
 @click.option(
     "--embedder",
-    type=click.Choice(["gemini", "openai", "openrouter", "ollama", "edenai", "mock", "auto"]),
+    type=click.Choice(["gemini", "openai", "openrouter", "ollama", "llamacpp", "edenai", "mock", "auto"]),
     default="auto",
     help="Embedder to use. 'auto' detects from env vars / config.",
 )

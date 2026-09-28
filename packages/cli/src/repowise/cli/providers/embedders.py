@@ -149,7 +149,9 @@ def template_run_embedder(embedder_name_resolved: str, embedder_was_requested: b
     Shared because ``init`` has to predict this answer before the pipeline, to
     build the run's vector store with the backend generation will actually use.
     """
-    hosted = embedder_name_resolved not in ("mock", "ollama")
+    from repowise.core.providers.embedding.registry import LOCAL_EMBEDDERS
+
+    hosted = embedder_name_resolved not in LOCAL_EMBEDDERS
     return "mock" if hosted and not embedder_was_requested else embedder_name_resolved
 
 

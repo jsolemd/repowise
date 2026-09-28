@@ -7,6 +7,8 @@ Built-in embedders:
     openai  → OpenAIEmbedder  (text-embedding-3-small default)
     gemini  → GeminiEmbedder  (gemini-embedding-001 default)
     edenai  → EdenAIEmbedder  (openai/text-embedding-3-small via Eden AI's EU gateway)
+    ollama  → OllamaEmbedder  (a local Ollama server)
+    llamacpp → LlamaCppEmbedder (a local llama.cpp llama-server)
     mock    → MockEmbedder    (testing only, zero dependencies)
 
 Custom embedder registration:
@@ -28,12 +30,17 @@ _BUILTIN_EMBEDDERS: dict[str, tuple[str, str]] = {
     "openai": ("repowise.core.providers.embedding.openai", "OpenAIEmbedder"),
     "gemini": ("repowise.core.providers.embedding.gemini", "GeminiEmbedder"),
     "ollama": ("repowise.core.providers.embedding.ollama", "OllamaEmbedder"),
+    "llamacpp": ("repowise.core.providers.embedding.llamacpp", "LlamaCppEmbedder"),
     "openrouter": ("repowise.core.providers.embedding.openrouter", "OpenRouterEmbedder"),
     "edenai": ("repowise.core.providers.embedding.edenai", "EdenAIEmbedder"),
     "mock": ("repowise.core.providers.embedding.base", "KeylessEmbedder"),
 }
 
 _custom_embedders: dict[str, Callable[..., Embedder]] = {}
+
+#: Embedders that run on this machine and need no key: choosing one never
+#: bills anything, so a run promised to cost nothing may still use it.
+LOCAL_EMBEDDERS: frozenset[str] = frozenset({"mock", "ollama", "llamacpp"})
 
 
 def register_embedder(name: str, factory: Callable[..., Embedder]) -> None:
@@ -82,6 +89,7 @@ def get_embedder(name: str, **kwargs: Any) -> Embedder:
         "openai": "openai",
         "gemini": "google-genai",
         "ollama": "httpx",
+        "llamacpp": "httpx",
         "openrouter": "openai",  # openrouter uses the openai package
         "edenai": "openai",  # edenai uses the openai package
     }

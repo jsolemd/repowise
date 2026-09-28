@@ -527,7 +527,7 @@ def _interactive_gate(
     "--embedder",
     "embedder_name",
     default=None,
-    type=click.Choice(["gemini", "openai", "openrouter", "ollama", "edenai", "mock"]),
+    type=click.Choice(["gemini", "openai", "openrouter", "ollama", "llamacpp", "edenai", "mock"]),
     help=(
         "Embedder for RAG: gemini | openai | openrouter | ollama | edenai | mock "
         "(default: auto-detect)."

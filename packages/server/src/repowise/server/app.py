@@ -114,6 +114,10 @@ def _build_embedder():
         from repowise.core.providers.embedding.ollama import OllamaEmbedder
 
         return OllamaEmbedder()
+    if name == "llamacpp":
+        from repowise.core.providers.embedding.llamacpp import LlamaCppEmbedder
+
+        return LlamaCppEmbedder()
     if name == "gemini":
         from repowise.core.providers.embedding.gemini import GeminiEmbedder
 
@@ -157,7 +161,7 @@ def _build_embedder():
         return EdenAIEmbedder(model=model)
     logger.warning(
         "embedder.mock_active: set REPOWISE_EMBEDDER=gemini, openai, openrouter, "
-        "ollama, or edenai for real RAG"
+        "ollama, llamacpp, or edenai for real RAG"
     )
     return KeylessEmbedder()
 
