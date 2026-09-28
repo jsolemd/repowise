@@ -125,7 +125,13 @@ async def init_pool() -> asyncpg.Pool:
             max_size=10,
             command_timeout=30,
         )
-        await _ensure_schema_compatibility(pool)
+        try:
+            await _ensure_schema_compatibility(pool)
+        except BaseException:
+            # Not published yet: close_pool cannot see this failed startup.
+            # Native termination also releases connections under cancellation.
+            pool.terminate()
+            raise
         _pool = pool
         logger.info("Database connection pool initialized")
         return _pool

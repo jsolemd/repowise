@@ -114,3 +114,38 @@ async def test_failed_writer_start_releases_ownership(monkeypatch, stage, failur
         docs_runtime.stop_worker.assert_awaited_once()
     if stage == "start_recovery_task":
         docs_runtime.stop_scheduler.assert_awaited_once()
+
+
+@pytest.mark.parametrize("failure", [RuntimeError, asyncio.CancelledError])
+async def test_failed_schema_initialization_releases_unpublished_pool(monkeypatch, failure):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    import asyncpg
+
+    import repowise.docs.db_runtime as db_runtime
+
+    failed_pool = MagicMock(spec=asyncpg.Pool)
+    ready_pool = MagicMock(spec=asyncpg.Pool)
+    create_pool = AsyncMock(side_effect=[failed_pool, ready_pool])
+    initialize = AsyncMock(side_effect=[failure("schema interrupted"), None])
+    monkeypatch.setattr(db_runtime, "_pool", None)
+    monkeypatch.setattr(db_runtime, "_pool_lock", asyncio.Lock())
+    monkeypatch.setattr(db_runtime.asyncpg, "create_pool", create_pool)
+    monkeypatch.setattr(db_runtime, "_ensure_schema_compatibility", initialize)
+    monkeypatch.setattr(
+        db_runtime, "get_settings", lambda: SimpleNamespace(postgres_dsn="postgresql://stub/docs")
+    )
+
+    with pytest.raises(failure, match="schema interrupted"):
+        await db_runtime.init_pool()
+
+    failed_pool.terminate.assert_called_once_with()
+    assert db_runtime._pool is None
+    assert await db_runtime.init_pool() is ready_pool
+    assert await db_runtime.init_pool() is ready_pool
+    assert create_pool.await_count == 2
+    assert initialize.await_count == 2
+    ready_pool.terminate.assert_not_called()
+    await db_runtime.close_pool()
+    ready_pool.close.assert_awaited_once_with()
