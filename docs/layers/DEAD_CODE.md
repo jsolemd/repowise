@@ -98,8 +98,16 @@ one added last week. Confidence starts from git activity:
 | No commits in 90 days, but the file is under 30 days old | `0.55` (may be work in progress) |
 | Still being committed to | `0.40` |
 
-Then it only ever goes down. Two caps apply:
+Then it only ever goes down. Three caps apply:
 
+- **Exact filename references.** If another indexed file names the full basename
+  and extension (`callout.lua`, for example), confidence is capped at `0.40`,
+  `safe_to_delete` becomes false, and the evidence names the referencing file.
+  This covers runtime script lists such as Pandoc's Lua filters. A comment or
+  duplicate basename also requires review; neither proves the file is loaded.
+  Bare stems, extensionless names and non-ASCII filenames are not matched.
+  The check reads ingestion's source bytes during analysis; existing findings
+  need reanalysis before this evidence reaches the report.
 - **Dynamic imports nearby.** If any file in the same directory uses a runtime
   loader, confidence is capped at `0.40`.
 - **Runtime-load risk factors.** If the path looks like config, environment,

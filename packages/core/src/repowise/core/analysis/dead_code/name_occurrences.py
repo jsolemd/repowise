@@ -48,6 +48,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import PurePosixPath
 
 from .models import DeadCodeFindingData, DeadCodeKind
 from .risk_factors import RISK_CAP_CONFIDENCE
@@ -57,6 +58,9 @@ from .risk_factors import RISK_CAP_CONFIDENCE
 #: ASCII-only is deliberate: a non-ASCII identifier that fails to match can
 #: only under-suppress, which is the safe direction.
 IDENTIFIER_RE = re.compile(rb"[A-Za-z_][A-Za-z0-9_]{2,}")
+# Full basenames keep "callout.lua" distinct from "callout", "old-callout.lua"
+# and "callout.lua.bak". This is textual evidence of possible use, not a loader.
+_FILENAME_RE = re.compile(rb"[A-Za-z0-9_@.$-]+")
 
 #: Shortest name this check can answer for. :data:`IDENTIFIER_RE` needs three
 #: characters, so a two-character name matches nowhere — including on its own
@@ -94,7 +98,10 @@ _ABSENT = _Verdict(_Answer.ABSENT)
 
 
 def occurrence_files(
-    source_map: dict[str, bytes], names: set[bytes]
+    source_map: dict[str, bytes],
+    names: set[bytes],
+    *,
+    token_pattern: re.Pattern[bytes] = IDENTIFIER_RE,
 ) -> dict[bytes, set[str]]:
     """For each name in *names*, the indexed files whose source writes it.
 
@@ -107,7 +114,7 @@ def occurrence_files(
     if not names:
         return found
     for path, blob in source_map.items():
-        for match in IDENTIFIER_RE.finditer(blob):
+        for match in token_pattern.finditer(blob):
             token = match.group()
             if token in names:
                 found.setdefault(token, set()).add(path)
@@ -257,6 +264,40 @@ def _verdicts(
     return out
 
 
+def _clamp_named_files(findings: list[DeadCodeFindingData], source_map: dict[str, bytes]) -> None:
+    """Downgrade files named elsewhere, including runtime-loaded script lists.
+
+    Exact ASCII basenames with extensions only: no broad stem matching. A
+    comment or duplicate basename can require review, but cannot prove use.
+    Reuse ingestion's bytes and scan once for all candidate names.
+    """
+    candidates: dict[bytes, list[DeadCodeFindingData]] = {}
+    for finding in findings:
+        if (
+            finding.kind != DeadCodeKind.UNREACHABLE_FILE
+            or finding.confidence <= RISK_CAP_CONFIDENCE
+        ):
+            continue
+        name = PurePosixPath(finding.file_path.replace("\\", "/")).name.encode("utf-8")
+        if b"." in name and _FILENAME_RE.fullmatch(name):
+            candidates.setdefault(name, []).append(finding)
+    occurrences = occurrence_files(source_map, set(candidates), token_pattern=_FILENAME_RE)
+    for name, named_findings in candidates.items():
+        for finding in named_findings:
+            elsewhere = sorted(occurrences.get(name, set()) - {finding.file_path})
+            if not elsewhere or finding.confidence <= RISK_CAP_CONFIDENCE:
+                continue
+            finding.reason = (
+                f"'{name.decode()}' has no importers, but is named elsewhere in the repo"
+            )
+            finding.confidence = RISK_CAP_CONFIDENCE
+            finding.safe_to_delete = False
+            finding.evidence.append(
+                f"Filename '{name.decode()}' is written at {elsewhere[0]}; "
+                "a runtime reference may bypass static imports — review before deleting"
+            )
+
+
 def clamp_unverified_absence(
     findings: list[DeadCodeFindingData], source_map: dict[str, bytes]
 ) -> list[DeadCodeFindingData]:
@@ -265,12 +306,10 @@ def clamp_unverified_absence(
     Mutates in place and returns the same list, matching the sibling clamp in
     the analyzer. Never raises a confidence and never drops a finding.
 
-    Scoped to unused *exports*, the one pass that promotes on import absence.
-    Unused internals already sit below the threshold and never claim to be
-    safe, and a whole-file finding would have to match on the path stem — the
-    broad-word shape ("index", "main", "utils") that the unindexed clamp and
-    the risk-factor token lists both refuse for being unable to tell a mention
-    from a coincidence.
+    Unused exports are checked by symbol name; unreachable files by exact
+    basename including extension. Bare file stems ("index", "main", "utils")
+    are too broad to establish a possible runtime reference. Unused internals
+    already sit below the threshold and never claim to be safe.
 
     With no source access there is no knowledge to add, so the pass declines
     rather than guessing in either direction.
@@ -278,6 +317,7 @@ def clamp_unverified_absence(
     if not source_map:
         return findings
 
+    _clamp_named_files(findings, source_map)
     candidates = [
         f
         for f in findings

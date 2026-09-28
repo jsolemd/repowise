@@ -274,7 +274,7 @@ class TestScopeAndSafety:
             DeadCodeKind.ZOMBIE_PACKAGE,
         ],
     )
-    def test_only_unused_exports_are_in_scope(self, kind):
+    def test_other_findings_ignore_bare_symbol_mentions(self, kind):
         source = _src(
             src__lib_kt="class Registry\n", src__b_kt="fun f() = Registry()\n"
         )
@@ -361,3 +361,90 @@ class TestScopeAndSafety:
 
         assert finding.confidence == RISK_CAP_CONFIDENCE
         assert "could not be searched" in finding.evidence[-1]
+
+
+class TestNamedFiles:
+    """A full filename can be a runtime reference across package boundaries."""
+
+    def test_declared_pandoc_filters_require_review_but_unused_file_stays_safe(self):
+        from repowise.core.analysis.dead_code import DeadCodeAnalyzer
+        from tests.unit.dead_code._helpers import _build_graph, _old_date
+
+        class CountedSources(dict):
+            scans = 0
+
+            def items(self):
+                self.scans += 1
+                return super().items()
+
+        source = CountedSources(
+            {
+                "src/make/engines/pandoc.py": b"\n".join(
+                    [
+                        b'_DOCUMENT_FILTERS = ("callout.lua", "linebreak.lua")',
+                        b"for name in _DOCUMENT_FILTERS:",
+                        b'    cmd.extend(["--lua-filter", str(filters_dir / name)])',
+                    ]
+                ),
+                "src/make/filters/callout.lua": b"function Div(el) return el end",
+                "src/make/filters/linebreak.lua": b"function LineBreak(el) return el end",
+                "src/make/filters/unused.lua": b"function Para(el) return el end",
+            }
+        )
+        graph = _build_graph(
+            {
+                path: {
+                    "language": "lua" if path.endswith(".lua") else "python",
+                    "is_entry_point": path.endswith(".py"),
+                    "symbol_count": 1,
+                }
+                for path in source
+            }
+        )
+        report = DeadCodeAnalyzer(
+            graph,
+            git_meta_map={
+                path: {"commit_count_90d": 0, "last_commit_at": _old_date(400)} for path in source
+            },
+            source_map=source,
+        ).analyze(
+            {
+                "detect_unused_exports": False,
+                "detect_unused_internals": False,
+                "detect_zombie_packages": False,
+            }
+        )
+        findings = {f.file_path: f for f in report.findings}
+        for filename in ("callout.lua", "linebreak.lua"):
+            finding = findings[f"src/make/filters/{filename}"]
+            assert finding.confidence == RISK_CAP_CONFIDENCE
+            assert finding.safe_to_delete is False
+            assert "src/make/engines/pandoc.py" in finding.evidence[-1]
+        assert findings["src/make/filters/unused.lua"].safe_to_delete is True
+        assert source.scans == 1  # One source scan, not one per candidate.
+
+    @pytest.mark.parametrize(
+        "reference",
+        [
+            '"callout"',
+            '"old-callout.lua"',
+            '"callout.lua.bak"',
+            '"callout.py"',
+        ],
+    )
+    def test_stems_substrings_and_other_extensions_do_not_match(self, reference):
+        finding = _finding("", file_path="filters/callout.lua", kind=DeadCodeKind.UNREACHABLE_FILE)
+        clamp_unverified_absence([finding], {"engine.py": reference.encode()})
+        assert finding.safe_to_delete is True
+
+    def test_self_mention_does_not_rescue_but_other_path_and_comment_require_review(self):
+        path = "filters/callout.lua"
+        finding = _finding("", file_path=path, kind=DeadCodeKind.UNREACHABLE_FILE)
+        source = {path: b"-- callout.lua implements a filter"}
+        clamp_unverified_absence([finding], source)
+        assert finding.safe_to_delete is True
+        source["notes.py"] = b'# old loader referenced "filters/callout.lua"'
+        clamp_unverified_absence([finding, finding], source)
+        assert finding.safe_to_delete is False
+        assert len(finding.evidence) == 1
+        assert "notes.py" in finding.evidence[-1]
