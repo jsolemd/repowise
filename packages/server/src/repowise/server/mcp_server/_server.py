@@ -495,7 +495,7 @@ def _detect_workspace(repo_path: str | None):
 
 @asynccontextmanager
 async def _lifespan(server: FastMCP):
-    """Lease process resources across the SDK's per-client lifespans."""
+    """Lease process resources to SDK clients and their accepted jobs."""
     loop = asyncio.get_running_loop()
     held = _state._runtime_lock
     if held is None or held[0] is not loop:
@@ -529,6 +529,9 @@ async def _runtime_lifespan(server: FastMCP):
     resources = AsyncExitStack()
     try:
         await _initialize_runtime(server, resources)
+        from repowise.server.mcp_server.tool_index_status import close_job_vector_stores
+
+        resources.push_async_callback(close_job_vector_stores)
         yield
     finally:
         # A later client may release the final lease from a different task.

@@ -118,6 +118,19 @@ _MCP_JOB_CANCEL_TOKENS: dict[str, Any] = {}
 _MCP_WORKSPACE_VECTOR_STORES: dict[str, Any] = {}
 
 
+async def close_job_vector_stores() -> None:
+    """Release job-owned stores when the last client/job runtime lease ends."""
+    from repowise.server.search_helpers import close_workspace_vector_stores
+
+    await close_workspace_vector_stores(SimpleNamespace(
+        state=SimpleNamespace(
+            vector_store=_state._vector_store,
+            workspace_vector_stores=_MCP_WORKSPACE_VECTOR_STORES,
+        ),
+    ))
+    _MCP_JOB_EVENTS.clear()
+
+
 def _repo_payload(ctx: Any, repository: Any) -> dict[str, Any]:
     return {
         "alias": getattr(ctx, "alias", "default"),
@@ -1016,12 +1029,16 @@ async def reindex_repository(
         reindex["confirmation_required"] = True
         reindex["next_action"] = "Retry with confirm=true after reviewing cost."
     else:
+        from repowise.server.mcp_server._server import _lifespan
+        from repowise.server.mcp_server._server import mcp as server
+
         queued = await queue_index_only_job(
             app_state=_job_runtime(ctx),
             session_factory=ctx.session_factory,
             repository_id=repository.id,
             force=force,
             executor=execute_job,
+            job_lifespan=_lifespan(server),
         )
         operation_status = queued.status
         reindex["will_run"] = queued.status == "accepted"

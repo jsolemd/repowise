@@ -149,3 +149,90 @@ async def test_concurrent_cold_clients_share_initialization(runtime):
         await asyncio.gather(*tasks)
 
     runtime.instances[0].close.assert_awaited_once()
+
+
+async def test_jobs_retain_runtime_across_client_disconnects(
+    runtime, session, factory, monkeypatch, tmp_path,
+):
+    from repowise.core.persistence import crud
+    from repowise.core.persistence.models import GenerationJob
+    from repowise.server.mcp_server import tool_index_status
+    from repowise.server.services.job_queue import queue_index_only_job
+
+    for name, value in (
+        ("_MCP_BACKGROUND_TASKS", set()), ("_MCP_JOB_TASKS", {}),
+        ("_MCP_JOB_EVENTS", {}), ("_MCP_JOB_CANCEL_TOKENS", {}),
+        ("_MCP_WORKSPACE_VECTOR_STORES", {}),
+    ):
+        monkeypatch.setattr(tool_index_status, name, value)
+    repos = [await crud.upsert_repository(
+        session, name=f"repo-{i}", local_path=str(tmp_path / f"repo-{i}"),
+    ) for i in range(2)]
+    await session.commit()
+    release = [asyncio.Event(), asyncio.Event()]
+    started = [asyncio.Event(), asyncio.Event()]
+    client = _server._lifespan(_server.mcp)
+    await client.__aenter__()
+    registry = _state._registry
+    store = SimpleNamespace(close=AsyncMock())
+    tool_index_status._MCP_WORKSPACE_VECTOR_STORES[repos[0].id] = store
+    tool_index_status._MCP_JOB_EVENTS["old-job"] = object()
+    app_state = tool_index_status._job_runtime(SimpleNamespace(
+        session_factory=factory, fts=object(), vector_store=object(),
+    ))
+
+    def executor(i):
+        async def run(job_id, *_args, **_kwargs):
+            started[i].set()
+            await release[i].wait()
+            registry.close.assert_not_awaited()
+            store.close.assert_not_awaited()
+            if i == 1:
+                raise RuntimeError("pipeline failed")
+            async with factory() as fresh:
+                await crud.update_job_status(fresh, job_id, "completed")
+                await fresh.commit()
+        return run
+
+    jobs = []
+    try:
+        for i, repo in enumerate(repos):
+            jobs.append(await queue_index_only_job(
+                app_state=app_state, session_factory=factory,
+                repository_id=repo.id, force=False, executor=executor(i),
+                job_lifespan=_server._lifespan(_server.mcp),
+            ))
+            await started[i].wait()
+        assert _state._runtime_users == 3
+        await client.__aexit__(None, None, None)
+        assert _state._runtime_users == 2
+        registry.close.assert_not_awaited()
+
+        # A new client joins immediately; the jobs never hold the runtime lock
+        # while waiting for their pipeline work.
+        async with _server._lifespan(_server.mcp):
+            assert _state._registry is registry
+            assert len(runtime.instances) == 1
+            release[0].set()
+            await app_state.job_tasks[jobs[0].job_id]
+            # Include the completion callback, which owns the returned lease.
+            while _state._runtime_users == 3:
+                await asyncio.sleep(0)
+            assert _state._runtime_users == 2
+        assert _state._runtime_users == 1
+    finally:
+        for event in release:
+            event.set()
+        while app_state.background_tasks:
+            await asyncio.gather(*app_state.background_tasks, return_exceptions=True)
+            await asyncio.sleep(0)
+
+    assert _state._runtime_users == 0
+    assert _state._registry is None
+    registry.close.assert_awaited_once()
+    store.close.assert_awaited_once()
+    assert tool_index_status._MCP_WORKSPACE_VECTOR_STORES == {}
+    assert tool_index_status._MCP_JOB_EVENTS == {}
+    for queued, expected in zip(jobs, ("completed", "failed"), strict=True):
+        await session.refresh(await session.get(GenerationJob, queued.job_id))
+        assert (await session.get(GenerationJob, queued.job_id)).status == expected

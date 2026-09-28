@@ -6,6 +6,7 @@ import asyncio
 import gc
 import json
 import weakref
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -309,3 +310,118 @@ def test_repository_job_lock_separates_factories_that_compare_equal():
     assert factory_a == factory_b
 
     assert repository_job_lock(factory_a, "repo-1") is not repository_job_lock(factory_b, "repo-1")
+
+
+@pytest.mark.parametrize("outcome", [
+    "completed", "crashed", "cancelled", "launch_failed", "construction_failed",
+])
+async def test_job_lease_outlives_terminal_persistence(
+    session, session_factory, tmp_path, monkeypatch, outcome,
+):
+    repo = await _repo(session, tmp_path)
+    await session.commit()
+    runtime = _runtime()
+    released = asyncio.Event()
+    observed = []
+
+    @asynccontextmanager
+    async def lease():
+        try:
+            yield
+        finally:
+            async with session_factory() as fresh:
+                job = (await fresh.scalars(select(GenerationJob))).one()
+                observed.append(job.status)
+            released.set()
+
+    async def execute(job_id, *_args, **_kwargs):
+        if outcome == "crashed":
+            raise RuntimeError("pipeline failed")
+        async with session_factory() as fresh:
+            await crud.update_job_status(fresh, job_id, "completed")
+            await fresh.commit()
+
+    if outcome == "launch_failed":
+        create_task = asyncio.create_task
+
+        def fail_once(coro, **kwargs):
+            if kwargs.get("name", "").startswith("job-"):
+                monkeypatch.setattr(asyncio, "create_task", create_task)
+                raise RuntimeError("task launch failed")
+            return create_task(coro, **kwargs)
+
+        monkeypatch.setattr(asyncio, "create_task", fail_once)
+    elif outcome == "construction_failed":
+        def execute(*_args, **_kwargs):
+            raise RuntimeError("executor construction failed")
+
+    queued = await queue_index_only_job(
+        app_state=runtime, session_factory=session_factory,
+        repository_id=repo.id, force=False, executor=execute, job_lifespan=lease(),
+    )
+    assert not released.is_set()
+    if outcome == "cancelled":
+        # Cancel before the executor's first instruction: its own finally
+        # cannot run, so the launch owner's terminal callback owns the lease.
+        runtime.job_tasks[queued.job_id].cancel()
+    await asyncio.wait_for(released.wait(), timeout=5)
+    while runtime.background_tasks:
+        await asyncio.gather(*runtime.background_tasks, return_exceptions=True)
+        await asyncio.sleep(0)
+
+    assert observed == [{
+        "completed": "completed", "crashed": "failed",
+        "cancelled": "cancelled", "launch_failed": "failed", "construction_failed": "failed",
+    }[outcome]]
+    assert runtime.job_tasks == {}
+
+
+@pytest.mark.parametrize("outcome", ["already_running", "queue_failed", "queue_cancelled"])
+async def test_unaccepted_job_returns_its_runtime_lease(
+    session, session_factory, tmp_path, monkeypatch, outcome,
+):
+    repo = await _repo(session, tmp_path)
+    await crud.upsert_generation_job(session, repository_id=repo.id, status="running")
+    await session.commit()
+    returned = []
+
+    @asynccontextmanager
+    async def lease():
+        try:
+            yield
+        finally:
+            returned.append(True)
+
+    if outcome != "already_running":
+        error = RuntimeError if outcome == "queue_failed" else asyncio.CancelledError
+        monkeypatch.setattr(crud, "get_repository", AsyncMock(side_effect=error("lookup failed")))
+
+    request = queue_index_only_job(
+        app_state=_runtime(), session_factory=session_factory,
+        repository_id=repo.id, force=False, executor=AsyncMock(), job_lifespan=lease(),
+    )
+    if outcome == "already_running":
+        assert (await request).status == "already_running"
+    else:
+        with pytest.raises(error):
+            await request
+    assert returned == [True]
+
+
+async def test_job_completion_callback_error_is_observed(session, session_factory, tmp_path, caplog):
+    repo = await _repo(session, tmp_path)
+    job = await crud.upsert_generation_job(session, repository_id=repo.id, status="pending")
+    await session.commit()
+    runtime = _runtime()
+    release = AsyncMock(side_effect=RuntimeError("close failed"))
+
+    job_queue_module.launch_job_task(
+        app_state=runtime, job_id=job.id, session_factory=session_factory,
+        executor=AsyncMock(), on_finished=release,
+    )
+    while runtime.background_tasks:
+        await asyncio.gather(*runtime.background_tasks, return_exceptions=True)
+        await asyncio.sleep(0)
+
+    release.assert_awaited_once()
+    assert "job_resource_release_failed" in caplog.text

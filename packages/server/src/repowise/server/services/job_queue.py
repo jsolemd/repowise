@@ -6,6 +6,7 @@ import asyncio
 import logging
 import weakref
 from collections.abc import Callable, Coroutine
+from contextlib import AbstractAsyncContextManager, AsyncExitStack
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -128,6 +129,7 @@ def launch_job_task(
     job_id: str,
     session_factory: Any,
     executor: JobExecutor,
+    on_finished: Callable[[], Coroutine[Any, Any, None]] | None = None,
 ) -> None:
     """Launch a background job and keep its task strongly referenced.
 
@@ -151,20 +153,35 @@ def launch_job_task(
         except Exception:
             logger.exception("fallback_job_failure_record_failed", extra={"job_id": job_id})
 
+    async def _finish(status: str | None = None, reason: str = "") -> None:
+        try:
+            if status is not None:
+                await _mark_terminal(status, reason)
+        finally:
+            if on_finished is not None:
+                try:
+                    await on_finished()
+                except Exception:
+                    logger.exception("job_resource_release_failed", extra={"job_id": job_id})
+
     bg_tasks = getattr(app_state, "background_tasks", None)
     if bg_tasks is None:
         bg_tasks = set()
         app_state.background_tasks = bg_tasks
 
+    coro = None
     try:
+        coro = executor(job_id, app_state, session_factory_override=session_factory)
         task: asyncio.Task[None] = asyncio.create_task(
-            executor(job_id, app_state, session_factory_override=session_factory),
+            coro,
             name=f"job-{job_id}",
         )
     except Exception as exc:
+        if coro is not None:
+            coro.close()
         logger.exception("create_task_failed", extra={"job_id": job_id})
         task = asyncio.create_task(
-            _mark_terminal("failed", f"Failed to launch background task: {exc}")
+            _finish("failed", f"Failed to launch background task: {exc}")
         )
         bg_tasks.add(task)
         task.add_done_callback(bg_tasks.discard)
@@ -187,12 +204,14 @@ def launch_job_task(
         bg_tasks.discard(done)
         job_tasks.pop(job_id, None)
         if done.cancelled():
-            _fire_and_track(_mark_terminal("cancelled", "Cancelled by user"))
+            _fire_and_track(_finish("cancelled", "Cancelled by user"))
             return
         exc = done.exception()
         if exc is not None:
             logger.error("background_job_failed", exc_info=exc)
-            _fire_and_track(_mark_terminal("failed", f"Background task crashed: {exc}"))
+            _fire_and_track(_finish("failed", f"Background task crashed: {exc}"))
+        elif on_finished is not None:
+            _fire_and_track(_finish())
 
     task.add_done_callback(_on_done)
 
@@ -204,6 +223,7 @@ async def queue_index_only_job(
     repository_id: str,
     force: bool,
     executor: JobExecutor,
+    job_lifespan: AbstractAsyncContextManager[None] | None = None,
 ) -> IndexJobQueueResult:
     """Deduplicate, persist, and launch one non-generative index-only job.
 
@@ -222,7 +242,9 @@ async def queue_index_only_job(
     """
 
     lock = repository_job_lock(session_factory, repository_id)
-    async with lock:
+    async with lock, AsyncExitStack() as resources:
+        if job_lifespan is not None:
+            await resources.enter_async_context(job_lifespan)
         async with get_session(session_factory) as session:
             repository = await crud.get_repository(session, repository_id)
             if repository is None:
@@ -269,12 +291,21 @@ async def queue_index_only_job(
             await session.commit()
             job_id = job.id
 
-        launch_job_task(
-            app_state=app_state,
-            job_id=job_id,
-            session_factory=session_factory,
-            executor=executor,
-        )
+        # Accepted work keeps its runtime alive after its requesting client
+        # leaves. Transfer the lease only at launch; deduplication and failed
+        # queue transactions return it through the local exit stack.
+        owned = resources.pop_all()
+        try:
+            launch_job_task(
+                app_state=app_state,
+                job_id=job_id,
+                session_factory=session_factory,
+                executor=executor,
+                on_finished=owned.aclose if job_lifespan is not None else None,
+            )
+        except BaseException:
+            await owned.aclose()
+            raise
         return IndexJobQueueResult(
             status="accepted",
             job_id=job_id,

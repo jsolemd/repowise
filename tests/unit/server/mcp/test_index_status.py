@@ -9,7 +9,7 @@ import threading
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -543,6 +543,10 @@ async def test_reindex_preview_is_read_only_and_confirmed_run_queues_index_only(
     fts,
 ) -> None:
     module = importlib.import_module("repowise.server.mcp_server.tool_index_status")
+    from repowise.server.mcp_server import _server
+
+    lease = Mock(return_value=object())
+    monkeypatch.setattr(_server, "_lifespan", lease)
     repo_path = tmp_path / "repo"
     repo_path.mkdir()
     await _wire_repo(
@@ -591,6 +595,7 @@ async def test_reindex_preview_is_read_only_and_confirmed_run_queues_index_only(
         "checkout_changes_may_change_totals": True,
     }
     queue.assert_not_awaited()
+    lease.assert_not_called()
 
     accepted = await module.reindex_repository(confirm=True)
 
@@ -604,6 +609,8 @@ async def test_reindex_preview_is_read_only_and_confirmed_run_queues_index_only(
         "existing": False,
     }
     queue.assert_awaited_once()
+    lease.assert_called_once_with(_server.mcp)
+    assert queue.await_args.kwargs["job_lifespan"] is lease.return_value
 
 
 @pytest.mark.asyncio
