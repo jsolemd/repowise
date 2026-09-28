@@ -315,14 +315,11 @@ async def execute_job(
 
     # Cooperative cancellation: the cancel endpoint flips this token (which
     # unwinds the CPU-bound loops that poll check_cancelled) and cancels the
-    # asyncio task (which interrupts the awaits in between). The core token
-    # slot is a process global, so when two jobs overlap the later one's token
-    # occupies it and the earlier job's CPU loops poll the wrong token — its
-    # async awaits still cancel, only an in-flight to_thread worker runs on.
-    # Acceptable for the single-active-job norm; worker isolation is the
-    # upgrade path.
+    # asyncio task (which interrupts the awaits in between). Each job's context
+    # carries its token into to_thread workers, independent of other jobs.
     cancel_token = CancellationToken()
     get_cancel_tokens(app_state)[job_id] = cancel_token
+    previous_token = get_active_token()
     set_active_token(cancel_token)
 
     try:
@@ -693,13 +690,7 @@ async def execute_job(
         )
     finally:
         get_cancel_tokens(app_state).pop(job_id, None)
-        # Disarm only if the global slot still holds our token; a later job
-        # may have replaced it, and its token must not be clobbered. Reset to
-        # None rather than the captured previous token — that one may belong
-        # to a job that already finished (possibly cancelled), and re-arming
-        # it would poison the next check_cancelled() poll.
-        if get_active_token() is cancel_token:
-            set_active_token(None)
+        set_active_token(previous_token)
 
 
 async def _finalize_job_status(

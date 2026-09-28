@@ -6,7 +6,7 @@ the event loop's KeyboardInterrupt frees the main thread, but the non-daemon
 worker keeps grinding, so the process never actually exits. That is the second
 half of issue #341: "Ctrl-C didn't return the terminal."
 
-The fix is cooperative: a process-global :class:`CancellationToken` is set by
+The fix is cooperative: a context-local :class:`CancellationToken` is set by
 the CLI for the duration of a run, the long synchronous loops poll
 :func:`check_cancelled` at coarse intervals, and the first Ctrl-C flips the
 token so those loops unwind promptly with :class:`PipelineCancelled`.
@@ -25,6 +25,7 @@ import signal
 import threading
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from contextvars import ContextVar
 
 import structlog
 
@@ -53,20 +54,19 @@ class CancellationToken:
         return self._event.is_set()
 
 
-# Process-global active token. ``None`` means cancellation is not armed, so
-# check_cancelled() is a no-op — the default everywhere except inside an active
-# cancellation_scope(). A plain module global (not a ContextVar) is intentional:
-# to_thread workers must see the same token the main thread armed.
-_active_token: CancellationToken | None = None
+# asyncio.to_thread copies the caller's context, retaining the same token in
+# that worker even after its awaiting task unwinds. Concurrent jobs therefore
+# cannot replace or disarm each other's token. Plain executor submissions that
+# need cancellation must explicitly copy their context.
+_active_token: ContextVar[CancellationToken | None] = ContextVar("cancellation_token", default=None)
 
 
 def set_active_token(token: CancellationToken | None) -> None:
-    global _active_token
-    _active_token = token
+    _active_token.set(token)
 
 
 def get_active_token() -> CancellationToken | None:
-    return _active_token
+    return _active_token.get()
 
 
 def check_cancelled() -> None:
@@ -75,7 +75,7 @@ def check_cancelled() -> None:
     Cheap enough to call inside hot loops at a coarse cadence (once per file,
     once per hash bucket). A no-op when no token is armed.
     """
-    token = _active_token
+    token = get_active_token()
     if token is not None and token.cancelled:
         raise PipelineCancelled()
 
@@ -96,7 +96,7 @@ def cancellation_scope(
     armed — callers may flip it manually — but no handler is installed.
     """
     token = CancellationToken()
-    prev_token = _active_token
+    prev_token = get_active_token()
     set_active_token(token)
 
     presses = {"count": 0}

@@ -8,6 +8,7 @@ are not re-indexed.
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -62,6 +63,39 @@ async def _seed_repo_and_job(
         )
         await session.commit()
     return job.id
+
+
+@pytest.mark.parametrize("failure, expected", [(RuntimeError, "failed"), (asyncio.CancelledError, "cancelled")])
+async def test_executor_restores_its_callers_token_after_unwind(
+    session_factory, tmp_path, monkeypatch, failure, expected,
+):
+    from repowise.core.cancellation import CancellationToken, get_active_token, set_active_token
+
+    monkeypatch.setenv("REPOWISE_TOOLS_NO_GENERATIVE", "1")
+    job_id = await _seed_repo_and_job(session_factory, tmp_path, mode="index_only")
+    app_state = SimpleNamespace(session_factory=session_factory, fts=None, vector_store=None)
+    parent_token = CancellationToken()
+
+    async def fail_pipeline(*args, **kwargs):
+        assert get_active_token() is app_state.job_cancel_tokens[job_id]
+        assert get_active_token() is not parent_token
+        raise failure("pipeline stopped")
+
+    previous = get_active_token()
+    set_active_token(parent_token)
+    try:
+        with (
+            patch("repowise.server.job_executor.run_pipeline", fail_pipeline),
+            patch("repowise.server.search_helpers.resolve_repo_vector_store", AsyncMock(return_value=None)),
+        ):
+            await execute_job(job_id, app_state)
+        assert get_active_token() is parent_token
+        assert app_state.job_cancel_tokens == {}
+    finally:
+        set_active_token(previous)
+    async with session_factory() as session:
+        job = await get_generation_job(session, job_id)
+        assert job.status == expected
 
 
 @pytest.mark.asyncio
