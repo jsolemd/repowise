@@ -41,17 +41,19 @@ class CancellationToken:
 
     Backed by :class:`threading.Event` so it can be flipped from a signal
     handler on the main thread and observed from ``asyncio.to_thread`` workers.
+    A child observes its parent's cancellation without cancelling that parent.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, parent: CancellationToken | None = None) -> None:
         self._event = threading.Event()
+        self._parent = parent
 
     def cancel(self) -> None:
         self._event.set()
 
     @property
     def cancelled(self) -> bool:
-        return self._event.is_set()
+        return self._event.is_set() or (self._parent is not None and self._parent.cancelled)
 
 
 # asyncio.to_thread copies the caller's context, retaining the same token in

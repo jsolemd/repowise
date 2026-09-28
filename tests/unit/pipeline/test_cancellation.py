@@ -45,6 +45,23 @@ def test_check_cancelled_noop_when_not_cancelled():
     assert token.cancelled is False
 
 
+def test_child_token_observes_parent_cancellation():
+    parent = CancellationToken()
+    child = CancellationToken(parent=parent)
+    assert not child.cancelled
+    parent.cancel()
+    assert child.cancelled
+
+
+def test_child_token_cancellation_leaves_parent_and_sibling_running():
+    parent = CancellationToken()
+    child, sibling = CancellationToken(parent=parent), CancellationToken(parent=parent)
+    child.cancel()
+    assert child.cancelled
+    assert not parent.cancelled
+    assert not sibling.cancelled
+
+
 def test_check_cancelled_raises_when_cancelled():
     token = CancellationToken()
     token.cancel()

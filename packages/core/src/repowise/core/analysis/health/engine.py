@@ -18,6 +18,7 @@ Repo-level KPIs are computed from the final per-file metrics.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import time
 from datetime import UTC, datetime
@@ -25,6 +26,7 @@ from typing import Any
 
 import structlog
 
+from ...cancellation import CancellationToken, get_active_token, set_active_token
 from ...ingestion.git_indexer.enrich import count_active_contributors
 from ...ingestion.git_indexer.function_blame import (
     BlameIndex,
@@ -854,23 +856,6 @@ class HealthAnalyzer:
         package_roots = self._package_boundaries(analyzed_paths)
         graph_view: HasEdge | None = ImportEdgeView(self.graph) if self.graph is not None else None
 
-        # Duplication is only consumed by the biomarker stage, so it can
-        # overlap with the pre-walk instead of blocking it — on large
-        # repos the scan takes seconds during which the progress bar
-        # would otherwise sit at zero.
-        dup_task: asyncio.Task | None = None
-        if "dry_violation" not in disabled:
-            dup_task = asyncio.ensure_future(
-                asyncio.to_thread(
-                    detect_clones,
-                    self.parsed_files,
-                    self.git_meta_map,
-                    cache_dir=self.duplication_cache_dir,
-                    source_reader=self.read_source,
-                    changed_files=changed_set,
-                )
-            )
-
         target_files = [
             pf
             for pf in self.parsed_files
@@ -878,8 +863,6 @@ class HealthAnalyzer:
             and scores_language(pf.file_info.language)
         ]
         if not target_files:
-            if dup_task is not None:
-                dup_task.cancel()
             return HealthReport(
                 repo_id="",
                 analyzed_at=datetime.now(UTC),
@@ -898,8 +881,14 @@ class HealthAnalyzer:
 
         async def _one(pf: Any) -> tuple[Any, FileComplexity]:
             async with semaphore:
+                worker = asyncio.create_task(asyncio.to_thread(self._walk, pf, vocab))
                 try:
-                    fcx = await asyncio.to_thread(self._walk, pf, vocab)
+                    fcx = await asyncio.shield(worker)
+                except asyncio.CancelledError:
+                    # Cancelling the awaiter cannot stop a running thread.
+                    # Keep its handle until the file walk has actually ended.
+                    await asyncio.gather(worker, return_exceptions=True)
+                    raise
                 except Exception as exc:
                     log.debug("health_walk_failed", path=pf.file_info.path, error=str(exc))
                     fcx = FileComplexity(functions=[], classes=[])
@@ -909,17 +898,50 @@ class HealthAnalyzer:
                 on_step(pf.file_info.path)
             return pf, fcx
 
-        walked = await asyncio.gather(*[_one(pf) for pf in target_files])
-
-        if dup_task is None:
-            dup_report = DuplicationReport()
-        else:
-            try:
-                dup_report = await dup_task
-                _log_duplication_diagnostics(dup_report)
-            except Exception as exc:
-                log.debug("health_duplication_failed", error=str(exc))
+        # Preserve the overlap, but own both kinds of worker until they stop.
+        # Health failures can be skipped by the pipeline; they must not cancel
+        # its parent token or leave a duplicate scan running into later phases.
+        parent_token = get_active_token()
+        phase_token = CancellationToken(parent=parent_token)
+        set_active_token(phase_token)
+        dup_task: asyncio.Task | None = None
+        walk_tasks: list[asyncio.Task] = []
+        try:
+            if "dry_violation" not in disabled:
+                dup_task = asyncio.create_task(asyncio.to_thread(
+                    detect_clones,
+                    self.parsed_files,
+                    self.git_meta_map,
+                    cache_dir=self.duplication_cache_dir,
+                    source_reader=self.read_source,
+                    changed_files=changed_set,
+                ))
+            walk_tasks = [asyncio.create_task(_one(pf)) for pf in target_files]
+            walked = await asyncio.shield(asyncio.gather(*walk_tasks))
+            if dup_task is None:
                 dup_report = DuplicationReport()
+            else:
+                try:
+                    dup_report = await asyncio.shield(dup_task)
+                    _log_duplication_diagnostics(dup_report)
+                except Exception as exc:
+                    log.debug("health_duplication_failed", error=str(exc))
+                    dup_report = DuplicationReport()
+        except BaseException:
+            phase_token.cancel()
+            for task in walk_tasks:
+                if not task.done() and not task.cancelling():
+                    task.cancel()
+            pending = walk_tasks + ([dup_task] if dup_task is not None else [])
+            drained = asyncio.gather(*pending, return_exceptions=True)
+            # Repeated cancellation cannot abandon worker cleanup. Re-raise
+            # the original exception only after the drain has completed.
+            while not drained.done():
+                with contextlib.suppress(asyncio.CancelledError):
+                    await asyncio.shield(drained)
+            raise
+        finally:
+            set_active_token(parent_token)
         repo_fn_mod_p80 = (
             repo_function_mod_p80
             if repo_function_mod_p80 is not None
