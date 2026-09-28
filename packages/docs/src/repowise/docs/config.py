@@ -52,12 +52,6 @@ class Settings(BaseSettings):
     tei_host: Annotated[str, Field(description="TEI API host")] = "http://tei:80"
     embedding_dimensions: Annotated[int, Field(description="Embedding vector dimensions")] = 768
 
-    # Supabase configuration
-    supabase_url: Annotated[str, Field(description="Supabase API URL")] = (
-        "http://supabase-kong:8000"
-    )
-    supabase_service_key: Annotated[str, Field(description="Supabase service role key")] = ""
-
     # PostgreSQL direct connection (for asyncpg)
     postgres_dsn: Annotated[str, Field(description="PostgreSQL connection string")] = ""
 
@@ -199,8 +193,6 @@ class Settings(BaseSettings):
             self.github_token = os.environ.get("GITHUB_TOKEN", "")
         if not self.postgres_dsn:
             self.postgres_dsn = os.environ.get("DATABASE_URL", "")
-        if not self.supabase_service_key:
-            self.supabase_service_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
         return self
 
 

@@ -41,10 +41,9 @@ class HealthChecker:
         """Initialize the health-check HTTP client."""
         self._http_client = httpx.AsyncClient(timeout=5.0)
         logger.info(
-            "Doc-search server initializing with Qdrant=%s, TEI=%s, Supabase=%s",
+            "Doc-search server initializing with Qdrant=%s, TEI=%s",
             self.settings.qdrant_host,
             self.settings.tei_host,
-            self.settings.supabase_url,
         )
 
     async def close(self) -> None:
