@@ -270,9 +270,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     app.state.job_cancel_tokens = {}  # job_id → CancellationToken
     app.state.job_events = {}  # job_id → JobEventBuffer (SSE message frames)
 
-    # Background scheduler (pass app.state so polling can launch jobs)
-    scheduler = setup_scheduler(session_factory, app_state=app.state)
-    scheduler.start()
+    # A native watcher or external timer may already own automatic refresh.
+    # Disabling this scheduler leaves explicit API sync requests available.
+    scheduler = None
+    if os.environ.get("REPOWISE_SCHEDULER_ENABLED", "1").strip().lower() not in {
+        "0", "false", "no", "off",
+    }:
+        scheduler = setup_scheduler(session_factory, app_state=app.state)
+        scheduler.start()
     app.state.scheduler = scheduler
 
     # Initialize chat tool state (bridges FastAPI state to MCP tool globals)
@@ -492,7 +497,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         # Shutdown. The finally matters for the workspace globals below: they
         # outlive the app object, so skipping this on a shutdown exception
         # would leave the tool layer pointing at disposed engines.
-        scheduler.shutdown(wait=False)
+        if scheduler is not None:
+            scheduler.shutdown(wait=False)
         with suppress(Exception):
             await vector_store.close()
         # Close cached per-repo vector stores (LanceDB connections).
