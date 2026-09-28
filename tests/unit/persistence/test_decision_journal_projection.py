@@ -457,3 +457,123 @@ async def test_automatic_evolution_is_disabled_before_any_provider_call(
         "amended": 0,
         "reaffirmed": 0,
     }
+
+
+async def test_unchanged_journal_refresh_writes_nothing(
+    async_session,
+    journal_projection_repo,
+) -> None:
+    """Every decision read refreshes first, so a no-op refresh must not write.
+
+    SQLite returns the timestamp columns naive while the journal parses to
+    aware UTC; comparing them as unequal once rewrote every row, link and edge
+    on each read, under the store's write lock.
+    """
+    from sqlalchemy import event
+
+    repo, root = journal_projection_repo
+    repo_id = repo.id
+    journal = DecisionJournal(root)
+    old = journal.record(
+        decision_id="dec-00000001",
+        title="Keep the journal canonical",
+        decision="Project decisions out of the tracked JSONL file.",
+        why="A rebuild must never lose governance history.",
+        anchors=[{"file": "src/service.py", "symbol": "VALUE"}],
+    )
+    journal.record(
+        decision_id="dec-00000002",
+        title="Use a replacement implementation",
+        decision="Move the implementation to replacement.py.",
+        why="The replacement has the corrected contract.",
+        anchors=[{"file": "src/replacement.py", "symbol": None}],
+        supersedes=old.id,
+    )
+    journal.confirm("dec-00000002")
+    await refresh_decision_journal(async_session, repo_id)
+    await async_session.commit()
+    async_session.expire_all()  # reload rows the way a later request sees them
+
+    writes: list[str] = []
+
+    def _record(conn, cursor, statement, params, context, executemany):
+        if not statement.lstrip().upper().startswith(("SELECT", "PRAGMA")):
+            writes.append(statement.split("\n", 1)[0])
+
+    sync_engine = async_session.bind.sync_engine
+    event.listen(sync_engine, "before_cursor_execute", _record)
+    try:
+        await refresh_decision_journal(async_session, repo_id)
+    finally:
+        event.remove(sync_engine, "before_cursor_execute", _record)
+
+    assert writes == []
+    links = (await async_session.execute(select(DecisionNodeLink))).scalars().all()
+    edges = (await async_session.execute(select(DecisionEdge))).scalars().all()
+    assert {link.node_id for link in links} == {"src/service.py", "src/replacement.py"}
+    assert [(edge.src_decision_id, edge.dst_decision_id) for edge in edges] == [
+        ("dec-00000002", "dec-00000001")
+    ]
+
+
+async def test_write_behind_a_held_store_lock_lands_once_and_reports_pending(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An index update can hold the store's write lock past the busy timeout.
+
+    The journal is the authority, so the write must succeed as pending rather
+    than fail: a failed call that had already appended invited a retry, and the
+    retry minted a duplicate under a new id.
+    """
+    import sqlite3
+
+    from repowise.core.analysis.decisions.journal_projection import (
+        DecisionProjectionPendingError,
+    )
+    from repowise.core.persistence import create_engine, create_session_factory, init_db
+
+    root = tmp_path / "repository"
+    (root / ".repowise").mkdir(parents=True)
+    (root / "src").mkdir()
+    (root / "src" / "service.py").write_text("VALUE = 1\n", encoding="utf-8")
+    monkeypatch.setenv(DECISIONS_JOURNAL_ENV, ".repowise/decisions.jsonl")
+    db_path = tmp_path / "wiki.db"
+    engine = create_engine(f"sqlite+aiosqlite:///{db_path}", busy_timeout_ms=200)
+    await init_db(engine)
+    factory = create_session_factory(engine)
+    async with factory() as session:
+        repo = await insert_repo(session, name="locked-repo", local_path=str(root))
+        repo_id = repo.id
+
+    holder = sqlite3.connect(db_path, timeout=0, isolation_level=None)
+    holder.execute("BEGIN IMMEDIATE")  # what a long index update does
+    try:
+        async with factory() as session:
+            with pytest.raises(DecisionProjectionPendingError) as pending:
+                await record_journal_decision(
+                    session,
+                    repo_id,
+                    title="Keep the journal canonical",
+                    decision="Project decisions out of the tracked JSONL file.",
+                    why="A rebuild must never lose governance history.",
+                    anchors=[{"file": "src/service.py", "symbol": "VALUE"}],
+                    confirmed=False,
+                )
+            await session.commit()  # the savepoint left nothing to write
+    finally:
+        holder.execute("ROLLBACK")
+        holder.close()
+
+    written = pending.value.record
+    assert written.status == "proposed"
+    assert written.title == "Keep the journal canonical"
+    assert len(DecisionJournal(root).snapshot().decisions) == 1
+
+    async with factory() as session:
+        await refresh_decision_journal(session, repo_id)
+        await session.commit()
+        projected = await session.get(DecisionRecord, written.id)
+        assert projected is not None
+        assert projected.status == "proposed"
+    await engine.dispose()

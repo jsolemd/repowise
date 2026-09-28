@@ -413,6 +413,7 @@ async def _dispatch(
             "decision": ops.serialize(record),
             "recorded": True,
             "journal_created": not existed_before,
+            **_pending(record),
             "next": (
                 "Landed as 'proposed'. Committing preserves the record but does not "
                 "confirm it. After verification, use "
@@ -433,7 +434,7 @@ async def _dispatch(
             actor=actor or "",
             vector_store=store,
         )
-        return {"decision": ops.serialize(record), "confirmed": True}
+        return {"decision": ops.serialize(record), "confirmed": True, **_pending(record)}
 
     if not decision_id:
         raise ops.DecisionOpsValidationError("decision_id is required to supersede a decision")
@@ -450,9 +451,28 @@ async def _dispatch(
         "decision": ops.serialize(retired),
         "successor": ops.serialize(successor),
         "superseded": True,
+        **_pending(retired),
         # Said explicitly because "superseded" reads like a delete to an agent
         # that has only seen CRUD surfaces.
         "note": "The retired record stays in the journal and stays readable.",
+    }
+
+
+def _pending(record: Any) -> dict[str, Any]:
+    """Say so when a write is in the journal but not yet in the index store.
+
+    The write succeeded and must not be repeated: a second ``record`` mints a
+    duplicate under a new id. The projection catches up on the next read.
+    """
+    if not ops.projection_pending(record):
+        return {}
+    return {
+        "projection": "pending",
+        "projection_note": (
+            "The journal has this write. The index store was busy with an update, "
+            "so reads may lag until the next decision read re-projects the journal. "
+            "Do not repeat the call."
+        ),
     }
 
 

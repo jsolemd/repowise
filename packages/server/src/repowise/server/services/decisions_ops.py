@@ -37,6 +37,7 @@ from typing import Any
 
 import structlog
 from sqlalchemy import case, or_, select
+from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from repowise.core.analysis.decisions.journal import (
@@ -50,7 +51,9 @@ from repowise.core.analysis.decisions.journal import (
 )
 from repowise.core.analysis.decisions.journal_projection import (
     DECISION_JOURNAL_SOURCE,
+    DecisionProjectionPendingError,
     confirm_journal_decision,
+    journal_record,
     record_journal_decision,
     refresh_decision_journal,
     supersede_journal_decision,
@@ -71,6 +74,7 @@ __all__ = [
     "journal_status",
     "list_decisions",
     "parse_anchor",
+    "projection_pending",
     "record_decision",
     "supersede_decision",
 ]
@@ -173,6 +177,16 @@ def journal_status(repo_root: str | Path) -> dict[str, str | bool | None]:
         "path": str(resolved) if resolved is not None else None,
         "exists": resolved.is_file() if resolved is not None else False,
     }
+
+
+def projection_pending(record: DecisionRecord) -> bool:
+    """True when a write landed in the journal but its projection is pending.
+
+    A pending write answers with a row built from the journal and never added
+    to a session, so SQLAlchemy reports it transient; a projected row is
+    persistent. The next read re-projects the journal and the flag clears.
+    """
+    return sa_inspect(record).transient
 
 
 def _translate(exc: Exception) -> DecisionOpsError:
@@ -498,6 +512,8 @@ async def record_decision(
             confirmed=False,
             vector_store=vector_store,
         )
+    except DecisionProjectionPendingError as pending:
+        record = pending.record
     except (DecisionJournalError, OSError) as exc:
         raise _translate(exc) from exc
 
@@ -544,6 +560,8 @@ async def confirm_decision(
             decision_id,
             vector_store=vector_store,
         )
+    except DecisionProjectionPendingError as pending:
+        record = pending.record
     except (DecisionJournalError, OSError) as exc:
         raise _translate(exc) from exc
 
@@ -594,10 +612,13 @@ async def supersede_decision(
             superseded_by=superseded_by,
             vector_store=vector_store,
         )
+    except DecisionProjectionPendingError as pending:
+        retired = pending.record
+        successor = await journal_record(repo_root, repository_id, superseded_by)
     except (DecisionJournalError, OSError) as exc:
         raise _translate(exc) from exc
-
-    successor = await session.get(DecisionRecord, superseded_by)
+    else:
+        successor = await session.get(DecisionRecord, superseded_by)
     if successor is None:  # defensive: the projection either wrote it or raised
         raise DecisionNotFoundError(f"successor {superseded_by!r} was not projected")
 
