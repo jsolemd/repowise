@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from qdrant_client import QdrantClient, models
+from qdrant_client import AsyncQdrantClient, models
 
 from repowise.docs.config import get_settings
 from repowise.docs.indexer.collection import get_qdrant_client
@@ -82,7 +82,7 @@ async def search_hybrid(
     limit: int = 10,
     chunk_types: list[str] | None = None,
     intent: QueryIntent | None = None,
-    client: QdrantClient | None = None,
+    client: AsyncQdrantClient | None = None,
 ) -> list[models.ScoredPoint]:
     """Hybrid search with BM25 + dense vectors using RRF fusion."""
     if client is None:
@@ -95,7 +95,7 @@ async def search_hybrid(
     query_filter = build_library_filter(library_id, chunk_types)
 
     prefetch_limit = max(200, limit * 10)
-    response = client.query_points(
+    response = await client.query_points(
         collection_name=settings.qdrant_collection,
         prefetch=[
             models.Prefetch(
@@ -122,7 +122,7 @@ async def search_hybrid(
     rescue_query = _surface_rescue_query(query)
     if rescue_query:
         rescue_limit = max(_SURFACE_RESCUE_LIMIT_MIN, limit * _SURFACE_RESCUE_LIMIT_SCALE)
-        rescue_response = client.query_points(
+        rescue_response = await client.query_points(
             collection_name=settings.qdrant_collection,
             query=models.Document(text=rescue_query, model="Qdrant/bm25"),
             using="bm25",
@@ -157,7 +157,7 @@ async def search_dense(
     query: str,
     limit: int = 10,
     chunk_types: list[str] | None = None,
-    client: QdrantClient | None = None,
+    client: AsyncQdrantClient | None = None,
 ) -> list[models.ScoredPoint]:
     """Dense (semantic) search only."""
     if client is None:
@@ -167,7 +167,7 @@ async def search_dense(
     query_embedding = await embed_single(query)
     query_filter = build_library_filter(library_id, chunk_types)
 
-    response = client.query_points(
+    response = await client.query_points(
         collection_name=settings.qdrant_collection,
         query=query_embedding,
         using="dense",
@@ -181,7 +181,7 @@ async def search_dense(
 
 async def get_chunk_by_id(
     chunk_id: str,
-    client: QdrantClient | None = None,
+    client: AsyncQdrantClient | None = None,
 ) -> models.Record | None:
     """Retrieve a single chunk by its ID."""
     if client is None:
@@ -190,7 +190,7 @@ async def get_chunk_by_id(
     settings = get_settings()
 
     try:
-        results = client.retrieve(
+        results = await client.retrieve(
             collection_name=settings.qdrant_collection,
             ids=[chunk_id],
             with_payload=True,
@@ -205,7 +205,7 @@ async def get_sibling_chunks(
     library_id: str,
     file_path: str,
     exclude_ids: list[str] | None = None,
-    client: QdrantClient | None = None,
+    client: AsyncQdrantClient | None = None,
 ) -> list[dict]:
     """Get other chunks from the same file for related-sections rendering."""
     if client is None:
@@ -214,7 +214,7 @@ async def get_sibling_chunks(
     settings = get_settings()
     exclude_ids = exclude_ids or []
 
-    response = client.scroll(
+    response = await client.scroll(
         collection_name=settings.qdrant_collection,
         scroll_filter=build_file_filter(library_id, file_path),
         limit=50,
@@ -250,7 +250,7 @@ async def get_code_chunks_for_section(
     library_id: str,
     file_path: str,
     section_anchor: str,
-    client: QdrantClient | None = None,
+    client: AsyncQdrantClient | None = None,
 ) -> list[dict]:
     """Fetch code chunks from the same section as a doc chunk."""
     if client is None:
@@ -259,7 +259,7 @@ async def get_code_chunks_for_section(
     settings = get_settings()
     base_anchor = ANCHOR_SPLIT_SUFFIX_PATTERN.sub("", section_anchor)
 
-    response, _ = client.scroll(
+    response, _ = await client.scroll(
         collection_name=settings.qdrant_collection,
         scroll_filter=build_file_filter(library_id, file_path, chunk_type="code"),
         with_payload=True,
@@ -302,7 +302,7 @@ async def search_bm25(
     query: str,
     limit: int = 10,
     chunk_types: list[str] | None = None,
-    client: QdrantClient | None = None,
+    client: AsyncQdrantClient | None = None,
 ) -> list[models.ScoredPoint]:
     """BM25 (keyword) search only."""
     if client is None:
@@ -311,7 +311,7 @@ async def search_bm25(
     settings = get_settings()
     query_filter = build_library_filter(library_id, chunk_types)
 
-    response = client.query_points(
+    response = await client.query_points(
         collection_name=settings.qdrant_collection,
         query=models.Document(text=query, model="Qdrant/bm25"),
         using="bm25",
@@ -329,7 +329,7 @@ async def search_exact_match(
     limit: int = 10,
     chunk_types: list[str] | None = None,
     phrase_boost: float = 2.0,
-    client: QdrantClient | None = None,
+    client: AsyncQdrantClient | None = None,
 ) -> list[models.ScoredPoint]:
     """BM25 search with phrase boost for exact API lookups."""
     if client is None:
@@ -339,7 +339,7 @@ async def search_exact_match(
     query_filter = build_library_filter(library_id, chunk_types)
     prefetch_limit = max(50, limit * 3)
 
-    response = client.query_points(
+    response = await client.query_points(
         collection_name=settings.qdrant_collection,
         query=models.Document(text=query, model="Qdrant/bm25"),
         using="bm25",

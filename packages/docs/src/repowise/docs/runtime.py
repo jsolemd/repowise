@@ -146,7 +146,7 @@ async def close_docs_runtime() -> None:
             await close_health_checker()
             await close_docs_embedding_http_client()
             await close_docs_remote_http_client()
-            close_qdrant_client()
+            await close_qdrant_client()
             await close_pool()
             _STATE.initialized = False
             _STATE.bootstrap_summary = None

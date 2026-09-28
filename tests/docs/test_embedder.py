@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
 
-from repowise.docs.indexer import embedder
+from repowise.docs.chunking.models import ChunkType, DocChunk
+from repowise.docs.indexer import embedder, mutations
 from repowise.docs.library.models import LibraryStatus
 from repowise.docs.server.health import HealthChecker
 
@@ -53,7 +55,10 @@ async def test_embed_texts_reuses_shared_client(monkeypatch):
         embedder,
         "get_settings",
         lambda: SimpleNamespace(
-            tei_host="http://tei", embedding_batch_size=32, chunk_max_tokens=800
+            tei_host="http://tei",
+            embedding_batch_size=32,
+            chunk_max_tokens=800,
+            embedding_dimensions=2,
         ),
     )
 
@@ -100,7 +105,10 @@ async def test_embed_texts_retries_transient_tei_errors(monkeypatch):
         embedder,
         "get_settings",
         lambda: SimpleNamespace(
-            tei_host="http://tei", embedding_batch_size=32, chunk_max_tokens=800
+            tei_host="http://tei",
+            embedding_batch_size=32,
+            chunk_max_tokens=800,
+            embedding_dimensions=2,
         ),
     )
 
@@ -133,7 +141,12 @@ async def test_embed_texts_trims_oversized_inputs_before_post(monkeypatch):
     monkeypatch.setattr(
         embedder,
         "get_settings",
-        lambda: SimpleNamespace(tei_host="http://tei", embedding_batch_size=32, chunk_max_tokens=4),
+        lambda: SimpleNamespace(
+            tei_host="http://tei",
+            embedding_batch_size=32,
+            chunk_max_tokens=4,
+            embedding_dimensions=2,
+        ),
     )
 
     await embedder.close_http_client()
@@ -148,6 +161,123 @@ async def test_embed_texts_trims_oversized_inputs_before_post(monkeypatch):
     ]
 
     await embedder.close_http_client()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("batch_size", [0, -1])
+async def test_nonpositive_batch_size_is_rejected_before_http(monkeypatch, batch_size):
+    post = AsyncMock()
+    monkeypatch.setattr(embedder, "_post_embed_batch", post)
+    with pytest.raises(ValueError, match="batch size must be positive"):
+        await embedder.embed_texts(["alpha"], batch_size=batch_size)
+    post.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [
+        [],
+        [[0.1, 0.2]],
+        [[0.1, 0.2]] * 3,
+        {"error": "bad response"},
+        [[0.1], [0.2]],
+        [[True, 0.2], [0.3, 0.4]],
+        [["bad", 0.2], [0.3, 0.4]],
+        [[float("inf"), 0.2], [0.3, 0.4]],
+    ],
+)
+async def test_invalid_embedding_batch_cannot_publish_partial_chunks(monkeypatch, payload):
+    # Use the real embedding and mutation path so a provider mismatch cannot
+    # be hidden by zip truncation before the pipeline stamps a file current.
+    import json
+
+    client = _FakeAsyncClient(
+        [
+            httpx.Response(
+                200, content=json.dumps(payload), request=httpx.Request("POST", "http://tei/embed")
+            )
+        ]
+    )
+    settings = SimpleNamespace(
+        tei_host="http://tei",
+        embedding_batch_size=32,
+        chunk_max_tokens=800,
+        embedding_dimensions=2,
+        qdrant_collection="docs",
+    )
+    monkeypatch.setattr(embedder, "_get_http_client", lambda: client)
+    monkeypatch.setattr(embedder, "get_settings", lambda: settings)
+    monkeypatch.setattr(mutations, "get_settings", lambda: settings)
+    chunks = [
+        DocChunk(
+            library_id="/test/docs",
+            file_path="api.md",
+            commit_sha="test",
+            chunk_type=ChunkType.DOC,
+            content=content,
+            breadcrumb=[],
+            section_anchor=content,
+            source_url="",
+        )
+        for content in ("first", "second")
+    ]
+    qdrant = MagicMock()
+
+    with pytest.raises(ValueError, match="TEI"):
+        await mutations.upsert_chunks(chunks, qdrant)
+
+    qdrant.upsert.assert_not_called()
+    assert len(client.calls) == 1  # Malformed successful responses are not retried.
+
+
+@pytest.mark.asyncio
+async def test_transport_retry_does_not_close_another_requests_client(monkeypatch):
+    active = asyncio.Event()
+    retry_finished = asyncio.Event()
+
+    class ConcurrentClient:
+        is_closed = False
+        attempts = 0
+
+        async def post(self, url, json):
+            if json["inputs"] == ["slow"]:
+                active.set()
+                await retry_finished.wait()
+                assert not self.is_closed, "retry closed a concurrent request's pool"
+            else:
+                await active.wait()
+                self.attempts += 1
+                if self.attempts == 1:
+                    raise httpx.ReadTimeout("transient read failure")
+                retry_finished.set()
+            return httpx.Response(200, json=[[0.1, 0.2]], request=httpx.Request("POST", url))
+
+        async def aclose(self):
+            self.is_closed = True
+
+    client = ConcurrentClient()
+    monkeypatch.setattr(embedder, "_http_client", client)
+    monkeypatch.setattr(embedder, "_get_http_client", lambda: client)
+    monkeypatch.setattr(
+        embedder,
+        "get_settings",
+        lambda: SimpleNamespace(
+            tei_host="http://tei",
+            embedding_batch_size=32,
+            chunk_max_tokens=800,
+            embedding_dimensions=2,
+        ),
+    )
+    monkeypatch.setattr(embedder.asyncio, "sleep", AsyncMock())
+
+    assert await asyncio.gather(
+        embedder.embed_texts(["slow"]), embedder.embed_texts(["retry"])
+    ) == [[[0.1, 0.2]], [[0.1, 0.2]]]
+    assert client.attempts == 2
+    assert not client.is_closed
+    await embedder.close_http_client()
+    assert client.is_closed
 
 
 @pytest.mark.asyncio

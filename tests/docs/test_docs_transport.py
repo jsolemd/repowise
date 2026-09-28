@@ -20,7 +20,7 @@ import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
 from starlette.responses import JSONResponse
@@ -553,7 +553,7 @@ async def test_the_host_starts_exactly_one_background_owner(
     }
     for name, mock in async_mocks.items():
         monkeypatch.setattr(docs_runtime, name, mock)
-    monkeypatch.setattr(docs_runtime, "close_qdrant_client", MagicMock())
+    monkeypatch.setattr(docs_runtime, "close_qdrant_client", AsyncMock())
 
     await docs_runtime.ensure_docs_runtime(start_background=True)
     app = docs_http.create_app(settings=_settings())

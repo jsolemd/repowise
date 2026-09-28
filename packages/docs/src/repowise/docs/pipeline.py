@@ -133,7 +133,7 @@ async def index_library(library_id: str, force: bool = False) -> dict:
     client = get_qdrant_client()
 
     # Ensure collection exists
-    ensure_collection(client)
+    await ensure_collection(client)
 
     # 1. Get library config from DB
     library = await get_library(library_id)

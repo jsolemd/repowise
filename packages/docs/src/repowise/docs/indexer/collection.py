@@ -3,7 +3,7 @@
 import logging
 import threading
 
-from qdrant_client import QdrantClient, models
+from qdrant_client import AsyncQdrantClient, models
 
 from repowise.docs.config import get_settings
 
@@ -11,21 +11,26 @@ logger = logging.getLogger(__name__)
 
 COLLECTION_NAME = "doc-search"
 DOC_SEARCH_INDEXING_THRESHOLD = 10000
-_CLIENT: QdrantClient | None = None
+_CLIENT: AsyncQdrantClient | None = None
 _CLIENT_LOCK = threading.Lock()
 
 
-def get_qdrant_client() -> QdrantClient:
+def get_qdrant_client() -> AsyncQdrantClient:
     """Get a process-local Qdrant client instance."""
     global _CLIENT
     with _CLIENT_LOCK:
         if _CLIENT is None:
             settings = get_settings()
-            _CLIENT = QdrantClient(url=settings.qdrant_host)
+            # The SDK's constructor version probe is synchronous even for its
+            # async client. Versions are pinned by the worker/deployment; health
+            # checks own connectivity, and all data requests stay cancellable.
+            _CLIENT = AsyncQdrantClient(
+                url=settings.qdrant_host, timeout=5, check_compatibility=False
+            )
         return _CLIENT
 
 
-def close_qdrant_client() -> None:
+async def close_qdrant_client() -> None:
     """Close the cached Qdrant client, primarily for tests and shutdown."""
     global _CLIENT
     with _CLIENT_LOCK:
@@ -33,10 +38,46 @@ def close_qdrant_client() -> None:
         _CLIENT = None
 
     if client is not None:
-        client.close()
+        await client.close()
 
 
-def ensure_collection(client: QdrantClient | None = None) -> None:
+def _collection_updates(info: models.CollectionInfo, dimensions: int) -> dict:
+    """Return only drift from the storage policy this module owns."""
+    vectors = info.config.params.vectors
+    dense = vectors.get("dense") if isinstance(vectors, dict) else None
+    if dense is None or dense.size != dimensions or dense.distance != models.Distance.COSINE:
+        raise ValueError(f"Docs collection requires a {dimensions}D cosine vector named 'dense'")
+    updates = {}
+    if dense.on_disk is not True:
+        updates["vectors_config"] = {"dense": models.VectorParamsDiff(on_disk=True)}
+    sparse = (info.config.params.sparse_vectors or {}).get("bm25")
+    if (
+        sparse is None
+        or sparse.index is None
+        or sparse.index.on_disk is not True
+        or sparse.modifier != models.Modifier.IDF
+    ):
+        updates["sparse_vectors_config"] = {
+            "bm25": models.SparseVectorParams(
+                index=models.SparseIndexParams(on_disk=True),
+                modifier=models.Modifier.IDF,
+            )
+        }
+    if info.config.hnsw_config.on_disk is not True:
+        updates["hnsw_config"] = models.HnswConfigDiff(on_disk=True)
+    optimizer = info.config.optimizer_config
+    if (
+        optimizer.indexing_threshold != DOC_SEARCH_INDEXING_THRESHOLD
+        or optimizer.memmap_threshold != DOC_SEARCH_INDEXING_THRESHOLD
+    ):
+        updates["optimizers_config"] = models.OptimizersConfigDiff(
+            indexing_threshold=DOC_SEARCH_INDEXING_THRESHOLD,
+            memmap_threshold=DOC_SEARCH_INDEXING_THRESHOLD,
+        )
+    return updates
+
+
+async def ensure_collection(client: AsyncQdrantClient | None = None) -> None:
     """
     Create the doc-search collection if it doesn't exist.
 
@@ -53,40 +94,11 @@ def ensure_collection(client: QdrantClient | None = None) -> None:
 
     settings = get_settings()
 
-    # Check if collection already exists
-    collections = client.get_collections().collections
-    exists = any(c.name == settings.qdrant_collection for c in collections)
-    if exists:
-        logger.info(f"Collection '{settings.qdrant_collection}' already exists")
-        try:
-            client.update_collection(
-                collection_name=settings.qdrant_collection,
-                vectors_config={
-                    "dense": models.VectorParamsDiff(on_disk=True),
-                },
-                sparse_vectors_config={
-                    "bm25": models.SparseVectorParams(
-                        index=models.SparseIndexParams(on_disk=True),
-                        modifier=models.Modifier.IDF,
-                    )
-                },
-                hnsw_config=models.HnswConfigDiff(on_disk=True),
-                optimizers_config=models.OptimizersConfigDiff(
-                    indexing_threshold=DOC_SEARCH_INDEXING_THRESHOLD,
-                    memmap_threshold=DOC_SEARCH_INDEXING_THRESHOLD,
-                ),
-            )
-        except Exception as e:
-            logger.warning(
-                "Failed to apply disk optimization to existing collection '%s': %s",
-                settings.qdrant_collection,
-                e,
-            )
-    else:
+    if not await client.collection_exists(settings.qdrant_collection):
         logger.info(f"Creating collection '{settings.qdrant_collection}'")
 
         # Create collection with dense + sparse (BM25) vectors
-        client.create_collection(
+        await client.create_collection(
             collection_name=settings.qdrant_collection,
             vectors_config={
                 "dense": models.VectorParams(
@@ -109,24 +121,23 @@ def ensure_collection(client: QdrantClient | None = None) -> None:
             on_disk_payload=True,
         )
 
-    # Create payload indexes for efficient filtering
-    client.create_payload_index(
-        collection_name=settings.qdrant_collection,
-        field_name="library_id",
-        field_schema=models.PayloadSchemaType.KEYWORD,
-    )
-
-    client.create_payload_index(
-        collection_name=settings.qdrant_collection,
-        field_name="file_path",
-        field_schema=models.PayloadSchemaType.KEYWORD,
-    )
-
-    client.create_payload_index(
-        collection_name=settings.qdrant_collection,
-        field_name="chunk_type",
-        field_schema=models.PayloadSchemaType.KEYWORD,
-    )
+    # Read server state on every pass. This makes an unchanged refresh read-only
+    # and also repairs a run interrupted between creation and payload indexes.
+    info = await client.get_collection(settings.qdrant_collection)
+    updates = _collection_updates(info, settings.embedding_dimensions)
+    if updates:
+        await client.update_collection(collection_name=settings.qdrant_collection, **updates)
+    for name in ("library_id", "file_path", "chunk_type"):
+        index = info.payload_schema.get(name)
+        if index is not None and index.data_type != models.PayloadSchemaType.KEYWORD:
+            raise ValueError(f"Docs payload index {name!r} must be keyword typed")
+        if index is None:
+            await client.create_payload_index(
+                collection_name=settings.qdrant_collection,
+                field_name=name,
+                field_schema=models.PayloadSchemaType.KEYWORD,
+                wait=True,
+            )
 
     logger.info(
         "Collection '%s' ensured with dense (%sD) + BM25 vectors (disk-optimized)",
@@ -135,7 +146,7 @@ def ensure_collection(client: QdrantClient | None = None) -> None:
     )
 
 
-def delete_collection(client: QdrantClient | None = None) -> bool:
+async def delete_collection(client: AsyncQdrantClient | None = None) -> bool:
     """
     Delete the doc-search collection if it exists.
 
@@ -150,17 +161,16 @@ def delete_collection(client: QdrantClient | None = None) -> bool:
 
     settings = get_settings()
 
-    collections = client.get_collections().collections
-    if not any(c.name == settings.qdrant_collection for c in collections):
+    if not await client.collection_exists(settings.qdrant_collection):
         logger.info(f"Collection '{settings.qdrant_collection}' does not exist")
         return False
 
-    client.delete_collection(collection_name=settings.qdrant_collection)
+    await client.delete_collection(collection_name=settings.qdrant_collection)
     logger.info(f"Deleted collection '{settings.qdrant_collection}'")
     return True
 
 
-def get_collection_info(client: QdrantClient | None = None) -> dict | None:
+async def get_collection_info(client: AsyncQdrantClient | None = None) -> dict | None:
     """
     Get information about the doc-search collection.
 
@@ -176,7 +186,7 @@ def get_collection_info(client: QdrantClient | None = None) -> dict | None:
     settings = get_settings()
 
     try:
-        info = client.get_collection(collection_name=settings.qdrant_collection)
+        info = await client.get_collection(collection_name=settings.qdrant_collection)
         return {
             "name": settings.qdrant_collection,
             "points_count": info.points_count,

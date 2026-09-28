@@ -60,7 +60,7 @@ async def export_bundle(
     offset = None
 
     while True:
-        response, next_offset = client.scroll(
+        response, next_offset = await client.scroll(
             collection_name=settings.qdrant_collection,
             scroll_filter=models.Filter(
                 must=[

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 
-from qdrant_client import QdrantClient, models
+from qdrant_client import AsyncQdrantClient, models
 
 from repowise.docs.chunking.models import DocChunk
 from repowise.docs.config import get_settings
@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 async def upsert_chunks(
     chunks: list[DocChunk],
-    client: QdrantClient | None = None,
+    client: AsyncQdrantClient | None = None,
 ) -> int:
     """Upsert document chunks with dense embeddings to Qdrant."""
     if not chunks:
@@ -37,7 +37,7 @@ async def upsert_chunks(
     embeddings = await embed_texts(texts)
 
     points: list[models.PointStruct] = []
-    for chunk, embedding in zip(chunks, embeddings, strict=False):
+    for chunk, embedding in zip(chunks, embeddings, strict=True):
         points.append(
             models.PointStruct(
                 id=chunk.id,
@@ -55,7 +55,7 @@ async def upsert_chunks(
     batch_size = 100
     for i in range(0, len(points), batch_size):
         batch = points[i : i + batch_size]
-        client.upsert(
+        await client.upsert(
             collection_name=settings.qdrant_collection,
             points=batch,
             wait=True,
@@ -69,14 +69,14 @@ async def upsert_chunks(
 async def delete_by_file(
     library_id: str,
     file_path: str,
-    client: QdrantClient | None = None,
+    client: AsyncQdrantClient | None = None,
 ) -> int:
     """Delete all chunks for a specific file."""
     if client is None:
         client = get_qdrant_client()
 
     settings = get_settings()
-    count_result = client.count(
+    count_result = await client.count(
         collection_name=settings.qdrant_collection,
         count_filter=build_file_filter(library_id, file_path),
     )
@@ -85,7 +85,7 @@ async def delete_by_file(
     if count == 0:
         return 0
 
-    client.delete(
+    await client.delete(
         collection_name=settings.qdrant_collection,
         points_selector=models.FilterSelector(
             filter=build_file_filter(library_id, file_path),
@@ -101,7 +101,7 @@ async def delete_stale_file_chunks(
     library_id: str,
     file_path: str,
     keep_chunk_ids: list[str],
-    client: QdrantClient | None = None,
+    client: AsyncQdrantClient | None = None,
 ) -> int:
     """Delete stale chunks for one file while preserving the current chunk IDs."""
     if not keep_chunk_ids:
@@ -112,7 +112,7 @@ async def delete_stale_file_chunks(
 
     settings = get_settings()
     stale_filter = build_stale_file_filter(library_id, file_path, keep_chunk_ids)
-    count_result = client.count(
+    count_result = await client.count(
         collection_name=settings.qdrant_collection,
         count_filter=stale_filter,
     )
@@ -121,7 +121,7 @@ async def delete_stale_file_chunks(
     if count == 0:
         return 0
 
-    client.delete(
+    await client.delete(
         collection_name=settings.qdrant_collection,
         points_selector=models.FilterSelector(filter=stale_filter),
         wait=True,
@@ -138,7 +138,7 @@ async def delete_stale_file_chunks(
 
 async def list_indexed_file_paths(
     library_id: str,
-    client: QdrantClient | None = None,
+    client: AsyncQdrantClient | None = None,
 ) -> set[str]:
     """Return the set of file paths currently indexed for a library."""
     if client is None:
@@ -149,7 +149,7 @@ async def list_indexed_file_paths(
     offset = None
 
     while True:
-        points, offset = client.scroll(
+        points, offset = await client.scroll(
             collection_name=settings.qdrant_collection,
             scroll_filter=build_library_filter(library_id),
             with_payload=["file_path"],
@@ -171,7 +171,7 @@ async def list_indexed_file_paths(
 async def delete_files_outside_scope(
     library_id: str,
     valid_file_paths: set[str],
-    client: QdrantClient | None = None,
+    client: AsyncQdrantClient | None = None,
 ) -> dict[str, int | list[str]]:
     """Delete indexed files that no longer belong to the library discovery scope."""
     if client is None:
@@ -201,14 +201,14 @@ async def delete_files_outside_scope(
 
 async def delete_by_library(
     library_id: str,
-    client: QdrantClient | None = None,
+    client: AsyncQdrantClient | None = None,
 ) -> int:
     """Delete all chunks for a library."""
     if client is None:
         client = get_qdrant_client()
 
     settings = get_settings()
-    count_result = client.count(
+    count_result = await client.count(
         collection_name=settings.qdrant_collection,
         count_filter=build_library_filter(library_id),
     )
@@ -217,7 +217,7 @@ async def delete_by_library(
     if count == 0:
         return 0
 
-    client.delete(
+    await client.delete(
         collection_name=settings.qdrant_collection,
         points_selector=models.FilterSelector(
             filter=build_library_filter(library_id),
@@ -232,7 +232,7 @@ async def delete_by_library(
 async def relabel_library_chunks(
     old_library_id: str,
     new_library_id: str,
-    client: QdrantClient | None = None,
+    client: AsyncQdrantClient | None = None,
 ) -> int:
     """Move all Qdrant chunks from one logical library ID to another."""
     if old_library_id == new_library_id:
@@ -242,7 +242,7 @@ async def relabel_library_chunks(
         client = get_qdrant_client()
 
     settings = get_settings()
-    count_result = client.count(
+    count_result = await client.count(
         collection_name=settings.qdrant_collection,
         count_filter=build_library_filter(old_library_id),
     )
@@ -250,7 +250,7 @@ async def relabel_library_chunks(
     if count == 0:
         return 0
 
-    client.set_payload(
+    await client.set_payload(
         collection_name=settings.qdrant_collection,
         payload={"library_id": new_library_id},
         points=models.FilterSelector(filter=build_library_filter(old_library_id)),
@@ -267,7 +267,7 @@ async def relabel_library_chunks(
 
 async def get_chunk_count(
     library_id: str | None = None,
-    client: QdrantClient | None = None,
+    client: AsyncQdrantClient | None = None,
 ) -> int:
     """Get the count of indexed chunks."""
     if client is None:
@@ -276,11 +276,11 @@ async def get_chunk_count(
     settings = get_settings()
 
     if library_id:
-        result = client.count(
+        result = await client.count(
             collection_name=settings.qdrant_collection,
             count_filter=build_library_filter(library_id),
         )
     else:
-        result = client.count(collection_name=settings.qdrant_collection)
+        result = await client.count(collection_name=settings.qdrant_collection)
 
     return result.count

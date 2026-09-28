@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import math
 import threading
 from collections import OrderedDict
 
@@ -104,6 +105,25 @@ async def close_http_client() -> None:
         await client.aclose()
 
 
+def _validate_embedding_batch(
+    vectors: object, *, input_count: int, dimensions: int
+) -> list[list[float]]:
+    """Reject incomplete or malformed successful responses before publication."""
+    if not isinstance(vectors, list) or len(vectors) != input_count:
+        raise ValueError(f"TEI must return one embedding for each of {input_count} inputs")
+    for vector in vectors:
+        if not isinstance(vector, list) or len(vector) != dimensions:
+            raise ValueError(f"TEI must return {dimensions}-dimensional embeddings")
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            for value in vector
+        ):
+            raise ValueError("TEI embeddings must contain finite numbers")
+    return vectors
+
+
 async def _post_embed_batch(
     *,
     settings,
@@ -120,7 +140,9 @@ async def _post_embed_batch(
                 json={"inputs": batch},
             )
             response.raise_for_status()
-            return response.json()
+            return _validate_embedding_batch(
+                response.json(), input_count=len(batch), dimensions=settings.embedding_dimensions
+            )
         except httpx.HTTPStatusError as exc:
             last_exc = exc
             if (
@@ -130,8 +152,9 @@ async def _post_embed_batch(
                 raise
         except (httpx.ConnectError, httpx.TimeoutException, httpx.RemoteProtocolError) as exc:
             last_exc = exc
-            await close_http_client()
-            client = _get_http_client()
+            # HTTPX retires failed connections within its pool. Closing the
+            # shared client here would also interrupt unrelated search/index
+            # requests; the runtime owns closing it at shutdown.
 
         if attempt < _EMBED_MAX_RETRIES:
             await asyncio.sleep(min(0.2 * (2**attempt), 1.0))
@@ -161,7 +184,9 @@ async def embed_texts(
         return []
 
     settings = get_settings()
-    batch_size = batch_size or settings.embedding_batch_size
+    batch_size = settings.embedding_batch_size if batch_size is None else batch_size
+    if batch_size < 1:
+        raise ValueError("Embedding batch size must be positive")
     max_chars = _max_embed_chars(settings)
 
     embeddings: list[list[float]] = []

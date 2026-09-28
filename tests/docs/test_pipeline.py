@@ -42,7 +42,9 @@ async def test_index_library_skips_hash_scan_when_head_and_paths_unchanged(tmp_p
     )
 
     with (
-        patch("repowise.docs.pipeline.get_qdrant_client", return_value=MagicMock()),
+        patch(
+            "repowise.docs.pipeline.get_qdrant_client", return_value=MagicMock(count=AsyncMock())
+        ),
         patch("repowise.docs.pipeline.ensure_collection"),
         patch(
             "repowise.docs.pipeline.delete_files_outside_scope", new_callable=AsyncMock
@@ -107,7 +109,9 @@ async def test_index_library_hashes_when_head_matches_but_indexed_path_set_chang
     repo_dir.mkdir()
 
     with (
-        patch("repowise.docs.pipeline.get_qdrant_client", return_value=MagicMock()),
+        patch(
+            "repowise.docs.pipeline.get_qdrant_client", return_value=MagicMock(count=AsyncMock())
+        ),
         patch("repowise.docs.pipeline.ensure_collection"),
         patch(
             "repowise.docs.pipeline.delete_files_outside_scope", new_callable=AsyncMock
@@ -186,7 +190,9 @@ async def test_index_library_prunes_out_of_scope_qdrant_files_even_when_hash_sca
     )
 
     with (
-        patch("repowise.docs.pipeline.get_qdrant_client", return_value=MagicMock()),
+        patch(
+            "repowise.docs.pipeline.get_qdrant_client", return_value=MagicMock(count=AsyncMock())
+        ),
         patch("repowise.docs.pipeline.ensure_collection"),
         patch(
             "repowise.docs.pipeline.delete_files_outside_scope", new_callable=AsyncMock
@@ -335,7 +341,9 @@ async def test_index_library_clears_file_when_replacement_produces_no_chunks(
     change_set.has_changes = True
 
     with (
-        patch("repowise.docs.pipeline.get_qdrant_client", return_value=MagicMock()),
+        patch(
+            "repowise.docs.pipeline.get_qdrant_client", return_value=MagicMock(count=AsyncMock())
+        ),
         patch("repowise.docs.pipeline.ensure_collection"),
         patch(
             "repowise.docs.pipeline.delete_files_outside_scope", new_callable=AsyncMock
@@ -408,7 +416,9 @@ async def test_index_library_raises_without_deleting_existing_chunks_when_file_p
     changes.has_changes = True
 
     with (
-        patch("repowise.docs.pipeline.get_qdrant_client", return_value=MagicMock()),
+        patch(
+            "repowise.docs.pipeline.get_qdrant_client", return_value=MagicMock(count=AsyncMock())
+        ),
         patch("repowise.docs.pipeline.ensure_collection"),
         patch(
             "repowise.docs.pipeline.delete_files_outside_scope", new_callable=AsyncMock
@@ -476,7 +486,9 @@ async def test_index_library_marks_library_ready_with_warning_when_some_files_fa
         return [fake_chunk]
 
     with (
-        patch("repowise.docs.pipeline.get_qdrant_client", return_value=MagicMock()),
+        patch(
+            "repowise.docs.pipeline.get_qdrant_client", return_value=MagicMock(count=AsyncMock())
+        ),
         patch("repowise.docs.pipeline.ensure_collection"),
         patch(
             "repowise.docs.pipeline.delete_files_outside_scope", new_callable=AsyncMock

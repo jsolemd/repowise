@@ -230,7 +230,7 @@ async def test_search_hybrid_rescues_exact_component_surface_candidates(mock_qdr
         section_anchor="stack",
     )
 
-    client = MagicMock()
+    client = MagicMock(query_points=AsyncMock())
     client.query_points.side_effect = [
         SimpleNamespace(points=[section_gaps]),
         SimpleNamespace(points=[stack]),
@@ -282,7 +282,7 @@ async def test_search_hybrid_api_lookup_demotes_weak_paths_when_stronger_surface
         section_anchor="interface-animatepresenceprops",
     )
 
-    client = MagicMock()
+    client = MagicMock(query_points=AsyncMock())
     client.query_points.side_effect = [
         SimpleNamespace(points=[weak_example, strong_source]),
         SimpleNamespace(points=[]),
@@ -346,7 +346,7 @@ async def test_search_hybrid_api_lookup_prefers_canonical_component_page_over_co
         content="Modal.Stack manages modal groups.",
     )
 
-    client = MagicMock()
+    client = MagicMock(query_points=AsyncMock())
     client.query_points.side_effect = [
         SimpleNamespace(points=[drawer_stack, modal_stack, canonical]),
         SimpleNamespace(points=[]),
