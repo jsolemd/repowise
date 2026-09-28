@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+from bisect import bisect_left
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from ..health import HealthFindingData
 from ..health.aggregation import finding_raw_deduction
 from .identity import finding_key, line_distance, normalize_path, severity_rank
 from .models import ChangeKind, FindingKey
+
+if TYPE_CHECKING:
+    from .sources import FileChange
 
 #: Health-impact movement below this is rounding, not a regression.
 _IMPACT_EPSILON = 0.01
@@ -44,14 +49,20 @@ class MatchResult:
 class FindingMatcher:
     """Match two finding sets by tolerant identity, then classify each pair.
 
-    Pairing is per identity group: findings sharing a key are zipped by line
-    proximity so a marker that fires twice in one symbol keeps a stable
-    correspondence, and a same-marker replacement reads as one unchanged
-    finding rather than one introduced plus one resolved.
+    Pairing is per identity group: reserve corresponding untouched lines when
+    the diff supplies them, then use proximity for the remainder. A marker
+    that fires twice in one symbol keeps a stable correspondence, and a
+    same-marker replacement remains one finding.
     """
 
-    def __init__(self, rename_map: dict[str, str] | None = None) -> None:
+    def __init__(
+        self,
+        rename_map: dict[str, str] | None = None,
+        *,
+        changes: dict[str, FileChange] | None = None,
+    ) -> None:
         self.rename_map = rename_map or {}
+        self.changes = changes or {}
 
     def match(self, base: list[HealthFindingData], head: list[HealthFindingData]) -> MatchResult:
         base_groups = self._group(base, normalize=True)
@@ -87,21 +98,25 @@ class FindingMatcher:
     def _pair(
         self, key: FindingKey, base: list[HealthFindingData], head: list[HealthFindingData]
     ) -> tuple[list[MatchedFinding], list[HealthFindingData]]:
-        """Pair the group's findings closest-first, and report what is left over.
+        """Reserve unchanged lines, then pair remaining findings closest-first.
 
         Closest-first over all candidate pairs, not first-come-first-served:
         letting the earliest head finding claim the only base peer lets an
         unrelated new finding absorb a moved one, which both hides the new
         finding and reports the moved one as introduced.
         """
+        base_lines, head_lines = self._unchanged_lines(key.path, base, head)
         candidates = sorted(
-            (line_distance(b, h), hi, bi)
+            (
+                not (bi in base_lines and hi in head_lines and base_lines[bi] == head_lines[hi]),
+                line_distance(b, h), hi, bi,
+            )
             for hi, h in enumerate(head)
             for bi, b in enumerate(base)
         )
         peers: dict[int, HealthFindingData] = {}
         taken: set[int] = set()
-        for _distance, head_index, base_index in candidates:
+        for _unmapped, _distance, head_index, base_index in candidates:
             if head_index in peers or base_index in taken:
                 continue
             peers[head_index] = base[base_index]
@@ -111,6 +126,35 @@ class FindingMatcher:
             for ordinal, item in enumerate(head)
         ]
         return matched, [b for i, b in enumerate(base) if i not in taken]
+
+    def _unchanged_lines(
+        self, path: str, base: list[HealthFindingData], head: list[HealthFindingData]
+    ) -> tuple[dict[int, int], dict[int, int]]:
+        """Rank untouched lines after removing each side's changed lines.
+
+        Their ranks correspond exactly across a reliable unified-zero diff.
+        Reserve these pairs before proximity, so an insertion cannot steal a
+        moved finding. Rewritten lines retain the existing tolerant matching.
+        """
+        change = self.changes.get(path)
+        if change is None or not change.diff_reliable or change.diff is None:
+            return {}, {}
+        diff = change.diff
+        added = sorted(diff.new_lines)
+        base_lines = {}
+        for index, finding in enumerate(base):
+            line = finding.line_start
+            if line is None or any(start <= line <= end for start, end in diff.old_ranges):
+                continue
+            base_lines[index] = line - sum(
+                end - start + 1 for start, end in diff.old_ranges if end < line
+            )
+        head_lines = {
+            index: finding.line_start - bisect_left(added, finding.line_start)
+            for index, finding in enumerate(head)
+            if finding.line_start is not None and finding.line_start not in diff.new_lines
+        }
+        return base_lines, head_lines
 
 
 def _classify(base: HealthFindingData | None, head: HealthFindingData) -> ChangeKind:

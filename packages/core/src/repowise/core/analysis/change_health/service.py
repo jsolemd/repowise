@@ -267,7 +267,8 @@ class ChangeHealthDeltaService:
         )
 
         rename = pair.rename_map()
-        matcher = FindingMatcher(rename)
+        change_map = {c.head_path: c for c in eligible if c.head_path}
+        matcher = FindingMatcher(rename, changes=change_map)
         # Both sides are restricted to the same comparable set, so an excluded
         # file cannot contribute a one-sided "introduced" or "resolved".
         # Advisory markers deduct nothing, so adding one is not a regression
@@ -290,7 +291,6 @@ class ChangeHealthDeltaService:
         by_file: dict[str, list[HealthFindingData]] = {}
         for finding in head_run.findings_for(subject):
             by_file.setdefault(finding.file_path, []).append(finding)
-        change_map = {c.head_path: c for c in eligible if c.head_path}
         attributor = FindingAttributor(change_map)
         changed_symbols = changed_symbols_for(change_map, by_file)
 
