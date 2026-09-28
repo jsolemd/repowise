@@ -62,7 +62,6 @@ def test_jobs_route_reports_runtime_state(monkeypatch, client: TestClient) -> No
 
 def test_stats_route_includes_healthful_runtime_summary(monkeypatch, client: TestClient) -> None:
     monkeypatch.setattr("repowise.docs.server.routes.db_list_libraries", AsyncMock(return_value=[]))
-    monkeypatch.setattr("repowise.docs.server.routes.get_chunk_count", AsyncMock(return_value=0))
     monkeypatch.setattr("repowise.docs.server.routes.list_jobs", AsyncMock(return_value=[]))
     monkeypatch.setattr("repowise.docs.server.routes.is_scheduler_running", lambda: True)
     monkeypatch.setattr("repowise.docs.server.routes.is_worker_running", lambda: True)

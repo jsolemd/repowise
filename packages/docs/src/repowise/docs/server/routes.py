@@ -12,7 +12,6 @@ from repowise.docs.config import get_settings
 from repowise.docs.db import get_job, list_jobs
 from repowise.docs.db import list_libraries as db_list_libraries
 from repowise.docs.graph_status import get_docs_graph_sync_status
-from repowise.docs.indexer import get_chunk_count
 from repowise.docs.indexer.embedder import get_cache_stats
 from repowise.docs.jobs import (
     JobStatus,
@@ -162,7 +161,6 @@ async def stats_handler(request: Request) -> Response:
         await build_docs_stats_payload(
             list_libraries_fn=db_list_libraries,
             list_jobs_fn=list_jobs,
-            get_chunk_count_fn=get_chunk_count,
             get_settings_fn=get_settings,
             is_scheduler_running_fn=is_scheduler_running,
             get_scheduler_status_fn=get_scheduler_status,

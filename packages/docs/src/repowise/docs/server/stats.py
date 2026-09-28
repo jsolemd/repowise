@@ -242,7 +242,6 @@ async def build_docs_stats_payload(
     *,
     list_libraries_fn=db_list_libraries,
     list_jobs_fn=list_jobs,
-    get_chunk_count_fn=None,
     get_settings_fn=get_settings,
     is_scheduler_running_fn=is_scheduler_running,
     get_scheduler_status_fn=get_scheduler_status,
@@ -253,30 +252,8 @@ async def build_docs_stats_payload(
     get_cache_stats_fn=get_cache_stats,
 ) -> dict[str, object]:
     """Build the full docs admin stats payload."""
-    _ = get_chunk_count_fn
     libraries_state = await list_libraries_fn()
-    inventory_payload = {
-        "summary": summarize_libraries(libraries_state),
-        "inventory": {
-            "total_files": sum(
-                int(lib.file_count or 0)
-                for lib in libraries_state
-                if lib.status == LibraryStatus.READY
-            ),
-            "total_chunks": sum(
-                int(lib.chunk_count or 0)
-                for lib in libraries_state
-                if lib.status == LibraryStatus.READY
-            ),
-            "git_libraries": sum(
-                1 for lib in libraries_state if lib.source_type == LibrarySourceType.GIT
-            ),
-            "snapshot_libraries": sum(
-                1 for lib in libraries_state if lib.source_type == LibrarySourceType.SNAPSHOT
-            ),
-        },
-        "libraries": [serialize_library_state(lib) for lib in libraries_state],
-    }
+    inventory_payload = build_library_inventory_payload(libraries_state)
     summary = dict(inventory_payload["summary"])
     summary["total"] = summary["total_libraries"]
     summary["ready"] = summary["ready_libraries"]
