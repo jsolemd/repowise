@@ -7,6 +7,11 @@ and all three have to be distinguishable from "this function is empty".
 
 from __future__ import annotations
 
+from dataclasses import replace
+
+import pytest
+
+from repowise.core.ingestion.parser import ASTParser
 from repowise.core.slices.models import SliceMember
 from repowise.core.slices.views import ViewContext, render_member
 
@@ -42,12 +47,12 @@ def _ctx(tmp_path, *, max_source_lines: int = 200) -> ViewContext:
 
 
 def test_a_symbol_body_is_sliced_to_its_own_line_range(tmp_path) -> None:
-    (tmp_path / "mod.py").write_text("\n".join(f"line{i}" for i in range(1, 11)))
+    (tmp_path / "mod.py").write_text("# heading\n\ndef thing():\n    return 1\n")
     payload = render_member(_symbol("mod.py", 3, 5), "full", _ctx(tmp_path))
 
-    assert payload["source"] == "line3\nline4\nline5"
+    assert payload["source"] == "def thing():\n    return 1"
     assert payload["source_first_line"] == 3
-    assert payload["source_lines"] == 3
+    assert payload["source_lines"] == 2
     assert "source_unavailable" not in payload
 
 
@@ -59,7 +64,7 @@ def test_a_missing_file_is_named_rather_than_returned_empty(tmp_path) -> None:
     assert "gone or unreadable" in payload["source_unavailable"]
 
 
-def test_a_line_range_past_the_end_of_the_file_is_named_too(tmp_path) -> None:
+def test_a_missing_symbol_cannot_use_its_former_line_range(tmp_path) -> None:
     """The index and the working tree disagreeing is not an empty function.
 
     This is the shape a stale index produces after someone deletes half a file:
@@ -70,8 +75,8 @@ def test_a_line_range_past_the_end_of_the_file_is_named_too(tmp_path) -> None:
     payload = render_member(_symbol("short.py", 40, 60), "full", _ctx(tmp_path))
 
     assert payload["source"] is None
-    assert "the file changed since it was indexed" in payload["source_unavailable"]
-    assert "40-60" in payload["source_unavailable"]
+    assert "successful live parse" in payload["source_unavailable"]
+    assert "short.py::thing" in payload["source_unavailable"]
 
 
 def test_a_file_member_over_the_cap_says_how_much_was_cut(tmp_path) -> None:
@@ -126,11 +131,55 @@ def test_a_symlinked_repo_root_still_serves_its_own_files(tmp_path) -> None:
     """
     real = tmp_path / "real"
     real.mkdir()
-    (real / "mod.py").write_text("line1\nline2\n")
+    (real / "mod.py").write_text("def thing():\n    return 1\n")
     link = tmp_path / "rootlink"
     link.symlink_to(real, target_is_directory=True)
 
     from repowise.core.slices.views import ViewContext
 
     payload = render_member(_symbol("mod.py", 1, 2), "full", ViewContext(repo_root=link))
-    assert payload["source"] == "line1\nline2"
+    assert payload["source"] == "def thing():\n    return 1"
+
+
+def test_live_parse_is_once_per_file_and_only_for_full_symbols(tmp_path, monkeypatch):
+    (tmp_path / "mod.py").write_text("def first():\n    return 1\ndef second():\n    return 2\n")
+    parse = ASTParser.parse_file
+    calls = []
+
+    def counted(self, info, source):
+        calls.append(info.path)
+        return parse(self, info, source)
+
+    monkeypatch.setattr(ASTParser, "parse_file", counted)
+    ctx = _ctx(tmp_path)
+    first = replace(_symbol("mod.py", 1, 2), node_id="mod.py::first", name="first")
+    second = replace(_symbol("mod.py", 3, 4), node_id="mod.py::second", name="second")
+    for view in ("card", "skeleton"):
+        render_member(first, view, ctx)
+    assert calls == []
+    assert ctx._source_cache == {}
+    render_member(_file_member("mod.py"), "full", ctx)
+    assert calls == []
+    assert render_member(first, "full", ctx)["source"] == "def first():\n    return 1"
+    assert render_member(second, "full", ctx)["source"] == "def second():\n    return 2"
+    assert calls == ["mod.py"]
+
+
+@pytest.mark.parametrize("failure", ["unsupported", "syntax", "exception"])
+def test_unsuccessful_parse_never_falls_back_to_indexed_bounds(tmp_path, monkeypatch, failure):
+    source = "def thing():\n    return 1\n"
+    member = _symbol("mod.py", 1, 2)
+    if failure == "syntax":
+        source = "def thing():\n    return ???\n"
+    elif failure == "unsupported":
+        member = replace(member, language="unknown")
+    else:
+
+        def broken(*args):
+            raise RuntimeError("parser failed")
+
+        monkeypatch.setattr(ASTParser, "parse_file", broken)
+    (tmp_path / "mod.py").write_text(source)
+    payload = render_member(member, "full", _ctx(tmp_path))
+    assert payload["source"] is None
+    assert "successful live parse" in payload["source_unavailable"]

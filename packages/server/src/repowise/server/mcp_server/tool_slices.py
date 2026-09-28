@@ -235,8 +235,10 @@ async def get_task_slice(
 
     The slice is not re-walked: this reads the stored members and re-renders
     them, so switching from "card" to "full" or raising the budget costs a
-    serialisation, not a graph traversal. An unknown slice id is an error with
-    the recent ids attached, never an empty slice.
+    render, not a graph traversal. Full views locate exact symbol IDs in one
+    live parse per source file, so uncommitted edits cannot leave old bounds
+    slicing another symbol's body. Unavailable source is disclosed. An unknown
+    slice id is an error with the recent ids attached, never an empty slice.
 
     Args:
         slice_id: The id build_task_slice returned (``sl_<12 hex>``).

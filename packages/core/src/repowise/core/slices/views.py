@@ -10,8 +10,9 @@
     for a file member — the signatures of the symbols it defines. Enough to
     decide whether to open it.
 ``full``
-    The skeleton plus source. Bounded per member by ``max_source_lines``: one
-    four-thousand-line file must not be able to consume a whole slice's
+    The skeleton plus source, with symbol identity and bounds checked by a
+    live parse cached once per file for this render. Bounded per member by
+    ``max_source_lines``: one four-thousand-line file cannot consume a whole slice's
     budget on its own, and when it is cut the cut is stated on the member
     (``source_truncated``), not inferred from a short string.
 
@@ -23,16 +24,21 @@ without paying for it twice.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import logging
+from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from repowise.core.ingestion.models import FileInfo, Symbol
 from repowise.core.ingestion.source_text import decode_source
 from repowise.core.persistence.models import WikiSymbol
 from repowise.core.slices.models import VIEWS, SliceMember
+
+logger = logging.getLogger(__name__)
 
 #: Symbols listed in a file member's skeleton. A barrel re-exporting two
 #: hundred names is not more informative at two hundred than at twenty.
@@ -55,13 +61,15 @@ def normalize_view(view: str | None) -> str:
 class ViewContext:
     """Batch-loaded material every view of one slice needs."""
 
-    docstrings: dict[str, str] = field(default_factory=dict)
-    signatures: dict[str, str] = field(default_factory=dict)
+    # None means no symbol lookup was requested (the card view). An empty
+    # mapping means the lookup found none, so an old source range is unsafe.
+    symbols: dict[str, WikiSymbol] | None = None
     file_symbols: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     file_symbol_totals: dict[str, int] = field(default_factory=dict)
     repo_root: Path | None = None
     max_source_lines: int = DEFAULT_MAX_SOURCE_LINES
     _source_cache: dict[str, list[str] | None] = field(default_factory=dict)
+    _live_symbols: dict[str, dict[str, Symbol]] = field(default_factory=dict)
 
     def source_lines(self, rel_path: str) -> list[str] | None:
         """Lines of one repo file, read once per slice render."""
@@ -83,6 +91,40 @@ class ViewContext:
                 lines = decode_source(data).splitlines()
         self._source_cache[rel_path] = lines
         return lines
+
+    def live_symbol(self, member: SliceMember) -> Symbol | None:
+        """Resolve an exact symbol from the same lines this render will serve."""
+        path = member.file_path
+        if path in self._live_symbols:
+            return self._live_symbols[path].get(member.node_id)
+        self._live_symbols[path] = {}
+        lines = self.source_lines(path)
+        if lines is None:
+            return None
+        source = "\n".join(lines).encode("utf-8")
+        info = FileInfo(
+            path=path,
+            abs_path=str(self.repo_root / path) if self.repo_root else path,
+            language=member.language,
+            size_bytes=len(source),
+            git_hash="",
+            last_modified=datetime.now(UTC),
+            is_test=False,
+            is_config=False,
+            is_api_contract=False,
+            is_entry_point=False,
+        )
+        try:
+            from repowise.core.ingestion.parser import ASTParser
+
+            parsed = ASTParser().parse_file(info, source)
+        except Exception:
+            logger.warning("Could not parse live slice source %s", path, exc_info=True)
+            return None
+        if parsed.parse_errors:
+            return None
+        self._live_symbols[path] = {symbol.id: symbol for symbol in parsed.symbols}
+        return self._live_symbols[path].get(member.node_id)
 
 
 def _chunks(values: list[str]) -> list[list[str]]:
@@ -110,6 +152,7 @@ async def prepare(
     if view == "card" or not members:
         return ctx
 
+    ctx.symbols = {}
     symbol_ids = [m.node_id for m in members if m.layer == "symbol"]
     for chunk in _chunks(symbol_ids):
         rows = await session.execute(
@@ -119,10 +162,7 @@ async def prepare(
             )
         )
         for row in rows.scalars().all():
-            if row.docstring:
-                ctx.docstrings[row.symbol_id] = row.docstring
-            if row.signature:
-                ctx.signatures[row.symbol_id] = row.signature
+            ctx.symbols[row.symbol_id] = row
 
     file_paths = [m.node_id for m in members if m.layer == "file"]
     for chunk in _chunks(file_paths):
@@ -213,8 +253,45 @@ def _source_for(member: SliceMember, ctx: ViewContext) -> dict[str, Any]:
     return block
 
 
+def _resolve_member(
+    member: SliceMember, view: str, ctx: ViewContext
+) -> tuple[SliceMember, str | None]:
+    """Keep slice membership/rank while resolving metadata from its current owner."""
+    if view == "card" or member.layer != "symbol":
+        return member, None
+    row = ctx.symbols.get(member.node_id) if ctx.symbols is not None else None
+    if ctx.symbols is not None and row is None:
+        return member, (
+            f"{member.node_id} is no longer in the symbol index; "
+            "its former line range cannot identify the current source."
+        )
+    if row is not None:
+        member = replace(member, file_path=row.file_path, language=row.language)
+    resolved: WikiSymbol | Symbol | None = row
+    if view == "full" and ctx.source_lines(member.file_path) is not None:
+        resolved = ctx.live_symbol(member)
+        if resolved is None:
+            return member, (
+                f"{member.node_id} could not be identified in a successful live parse; "
+                "the symbol was removed or renamed, the file has parse errors, "
+                "or its parser is unavailable. Indexed bounds cannot identify its source."
+            )
+    if resolved is not None:
+        member = replace(
+            member,
+            name=resolved.name,
+            kind=resolved.kind,
+            start_line=resolved.start_line,
+            end_line=resolved.end_line,
+            signature=resolved.signature,
+            docstring=resolved.docstring,
+        )
+    return member, None
+
+
 def render_member(member: SliceMember, view: str, ctx: ViewContext) -> dict[str, Any]:
     """Render one member at the requested fidelity."""
+    member, unavailable = _resolve_member(member, view, ctx)
     payload = member.identity()
     payload["why"] = member.reasons[:3]
     if member.edge_types:
@@ -222,10 +299,10 @@ def render_member(member: SliceMember, view: str, ctx: ViewContext) -> dict[str,
     if view == "card":
         return payload
 
-    signature = member.signature or ctx.signatures.get(member.node_id)
+    signature = member.signature
     if signature:
         payload["signature"] = signature
-    doc = _first_line(member.docstring or ctx.docstrings.get(member.node_id))
+    doc = _first_line(member.docstring)
     if doc:
         payload["doc"] = doc
     if member.layer == "file":
@@ -237,5 +314,8 @@ def render_member(member: SliceMember, view: str, ctx: ViewContext) -> dict[str,
                 payload["defines_truncated"] = total - len(symbols)
 
     if view == "full":
-        payload.update(_source_for(member, ctx))
+        if unavailable:
+            payload.update(source=None, source_unavailable=unavailable)
+        else:
+            payload.update(_source_for(member, ctx))
     return payload

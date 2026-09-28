@@ -11,6 +11,7 @@ needs no code.
 from __future__ import annotations
 
 import re
+import subprocess
 
 import pytest
 
@@ -37,6 +38,33 @@ async def slice_env(setup_mcp, tmp_path):
 @pytest.fixture
 async def built(slice_env):
     return await build_task_slice(task=TASK, entry_points=["src/auth/service.py"], view="card")
+
+
+@pytest.fixture
+async def symbol_slice(slice_env, factory, setup_mcp):
+    from repowise.core.persistence.models import GraphNode
+
+    async with factory() as session:
+        session.add(
+            GraphNode(
+                repository_id=setup_mcp,
+                node_id="src/auth/service.py::login",
+                node_type="symbol",
+                file_path="src/auth/service.py",
+                name="login",
+                kind="method",
+                language="python",
+                start_line=20,
+                end_line=40,
+                signature="async def login(self, username: str, password: str) -> Token",
+            )
+        )
+        await session.commit()
+    return await build_task_slice(
+        task=TASK,
+        entry_points=["src/auth/service.py::login"],
+        view="card",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -199,3 +227,119 @@ async def test_full_view_says_so_when_the_source_is_gone(built, slice_env) -> No
     for member in missing:
         assert member["source"] is None
         assert member["file"] in member["source_unavailable"]
+
+
+async def test_reread_uses_current_symbol_bounds_without_rewalking(
+    symbol_slice, slice_env, factory
+):
+    """A persistent slice may outlive a symbol's location and signature."""
+    from sqlalchemy import update
+
+    from repowise.core.persistence.models import WikiSymbol
+    from repowise.core.slices.store import SliceStore
+
+    symbol_id = "src/auth/service.py::login"
+    with SliceStore.open_default(slice_env) as store:
+        original = store.load(symbol_slice["slice_id"])
+    stored = next(member for member in original.members if member.node_id == symbol_id)
+    assert stored.start_line == 20
+    path = slice_env / "src/auth/service.py"
+    path.parent.mkdir(parents=True)
+    path.write_text("def other():\n    return 'unrelated'\n\ndef login(token):\n    return token\n")
+    async with factory() as session:
+        await session.execute(
+            update(WikiSymbol)
+            .where(WikiSymbol.symbol_id == symbol_id)
+            .values(
+                start_line=4,
+                end_line=5,
+                signature="def login(token)",
+                docstring=None,
+            )
+        )
+        await session.commit()
+
+    payload = await get_task_slice(
+        slice_id=symbol_slice["slice_id"], view="full", budget_tokens=8000
+    )
+    member = next(row for row in payload["members"] if row["node"] == symbol_id)
+    assert member["source"] == "def login(token):\n    return token"
+    assert member["source_first_line"] == 4
+    assert member["lines"] == [4, 5]
+    assert member["signature"] == "def login(token)"
+    assert "doc" not in member
+    assert member["rank"] == stored.rank
+    with SliceStore.open_default(slice_env) as store:
+        assert store.load(symbol_slice["slice_id"]).revision == original.revision
+
+
+async def test_removed_symbol_does_not_return_another_symbols_body(
+    symbol_slice, slice_env, factory
+):
+    from sqlalchemy import delete
+
+    from repowise.core.persistence.models import WikiSymbol
+
+    symbol_id = "src/auth/service.py::login"
+    path = slice_env / "src/auth/service.py"
+    path.parent.mkdir(parents=True)
+    path.write_text("# preceding code\n" * 19 + "def unrelated():\n    return 1\n")
+    async with factory() as session:
+        await session.execute(delete(WikiSymbol).where(WikiSymbol.symbol_id == symbol_id))
+        await session.commit()
+
+    payload = await get_task_slice(
+        slice_id=symbol_slice["slice_id"], view="full", budget_tokens=8000
+    )
+    member = next(row for row in payload["members"] if row["node"] == symbol_id)
+    assert member["source"] is None
+    assert "no longer" in member["source_unavailable"]
+
+
+@pytest.mark.parametrize("change", ["shift", "remove"])
+async def test_uncommitted_source_edits_cannot_serve_old_symbol_bounds(
+    symbol_slice, slice_env, factory, setup_mcp, change
+):
+    from sqlalchemy import update
+
+    from repowise.core.persistence.models import Repository
+
+    path = slice_env / "src/auth/service.py"
+    path.parent.mkdir(parents=True)
+    path.write_text("# padding\n" * 19 + "def login():\n    return 1\n" + "# after\n" * 20)
+
+    def git(*args):
+        return subprocess.run(
+            ["git", *args], cwd=slice_env, check=True, capture_output=True, text=True
+        ).stdout.strip()
+
+    git("init", "-q")
+    git("add", "src/auth/service.py")
+    git("-c", "user.name=Test", "-c", "user.email=test@example.test", "commit", "-qm", "source")
+    head = git("rev-parse", "HEAD")
+    async with factory() as session:
+        await session.execute(
+            update(Repository)
+            .where(Repository.id == setup_mcp)
+            .values(local_path=str(slice_env), head_commit=head)
+        )
+        await session.commit()
+
+    replacement = "def unrelated():\n    return 'wrong body'\n\n"
+    live_symbol = "def login(token):\n    return token\n" if change == "shift" else ""
+    path.write_text("# padding\n" * 19 + replacement + live_symbol + "# after\n" * 20)
+    assert git("rev-parse", "HEAD") == head
+    assert git("diff", "--name-only") == "src/auth/service.py"
+
+    payload = await get_task_slice(
+        slice_id=symbol_slice["slice_id"], view="full", budget_tokens=8000
+    )
+    assert payload["_meta"]["index_behind"] is False
+    member = next(row for row in payload["members"] if row["node"] == "src/auth/service.py::login")
+    if change == "shift":
+        assert member["source"] == live_symbol.rstrip()
+        assert member["lines"] == [23, 24]
+        assert member["source_first_line"] == 23
+    else:
+        assert member["source"] is None
+        assert "successful live parse" in member["source_unavailable"]
