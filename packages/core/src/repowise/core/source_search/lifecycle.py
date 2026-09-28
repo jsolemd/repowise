@@ -91,11 +91,16 @@ class SourceIndexDeferredError(RuntimeError):
 
 
 class SourceFileChangedError(SourceIndexDeferredError):
-    """A captured file changed or disappeared and needs a fresh SQL capture."""
+    """Captured files changed or disappeared and need a fresh SQL capture."""
 
-    def __init__(self, path: str) -> None:
+    def __init__(self, path: str, *other_paths: str) -> None:
         self.path = path
-        super().__init__(f"{path} changed after its SQL update; source recapture required")
+        self.paths = (path, *other_paths)
+        detail = (
+            f"{path} changed after its SQL update"
+            if not other_paths else f"{len(self.paths)} files changed after their SQL updates, first: {path}"
+        )
+        super().__init__(f"{detail}; source recapture required")
 
 
 @dataclass(frozen=True, slots=True)
@@ -402,6 +407,7 @@ def _chunks_for_replacements(
         by_file[symbol.file_path].append(symbol)
 
     chunks: list[SourceChunk] = []
+    changed_paths: list[str] = []
     for change in changes:
         file_symbols = by_file.get(change.path, [])
         # The SQL outbox can include media and other non-source paths. They
@@ -409,7 +415,11 @@ def _chunks_for_replacements(
         # publication of the actual source edits beside it.
         if not file_symbols and not window_eligible(change.path, indexed_symbols=0):
             continue
-        data = _read_changed_bytes(repo, change)
+        try:
+            data = _read_changed_bytes(repo, change)
+        except SourceFileChangedError:
+            changed_paths.append(change.path)
+            continue
         if looks_binary(data) or len(data) > MAX_WINDOW_FILE_BYTES:
             continue
         text = _decode(data)
@@ -418,6 +428,8 @@ def _chunks_for_replacements(
         chunks.extend(symbol_chunks)
         if window_eligible(change.path, indexed_symbols=len(symbol_chunks)):
             chunks.extend(iter_file_windows(change.path, text))
+    if changed_paths:
+        raise SourceFileChangedError(*changed_paths)
     return chunks
 
 

@@ -9,6 +9,7 @@ from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from filelock import FileLock
@@ -1083,6 +1084,46 @@ async def test_host_recaptures_changes_after_sql_without_another_save(
     with _fts(repo, current) as fts:
         assert bool(fts.query("finalpulsar")) is not deleted
         assert bool(fts.query("stablecomet")) is not deleted
+        assert not fts.query("newnebula")
+        assert not fts.query("oldquasar")
+    status = await inspect_source_index(repo)
+    assert status.pending_updates == 0
+    assert status.stale_files == {}
+
+
+async def test_host_recaptures_all_stale_files_in_one_bounded_retry(lifecycle_repo, monkeypatch):
+    from repowise.cli.source_search_runtime import reconcile_configured_source_index
+    from repowise.core.source_search import fast_update, lifecycle
+
+    monkeypatch.setenv("REPOWISE_SOURCE_SEARCH", "1")
+    repo = lifecycle_repo
+    old = read_manifest(default_manifest_path(repo))
+    paths = {"src/app.py", "src/second.py", "src/third.py"}
+    for path in sorted(paths):
+        (repo / path).write_text(_APP_V2)
+        await _capture(repo, path=path)
+        (repo / path).write_text(_APP_V3)
+
+    async def recapture(*args, **kwargs):
+        # No stale or partly repaired snapshot becomes visible while SQL is
+        # recaptured. Publication still belongs to the successful retry.
+        assert read_manifest(default_manifest_path(repo)) == old
+        return await capture_source_changes(*args, **kwargs)
+
+    capture = AsyncMock(side_effect=recapture)
+    reconcile = AsyncMock(wraps=lifecycle.reconcile_source_index)
+    monkeypatch.setattr(fast_update, "capture_source_changes", capture)
+    monkeypatch.setattr(lifecycle, "reconcile_source_index", reconcile)
+    result = await reconcile_configured_source_index(
+        repo, embedder=MockEmbedder(), embedder_name="mock", allow_keyless=True,
+    )
+
+    assert result.status == "published"
+    assert reconcile.await_count == 2
+    capture.assert_awaited_once_with(repo, paths, db_url=None)
+    current = read_manifest(default_manifest_path(repo))
+    with _fts(repo, current) as fts:
+        assert {hit.file_path for hit in fts.query("finalpulsar")} == paths
         assert not fts.query("newnebula")
         assert not fts.query("oldquasar")
     status = await inspect_source_index(repo)

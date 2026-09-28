@@ -179,11 +179,12 @@ async def reconcile_configured_source_index(
         return await reconcile()
     except SourceFileChangedError as exc:
         # A slower graph writer can enqueue old bytes after the watcher has
-        # already handled a newer save. Recapture through the native SQL/outbox
-        # transaction; retry once so continuous edits cannot trap this caller.
+        # already handled newer saves. Recapture every known mismatch through
+        # one native SQL/outbox transaction; retry once so continuous edits
+        # cannot trap this caller.
         from repowise.core.source_search.fast_update import capture_source_changes
 
-        await capture_source_changes(repo, {exc.path}, db_url=db_url)
+        await capture_source_changes(repo, set(exc.paths), db_url=db_url)
         return await reconcile()
 
 

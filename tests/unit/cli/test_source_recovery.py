@@ -13,6 +13,7 @@ from repowise.core.source_search import fast_update, lifecycle
     ("error", "expected_calls"),
     [
         (lifecycle.SourceFileChangedError("src/app.py"), 2),
+        (lifecycle.SourceFileChangedError("src/app.py", "src/other.py"), 2),
         (lifecycle.SourceIndexDeferredError("unreadable input"), 1),
         (RuntimeError("embedding backend unavailable"), 1),
     ],
@@ -39,6 +40,7 @@ async def test_only_file_changes_receive_one_recapture(
     assert reconcile.await_count == expected_calls
     assert all(call.kwargs["db_url"] == db_url for call in reconcile.await_args_list)
     if expected_calls == 2:
-        capture.assert_awaited_once_with(tmp_path, {"src/app.py"}, db_url=db_url)
+        assert error.path == "src/app.py"  # Single-path callers retain the first path.
+        capture.assert_awaited_once_with(tmp_path, set(error.paths), db_url=db_url)
     else:
         capture.assert_not_awaited()
