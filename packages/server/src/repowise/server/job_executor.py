@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
 
@@ -312,6 +313,7 @@ async def execute_job(
     start = time.monotonic()
     progress: JobProgressCallback | None = None
     session_factory = None
+    writer_guard = ExitStack()
 
     # Cooperative cancellation: the cancel endpoint flips this token (which
     # unwinds the CPU-bound loops that poll check_cancelled) and cancels the
@@ -328,7 +330,6 @@ async def execute_job(
         # development hot-reload) gets recorded as a job failure instead of
         # leaving the row stuck in 'pending' forever.
         session_factory = session_factory_override or app_state.session_factory
-        fts = app_state.fts
 
         # ---- Fetch job + repo metadata ------------------------------------
         async with get_session(session_factory) as session:
@@ -347,6 +348,7 @@ async def execute_job(
 
             repo_path = repo.local_path
             repo_id = repo.id
+            index_engine = session.bind
             # Resolve excludes while ``repo`` is still session-attached. Every
             # job entry point flows through here, so this covers them all.
             exclude_patterns = _repo_exclude_patterns(repo, repo_path)
@@ -366,6 +368,25 @@ async def execute_job(
 
             # Mark running
             await update_job_status(session, job_id, "running")
+
+        # Share the CLI/watcher's native writer ownership through publication
+        # and cleanup. Busy jobs still get terminal bookkeeping, but cannot
+        # race another writer's restored pages or cleanup-debt updates.
+        from repowise.core.update_lock import strict_update_lock
+
+        writer_guard.enter_context(strict_update_lock(Path(repo_path)))
+
+        # SQL, FTS and vectors must all follow the selected repository. A
+        # missing per-repo FTS cache must never fall back to another database.
+        fts = (getattr(app_state, "workspace_fts", None) or {}).get(repo_id)
+        if fts is None:
+            if session_factory is app_state.session_factory:
+                fts = app_state.fts
+            else:
+                from repowise.core.persistence.search import FullTextSearch
+
+                fts = FullTextSearch(index_engine)
+                await fts.ensure_index()
 
         # Vector writes and deletes must follow the repository, just like its
         # routed SQL session. This opens/creates <repo>/.repowise/lancedb and
@@ -523,14 +544,17 @@ async def execute_job(
 
                 await rebuild_page_tree(session, repo_id)
 
-            # Drop swept pages from the vector store *before* the SQL session
-            # commits. The vector store is a separate engine/file (pgvector DB,
-            # LanceDB dir, or in-memory), so there is no SQLite write-lock
-            # conflict and the idempotent delete leaves the durable SQL commit
-            # last: an interrupted run self-heals (embedding already gone, SQL
-            # rows follow on commit).
-            if swept_page_ids and vector_store is not None:
-                await vector_store.delete_many(swept_page_ids)
+        from repowise.core.pipeline.cleanup_debt import (
+            clear_cleanup_debt,
+            exclude_live_cleanup_ids,
+            load_cleanup_debt,
+            record_cleanup_debt,
+        )
+
+        # SQL is authoritative. Preserve both post-commit cleanup intents
+        # before another await; either independent index can fail or cancel.
+        for kind in ("fts", "vectors"):
+            record_cleanup_debt(Path(repo_path), kind, set(swept_page_ids or []))
 
         # Source rows were queued in the same transaction as their symbol
         # bounds. Publish the derived FTS/Lance generation only after that
@@ -550,13 +574,37 @@ async def execute_job(
                 extra={"repo": str(repo_path), "error": str(exc)},
             )
 
-        # FTS deletes/indexing run after the session closes: the FTS index can
-        # share the SQLite file with the session, so writing it while the
-        # session holds a write lock raises "database is locked". The swept-id
-        # delete is idempotent (orphan FTS rows only) and must stay here.
+        # Retry historical debt even when this run discovers no new retirees.
+        # A restored live page invalidates deletion intent; the native lock
+        # keeps another writer from reviving it between this read and delete.
+        debt = load_cleanup_debt(Path(repo_path))
+        cleanup_errors = []
+        for kind, store in (("fts", fts), ("vectors", vector_store)):
+            if not debt[kind]:
+                continue
+            try:
+                cleanup_ids = await exclude_live_cleanup_ids(
+                    Path(repo_path), index_engine, debt[kind]
+                )
+                if (
+                    cleanup_ids
+                    and kind == "vectors"
+                    and not getattr(store, "persists_across_runs", False)
+                    and (Path(repo_path) / ".repowise" / "lancedb").exists()
+                ):
+                    raise RuntimeError("persisted page vectors are unavailable")
+                if store is None:
+                    continue
+                if cleanup_ids:
+                    await store.delete_many(sorted(cleanup_ids))
+                    clear_cleanup_debt(Path(repo_path), kind, cleanup_ids)
+            except Exception as exc:
+                cleanup_errors.append(f"{kind} cleanup deferred: {exc}")
+        if cleanup_errors:
+            raise RuntimeError("; ".join(cleanup_errors))
+
+        # FTS shares SQLite with the page session, so writes stay post-commit.
         all_pages = (result.generated_pages or []) + incremental_pages
-        if fts is not None and swept_page_ids:
-            await fts.delete_many(swept_page_ids)
         if fts is not None and all_pages:
             for page in all_pages:
                 await fts.index(
@@ -690,6 +738,7 @@ async def execute_job(
             error_message=str(exc)[:500],
         )
     finally:
+        writer_guard.close()
         get_cancel_tokens(app_state).pop(job_id, None)
         set_active_token(previous_token)
 
