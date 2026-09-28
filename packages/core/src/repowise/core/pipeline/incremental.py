@@ -2392,6 +2392,7 @@ async def persist_incremental_index(
         # full while the page it names 404s.
         from repowise.core.pipeline.cleanup_debt import (
             clear_cleanup_debt,
+            exclude_live_cleanup_ids,
             load_cleanup_debt,
             record_cleanup_debt,
         )
@@ -2402,6 +2403,9 @@ async def persist_incremental_index(
         )
         if fts_cleanup_ids:
             try:
+                fts_cleanup_ids = await exclude_live_cleanup_ids(
+                    Path(repo_path), engine, fts_cleanup_ids
+                )
                 from repowise.core.persistence.search import FullTextSearch
 
                 fts = FullTextSearch(engine)
@@ -2423,12 +2427,17 @@ async def persist_incremental_index(
         # when this core caller has no configured vector adapter. The CLI
         # consumes it after commit using the same adapter as indexing.
         vector_cleanup_ids = (
-            set(tombstoned_page_ids) | set(swept_page_ids) | cleanup_debt["vectors"]
+            set(tombstoned_page_ids)
+            | set(swept_page_ids)
+            | load_cleanup_debt(Path(repo_path))["vectors"]
         )
         if vector_cleanup_ids:
             record_cleanup_debt(Path(repo_path), "vectors", vector_cleanup_ids)
         if vector_cleanup_ids and vector_store is not None:
             try:
+                vector_cleanup_ids = await exclude_live_cleanup_ids(
+                    Path(repo_path), engine, vector_cleanup_ids
+                )
                 with timed(timings, "persist.vectors"):
                     await vector_store.delete_many(sorted(vector_cleanup_ids))
                 clear_cleanup_debt(Path(repo_path), "vectors", vector_cleanup_ids)

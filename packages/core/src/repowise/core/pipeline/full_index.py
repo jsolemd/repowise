@@ -86,16 +86,24 @@ async def index_repo_full(
 
         from repowise.core.pipeline.cleanup_debt import (
             clear_cleanup_debt,
+            exclude_live_cleanup_ids,
             load_cleanup_debt,
             record_cleanup_debt,
         )
 
+        # The SQL rows are gone. Either independent index can fail next, so
+        # preserve both retirement intents before attempting either cleanup.
+        for kind in ("fts", "vectors"):
+            record_cleanup_debt(repo_path, kind, set(stale_page_ids))
         debt = load_cleanup_debt(repo_path)
         fts_cleanup_ids = set(stale_page_ids) | debt["fts"]
         if fts_cleanup_ids:
             from repowise.core.persistence.search import FullTextSearch
 
             try:
+                fts_cleanup_ids = await exclude_live_cleanup_ids(
+                    repo_path, engine, fts_cleanup_ids
+                )
                 fts = FullTextSearch(engine)
                 await fts.ensure_index()
                 await fts.delete_many(sorted(fts_cleanup_ids))
@@ -114,8 +122,15 @@ async def index_repo_full(
                 # Deletion does not embed or validate vector dimensions, so a
                 # mock instance can safely open a real-embedder table here.
                 try:
-                    vector_store = LanceDBVectorStore(str(lance_dir), embedder=MockEmbedder())
-                    await vector_store.delete_many(sorted(vector_cleanup_ids))
+                    vector_cleanup_ids = await exclude_live_cleanup_ids(
+                        repo_path, engine, vector_cleanup_ids
+                    )
+                    if vector_cleanup_ids:
+                        vector_store = LanceDBVectorStore(str(lance_dir), embedder=MockEmbedder())
+                        try:
+                            await vector_store.delete_many(sorted(vector_cleanup_ids))
+                        finally:
+                            await vector_store.close()
                     clear_cleanup_debt(repo_path, "vectors", vector_cleanup_ids)
                 except Exception:
                     record_cleanup_debt(repo_path, "vectors", vector_cleanup_ids)

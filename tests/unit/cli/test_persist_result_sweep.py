@@ -14,6 +14,7 @@ index, and an attached vector store, while the run's current page survives.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
@@ -298,16 +299,31 @@ class _RecordingStore:
     async def delete_many(self, page_ids: list[str]) -> None:
         self.deleted.append(list(page_ids))
 
+    async def close(self) -> None:
+        pass
 
-def test_update_persist_deletes_vectors_for_tombstoned_and_swept_pages(tmp_path, monkeypatch):
+
+@pytest.fixture
+def empty_repo(tmp_path):
+    repo_path = tmp_path / "repo"
+    (repo_path / ".repowise").mkdir(parents=True)
+
+    async def initialize():
+        engine, _, _ = await open_repo_db(repo_path, repo_name="test")
+        await engine.dispose()
+
+    asyncio.run(initialize())
+    return repo_path
+
+
+def test_update_persist_deletes_vectors_for_tombstoned_and_swept_pages(empty_repo, monkeypatch):
     """The single-repo index-only path deletes the union, not just tombstones."""
     from repowise.cli.commands.update_cmd import incremental as update_incremental
     from repowise.cli.commands.update_cmd import persistence as update_persistence
     from repowise.core.pipeline import incremental as core_incremental
     from repowise.core.pipeline.prune_state import DeletedFilePruneOutcome
 
-    repo_path = tmp_path / "repo"
-    (repo_path / ".repowise").mkdir(parents=True)
+    repo_path = empty_repo
 
     outcome = DeletedFilePruneOutcome(
         attempted=True,
@@ -347,13 +363,12 @@ def test_update_persist_deletes_vectors_for_tombstoned_and_swept_pages(tmp_path,
     )
 
 
-def test_workspace_vector_delete_covers_swept_pages(tmp_path, monkeypatch):
+def test_workspace_vector_delete_covers_swept_pages(empty_repo, monkeypatch):
     """The workspace pass takes the same union, for repos on the core path."""
     from repowise.cli.commands.update_cmd import incremental as update_incremental
     from repowise.cli.commands.update_cmd.workspace import _remove_tombstoned_page_vectors
     from repowise.core.pipeline.prune_state import DeletedFilePruneOutcome
 
-    (tmp_path / "a").mkdir()
     store = _RecordingStore()
     monkeypatch.setattr(update_incremental, "_build_update_vector_store", lambda *_a, **_kw: store)
 
@@ -366,8 +381,8 @@ def test_workspace_vector_delete_covers_swept_pages(tmp_path, monkeypatch):
             swept_page_ids=("scc_page:cycle-1",),
         ),
     )
-    ws_config = SimpleNamespace(repos=[SimpleNamespace(alias="a", path="a")])
+    ws_config = SimpleNamespace(repos=[SimpleNamespace(alias="a", path=empty_repo.name)])
 
-    _remove_tombstoned_page_vectors(tmp_path, ws_config, [result])
+    _remove_tombstoned_page_vectors(empty_repo.parent, ws_config, [result])
 
     assert store.deleted == [["file_page:a.py", "scc_page:cycle-1"]]

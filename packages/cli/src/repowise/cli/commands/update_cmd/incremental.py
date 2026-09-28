@@ -7,6 +7,7 @@ routing core log output through the CLI ``console``.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
@@ -62,8 +63,10 @@ def cleanup_retired_page_vectors(
     from pathlib import Path
 
     from repowise.cli.helpers import load_config, run_async
+    from repowise.core.persistence.database import create_engine, has_db_store, resolve_db_url
     from repowise.core.pipeline.cleanup_debt import (
         clear_cleanup_debt,
+        exclude_live_cleanup_ids,
         load_cleanup_debt,
         record_cleanup_debt,
     )
@@ -73,16 +76,73 @@ def cleanup_retired_page_vectors(
     if not cleanup_ids:
         return
     record_cleanup_debt(root, "vectors", cleanup_ids)
+
+    async def recheck() -> set[str]:
+        if not has_db_store(root):
+            raise RuntimeError("page authority is unavailable; vector cleanup deferred")
+        engine = create_engine(resolve_db_url(root))
+        try:
+            return await exclude_live_cleanup_ids(root, engine, cleanup_ids)
+        finally:
+            await engine.dispose()
+
+    cleanup_ids = run_async(recheck())
+    if not cleanup_ids:
+        return
     store = vector_store
     if store is None:
         store = _build_update_vector_store(root, load_config(root), required=True)
     if store is not None:
-        run_async(store.delete_many(sorted(cleanup_ids)))
+
+        async def remove() -> None:
+            try:
+                await store.delete_many(sorted(cleanup_ids))
+            finally:
+                if vector_store is None:
+                    await store.close()
+
+        run_async(remove())
         clear_cleanup_debt(root, "vectors", cleanup_ids)
     elif not (root / ".repowise" / "lancedb").exists():
         # A repository that never created a page-vector store has no rows to
         # delete. An unavailable existing store keeps its durable retry debt.
         clear_cleanup_debt(root, "vectors", cleanup_ids)
+
+
+def retry_idle_page_vector_cleanup(repo_path: Path, head: str | None) -> None:
+    """Finish failed deletions without requiring another content-changing update."""
+    from repowise.core.pipeline.cleanup_debt import load_cleanup_debt
+    from repowise.core.procutils import process_create_token
+    from repowise.core.update_lock import (
+        read_update_lock,
+        release_update_lock,
+        try_acquire_update_lock,
+    )
+
+    if not load_cleanup_debt(repo_path)["vectors"]:
+        return
+    if try_acquire_update_lock(repo_path, head) is not None:
+        return
+    owner = read_update_lock(repo_path)
+    pid = os.getpid()
+    if (
+        owner is None
+        or owner.get("pid") != pid
+        or owner.get("pid_create_token") != process_create_token(pid)
+    ):
+        console.print(
+            f"[yellow]{repo_path.name}: retired page vector removal deferred: "
+            "update lock ownership could not be verified[/yellow]"
+        )
+        return
+    try:
+        cleanup_retired_page_vectors(repo_path, [])
+    except Exception as exc:
+        console.print(
+            f"[yellow]{repo_path.name}: retired page vector removal deferred: {exc}[/yellow]"
+        )
+    finally:
+        release_update_lock(repo_path)
 
 
 def _build_filtered_changed_paths(file_diffs: list, exclude_patterns: list[str]) -> list[str]:

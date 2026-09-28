@@ -91,8 +91,14 @@ def test_full_upgrade_fts_cleanup_retries_after_failure(
             indexed.append(page_id)
 
     import repowise.core.persistence.search as search
+    from repowise.core.pipeline import cleanup_debt
+
+    async def retired(_root, _engine, ids):
+        # This unit isolates FTS retry; real SQL authority is covered separately.
+        return ids
 
     monkeypatch.setattr(search, "FullTextSearch", _FakeFts)
+    monkeypatch.setattr(cleanup_debt, "exclude_live_cleanup_ids", retired)
     page = SimpleNamespace(
         page_id="file_page:current.py",
         title="Current",

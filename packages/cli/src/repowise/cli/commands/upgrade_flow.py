@@ -216,12 +216,14 @@ async def _sync_authoritative_fts(
     from repowise.core.persistence.search import FullTextSearch
     from repowise.core.pipeline.cleanup_debt import (
         clear_cleanup_debt,
+        exclude_live_cleanup_ids,
         load_cleanup_debt,
         record_cleanup_debt,
     )
 
     cleanup_ids = set(retired_page_ids) | load_cleanup_debt(repo_path)["fts"]
     try:
+        cleanup_ids = await exclude_live_cleanup_ids(repo_path, engine, cleanup_ids)
         fts = FullTextSearch(engine)
         await fts.ensure_index()
         if cleanup_ids:

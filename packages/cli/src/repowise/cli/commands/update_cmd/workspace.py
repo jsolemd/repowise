@@ -296,6 +296,10 @@ def _workspace_update(
                 await reconcile_idle_repo_head_commit(repo_path, head)
 
         run_async(_reconcile_up_to_date())
+        from .incremental import retry_idle_page_vector_cleanup
+
+        for repo_path, head in up_to_date_repos:
+            retry_idle_page_vector_cleanup(repo_path, head)
 
     if stale_count == 0:
         console.print("[green]All repos are up to date.[/green]")

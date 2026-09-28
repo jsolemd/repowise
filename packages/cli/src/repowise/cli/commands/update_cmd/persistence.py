@@ -1480,6 +1480,7 @@ async def _persist_full_update_async(
 
         from repowise.core.pipeline.cleanup_debt import (
             clear_cleanup_debt,
+            exclude_live_cleanup_ids,
             load_cleanup_debt,
             record_cleanup_debt,
         )
@@ -1510,6 +1511,7 @@ async def _persist_full_update_async(
         cleanup_ids = set(tombstoned_page_ids) | set(swept_page_ids)
         cleanup_ids.update(load_cleanup_debt(Path(repo_path))["fts"])
         try:
+            cleanup_ids = await exclude_live_cleanup_ids(Path(repo_path), engine, cleanup_ids)
             fts = FullTextSearch(engine)
             await fts.ensure_index()
             for page in generated_pages:
@@ -1542,6 +1544,9 @@ async def _persist_full_update_async(
 
         if vector_cleanup_ids and decision_vector_store is not None:
             try:
+                vector_cleanup_ids = await exclude_live_cleanup_ids(
+                    Path(repo_path), engine, vector_cleanup_ids
+                )
                 await decision_vector_store.delete_many(sorted(vector_cleanup_ids))
                 clear_cleanup_debt(Path(repo_path), "vectors", vector_cleanup_ids)
             except Exception as exc:
