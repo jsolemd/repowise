@@ -27,8 +27,6 @@ ALLOWED_UPDATE_FIELDS = {
     "chunk_count",
     "file_count",
     "error_message",
-    "graph_synced_at",
-    "graph_sync_error",
     "branch",
 }
 
@@ -379,8 +377,6 @@ async def update_library_status(
     error_message: str | None = None,
     chunk_count: int | None = None,
     file_count: int | None = None,
-    graph_synced_at: datetime | None = None,
-    graph_sync_error: str | None = None,
     branch: str | None = None,
 ) -> LibraryState | None:
     """Update library indexing state."""
@@ -407,10 +403,6 @@ async def update_library_status(
         update_fields["chunk_count"] = chunk_count
     if file_count is not None:
         update_fields["file_count"] = file_count
-    if graph_synced_at is not None:
-        update_fields["graph_synced_at"] = graph_synced_at
-    if graph_sync_error is not None:
-        update_fields["graph_sync_error"] = graph_sync_error
     if branch is not None:
         update_fields["branch"] = branch
 
@@ -439,30 +431,6 @@ async def update_library_status(
 
     async with get_connection() as conn:
         row = await conn.fetchrow(query, *values)
-        if row is not None:
-            return _row_to_library_state(row)
-    return None
-
-
-async def mark_graph_sync_pending(
-    library_id: str,
-    *,
-    error: str,
-) -> LibraryState | None:
-    """Clear the successful graph-sync marker and persist a pending reason."""
-    async with get_connection() as conn:
-        row = await conn.fetchrow(
-            """
-            UPDATE doc_search.libraries
-            SET graph_synced_at = NULL,
-                graph_sync_error = $1,
-                updated_at = NOW()
-            WHERE library_id = $2
-            RETURNING *
-            """,
-            error,
-            library_id,
-        )
         if row is not None:
             return _row_to_library_state(row)
     return None
