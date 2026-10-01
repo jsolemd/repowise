@@ -11,7 +11,7 @@ import json
 import logging
 from collections.abc import Iterable
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
@@ -20,8 +20,12 @@ from repowise.core.generation.models import (
     STRUCTURALLY_KEYED_PAGE_TYPES,
     STUB_FALLBACK_ERROR,
 )
-from repowise.core.persistence.parser_state import SymbolParserRefresh, SymbolParserRefreshError
 from repowise.core.pipeline.prune_state import DeletedFilePruneOutcome, PruneRefusal
+
+if TYPE_CHECKING:
+    # Runtime import stays inside the function: a parse worker re-imports this
+    # module, and the persistence package pulls SQLAlchemy into every worker.
+    from repowise.core.persistence.parser_state import SymbolParserRefresh
 
 logger = structlog.get_logger(__name__)
 
@@ -668,7 +672,11 @@ async def persist_incremental_symbols(
         return None
     from repowise.core.ingestion.parse_cache import parser_fingerprint
     from repowise.core.persistence.crud import reconcile_symbols_for_files
-    from repowise.core.persistence.parser_state import stored_symbol_parser
+    from repowise.core.persistence.parser_state import (
+        SymbolParserRefresh,
+        SymbolParserRefreshError,
+        stored_symbol_parser,
+    )
 
     fingerprint = parser_fingerprint()
     parser_changed = await stored_symbol_parser(session, repo_id) != fingerprint
