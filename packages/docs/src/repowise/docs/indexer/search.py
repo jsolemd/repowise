@@ -15,7 +15,6 @@ from repowise.docs.indexer.scoring import (
     apply_exact_match_boosts,
     apply_search_boosts,
     is_exact_lookup_weak_path,
-    surface_query_tokens,
 )
 from repowise.docs.indexer.shared import build_file_filter, build_library_filter
 
@@ -23,38 +22,6 @@ if TYPE_CHECKING:
     from repowise.docs.search.intent import QueryIntent
 
 logger = logging.getLogger(__name__)
-
-_SURFACE_RESCUE_LIMIT_MIN = 40
-_SURFACE_RESCUE_LIMIT_SCALE = 4
-
-
-def _surface_rescue_query(query: str) -> str | None:
-    """Return the leading exact surface token for a descriptive query, if useful."""
-    normalized = query.strip()
-    if not normalized or " " not in normalized:
-        return None
-    tokens = surface_query_tokens(normalized)
-    if not tokens:
-        return None
-    token = tokens[0]
-    if len(token) < 3:
-        return None
-    return token
-
-
-def _merge_scored_points(
-    primary: list[models.ScoredPoint],
-    rescue: list[models.ScoredPoint],
-) -> list[models.ScoredPoint]:
-    """Merge result sets by point id, keeping the strongest score per point."""
-    merged: dict[object, models.ScoredPoint] = {}
-    for point in primary:
-        merged[point.id] = point
-    for point in rescue:
-        existing = merged.get(point.id)
-        if existing is None or (point.score or 0.0) > (existing.score or 0.0):
-            merged[point.id] = point
-    return list(merged.values())
 
 
 def _sort_results(
@@ -118,21 +85,6 @@ async def search_hybrid(
 
     results = list(response.points)
     results = apply_search_boosts(results, settings, intent=intent, query=query)
-
-    rescue_query = _surface_rescue_query(query)
-    if rescue_query:
-        rescue_limit = max(_SURFACE_RESCUE_LIMIT_MIN, limit * _SURFACE_RESCUE_LIMIT_SCALE)
-        rescue_response = await client.query_points(
-            collection_name=settings.qdrant_collection,
-            query=models.Document(text=rescue_query, model="Qdrant/bm25"),
-            using="bm25",
-            limit=rescue_limit,
-            query_filter=query_filter,
-            with_payload=True,
-        )
-        rescue_results = list(rescue_response.points)
-        rescue_results = apply_search_boosts(rescue_results, settings, intent=intent, query=query)
-        results = _merge_scored_points(results, rescue_results)
 
     if intent is not None and intent.value == "api_lookup":
         results = apply_exact_match_boosts(results, query, phrase_boost=1.25)

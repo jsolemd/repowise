@@ -205,56 +205,6 @@ class TestDocCategoryBoosting:
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_search_hybrid_rescues_exact_component_surface_candidates(mock_qdrant_point):
-    """Hybrid search should rescue canonical component pages from exact-surface BM25 hits."""
-    section_gaps = mock_qdrant_point(
-        "ring-progress-section-gaps",
-        score=0.64,
-        doc_category="other",
-        chunk_type="doc",
-        breadcrumb=["RingProgress", "Section gaps"],
-        breadcrumb_text="RingProgress > Section gaps",
-        file_path="apps/mantine.dev/src/pages/core/ring-progress.mdx",
-        section_anchor="section-gaps",
-    )
-    stack = mock_qdrant_point(
-        "stack-reference",
-        score=0.42,
-        doc_category="reference",
-        chunk_type="doc",
-        breadcrumb=["Components", "Stack"],
-        breadcrumb_text="Components > Stack",
-        file_path="apps/mantine.dev/src/pages/core/stack.mdx",
-        section_anchor="stack",
-    )
-
-    client = MagicMock(query_points=AsyncMock())
-    client.query_points.side_effect = [
-        SimpleNamespace(points=[section_gaps]),
-        SimpleNamespace(points=[stack]),
-    ]
-
-    with (
-        patch("repowise.docs.indexer.search.embed_query", new_callable=AsyncMock) as mock_embed,
-        patch("repowise.docs.indexer.search.get_settings") as mock_settings,
-    ):
-        mock_embed.return_value = [0.1] * 768
-        mock_settings.return_value = Settings()
-
-        results = await search_hybrid(
-            library_id="/mantinedev/mantine",
-            query="Stack gap motion layout patterns",
-            limit=3,
-            intent=QueryIntent.CONCEPT,
-            client=client,
-        )
-
-    assert results[0].id == "stack-reference"
-    assert client.query_points.call_count == 2
-
-
-@pytest.mark.unit
-@pytest.mark.asyncio
 async def test_search_hybrid_api_lookup_demotes_weak_paths_when_stronger_surface_exists(
     mock_qdrant_point,
 ):
@@ -281,10 +231,7 @@ async def test_search_hybrid_api_lookup_demotes_weak_paths_when_stronger_surface
     )
 
     client = MagicMock(query_points=AsyncMock())
-    client.query_points.side_effect = [
-        SimpleNamespace(points=[weak_example, strong_source]),
-        SimpleNamespace(points=[]),
-    ]
+    client.query_points.return_value = SimpleNamespace(points=[weak_example, strong_source])
 
     with (
         patch("repowise.docs.indexer.search.embed_query", new_callable=AsyncMock) as mock_embed,
@@ -345,10 +292,9 @@ async def test_search_hybrid_api_lookup_prefers_canonical_component_page_over_co
     )
 
     client = MagicMock(query_points=AsyncMock())
-    client.query_points.side_effect = [
-        SimpleNamespace(points=[drawer_stack, modal_stack, canonical]),
-        SimpleNamespace(points=[]),
-    ]
+    client.query_points.return_value = SimpleNamespace(
+        points=[drawer_stack, modal_stack, canonical]
+    )
 
     with (
         patch("repowise.docs.indexer.search.embed_query", new_callable=AsyncMock) as mock_embed,
@@ -366,6 +312,7 @@ async def test_search_hybrid_api_lookup_prefers_canonical_component_page_over_co
         )
 
     assert results[0].id == "stack-usage"
+    client.query_points.assert_awaited_once()
 
 
 # ============================================================================
