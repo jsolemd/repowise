@@ -85,7 +85,7 @@ def _compile_spec(root_key: str, _stamp: tuple[tuple[int, int], ...]) -> Any:
     """Compile and cache one repo's spec. Keyed by root + rule-file mtimes."""
     import pathspec
 
-    from repowise.core.ingestion.traverser import _load_extra_ignore_spec
+    from repowise.core.ingestion.traverser import load_extra_ignore_spec
     from repowise.core.repo_config import load_repo_config
 
     root = Path(root_key)
@@ -110,7 +110,7 @@ def _compile_spec(root_key: str, _stamp: tuple[tuple[int, int], ...]) -> Any:
     # Traversal treats its root .repowiseIgnore as a separate veto, so a
     # negation there cannot reopen a Git/config exclusion. Reuse its loader,
     # including read failures: unreadable rules cannot authorize a prune.
-    extra_ignore = _load_extra_ignore_spec(root, ".repowiseIgnore")
+    extra_ignore = load_extra_ignore_spec(root, ".repowiseIgnore")
     if not patterns and not extra_ignore.patterns:
         return None
     # Concatenating the compiled patterns preserves the exact cross-source

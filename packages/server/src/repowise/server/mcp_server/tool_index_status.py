@@ -725,9 +725,9 @@ def _path_mode_payload(
     else:
         window_policy = window_eligible(normalized, indexed_symbols=0)
 
-    from repowise.core.ingestion.traverser import _load_extra_ignore_spec
+    from repowise.core.ingestion.traverser import load_extra_ignore_spec
 
-    if _load_extra_ignore_spec(repo_path, ".repowiseIgnore").match_file(normalized):
+    if load_extra_ignore_spec(repo_path, ".repowiseIgnore").match_file(normalized):
         window_policy = False
 
     working_tree_indexed = normalized in set(_recorded_working_tree_paths(status, repo_state))

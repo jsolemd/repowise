@@ -112,9 +112,9 @@ async def capture_source_changes(
     if not paths:
         return FastSourceCaptureResult((), 0, 0, 0)
 
-    from repowise.core.ingestion.traverser import _load_extra_ignore_spec
+    from repowise.core.ingestion.traverser import load_extra_ignore_spec
 
-    explicit_ignore = _load_extra_ignore_spec(repo, ".repowiseIgnore")
+    explicit_ignore = load_extra_ignore_spec(repo, ".repowiseIgnore")
     config = load_repo_config(repo)
     include_submodules, include_nested_repos = _state_flags(repo)
     traverser = FileTraverser(
