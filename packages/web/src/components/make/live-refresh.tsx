@@ -51,15 +51,18 @@ export function LiveRefresh({ initialRevision }: { initialRevision: number | nul
     };
   }, [router]);
 
+  // The revision is for whoever is debugging a refresh, so it rides on hover.
   return (
-    <p className="inline-flex min-h-11 items-center gap-1.5 text-xs text-[var(--color-text-tertiary)]">
+    <p
+      className="inline-flex min-h-11 items-center gap-1.5 text-xs text-[var(--color-text-tertiary)]"
+      title={state.revision !== null ? `Catalog revision ${state.revision}` : undefined}
+    >
       <span
         aria-hidden
         className="h-1.5 w-1.5 rounded-full"
         style={{ background: state.connection === "live" ? "var(--color-success)" : "var(--color-text-tertiary)" }}
       />
       {CONNECTION_LABEL[state.connection]}
-      {state.revision !== null && <span className="tabular-nums">· revision {state.revision}</span>}
     </p>
   );
 }

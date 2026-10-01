@@ -4,7 +4,6 @@ import { Activity } from "lucide-react";
 import { PageShell } from "@repowise-dev/ui/shared/page-shell";
 import { ApiError } from "@repowise-dev/ui/shared/api-error";
 import { OverviewSection } from "@repowise-dev/ui/overview";
-import { formatAgeDays } from "@repowise-dev/ui/lib/format";
 import {
   getMakeBuilds,
   getMakeDoctor,
@@ -19,48 +18,40 @@ import {
 import {
   ActivityPanel,
   BuildsPanel,
-  DoctorGrid,
   DoctorPending,
+  DoctorStrip,
   EvidencePanel,
   ImagesPanel,
   MeetingsPanel,
-  SpendTile,
+  NeedsYou,
+  SpendPanel,
   StoragePanel,
 } from "@/components/make/make-sections";
-import { Label, Meter, RAMP } from "@/components/make/make-charts";
 import { LiveRefresh } from "@/components/make/live-refresh";
 
 export const metadata: Metadata = { title: "Make platform" };
 export const dynamic = "force-dynamic";
 
-/** Days of spend the tile covers, counted in Jon's time zone. */
+/** Days of spend the panel covers, counted in Jon's time zone. */
 const SPEND_DAYS = 30;
 /** Days the operation mix covers. */
 const MIX_DAYS = 7;
 const TIME_ZONE = process.env.MAKE_REPORT_TIME_ZONE || "America/Los_Angeles";
 /** Where Jon gives verdicts on renders: SoleMD.Web's review library. */
 const REVIEW_LIBRARY_URL = process.env.MAKE_REVIEW_LIBRARY_URL || "https://solemd-web.taild0afc1.ts.net/make";
-const DAY_SECONDS = 86_400;
 
 const value = <T,>(result: PromiseSettledResult<T>): T | null =>
   result.status === "fulfilled" ? result.value : null;
 
 /** The doctor is slow (live checks), so it streams in behind the rest. */
 async function Doctor({ report }: { report: Promise<MakeDoctor | null> }) {
-  const doctor = await report;
-  return doctor ? (
-    <DoctorGrid doctor={doctor} />
-  ) : (
-    <ApiError title="The doctor did not answer" message="make-api answered other reports but not /v1/report/doctor." />
-  );
+  return <DoctorStrip doctor={await report} />;
 }
 
 /**
- * The Make platform: Jon's window onto what Make built, spent and kept.
+ * The Make platform: what waits on Jon's hand, what Make built, what it spent
+ * and what it keeps, each a figure and one mark, under the doctor's strip.
  *
- * Charts first, with the doctor's open findings in a list that opens by touch
- * and the rest of the prose on hover. Agents read make-api directly and act on
- * the doctor's findings, so this page shows shapes and counts, not a queue.
  * Read-only by contract (SoleMD.Make native-catalog-cutover): every figure is
  * a make-api report reached through a private socket from this server render,
  * and the page re-renders when Make's catalog revision moves (LiveRefresh).
@@ -109,39 +100,30 @@ export default async function MakePlatformPage() {
             <Doctor report={doctor} />
           </Suspense>
 
-          <div className="grid grid-cols-2 divide-[var(--color-border-default)] lg:grid-cols-4 lg:divide-x [&>*:first-child]:pl-0 max-lg:[&>*:nth-child(odd)]:pl-0">
-            {media ? (
-              <Meter label="Images to review" value={media.queue.pending} href={REVIEW_LIBRARY_URL}
-                unit={media.queue.oldest_seconds !== null ? `oldest ${formatAgeDays(media.queue.oldest_seconds / DAY_SECONDS)}` : undefined} />
-            ) : <div />}
-            {meetings ? (
-              <Meter label="Notes to file" value={meetings.recordings.awaiting_summary} of={meetings.recordings.total} color="var(--color-node-needs-work)" />
-            ) : <div />}
-            {evidence ? (
-              <Meter label="Papers awaiting a copy" value={evidence.fulltext.waiting} of={evidence.fulltext.needed} color={RAMP[2]} />
-            ) : <div />}
-            <div className="flex min-w-0 flex-col gap-2 p-4">
-              <Label>Spend</Label>
-              <SpendTile spend={spend} />
-            </div>
-          </div>
+          <OverviewSection title="Needs you" flush>
+            <NeedsYou media={media} meetings={meetings} evidence={evidence} libraryUrl={REVIEW_LIBRARY_URL} />
+          </OverviewSection>
 
-          <OverviewSection title="Pipelines">
-            <div className="grid gap-x-12 gap-y-10 lg:grid-cols-2">
+          <OverviewSection title="Built">
+            <div className="grid gap-x-12 gap-y-10 md:grid-cols-2 lg:grid-cols-3">
               <EvidencePanel evidence={evidence} />
               <BuildsPanel builds={builds} />
-              <ImagesPanel media={media} libraryUrl={REVIEW_LIBRARY_URL} />
+              <ImagesPanel media={media} />
               <MeetingsPanel meetings={meetings} />
+              <div className="md:col-span-2">
+                <ActivityPanel mix={mix} />
+              </div>
             </div>
           </OverviewSection>
 
-          <OverviewSection title="Activity">
-            <ActivityPanel mix={mix} />
-          </OverviewSection>
-
-          <OverviewSection title="Storage">
-            <StoragePanel storage={storage} />
-          </OverviewSection>
+          <div className="grid gap-x-12 gap-y-[var(--section-gap)] lg:grid-cols-2">
+            <OverviewSection title="Spent">
+              <SpendPanel spend={spend} />
+            </OverviewSection>
+            <OverviewSection title="Kept">
+              <StoragePanel storage={storage} />
+            </OverviewSection>
+          </div>
         </>
       )}
     </PageShell>

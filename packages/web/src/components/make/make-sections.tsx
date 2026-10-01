@@ -1,15 +1,17 @@
 /**
- * The Make platform page's sections, drawn as charts. Server components: plain
- * data in, markup out. The page owns fetching; each section owns one subject.
+ * The Make platform page's sections. Server components: plain data in, markup
+ * out. The page owns fetching; each section owns one subject.
  *
- * The page is Jon's window onto Make, not its work queue: agents read make-api
- * and act on findings. So each section shows a shape (what is flowing, what is
- * stuck, what is growing) with labels and figures. The doctor's open findings
- * are printed in a list that opens by touch or keyboard; the rest of the prose
- * rides on the `title` a mark carries on hover (make-charts.tsx says which).
+ * The page answers four questions at a glance, in the order Jon needs them: what
+ * waits on his hand, what Make built, what it spent, and what it keeps. Each
+ * section is a figure and one mark, labelled only where a mark cannot carry the
+ * meaning. The doctor's health leads as a strip of one cell per check; its open
+ * findings, the one place prose remains, open from that strip by touch or
+ * keyboard. Agents read make-api and act on the findings themselves.
  */
 import type { ReactNode } from "react";
-import { formatAgeDays, formatBytes, formatCost, formatRelativeTimeOrNull, stripMarkdown } from "@repowise-dev/ui/lib/format";
+import { BookOpen, Clock, FileStack, Images, Network, NotebookPen, RefreshCw, Stethoscope, type LucideIcon } from "lucide-react";
+import { formatBytes, formatCost, formatNumber, formatRelativeTimeOrNull, stripMarkdown } from "@repowise-dev/ui/lib/format";
 import {
   microsToUsd,
   operationLabel,
@@ -23,12 +25,14 @@ import {
   type MakeSpend,
   type MakeStorage,
 } from "@/lib/make-platform";
-import { BarRows, DayColumns, FILL, Figure, Label, Legend, RAMP, StackBar, type Segment } from "./make-charts";
+import { BarRows, DayColumns, FILL, Figure, Label, Legend, RAMP, StackBar, Tile, type Segment } from "./make-charts";
+
+const DAY_SECONDS = 86_400;
 
 function Unavailable({ what }: { what: string }) {
   return (
-    <p role="status" className="text-xs text-[var(--color-text-tertiary)]">
-      {what}: no answer from make-api.
+    <p role="status" className="m-0 text-xs text-[var(--color-text-tertiary)]">
+      {what} · no answer
     </p>
   );
 }
@@ -36,7 +40,7 @@ function Unavailable({ what }: { what: string }) {
 function Panel({ label, aside, children }: { label: string; aside?: ReactNode; children: ReactNode }) {
   return (
     <div className="flex min-w-0 flex-col gap-3">
-      <div className="flex items-baseline justify-between gap-3">
+      <div className="flex min-h-4 items-baseline justify-between gap-3">
         <Label>{label}</Label>
         {aside && <span className="text-[11px] tabular-nums text-[var(--color-text-tertiary)]">{aside}</span>}
       </div>
@@ -45,12 +49,30 @@ function Panel({ label, aside, children }: { label: string; aside?: ReactNode; c
   );
 }
 
-const count = (n: number) => n.toLocaleString();
-const plural = (n: number, noun: string) => `${count(n)} ${noun}${n === 1 ? "" : "s"}`;
+/** A small icon and a short time, with the words a screen reader needs. */
+function Stamp({ icon: Icon, said, children, color }: { icon: LucideIcon; said: string; children: ReactNode; color?: string }) {
+  return (
+    <span className="inline-flex items-center gap-1" style={color ? { color } : undefined}>
+      <Icon aria-hidden className="h-3 w-3" />
+      <span className="sr-only">{said} </span>
+      {children}
+    </span>
+  );
+}
+
+/** How long something has waited, in its largest whole unit: "5h", "2d", "3w". */
+export function compactAge(seconds: number): string {
+  const hours = seconds / 3600;
+  if (hours < 1) return "<1h";
+  if (hours < 24) return `${Math.floor(hours)}h`;
+  const days = hours / 24;
+  return days < 14 ? `${Math.floor(days)}d` : `${Math.floor(days / 7)}w`;
+}
+
+const plural = (n: number, noun: string) => `${noun}${n === 1 ? "" : "s"}`;
 
 // --- Doctor -------------------------------------------------------------------------
 
-const AREA_ORDER = ["catalog", "media", "evidence", "meetings", "operations", "storage", "recovery", "jobs"];
 const AREA_LABEL: Record<string, string> = {
   catalog: "Catalog",
   media: "Images",
@@ -60,6 +82,18 @@ const AREA_LABEL: Record<string, string> = {
   storage: "Storage",
   operations: "Ops",
   jobs: "Jobs",
+};
+
+const SEVERITY_RANK: Record<MakeFinding["severity"], number> = { fail: 0, warn: 1, ok: 2 };
+
+/** Severity as a cell, in the node fills. */
+const CELL: Record<MakeFinding["severity"], string> = { fail: FILL.fail, warn: FILL.wait, ok: FILL.ok };
+
+/** Severity as type, in the status ink vars. */
+const INK: Record<MakeFinding["severity"], string> = {
+  fail: "var(--color-error)",
+  warn: "var(--color-warning)",
+  ok: "var(--color-success)",
 };
 
 /** A finding's action as a sentence: Make writes commands in backticks. */
@@ -74,268 +108,221 @@ function findingTitle(f: MakeFinding): string {
   return [`${f.check}: ${detail}`, actionSentence(f.action)].filter(Boolean).join("\n");
 }
 
-/** Severity as type, in the status ink vars; the cells take the node fills. */
-const INK: Record<MakeFinding["severity"], string> = {
-  fail: "var(--color-error)",
-  warn: "var(--color-warning)",
-  ok: "var(--color-success)",
-};
+const STRIP = "flex min-h-11 flex-wrap items-center gap-x-4 gap-y-2";
 
 /**
- * Every make doctor check as one cell, grouped by area, with the open count as
- * the page's headline. A cell cannot be hovered on a phone, so the failing
- * checks are named under the grid, and every open finding's detail and action
- * sit in a native disclosure across the foot of the section, which opens by
- * touch or keyboard and leaves the headline where it was when it opens.
+ * Every make doctor check as one cell, failing first, then warning, then passing,
+ * so the share of red and amber reads before any number. The legend gives the
+ * three counts. When anything is open the whole strip is the summary of a native
+ * disclosure, so one tap or keypress lists every open finding's check, detail
+ * and action, and the strip stays where it was.
  */
-export function DoctorGrid({ doctor }: { doctor: MakeDoctor }) {
-  const { fail, warn, ok } = doctor.counts;
-  const rank = (area: string) => (AREA_ORDER.includes(area) ? AREA_ORDER.indexOf(area) : AREA_ORDER.length);
-  const areas = [...new Set(doctor.findings.map((f) => f.area))].sort((a, b) => rank(a) - rank(b));
-  const failing = doctor.findings.filter((f) => f.severity === "fail");
-  const open = [...failing, ...doctor.findings.filter((f) => f.severity === "warn")];
-  const color = INK[fail ? "fail" : warn ? "warn" : "ok"];
-  return (
-    <div className="flex flex-col gap-2 border-b border-[var(--color-border-default)] pb-6">
-      <div className="flex flex-col gap-5 sm:flex-row sm:items-end sm:gap-10">
-        <div className="flex shrink-0 flex-col gap-2">
-          <Label>Doctor</Label>
-          <p className="m-0 flex items-baseline gap-2">
-            <span className="text-[56px] font-semibold leading-none tracking-tight tabular-nums" style={{ color }}>
-              {fail + warn}
-            </span>
-            <span className="text-sm text-[var(--color-text-tertiary)]">open of {doctor.findings.length}</span>
-          </p>
-          <div className="flex gap-3 text-[11px] tabular-nums text-[var(--color-text-secondary)]">
-            {([["fail", fail], ["warn", warn], ["ok", ok]] as const).map(([k, n]) => (
-              <span key={k} className="inline-flex items-center gap-1">
-                <span aria-hidden className="inline-block h-2 w-2 rounded-[2px]" style={{ background: FILL[k] }} />
-                {n} {k === "ok" ? "pass" : k}
-              </span>
-            ))}
-          </div>
-        </div>
-        <div className="flex min-w-0 flex-1 flex-col gap-3">
-          <ul className="m-0 flex list-none flex-wrap gap-x-5 gap-y-3 p-0">
-            {areas.map((area) => (
-              <li key={area} className="flex flex-col gap-1.5">
-                <div className="flex gap-[3px]">
-                  {doctor.findings
-                    .filter((f) => f.area === area)
-                    .map((f, i) => (
-                      <span
-                        key={`${f.check}-${i}`}
-                        role="img"
-                        aria-label={`${f.check}: ${f.severity}`}
-                        title={findingTitle(f)}
-                        className="block h-6 w-6 rounded-[4px]"
-                        style={{ background: FILL[f.severity], opacity: f.severity === "ok" ? 0.55 : 1 }}
-                      />
-                    ))}
-                </div>
-                <span className="font-mono text-[9px] uppercase tracking-[0.12em] text-[var(--color-text-tertiary)]">
-                  {AREA_LABEL[area] ?? area}
-                </span>
-              </li>
-            ))}
-          </ul>
-          {failing.length > 0 && (
-            <p className="m-0 text-xs text-[var(--color-error)]">
-              {failing.map((f) => f.check).join(" · ")}
-            </p>
-          )}
-        </div>
+export function DoctorStrip({ doctor }: { doctor: MakeDoctor | null }) {
+  if (!doctor) {
+    return (
+      <div className={`${STRIP} border-b border-[var(--color-border-default)] pb-3`}>
+        <Unavailable what="Doctor" />
       </div>
-      {open.length > 0 && (
-        <details className="group">
-          <summary className="flex min-h-11 w-fit cursor-pointer list-none items-center gap-2 rounded-sm text-xs text-[var(--color-text-secondary)] marker:hidden focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-accent-primary)] [&::-webkit-details-marker]:hidden">
-            <span aria-hidden className="text-[var(--color-text-tertiary)] transition-transform group-open:rotate-90">›</span>
-            <span>{plural(open.length, "open finding")}</span>
-          </summary>
-          <ul className="m-0 flex list-none flex-col gap-3 p-0 pb-1 text-xs">
-            {open.map((f, i) => (
-              <li key={`${f.check}-${i}`} className="flex flex-col gap-0.5">
-                <p className="m-0">
-                  <span className="font-semibold" style={{ color: INK[f.severity] }}>{f.check}</span>{" "}
-                  <span className="font-mono text-[10px] uppercase tracking-[0.12em] text-[var(--color-text-tertiary)]">
-                    {f.severity} · {AREA_LABEL[f.area] ?? f.area}
-                  </span>
-                </p>
-                <p className="m-0 text-[var(--color-text-secondary)] [overflow-wrap:anywhere]">{f.detail}</p>
-                {f.action && <p className="m-0 text-[var(--color-text-primary)]">{actionSentence(f.action)}</p>}
-              </li>
-            ))}
-          </ul>
-        </details>
-      )}
-    </div>
+    );
+  }
+  const { fail, warn, ok } = doctor.counts;
+  const checks = [...doctor.findings].sort((a, b) => SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity]);
+  const open = checks.filter((f) => f.severity !== "ok");
+  const row = (
+    <>
+      <Label className="flex items-center gap-1.5">
+        <Stethoscope aria-hidden className="h-3.5 w-3.5" />
+        Doctor
+      </Label>
+      <span aria-hidden className="flex flex-wrap gap-[3px]">
+        {checks.map((f, i) => (
+          <span
+            key={`${f.check}-${i}`}
+            data-severity={f.severity}
+            title={findingTitle(f)}
+            className="block h-3.5 w-3.5 rounded-[3px] sm:h-4 sm:w-4"
+            style={{ background: CELL[f.severity], opacity: f.severity === "ok" ? 0.55 : 1 }}
+          />
+        ))}
+      </span>
+      <Legend
+        items={[
+          { key: "fail", label: "fail", color: FILL.fail, value: formatNumber(fail) },
+          { key: "warn", label: "warn", color: FILL.wait, value: formatNumber(warn) },
+          { key: "ok", label: "ok", color: FILL.ok, value: formatNumber(ok) },
+        ]}
+      />
+    </>
+  );
+  if (!open.length) {
+    return <div className={`${STRIP} border-b border-[var(--color-border-default)] pb-3`}>{row}</div>;
+  }
+  return (
+    <details className="group border-b border-[var(--color-border-default)] pb-3">
+      <summary
+        className={`${STRIP} cursor-pointer list-none rounded-sm marker:hidden focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-accent-primary)] [&::-webkit-details-marker]:hidden`}
+      >
+        {row}
+        <span aria-hidden className="ml-auto text-[var(--color-text-tertiary)] transition-transform group-open:rotate-90">
+          ›
+        </span>
+      </summary>
+      <ul className="m-0 mt-2 flex list-none flex-col gap-3 p-0 pb-1 text-xs">
+        {open.map((f, i) => (
+          <li key={`${f.check}-${i}`} className="flex flex-col gap-0.5">
+            <p className="m-0">
+              <span className="font-semibold" style={{ color: INK[f.severity] }}>{f.check}</span>{" "}
+              <span className="font-mono text-[10px] uppercase tracking-[0.12em] text-[var(--color-text-tertiary)]">
+                {f.severity} · {AREA_LABEL[f.area] ?? f.area}
+              </span>
+            </p>
+            <p className="m-0 text-[var(--color-text-secondary)] [overflow-wrap:anywhere]">{f.detail}</p>
+            {f.action && <p className="m-0 text-[var(--color-text-primary)]">{actionSentence(f.action)}</p>}
+          </li>
+        ))}
+      </ul>
+    </details>
   );
 }
 
-/** Holds the doctor's usual height (the grid and the closed findings list) while it checks. */
+/** Holds the strip's height while the doctor runs its live checks. */
 export function DoctorPending() {
   return (
-    <div className="flex h-[180px] items-end border-b border-[var(--color-border-default)] pb-6" aria-busy>
-      <Label>Doctor · checking</Label>
+    <div className={`${STRIP} border-b border-[var(--color-border-default)] pb-3`} aria-busy>
+      <Label className="flex items-center gap-1.5">
+        <Stethoscope aria-hidden className="h-3.5 w-3.5" />
+        Doctor · checking
+      </Label>
     </div>
   );
 }
 
-// --- Pipelines ----------------------------------------------------------------------
+// --- Needs you ----------------------------------------------------------------------
 
 /**
- * The evidence map's state. Its fingerprint first: the published claims by how clear the
- * literature is on each, ordered from clear to contested down the ramp. Then what asks for
- * a hand: concepts a changed claim made stale, documents citing a claim whose sentence
- * moved since they were built, and papers whose body a claim needs that have no copy yet.
+ * What waits on Jon's hand, one tile each, always in the same place so the row
+ * is learned once: images to review (the tile opens the review library), notes
+ * to file, library copies to fetch against the papers a claim needs, concepts a
+ * changed claim made stale, and documents citing a changed claim.
+ */
+export function NeedsYou({
+  media,
+  meetings,
+  evidence,
+  libraryUrl,
+}: {
+  media: MakeMedia | null;
+  meetings: MakeMeetings | null;
+  evidence: MakeEvidence | null;
+  libraryUrl: string;
+}) {
+  const oldest = media?.queue.oldest_seconds ?? null;
+  return (
+    <div className="-mx-3 grid grid-cols-2 gap-x-2 gap-y-1 sm:grid-cols-3 lg:grid-cols-5">
+      <div className="col-span-2 sm:col-span-1">
+        <Tile
+          icon={Images}
+          label="Images to review"
+          value={media?.queue.pending ?? null}
+          href={libraryUrl}
+          unit={
+            media && media.queue.pending > 0 && oldest !== null ? (
+              <Stamp icon={Clock} said="oldest waiting">{compactAge(oldest)}</Stamp>
+            ) : undefined
+          }
+        />
+      </div>
+      <Tile icon={NotebookPen} label="Notes to file" value={meetings?.recordings.awaiting_summary ?? null} />
+      <Tile
+        icon={BookOpen}
+        label="Copies to fetch"
+        value={evidence?.fulltext.waiting ?? null}
+        of={evidence?.fulltext.needed}
+      />
+      <Tile icon={Network} label="Stale concepts" value={evidence?.claims.stale_concepts ?? null} />
+      <Tile icon={FileStack} label="Docs to rebuild" value={evidence?.claims.documents_changed ?? null} />
+    </div>
+  );
+}
+
+// --- Built --------------------------------------------------------------------------
+
+/**
+ * The evidence map: published claims by how clear the literature is on each, with
+ * the concepts and open questions beside them. The certainty bar is the ordinal
+ * exception make-charts.tsx describes: clear, uncertain and contested step down
+ * the ramp in that fixed order whatever their counts.
  */
 export function EvidencePanel({ evidence }: { evidence: MakeEvidence | null }) {
   if (!evidence) return <Unavailable what="Evidence" />;
-  const { questions, claims, fulltext } = evidence;
+  const { questions, claims } = evidence;
   const certainty = claims.by_certainty;
   // Make totals questions in every state (open, answered, withdrawn).
   const openQuestions = questions.by_state.open ?? 0;
-  const attention = [
-    {
-      key: "stale",
-      value: claims.stale_concepts,
-      label: "concepts stale",
-      title: "Concepts resting on a claim that changed since they pinned it. A final build refuses them.",
-      alert: true,
-    },
-    {
-      key: "documents",
-      value: claims.documents_changed,
-      label: "documents to rebuild",
-      title: "Documents citing a claim whose sentence changed since they were last built.",
-      alert: true,
-    },
-    {
-      key: "copies",
-      value: fulltext.waiting,
-      label: `of ${count(fulltext.needed)} papers await a copy`,
-      title: "Papers whose body a claim needs, with no full text yet: a library copy settles them.",
-      alert: false,
-    },
-  ];
+  const concepts = claims.by_kind.concept ?? 0;
   return (
-    <Panel label="Evidence" aside={plural(openQuestions, "open question")}>
-      <div className="grid grid-cols-2 gap-4">
-        <div className="flex flex-col gap-2">
-          <Figure value={count(claims.by_kind.claim ?? 0)} unit="claims" />
-          {/* A deliberate exception to globals.css, where position on the ramp means
-              magnitude. Here the ramp is Jon's certainty scale, how clear and how gray the
-              literature is on a claim, so clear, uncertain and contested step toward the
-              ground in that fixed order whatever their counts; the printed counts carry
-              the magnitudes. */}
-          <StackBar
-            segments={[
-              { key: "clear", value: certainty.clear ?? 0, color: RAMP[0], label: "clear" },
-              { key: "uncertain", value: certainty.uncertain ?? 0, color: RAMP[2], label: "uncertain" },
-              { key: "contested", value: certainty.contested ?? 0, color: RAMP[4], label: "contested" },
-            ]}
-            legend
-          />
-        </div>
-        <div className="flex flex-col gap-2">
-          <Figure value={count(claims.by_kind.concept ?? 0)} unit="concepts" />
-          <ul className="m-0 flex list-none flex-col gap-1 p-0 text-xs text-[var(--color-text-secondary)]">
-            {attention.map((a) => (
-              <li key={a.key} title={a.title} className="tabular-nums">
-                <span
-                  className="font-semibold"
-                  style={{ color: a.alert && a.value ? "var(--color-warning)" : "var(--color-text-primary)" }}
-                >
-                  {count(a.value)}
-                </span>{" "}
-                {a.label}
-              </li>
-            ))}
-          </ul>
-        </div>
+    <Panel label="Evidence">
+      <div className="flex flex-wrap items-baseline gap-x-5 gap-y-1">
+        <Figure value={formatNumber(claims.by_kind.claim ?? 0)} unit="claims" />
+        <Figure size="sm" value={formatNumber(concepts)} unit={plural(concepts, "concept")} />
+        <Figure size="sm" value={formatNumber(openQuestions)} unit={`open ${plural(openQuestions, "question")}`} />
       </div>
+      <StackBar
+        segments={[
+          { key: "clear", value: certainty.clear ?? 0, color: RAMP[0], label: "clear" },
+          { key: "uncertain", value: certainty.uncertain ?? 0, color: RAMP[2], label: "uncertain" },
+          { key: "contested", value: certainty.contested ?? 0, color: RAMP[4], label: "contested" },
+        ]}
+        legend
+      />
     </Panel>
   );
 }
 
+/** Documents by group; a group's failed builds in the fail fill, and counted. */
 export function BuildsPanel({ builds }: { builds: MakeBuilds | null }) {
   if (!builds) return <Unavailable what="Builds" />;
   const documents = builds.groups.reduce((n, g) => n + g.documents, 0);
   const latest = builds.items[0];
   return (
-    <Panel label="Builds by group" aside={latest ? `last ${formatRelativeTimeOrNull(latest.built_at, "never")}` : undefined}>
-      <Figure value={count(documents)} unit="documents" />
+    <Panel
+      label="Builds"
+      aside={latest ? <Stamp icon={Clock} said="last build">{formatRelativeTimeOrNull(latest.built_at, "never")}</Stamp> : undefined}
+    >
+      <Figure value={formatNumber(documents)} unit={plural(documents, "document")} />
       <BarRows
-        rows={builds.groups.map((g) => ({
-          key: g.group ?? "none",
-          label: g.group ?? "No group",
-          segments: [
-            {
-              key: "docs",
-              value: g.documents,
-              color: RAMP[1],
-              label: "documents",
-              hatched: g.failed,
-              title: `${g.group ?? "No group"}: ${g.documents} documents${g.failed ? `, ${g.failed} failed` : ""}`,
-            },
-          ],
-          note: g.failed ? <span className="ml-1.5 text-[var(--color-error)]">· {count(g.failed)} failed</span> : undefined,
-        }))}
+        rows={builds.groups.map((g) => {
+          const label = g.group ?? "No group";
+          return {
+            key: g.group ?? "none",
+            label,
+            segments: [
+              { key: "built", value: g.documents - g.failed, color: RAMP[0], label: "built", title: `${label}: ${g.documents - g.failed} built` },
+              { key: "failed", value: g.failed, color: FILL.fail, label: "failed", title: `${label}: ${g.failed} failed` },
+            ],
+            note: g.failed ? <span className="ml-1.5 text-[var(--color-error)]">· {formatNumber(g.failed)} failed</span> : undefined,
+          };
+        })}
       />
     </Panel>
   );
 }
 
-const DAY_SECONDS = 86_400;
-
-export function ImagesPanel({ media, libraryUrl }: { media: MakeMedia | null; libraryUrl: string }) {
+/** Review cards by verdict: settled ones recede, the pending ones carry the wait fill. */
+export function ImagesPanel({ media }: { media: MakeMedia | null }) {
   if (!media) return <Unavailable what="Images" />;
-  const { cards, queue } = media;
-  const owners = media.owners.filter((o) => o.pending || o.blocked).slice(0, 5);
-  // Make counts a blocked card apart from pending (media_review_cards_v2), so
-  // each owner's row is the two side by side and its total is their sum.
-  const waiting = (pending: number, blocked: number): Segment[] => [
-    { key: "pending", value: pending, color: FILL.warn, label: "pending" },
-    { key: "blocked", value: blocked, color: FILL.fail, label: "blocked" },
-  ];
+  const { cards } = media;
   return (
-    <Panel
-      label="Images"
-      aside={
-        <a href={libraryUrl} className="text-[var(--color-accent-primary)] hover:underline">
-          review library →
-        </a>
-      }
-    >
-      <Figure
-        value={count(Object.values(cards).reduce((a, b) => a + b, 0))}
-        unit="cards"
-      />
+    <Panel label="Images">
+      <Figure value={formatNumber(Object.values(cards).reduce((a, b) => a + b, 0))} unit="cards" />
       <StackBar
         segments={[
-          { key: "accept", value: cards.accept ?? 0, color: RAMP[1], label: "accepted" },
-          { key: "pending", value: cards.pending ?? 0, color: FILL.warn, label: "pending" },
-          { key: "reject", value: cards.reject ?? 0, color: FILL.quiet, label: "rejected" },
+          { key: "accept", value: cards.accept ?? 0, color: FILL.done, label: "accepted" },
+          { key: "pending", value: cards.pending ?? 0, color: FILL.wait, label: "pending" },
+          { key: "reject", value: cards.reject ?? 0, color: FILL.faint, label: "rejected" },
         ]}
         legend
       />
-      {owners.length > 0 && (
-        <>
-          <BarRows
-            rows={owners.map((o) => ({
-              key: o.owner,
-              label: o.owner_title,
-              segments: waiting(o.pending, o.blocked),
-            }))}
-          />
-          <Legend lead="by owner, pending + blocked" items={waiting(0, 0)} />
-        </>
-      )}
-      {queue.oldest_seconds !== null && (
-        <p className="m-0 text-[11px] text-[var(--color-text-tertiary)]">
-          oldest waiting {formatAgeDays(queue.oldest_seconds / DAY_SECONDS)}
-        </p>
-      )}
     </Panel>
   );
 }
@@ -346,91 +333,57 @@ const MEETING_STAGES: Record<string, string> = {
   transcribe: "transcribe",
   diarize: "speakers",
   finalize: "assemble",
+  speaker: "voice match",
 };
 
-/** Recordings as a chain of stages, ending at the filed note. */
+/**
+ * Recordings by where they stand. Make partitions them into filed, awaiting a
+ * note and still in the pipeline; a failed or stuck stage holds its recording in
+ * the pipeline, so those come out of that share in the fail fill.
+ */
+export function meetingShares(meetings: MakeMeetings): { filed: number; waiting: number; flowing: number; stuck: number } {
+  const r = meetings.recordings;
+  const failed = meetings.stages.reduce((n, s) => n + (s.statuses.failed ?? 0), 0);
+  const stuck = Math.min(r.in_pipeline, failed + meetings.stuck.length);
+  return { filed: r.summarized, waiting: r.awaiting_summary, flowing: r.in_pipeline - stuck, stuck };
+}
+
 export function MeetingsPanel({ meetings }: { meetings: MakeMeetings | null }) {
   if (!meetings) return <Unavailable what="Meetings" />;
-  const r = meetings.recordings;
-  const stuck = new Set(meetings.stuck.map((s) => s.stage));
-  const nodes = [
-    ...meetings.stages.map((s) => {
-      const done = s.statuses.completed ?? 0;
-      const total = Object.values(s.statuses).reduce((a, b) => a + b, 0);
-      const failed = (s.statuses.failed ?? 0) + (stuck.has(s.stage) ? 1 : 0);
-      return { key: s.stage, label: MEETING_STAGES[s.stage] ?? s.stage, done, total, failed };
-    }),
-    { key: "note", label: "note filed", done: r.summarized, total: r.total, failed: 0 },
+  const { filed, waiting, flowing, stuck } = meetingShares(meetings);
+  const troubled = [
+    ...meetings.stages.filter((s) => s.statuses.failed).map((s) => `${MEETING_STAGES[s.stage] ?? s.stage} failed ×${s.statuses.failed}`),
+    ...meetings.stuck.map((s) => `stuck at ${MEETING_STAGES[s.stage] ?? s.stage}`),
   ];
+  const poll = meetings.poll;
   return (
     <Panel
       label="Meetings"
-      aside={meetings.poll ? `poll ${meetings.poll.failed ? "failed" : "ok"} · ${formatRelativeTimeOrNull(meetings.poll.last_finished_at, "never")}` : undefined}
+      aside={
+        poll ? (
+          <Stamp
+            icon={RefreshCw}
+            said={poll.failed ? "phone poll" : "last phone poll"}
+            color={poll.failed ? "var(--color-error)" : undefined}
+          >
+            {poll.failed ? "failed" : formatRelativeTimeOrNull(poll.last_finished_at, "never")}
+          </Stamp>
+        ) : undefined
+      }
     >
-      <Figure value={count(r.total)} unit="recordings" />
-      <ol className="m-0 flex list-none items-start p-0">
-        {nodes.map((n, i) => {
-          const complete = n.total > 0 && n.done === n.total;
-          const color = n.failed ? FILL.fail : complete ? RAMP[1] : FILL.warn;
-          return (
-            <li key={n.key} className="flex min-w-0 flex-1 flex-col items-center gap-1.5">
-              <div className="flex w-full items-center">
-                <span className={`h-px flex-1 ${i ? "bg-[var(--color-border-hover)]" : ""}`} />
-                <span
-                  title={`${n.label}: ${n.done} of ${n.total}`}
-                  className="grid h-7 w-7 shrink-0 place-items-center rounded-full text-[10px] font-semibold tabular-nums"
-                  style={{
-                    background: complete ? color : "var(--color-bg-surface)",
-                    border: `2px solid ${color}`,
-                    color: complete ? "var(--color-text-on-accent)" : "var(--color-text-primary)",
-                  }}
-                >
-                  {complete ? "✓" : n.total - n.done}
-                </span>
-                <span className={`h-px flex-1 ${i < nodes.length - 1 ? "bg-[var(--color-border-hover)]" : ""}`} />
-              </div>
-              <span className="truncate text-center text-[10px] text-[var(--color-text-tertiary)]">{n.label}</span>
-            </li>
-          );
-        })}
-      </ol>
+      <Figure value={formatNumber(meetings.recordings.total)} unit="recordings" />
+      <StackBar
+        segments={[
+          { key: "filed", value: filed, color: FILL.done, label: "filed" },
+          { key: "waiting", value: waiting, color: FILL.wait, label: "to file" },
+          { key: "flowing", value: flowing, color: FILL.flight, label: "in pipeline" },
+          { key: "stuck", value: stuck, color: FILL.fail, label: "stuck", title: troubled.join(", ") || "stuck" },
+        ]}
+        legend
+      />
     </Panel>
   );
 }
-
-// --- Spend --------------------------------------------------------------------------
-
-export function SpendTile({ spend }: { spend: MakeSpend | null }) {
-  if (!spend) return <Unavailable what="Spend" />;
-  const usd = (micros: number) => formatCost(microsToUsd(micros));
-  // Each day's amount rides on hover; the largest is printed under the columns.
-  const peak = spend.daily.reduce<MakeSpend["daily"][number] | null>(
-    (top, d) => (d.micros > (top?.micros ?? 0) ? d : top),
-    null,
-  );
-  return (
-    <>
-      <Figure value={usd(spend.total_micros)} unit={`${spend.days} days`} />
-      <DayColumns days={spend.daily.map((d) => ({ day: d.day, value: d.micros }))} height={36} format={usd} />
-      {peak && (
-        <p className="m-0 text-[11px] tabular-nums text-[var(--color-text-tertiary)]">
-          largest day {usd(peak.micros)},{" "}
-          {new Date(`${peak.day}T00:00:00Z`).toLocaleDateString("en-US", { month: "short", day: "numeric", timeZone: "UTC" })}
-        </p>
-      )}
-      <StackBar
-        height={6}
-        segments={spend.by_provider
-          .filter((p) => p.micros > 0)
-          .map((p, i) => ({ key: p.provider, value: p.micros, color: RAMP[i * 2] ?? FILL.quiet, label: p.provider }))}
-        format={usd}
-        legend
-      />
-    </>
-  );
-}
-
-// --- Activity -----------------------------------------------------------------------
 
 const FAMILY_LABEL: Record<string, string> = {
   media: "Images and video",
@@ -439,11 +392,12 @@ const FAMILY_LABEL: Record<string, string> = {
   evidence: "Evidence",
   catalog: "Catalog",
   brand: "Brand",
+  vault: "Vault",
 };
 
-/** Seven days of operations by family, split by how each ended. */
+/** The window's operations by family, split by how each ended; only failures take colour. */
 export function ActivityPanel({ mix }: { mix: MakeOperationMix | null }) {
-  if (!mix) return <Unavailable what="Activity" />;
+  if (!mix) return <Unavailable what="Operations" />;
   const families = new Map<string, Record<string, number>>();
   for (const k of mix.by_kind) {
     const family = k.kind.split(".")[0] ?? k.kind;
@@ -457,8 +411,8 @@ export function ActivityPanel({ mix }: { mix: MakeOperationMix | null }) {
   const failed = rows.reduce((n, r) => n + (r.s.failed ?? 0) + (r.s.ambiguous ?? 0), 0);
   const total = rows.reduce((n, r) => n + r.total, 0);
   const segment = (s: Record<string, number>, family: string): Segment[] => [
-    { key: "completed", value: s.completed ?? 0, color: FILL.quiet, label: "completed" },
-    { key: "running", value: (s.running ?? 0) + (s.queued ?? 0) + (s.dispatch_started ?? 0), color: RAMP[0], label: "running" },
+    { key: "completed", value: s.completed ?? 0, color: FILL.done, label: "completed" },
+    { key: "running", value: (s.running ?? 0) + (s.queued ?? 0) + (s.dispatch_started ?? 0), color: FILL.flight, label: "running" },
     { key: "cancelled", value: s.cancelled ?? 0, color: FILL.faint, label: "cancelled" },
     {
       key: "failed",
@@ -472,17 +426,47 @@ export function ActivityPanel({ mix }: { mix: MakeOperationMix | null }) {
     },
   ];
   return (
-    <Panel label={`Operations · ${mix.days} days`} aside={failed ? <span className="text-[var(--color-error)]">{failed} failed</span> : "none failed"}>
-      <Figure value={count(total)} unit="operations" />
+    <Panel
+      label={`Operations · ${mix.days} days`}
+      aside={failed ? <span className="text-[var(--color-error)]">{formatNumber(failed)} failed</span> : undefined}
+    >
+      <Figure value={formatNumber(total)} unit="operations" />
       <BarRows
         rows={rows.map((r) => ({ key: r.family, label: FAMILY_LABEL[r.family] ?? r.family, segments: segment(r.s, r.family) }))}
       />
-      <Legend items={segment({}, "")} />
+      <Legend items={segment({}, "").map(({ key, label, color }) => ({ key, label, color }))} />
     </Panel>
   );
 }
 
-// --- Storage ------------------------------------------------------------------------
+// --- Spent --------------------------------------------------------------------------
+
+/**
+ * The window's spend: the total, each day as a column, and the split by provider.
+ * The columns are the panel's one series and take the accent; the provider split
+ * supports them in the neutral steps, so no provider reads as the columns' colour.
+ */
+export function SpendPanel({ spend }: { spend: MakeSpend | null }) {
+  if (!spend) return <Unavailable what="Spend" />;
+  const usd = (micros: number) => formatCost(microsToUsd(micros));
+  const neutrals = [FILL.done, FILL.flight, FILL.faint];
+  return (
+    <>
+      <Figure value={usd(spend.total_micros)} unit={`${spend.days} days`} />
+      <DayColumns days={spend.daily.map((d) => ({ day: d.day, value: d.micros }))} height={56} format={usd} />
+      <StackBar
+        height={8}
+        segments={spend.by_provider
+          .filter((p) => p.micros > 0)
+          .map((p, i) => ({ key: p.provider, value: p.micros, color: neutrals[i] ?? FILL.faint, label: p.provider }))}
+        format={usd}
+        legend
+      />
+    </>
+  );
+}
+
+// --- Kept ---------------------------------------------------------------------------
 
 const CLASS_LABEL: Record<string, string> = {
   "document-output": "Documents",
@@ -516,7 +500,10 @@ function calendar(days: { day: string; bytes: number }[], span: number) {
   });
 }
 
-/** Bytes by file class (expiring share hatched) and the days they expire on. */
+/**
+ * Bytes by file class down the ramp with the expiring share hatched, then the days
+ * that share expires on, drawn in the same hatch as its legend swatch.
+ */
 export function StoragePanel({ storage }: { storage: MakeStorage | null }) {
   if (!storage) return <Unavailable what="Storage" />;
   const byClass = new Map<string, { bytes: number; expiring: number }>();
@@ -534,40 +521,28 @@ export function StoragePanel({ storage }: { storage: MakeStorage | null }) {
       key: name,
       value: c.bytes,
       hatched: c.expiring,
-      color: RAMP[i] ?? FILL.quiet,
+      color: RAMP[i] ?? FILL.done,
       label: CLASS_LABEL[name] ?? name,
       title: `${CLASS_LABEL[name] ?? name}: ${formatBytes(c.bytes)}${c.expiring ? `, ${formatBytes(c.expiring)} expiring` : ""}`,
     })),
-    ...(rest.bytes ? [{ key: "rest", value: rest.bytes, hatched: rest.expiring, color: FILL.quiet, label: "Other" }] : []),
+    ...(rest.bytes ? [{ key: "rest", value: rest.bytes, hatched: rest.expiring, color: FILL.done, label: "Other" }] : []),
   ];
   const total = sorted.reduce((n, [, c]) => n + c.bytes, 0);
-  const { expiring, reclaimed, grace_days } = storage.retention;
+  const { expiring } = storage.retention;
   const upcoming = calendar(expiring.by_day, 28);
   return (
-    <div className="grid gap-x-12 gap-y-8 lg:grid-cols-[3fr_2fr]">
-      <Panel label="Catalogued bytes" aside={`${formatBytes(expiring.bytes)} expiring (hatched)`}>
-        <Figure value={formatBytes(total)} />
-        <StackBar segments={segments} height={14} format={formatBytes} legend />
-      </Panel>
-      <Panel label="Expiry calendar" aside={`${grace_days}-day grace · ${formatBytes(reclaimed.bytes)} reclaimed in ${reclaimed.days} d`}>
-        {upcoming.length ? (
-          <>
-            <DayColumns
-              days={upcoming.map((d) => ({ day: d.day, value: d.bytes }))}
-              height={56}
-              color={FILL.warn}
-              format={formatBytes}
-            />
-            <div className="flex justify-between font-mono text-[10px] text-[var(--color-text-tertiary)]">
-              <span>{upcoming[0]?.day.slice(5)}</span>
-              <span>{upcoming.at(-1)?.day.slice(5)}</span>
-            </div>
-          </>
-        ) : (
-          <p className="m-0 text-xs text-[var(--color-text-tertiary)]">Nothing is due to expire.</p>
-        )}
-      </Panel>
-    </div>
+    <>
+      <Figure value={formatBytes(total)} />
+      <StackBar
+        segments={segments}
+        height={14}
+        format={formatBytes}
+        legend
+        extra={[{ key: "expiring", label: "expiring", color: FILL.done, value: formatBytes(expiring.bytes), hatched: true }]}
+      />
+      {upcoming.length > 0 && (
+        <DayColumns days={upcoming.map((d) => ({ day: d.day, value: d.bytes }))} height={40} color={FILL.done} hatched format={formatBytes} />
+      )}
+    </>
   );
 }
-
