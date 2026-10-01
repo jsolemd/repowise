@@ -51,7 +51,8 @@ def _render_performance_section(report: Any, lang_by_path: dict[str, str]) -> No
         cov_line += f"; {coverage.skipped_files} skipped in unsupported languages ({langs})"
     console.print(cov_line)
     console.print(
-        "[dim]Scope: I/O-in-loop / N+1, resource/regex/defer-in-loop, blocking-in-async. "
+        "[dim]Scope: I/O-in-loop (N+1 on database calls), resource/regex/defer-in-loop, "
+        "blocking-in-async. "
         "Not covered: algorithmic blowups, GC pressure, ORM lazy-load N+1.[/dim]"
     )
 
@@ -96,13 +97,13 @@ def _render_badge(average_health: object) -> None:
     Emits a static shields badge for the current score (immediately usable) and
     documents the live endpoint form for a running Repowise server / hosted repo.
     """
-    from repowise.core.analysis.health.grading import BAND_BADGE_COLOR, band_for
+    from repowise.core.analysis.health.grading import BAND_BADGE_COLOR, band_for, format_score
 
     if not isinstance(average_health, (int, float)):
         console.print("[yellow]No health score yet — run `repowise health` first.[/yellow]")
         return
     color = BAND_BADGE_COLOR[band_for(float(average_health))]
-    msg = f"{float(average_health):.1f}/10"
+    msg = f"{format_score(float(average_health))}/10"
     static = f"https://img.shields.io/badge/health-{msg.replace('/', '%2F')}-{color}"
     console.print("[bold]Static badge (current score):[/bold]")
     console.print(f"  ![code health]({static})")

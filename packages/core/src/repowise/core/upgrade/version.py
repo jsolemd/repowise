@@ -77,7 +77,15 @@ STORE_FORMAT_VERSION: int = 2
 #: case-insensitive TSX grammar selection. Keep old extraction caches invalid.
 #: v7: v0.53 expands PHP grouped imports and Rust extraction helpers.
 #: Python helper bodies are not covered by the query/dataclass fingerprint.
-PARSER_SCHEMA_VERSION: int = 7
+#: v8: v0.54 carries upstream's own v4 and v5. Python absolute imports resolve
+#: only by their full dotted path (no stem guess, no sibling lookup inside a
+#: package, never the importer itself), and ``from pkg import a, b`` over
+#: submodules no longer edges into ``pkg/__init__.py``; an overload signature
+#: (Python ``@overload``, TypeScript function / method overload) is marked
+#: ``is_declaration`` so lookups serve the implementation. Python qualified
+#: names use the importable module. Upstream's 4 and 5 are numerals the fork
+#: already sealed live caches with, so the merged schema moves past both.
+PARSER_SCHEMA_VERSION: int = 8
 
 #: state.json key holding the store format version that wrote the store.
 STORE_FORMAT_VERSION_KEY = "store_format_version"

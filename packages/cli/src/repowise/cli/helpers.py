@@ -217,18 +217,24 @@ def get_db_url_for_repo(repo_path: Path) -> str:
 
 
 @contextlib.asynccontextmanager
-async def repo_index_session(root: Path) -> AsyncIterator[tuple[AsyncSession, str] | None]:
+async def repo_index_session(
+    root: Path, *, reconcile: bool = True
+) -> AsyncIterator[tuple[AsyncSession, str] | None]:
     """Open the repo-local store, yielding ``(session, repo_id)`` or ``None``.
 
     A scoring or scanning command must never fail because the index is absent,
     stale or locked, so every storage error yields ``None`` instead.
+    ``reconcile=False`` skips the schema reconcile, so a caller that only reads
+    writes nothing to the store.
     """
     from sqlalchemy.exc import SQLAlchemyError
 
     from repowise.core.persistence import create_engine, create_session_factory, get_session
     from repowise.core.persistence.crud import get_repository_by_path
+    from repowise.core.persistence.database import has_db_store
 
-    if not (root / REPOWISE_DIR / "wiki.db").is_file():
+    # The configured store, which may live outside the repo (REPOWISE_DB_URL).
+    if not has_db_store(root):
         yield None
         return
     # The stack keeps the session open across the yield and disposes the engine
@@ -236,7 +242,10 @@ async def repo_index_session(root: Path) -> AsyncIterator[tuple[AsyncSession, st
     async with contextlib.AsyncExitStack() as stack:
         opened: tuple[AsyncSession, str] | None = None
         try:
-            engine = create_engine(get_db_url_for_repo(root))
+            url = get_db_url_for_repo(root)
+            if reconcile:
+                await reconcile_schema_best_effort(url)
+            engine = create_engine(url)
             stack.push_async_callback(engine.dispose)
             factory = create_session_factory(engine)
             session = await stack.enter_async_context(get_session(factory))
@@ -630,8 +639,8 @@ def head_commit_ts(repo_path: Path) -> float | None:
     """Committer timestamp of the repo's HEAD, or None when git is unavailable.
 
     Anchors the periodic idle-file health re-score gate (#728) to repo time
-    rather than wall clock, so the cadence is deterministic under
-    ``REPOWISE_GIT_WINDOW_ANCHOR`` and correct for historical checkouts.
+    rather than wall clock, the same anchor the git history windows use, so
+    the cadence is deterministic and correct for historical checkouts.
 
     Shared with ``init`` so a fresh index can stamp ``last_full_rescore_at`` in
     the same units the gate reads it back in.

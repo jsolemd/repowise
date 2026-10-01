@@ -199,22 +199,52 @@ def clean_string_literal(text: str) -> str:
     return text
 
 
+# Statements a declaration sits inside when its JSDoc is written above the
+# whole statement: ``/** doc */ export const f = () => {}`` puts the comment
+# beside the export_statement, not beside the declarator. ``declare`` wraps a
+# declaration in an ambient_declaration the same way.
+_JSDOC_WRAPPER_TYPES = frozenset(
+    {
+        "export_statement",
+        "ambient_declaration",
+        "lexical_declaration",
+        "variable_declaration",
+        "variable_declarator",
+    }
+)
+
+
+def _leads_statement(node: Node, parent: Node) -> bool:
+    """Whether *node* is *parent*'s first named child other than comments and decorators."""
+    first = next((c for c in parent.named_children if c.type not in ("comment", "decorator")), None)
+    return first is not None and first.id == node.id
+
+
 def find_preceding_jsdoc(node: Node, src: str) -> str | None:
-    """Return JSDoc immediately before a declaration or its export wrapper."""
-    while (parent := node.parent) is not None:
-        prev = node.prev_sibling
-        if prev is not None and prev.type == "comment":
-            text = node_text(prev, src).strip()
-            # The nearest comment owns this position, even when it is not
-            # JSDoc. Never borrow an outer comment across an intervening one.
-            return clean_jsdoc(text) if text.startswith("/**") else None
-        if parent.type != "export_statement":
-            break
-        # In `/** ... */ export [default] function/class ...`, the comment
-        # precedes the export statement, not the captured declaration node.
-        # Only this immediate wrapper is transparent; members and nested
-        # declarations must not inherit their containing declaration's docs.
-        node = parent
+    """Return the JSDoc comment written directly above *node*, if any.
+
+    Climbs out of the export / declaration wrappers *node* leads (never past
+    them, so never past ``program``), steps over the node's own decorators,
+    and requires the comment to touch the declaration with no blank line, so a
+    file-header comment never documents the first export.
+    """
+    parent = node.parent
+    while (
+        parent is not None
+        and parent.type in _JSDOC_WRAPPER_TYPES
+        and _leads_statement(node, parent)
+    ):
+        node, parent = parent, parent.parent
+    prev = node.prev_sibling
+    while prev is not None and prev.type == "decorator":
+        node, prev = prev, prev.prev_sibling
+    if prev is None or prev.type != "comment":
+        return None
+    if node.start_point[0] - prev.end_point[0] > 1:
+        return None
+    text = node_text(prev, src).strip()
+    if text.startswith("/**"):
+        return clean_jsdoc(text)
     return None
 
 

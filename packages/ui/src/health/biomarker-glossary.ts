@@ -89,10 +89,10 @@ export const BIOMARKER_GLOSSARY: Record<string, BiomarkerInfo> = {
       "A function with too many non-comment lines of code. Even simple logic gets hard to hold in your head past a point.",
   },
   primitive_obsession: {
-    label: "Primitive obsession",
+    label: "Long parameter list",
     category: "size_and_complexity",
     description:
-      "Many primitive parameters where a domain object would carry the same data. Calls become positional and easy to mismatch.",
+      "A function that takes many parameters, where a value object would often carry the same data. Calls become positional and easy to mismatch. Test cases are skipped: their parameters are injected fixtures.",
   },
   dry_violation: {
     label: "DRY violation",
@@ -134,7 +134,7 @@ export const BIOMARKER_GLOSSARY: Record<string, BiomarkerInfo> = {
     label: "Hidden coupling",
     category: "organizational",
     description:
-      "Two files co-change in git history but have no explicit import between them. The implicit contract is invisible at the source level, so changes slip out of sync and break in production.",
+      "Two files co-change in git history but have no explicit import between them. The implicit contract is invisible at the source level, so changes slip out of sync and break in production. Advisory: it costs this file no points.",
   },
   complex_conditional: {
     label: "Complex conditional",
@@ -248,7 +248,7 @@ export const BIOMARKER_GLOSSARY: Record<string, BiomarkerInfo> = {
     label: "I/O in loop",
     category: "performance",
     description:
-      "A database call, network request, filesystem read, or subprocess spawn that runs once per loop iteration — the classic N+1. Detected across function boundaries via the call graph, resolved to a classified I/O boundary. A static performance RISK (high precision, low recall), not measured runtime.",
+      "A database call, network request, filesystem read, or subprocess spawn that runs once per loop iteration. On a database boundary this is the classic N+1 query; elsewhere it is an I/O call inside a loop. Detected across function boundaries via the call graph, resolved to a classified I/O boundary. A static performance RISK (high precision, low recall), not measured runtime.",
   },
   string_concat_in_loop: {
     label: "String concat in loop",
@@ -382,13 +382,15 @@ export type BiomarkerDimension = "defect" | "maintainability" | "performance" | 
 
 /**
  * Biomarkers that home to the non-scoring `advisory` dimension. They measure
- * something real that no defect corpus labels, so they never deduct and the
- * chip has to say so rather than borrowing the defect pillar's label. Mirror of
+ * something real that no defect corpus labels, or that showed no defect signal
+ * when tested, so they never deduct and the chip has to say so rather than
+ * borrowing the defect pillar's label. Mirror of
  * ``_ADVISORY_HOME`` in core's `scoring.py`.
  */
 export const ADVISORY_HOME_BIOMARKERS: ReadonlySet<string> = new Set([
   "assertion_free_test",
   "mock_saturated_test",
+  "hidden_coupling",
 ]);
 
 /**
@@ -530,6 +532,21 @@ export const HISTORY_CHIP =
   "bg-[var(--color-bg-elevated)] text-[var(--color-text-secondary)]";
 
 export const HISTORY_LABEL = "Watch";
+
+/**
+ * History-category markers that are still work: writing or updating a
+ * decision clears them. Mirrors core `GOVERNANCE_BIOMARKERS`.
+ */
+const GOVERNANCE_BIOMARKERS: ReadonlySet<string> = new Set([
+  "ungoverned_hotspot",
+  "stale_governance",
+  "contradictory_decision",
+]);
+
+/** A marker nothing in the repository can clear: context for a reviewer. */
+export function isWatchOnlyBiomarker(name: string): boolean {
+  return isHistoryBiomarker(name) && !GOVERNANCE_BIOMARKERS.has(name);
+}
 
 export const HISTORY_EXPLAINER =
   "Measured from this file's git history, not its code. Editing the file will not clear it.";

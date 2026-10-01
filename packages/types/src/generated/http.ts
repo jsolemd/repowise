@@ -9,6 +9,82 @@
 // `?` mirrors the schema's `required` list, which states what a request may
 // omit. A response field with a server-side default is still always sent.
 
+export interface ActionCommand {
+  purpose: string;
+  mcp?: string | null;
+  cli?: string | null;
+}
+
+export interface ActionContext {
+  production_files: number;
+  active_authors_90d: number;
+  fix_commits_90d: number;
+  busy_threshold: number;
+  coverage: "measured" | "stale" | "unknown";
+}
+
+export interface ActionDetail {
+  path: string;
+  line?: number | null;
+  symbol?: string | null;
+  marker?: string | null;
+  severity?: string | null;
+  reason?: string;
+  ref?: string | null;
+}
+
+export interface ActionHorizon {
+  actions: NextAction[];
+  /** Every visible action in this horizon, not only those listed. */
+  total: number;
+  /** Actions the person dismissed, snoozed or marked done. */
+  hidden: number;
+  by_tier: Record<string, number>;
+}
+
+export interface ActionRuleStatus {
+  rule: string;
+  status: "evaluated" | "not_applicable" | "unavailable";
+  reason: string;
+  emitted: number;
+}
+
+export interface ActionStateRequest {
+  /** None clears the person's answer. */
+  state: "dismissed" | "snoozed" | "done" | null;
+  fingerprint?: string;
+  snooze_days?: number;
+}
+
+export interface ActionStateResponse {
+  action_id: string;
+  state: "dismissed" | "snoozed" | "done" | null;
+  until?: string | null;
+}
+
+export interface ActionTarget {
+  kind: "file" | "symbol" | "folder" | "document" | "decision" | "repo";
+  path: string;
+  symbol?: string | null;
+}
+
+export interface ActionWhy {
+  label: string;
+  value: string;
+  basis: "measured" | "inferred" | "unknown";
+}
+
+export interface ActionsResponse {
+  status: "available";
+  /** Newest indexed commit time; windows count back from it. */
+  anchor: string | null;
+  week_start: string | null;
+  context: ActionContext;
+  horizons: Record<string, ActionHorizon>;
+  rules: ActionRuleStatus[];
+  unavailable: Record<string, string>;
+}
+
 /** The provider/model this scope resolves to; ``None`` when unset. */
 export interface ActiveProviderSelection {
   provider?: string | null;
@@ -708,6 +784,56 @@ export interface CouplingNodeResponse {
   nloc?: number;
 }
 
+/** One ingested report's repo-wide figures, as ``crud.load_coverage_history`` reads them. */
+export interface CoverageHistoryPoint {
+  ingested_at: string;
+  ingested_commit_sha: string | null;
+  line_coverage_pct: number;
+  branch_coverage_pct: number | null;
+}
+
+/** How the report's own file entries mapped to the repository at ingest. */
+export interface CoverageReportPaths {
+  total: number;
+  matched: number;
+  unmatched: number;
+  ambiguous: number;
+  unmatched_sample: string[];
+}
+
+/** ``GET /health/coverage``. ``basis`` is absent when the graph was not consulted. */
+export interface CoverageResponse {
+  summary: CoverageSummary;
+  files: Record<string, unknown>[];
+  modules: Record<string, unknown>[];
+  modules_total: number;
+  basis?: "measured" | "inferred" | "none" | null;
+  inferred?: Record<string, unknown> | null;
+  history?: CoverageHistoryPoint[] | null;
+}
+
+/** The repository's stored coverage, aggregated. Zero counts and nulls when none is stored. */
+export interface CoverageSummary {
+  file_count: number;
+  covered_lines: number;
+  total_lines: number;
+  line_coverage_pct: number | null;
+  branch_coverage_pct: number | null;
+  source_format: string | null;
+  source_formats: string[];
+  mapping_partial: boolean | null;
+  ingested_at: string | null;
+  ingested_commit_sha: string | null;
+  report_paths: CoverageReportPaths | null;
+  freshness: CoverageSummaryFreshness | null;
+}
+
+/** Whether the coverage was measured at the commit the index describes. */
+export interface CoverageSummaryFreshness {
+  status: "current" | "stale" | "unknown";
+  indexed_commit: string | null;
+}
+
 /** 202 launch payload for a re-analysis (an index-only job, no LLM work). */
 export interface DeadCodeAnalyzeResponse {
   job_id: string;
@@ -723,7 +849,7 @@ export interface DeadCodeFindingResponse {
   symbol_kind: string | null;
   confidence: number;
   reason: string;
-  lines: number;
+  lines: number | null;
   start_line: number | null;
   end_line: number | null;
   safe_to_delete: boolean;
@@ -734,6 +860,7 @@ export interface DeadCodeFindingResponse {
   note: string | null;
   last_commit_at: string | null;
   commit_count_90d: number;
+  verification?: string | null;
 }
 
 export interface DeadCodeGraphNodeResponse {
@@ -1105,6 +1232,11 @@ export interface DocDriftFindingResponse {
   raw: string;
   context: string;
   evidence: string[];
+  fingerprint: string;
+  suggestion?: string | null;
+  suggestion_basis?: string | null;
+  first_seen_at?: string | null;
+  is_new?: boolean;
 }
 
 /**
@@ -1153,6 +1285,7 @@ export interface DocDriftSummaryResponse {
   confidence: Record<string, number>;
   by_kind: Record<string, number>;
   findings_basis: string;
+  new_since_last_update?: number | null;
 }
 
 export interface EgoGraphResponse {
@@ -1510,6 +1643,7 @@ export interface GitMetadataResponse {
   primary_owner_name: string | null;
   primary_owner_email: string | null;
   primary_owner_commit_pct: number | null;
+  primary_owner_line_pct?: number | null;
   recent_owner_name: string | null;
   recent_owner_commit_pct: number | null;
   top_authors: Record<string, unknown>[];
@@ -1653,6 +1787,7 @@ export interface HealthFindingResponse {
   details?: Record<string, unknown>;
   status: string;
   dimension?: string;
+  verification?: string | null;
 }
 
 /**
@@ -1674,6 +1809,7 @@ export interface HealthFindingWithSymbolResponse {
   details?: Record<string, unknown>;
   status: string;
   dimension?: string;
+  verification?: string | null;
   symbol_id?: string | null;
 }
 
@@ -1706,6 +1842,7 @@ export interface HealthTrendKpiRow {
   structure_average?: number | null;
   history_average?: number | null;
   maintainability_average?: number | null;
+  doc_drift_count?: number | null;
 }
 
 export interface HealthTrendResponse {
@@ -1997,6 +2134,32 @@ export interface NeighboringCommunity {
   cross_edge_count: number;
 }
 
+export interface NextAction {
+  id: string;
+  rule: string;
+  tier: "act_now" | "plan" | "improve_signal";
+  horizons: ("week" | "quarter")[];
+  severity: "critical" | "high" | "medium" | "low";
+  /** Verb first; paths and symbols wrapped in backticks. */
+  title: string;
+  impact: string;
+  why: ActionWhy[];
+  target: ActionTarget;
+  surface: string;
+  effort: "S" | "M" | "L";
+  confidence: "high" | "medium";
+  done_when: string;
+  command?: string | null;
+  marker?: string | null;
+  evidence_ids: string[];
+  evidence_total: number;
+  includes: string[];
+  fingerprint: string;
+  details?: ActionDetail[];
+  details_total?: number;
+  commands?: ActionCommand[];
+}
+
 export interface NodeSearchResult {
   node_id: string;
   language: string;
@@ -2049,7 +2212,7 @@ export interface OwnerListEntry {
   silo_modules: number;
   dead_code_files_owned: number;
   dead_code_lines_owned: number;
-  commit_count_90d: number;
+  commit_count_90d: number | null;
   last_commit_at: string | null;
   bus_factor_risk_files: number;
 }
@@ -2070,7 +2233,7 @@ export interface OwnerProfileResponse {
   silo_modules: number;
   dead_code_files_owned: number;
   dead_code_lines_owned: number;
-  commit_count_90d: number;
+  commit_count_90d: number | null;
   last_commit_at: string | null;
   first_commit_at: string | null;
   bus_factor_risk_files: number;
@@ -2185,6 +2348,152 @@ export interface Paginated_SymbolResponse_ {
   total: number;
   has_more: boolean;
   next_offset?: number | null;
+}
+
+/** Branches on changed lines, reported beside patch coverage, never blended into it. */
+export interface PatchCoverageBranches {
+  branch_taken: number;
+  branch_total: number;
+  branch_coverage_pct: number | null;
+  partial_line_count: number;
+  threshold: number | null;
+  gate: "pass" | "fail" | "no_data" | "not_set" | "too_small";
+}
+
+export interface PatchCoverageFile {
+  file_path: string;
+  status: "measured" | "not_in_report" | "no_line_data" | "no_coverable_changes";
+  changed_line_count: number;
+  coverable_line_count: number;
+  covered_line_count: number;
+  patch_coverage_pct: number | null;
+  uncovered_ranges: number[][];
+  branch_taken: number;
+  branch_total: number;
+  partial_ranges: number[][];
+  risk: PatchCoverageFileRisk | null;
+  hints: PatchCoverageTestHint[] | null;
+}
+
+export interface PatchCoverageFileCounts {
+  measured: number;
+  not_in_report: number;
+  no_line_data: number;
+  no_coverable_changes: number;
+  out_of_scope: number;
+}
+
+export interface PatchCoverageFileRisk {
+  fix_pressure: number | null;
+  dependents: number | null;
+  hotspot: boolean | null;
+  bug_magnet: boolean | null;
+  basis: "git" | "index" | "git_and_index" | "unavailable";
+  risky: boolean;
+  reasons: string[];
+}
+
+/** A file whose coverage changed on lines the change did not touch. */
+export interface PatchCoverageOutsideChange {
+  file_path: string;
+  status: "changed" | "no_longer_measured";
+  newly_uncovered_ranges: number[][];
+  newly_uncovered_line_count: number;
+  newly_covered_line_count: number;
+  base_pct: number | null;
+  head_pct: number | null;
+  causes: PatchCoverageOutsideChangeCause[] | null;
+}
+
+/** A changed file that explains coverage lost outside the change. */
+export interface PatchCoverageOutsideChangeCause {
+  kind: "test_deleted" | "test_modified" | "dependent_changed";
+  path: string;
+  basis: "per_test" | "graph" | "name";
+}
+
+/** One path-scoped gate from ``coverage.gates``, judged on the change. */
+export interface PatchCoveragePathGate {
+  name: string;
+  paths: string[];
+  threshold: number | null;
+  informational: boolean;
+  measured_file_count: number;
+  unmeasured_file_count: number;
+  covered_line_count: number;
+  coverable_line_count: number;
+  patch_coverage_pct: number | null;
+  gate: "pass" | "fail" | "no_data" | "not_set" | "too_small";
+}
+
+/** Project coverage at the change's base against its head. */
+export interface PatchCoverageProject {
+  basis: "base_report" | "history";
+  base_commit: string | null;
+  head_commit: string | null;
+  base: PatchCoverageProjectTotals | null;
+  head: PatchCoverageProjectTotals | null;
+  delta_pct: number | null;
+  max_drop: number | null;
+  gate: "pass" | "fail" | "no_data" | "not_set" | "too_small";
+  incomparable: string[];
+  outside_change: PatchCoverageOutsideChange[] | null;
+  outside_change_note: string | null;
+}
+
+export interface PatchCoverageProjectTotals {
+  covered_line_count: number;
+  coverable_line_count: number;
+  coverage_pct: number | null;
+}
+
+export interface PatchCoverageResponse {
+  patch_coverage_pct: number | null;
+  covered_line_count: number;
+  coverable_line_count: number;
+  threshold: number | null;
+  min_coverable_lines: number | null;
+  gate: "pass" | "fail" | "no_data" | "not_set" | "too_small";
+  file_counts: PatchCoverageFileCounts;
+  files: PatchCoverageFile[];
+  scope: PatchCoverageScope;
+  path_gates: PatchCoveragePathGate[];
+  risky: PatchCoverageRisky | null;
+  project: PatchCoverageProject | null;
+  branches: PatchCoverageBranches | null;
+}
+
+/** Patch coverage over the measured files history marks as risky. */
+export interface PatchCoverageRisky {
+  file_count: number;
+  covered_line_count: number;
+  coverable_line_count: number;
+  patch_coverage_pct: number | null;
+  threshold: number | null;
+  gate: "pass" | "fail" | "no_data" | "not_set" | "too_small";
+}
+
+export interface PatchCoverageScope {
+  label: string;
+  source_formats: string[];
+  reports: string[];
+  report_path_count: number | null;
+  unmatched_report_path_count: number | null;
+  mapping_partial: boolean;
+  measured_commit: string | null;
+  freshness: "current" | "stale" | "unknown";
+  ignored_file_count: number;
+  config_errors: string[];
+  branch_data: "per_line" | "none" | "stored_before" | null;
+}
+
+/** Where to extend the tests for one uncovered range. */
+export interface PatchCoverageTestHint {
+  range: number[];
+  symbol: string | null;
+  tests: string[];
+  basis: "per_test" | "call_graph" | "import_graph" | "none";
+  total: number;
 }
 
 /**
@@ -2898,6 +3207,11 @@ export interface WebhookResponse {
   status?: string;
 }
 
+export interface WorkspaceActionsResponse {
+  repos: WorkspaceRepoActions[];
+  cross_repo: WorkspaceCrossRepoAction[];
+}
+
 /** Architecture-complexity metrics over the system graph (Phase 6). */
 export interface WorkspaceArchitectureResponse {
   node_count?: number;
@@ -3075,6 +3389,14 @@ export interface WorkspaceContractsResponse {
   by_type?: Record<string, number>;
 }
 
+export interface WorkspaceCrossRepoAction {
+  kind: "breaking_contract";
+  title: string;
+  impact: string;
+  count: number;
+  repos: string[];
+}
+
 export interface WorkspaceCrossRepoSummary {
   co_change_count?: number;
   package_dep_count?: number;
@@ -3164,6 +3486,14 @@ export interface WorkspaceOrphanProvider {
   file_path: string;
   contract_id: string;
   contract_type: string;
+}
+
+export interface WorkspaceRepoActions {
+  alias: string;
+  repo_id: string | null;
+  status: "available" | "unavailable";
+  reason?: string;
+  horizons?: Record<string, ActionHorizon>;
 }
 
 export interface WorkspaceRepoDiagnostics {

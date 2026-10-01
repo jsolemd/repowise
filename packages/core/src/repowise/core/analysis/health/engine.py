@@ -20,7 +20,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
-import time
 from datetime import UTC, datetime
 from typing import Any
 
@@ -39,16 +38,18 @@ from ...ingestion.package_roots import module_for as _module_for
 from ...ingestion.package_roots import package_roots_from_paths as _package_roots
 from ...ingestion.package_roots import scan_package_roots as _scan_package_roots
 from ...test_paths import paired_test_names
+from ..dead_code.file_reachability import file_dependency_neighbors
 from ..graph_view import HasEdge, ImportEdgeView
-from ..test_reachability import files_reached_by_tests
+from ..test_reachability import files_reached_by_tests, files_with_paired_tests
 from .asserts.lexicon import AssertVocabulary
 from .asserts.oracle_reach import collect_cross_file_oracles
 from .biomarkers import FileContext, detect_all
 from .complexity import FileComplexity, FunctionComplexity, walk_file
 from .coverage import is_test_file as _coverage_is_test_file
 from .dataflow import FileDataflowCache
-from .duplication import DuplicationReport
+from .duplication import ClonePair, DuplicationReport
 from .duplication.isolation import detect_clones_with_isolation as detect_clones
+from .history_refresh import BLAME_MARKERS, as_biomarker_result
 from .models import HealthFileMetricData, HealthFindingData, HealthReport, Severity
 from .perf import (
     CallGraphIndex,
@@ -105,7 +106,14 @@ log = structlog.get_logger(__name__)
 # Not a licence to move a calibrated scoring weight — those are frozen
 # independently of this stamp.
 #
-# Current stamp: a multi-item ``with`` header is classified on its oracle rather
+# Current stamp: which files are tests changed (``repowise.core.test_paths``).
+# Compound directories headed by a test word (``e2e-tests/``, ``pkg_tests/``,
+# ``integration_test/``) became test trees, and ``test``/``.test.`` filenames
+# stopped counting on configuration (``tsconfig.test.json``, a workflow's
+# ``*.test.yml``) and on a bare non-Python ``test.ts``. Every biomarker that
+# exempts or targets tests reads that flag, so stored findings move.
+#
+# v35 (also): a multi-item ``with`` header is classified on its oracle rather
 # than on whichever context manager the author happened to type first.
 # ``assert_call_kinds`` is the language's plain call node, not an assertion
 # shape, so the header scan returned the first call it met and classified only
@@ -113,6 +121,28 @@ log = structlog.get_logger(__name__)
 # ``with atomic(), pytest.raises(E):`` counted one. Each item is classified now,
 # and a declining call's arguments are not scanned, so an assertion passed as an
 # argument still does not stand in for the header's oracle.
+#
+# v36: files a package manifest declares (package.json ``bin``, a built
+# ``main`` mapped to its source, a distribution's package ``__init__``) are
+# entry points, so perf findings reachable from them are marked so.
+#
+# v35: the update's full re-score reads every stored git column, so the
+# percentile gates of ``prior_defect`` and ``co_change_scatter`` see their
+# inputs, and it keeps the stored blame-marker findings it cannot recompute.
+# A store an older re-score wrote is missing those findings.
+#
+# v34: ``hidden_coupling`` is advisory: still detected and stored, it no longer
+# deducts from the defect score, so every stored score that carried one moves.
+#
+# v33: git history windows are measured from the indexed commit's committer
+# date instead of wall-clock time, by default. ``code_age_volatility`` and the
+# per-function blame rollup read line ages from the same anchor, so a store
+# scored against wall-clock time holds different windowed findings for any repo
+# whose last commit is not today.
+#
+# v32: the history (organizational) cap follows the file's structure half,
+# ``history_cap(structure)`` in scoring.py, so every stored score that carries
+# a history deduction, and the refactoring impact figures, move.
 #
 # v31: Pascal opts into assertion detection (``assert_call_kinds``): DUnit's
 # ``Check``/``CheckEquals``/``Fail`` family (a new ``asserts/lexicon.py`` row,
@@ -305,7 +335,7 @@ log = structlog.get_logger(__name__)
 # forms. Files that were counted untested and are not become tested, which
 # moves untested-hotspot findings and the scores that carry them, on every
 # language with a prefix or spec convention rather than Ruby alone.
-HEALTH_ANALYZER_VERSION = 31
+HEALTH_ANALYZER_VERSION = 36
 
 
 def walked_functions(
@@ -374,6 +404,25 @@ def _read_source_lines(abs_path: str, read_source: SourceReader) -> list[str] | 
     return text.splitlines()
 
 
+def _clone_sources(
+    file_path: str,
+    own_lines: list[str],
+    clones: list[ClonePair],
+    abs_paths: dict[str, str],
+    read_source: SourceReader,
+) -> dict[str, list[str]]:
+    """This file's lines plus each clone partner's, for text-level checks."""
+    out = {file_path: own_lines}
+    for clone in clones:
+        for path in (clone.file_a, clone.file_b):
+            if path in out or path not in abs_paths:
+                continue
+            lines = _read_source_lines(abs_paths[path], read_source)
+            if lines is not None:
+                out[path] = lines
+    return out
+
+
 def _percentile_p80(counts: list[int]) -> int | None:
     """80th percentile of *counts* using the inclusive-lower convention
     already used by ``churn_percentile`` in ``enrich.compute_percentiles``.
@@ -424,6 +473,11 @@ def _compute_repo_function_mod_p80(
     return _percentile_p80(counts)
 
 
+def _dependents_count(graph: Any, path: str) -> int:
+    """Distinct files that depend on *path* in code; co-change is history, not a dependent."""
+    return len(set(file_dependency_neighbors(graph, path, incoming=True)))
+
+
 def _compute_repo_dependents_p80(parsed_files: list[Any], graph: Any) -> int | None:
     """Repo-wide 80th percentile of file-level in-degree (dependents).
 
@@ -443,10 +497,7 @@ def _compute_repo_dependents_p80(parsed_files: list[Any], graph: Any) -> int | N
         path = pf.file_info.path
         if path not in graph:
             continue
-        try:
-            deg = int(graph.in_degree(path))
-        except Exception:
-            continue
+        deg = _dependents_count(graph, path)
         if deg > 0:
             counts.append(deg)
     return _percentile_p80(counts)
@@ -500,10 +551,12 @@ class HealthAnalyzer:
         duplication_cache_dir: Any | None = None,
         repo_root: Any | None = None,
         source_reader: SourceReader | None = None,
+        stored_blame_findings: dict[str, list[Any]] | None = None,
     ) -> None:
         self.graph = graph
         self.git_meta_map = git_meta_map or {}
         self.parsed_files = list(parsed_files or [])
+        self._abs_paths = {pf.file_info.path: pf.file_info.abs_path for pf in self.parsed_files}
         # Per-file coverage keyed by repo-relative POSIX path. Each value
         # is ``{line_coverage_pct, branch_coverage_pct, covered_lines,
         # total_coverable_lines}``. ``None``-equivalent files are simply
@@ -533,6 +586,10 @@ class HealthAnalyzer:
         # Every source read in the pass. Defaults to the working tree; a
         # revision comparison supplies bytes instead.
         self.read_source: SourceReader = source_reader or disk_source_reader
+        # Stored ``BLAME_MARKERS`` findings by path, replayed for a file scored
+        # without a blame index (a re-score from stored git metadata) so the
+        # pass does not delete what it cannot recompute.
+        self.stored_blame_findings = stored_blame_findings or {}
         self._package_roots_cache: set[str] | None = None
         self._tests_reach_cache: set[str] | None = None
         self._execution_graph_cache: CallGraphIndex | None = None
@@ -561,6 +618,21 @@ class HealthAnalyzer:
             index = self._execution_graph()
             self._tests_reach_cache = files_reached_by_tests(index or CallGraphIndex(), test_files)
         return self._tests_reach_cache
+
+    def _paired_tests(self, analyzed_paths: set[str]) -> set[str]:
+        """Analyzed files a test is paired with; see ``files_with_paired_tests``.
+
+        Test files come from the graph as well as this pass, so an incremental
+        run that re-parses only the changed files still sees every test.
+        """
+        test_files = {pf.file_info.path for pf in self.parsed_files if pf.file_info.is_test}
+        if self.graph is not None:
+            test_files.update(
+                node
+                for node, data in self.graph.nodes(data=True)
+                if data.get("is_test") and data.get("node_type") != "symbol"
+            )
+        return files_with_paired_tests(self.graph, analyzed_paths, test_files)
 
     def _package_boundaries(self, analyzed_paths: set[str]) -> set[str]:
         """Package roots for this repo, decided once per analyzer.
@@ -643,7 +715,7 @@ class HealthAnalyzer:
         # is symbol-level; we use file-level in-degree as the dependents
         # signal (cheap, deterministic, conservative).
         analyzed_paths = {pf.file_info.path for pf in self.parsed_files}
-        path_basenames = _path_basenames(analyzed_paths)
+        paired_tests = self._paired_tests(analyzed_paths)
         package_roots = self._package_boundaries(analyzed_paths)
         graph_view: HasEdge | None = ImportEdgeView(self.graph) if self.graph is not None else None
 
@@ -751,7 +823,7 @@ class HealthAnalyzer:
             file_metric, file_findings, file_suggestions = self._evaluate_file(
                 pf,
                 fcx,
-                path_basenames,
+                paired_tests,
                 package_roots,
                 disabled=file_disabled,
                 dup_report=dup_report,
@@ -852,7 +924,7 @@ class HealthAnalyzer:
         changed_set: set[str] | None = set(changed_files) if changed_files is not None else None
 
         analyzed_paths = {pf.file_info.path for pf in self.parsed_files}
-        path_basenames = _path_basenames(analyzed_paths)
+        paired_tests = self._paired_tests(analyzed_paths)
         package_roots = self._package_boundaries(analyzed_paths)
         graph_view: HasEdge | None = ImportEdgeView(self.graph) if self.graph is not None else None
 
@@ -981,7 +1053,7 @@ class HealthAnalyzer:
             file_metric, file_findings, file_suggestions = self._evaluate_file(
                 pf,
                 fcx,
-                path_basenames,
+                paired_tests,
                 package_roots,
                 disabled=file_disabled,
                 dup_report=dup_report,
@@ -1053,10 +1125,7 @@ class HealthAnalyzer:
             path = s.file_path
             if path in out or path not in self.graph:
                 continue
-            try:
-                out[path] = float(self.graph.in_degree(path))
-            except Exception:
-                out[path] = 0.0
+            out[path] = float(_dependents_count(self.graph, path))
         return out
 
     def _apply_cross_file_oracles(self, walked: list[tuple[Any, FileComplexity]]) -> None:
@@ -1176,9 +1245,7 @@ class HealthAnalyzer:
         try:
             from .function_blame_rollup import build_function_blame_rows
 
-            return build_function_blame_rows(
-                list(walked), self.git_meta_map, now_ts=int(time.time())
-            )
+            return build_function_blame_rows(list(walked), self.git_meta_map)
         except Exception as exc:
             log.debug("function_blame_rollup_failed", error=str(exc))
             return []
@@ -1263,7 +1330,7 @@ class HealthAnalyzer:
         self,
         pf: Any,
         fcx: FileComplexity,
-        path_basenames: set[str],
+        paired_tests: set[str],
         package_roots: set[str],
         *,
         disabled: list[str],
@@ -1289,11 +1356,8 @@ class HealthAnalyzer:
         nloc = fcx.file_nloc
 
         dependents_count = 0
-        if self.graph is not None and file_path in self.graph:
-            try:
-                dependents_count = int(self.graph.in_degree(file_path))
-            except Exception:
-                dependents_count = 0
+        if self.graph is not None:
+            dependents_count = _dependents_count(self.graph, file_path)
 
         cov = self.coverage_map.get(file_path)
         if cov is None:
@@ -1305,6 +1369,15 @@ class HealthAnalyzer:
 
         clones = dup_report.pairs_by_file.get(file_path, [])
         dup_pct = dup_report.duplication_pct.get(file_path)
+        # Read only for clone-bearing files, keeping the read proportional.
+        source_lines = (
+            _read_source_lines(pf.file_info.abs_path, self.read_source) if clones else None
+        )
+        clone_sources = (
+            _clone_sources(file_path, source_lines, clones, self._abs_paths, self.read_source)
+            if source_lines is not None and _coverage_is_test_file(file_path)
+            else {}
+        )
 
         # The enclosing package root, falling back to the top-level directory
         # when the repo has no nested packages.
@@ -1323,12 +1396,12 @@ class HealthAnalyzer:
             # re-derive from the path string (#1103). The coverage check stays
             # because it also sniffs framework imports out of the source, which
             # a path cannot tell you.
-            has_test_file=_has_paired_test_file(file_path, path_basenames)
+            has_test_file=file_path in paired_tests
             or pf.file_info.is_test
             or _coverage_is_test_file(file_path)
             or fcx.has_inline_tests,
             # Kept separate from ``has_test_file`` on purpose. That flag means
-            # "a file named like this one's test exists"; this one means "the
+            # "a test imports this file, or is named for it"; this one means "the
             # call graph records a test reaching this file". They disagree
             # often, and collapsing them would leave no way to say which signal
             # answered, or that one of them over-claims.
@@ -1346,6 +1419,7 @@ class HealthAnalyzer:
             total_coverable_lines=total_coverable_lines,
             clones=list(clones),
             duplication_pct=dup_pct,
+            clone_sources=clone_sources,
             graph_view=graph_view,
             blame_index=blame_index,
             repo_function_mod_p80=repo_function_mod_p80,
@@ -1357,6 +1431,11 @@ class HealthAnalyzer:
         )
 
         biomarker_results = detect_all(ctx, disabled=disabled)
+        if blame_index is None:
+            for stored in self.stored_blame_findings.get(file_path, ()):
+                replayed = as_biomarker_result(stored)
+                if replayed.biomarker_type in BLAME_MARKERS and replayed.biomarker_type not in disabled:
+                    biomarker_results.append(replayed)
         biomarker_results = remap_severities(biomarker_results, severity_overrides)
         scores, deductions = score_file(biomarker_results)
         findings = attach_impacts(biomarker_results, deductions)
@@ -1419,13 +1498,8 @@ class HealthAnalyzer:
             ),
             function_analyses=self._extract_method_analyses(pf, findings, dataflow_cache),
             blame_index=blame_index,
-            # Source is threaded only for clone-bearing files (the Extract Helper
-            # detector's snippet). Reading it unconditionally would put a
-            # repo-sized read back into the per-file path; gating on clones keeps
-            # it proportional to the small set of files that actually carry one.
-            source_lines=(
-                _read_source_lines(pf.file_info.abs_path, self.read_source) if clones else None
-            ),
+            # The Extract Helper snippet; ``None`` unless the file carries clones.
+            source_lines=source_lines,
         )
         suggestions = detect_refactorings(
             rctx,

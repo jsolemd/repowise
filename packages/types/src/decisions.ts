@@ -169,6 +169,7 @@ export const DECISION_CURRENCIES = [
   "active",
   "needs_review",
   "uncheckable",
+  "stale",
   "superseded",
   "dismissed",
 ] as const;
@@ -187,6 +188,7 @@ export const DECISION_CURRENCY_LABELS: Record<DecisionCurrency, string> = {
   active: "Active",
   needs_review: "Needs review",
   uncheckable: "Uncheckable",
+  stale: "Stale",
   superseded: "Superseded",
   dismissed: "Dismissed",
 };
@@ -197,6 +199,7 @@ export const DECISION_CURRENCY_DESCRIPTIONS: Record<DecisionCurrency, string> =
     needs_review: "Accepted, but the code it names has moved since.",
     uncheckable:
       "Accepted, but it names no file or module, so nothing checks it against the code.",
+    stale: "Accepted, but nothing it names exists in the code any more.",
     superseded: "Replaced by a later decision.",
     dismissed: "Authority withdrawn. Kept for history.",
   };

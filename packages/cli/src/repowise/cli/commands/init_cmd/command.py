@@ -77,6 +77,7 @@ from repowise.cli.ui import (
     should_offer_fast_mode,
 )
 from repowise.core.analysis.health import HEALTH_ANALYZER_VERSION
+from repowise.core.analysis.health.coverage import PARSERS as COVERAGE_PARSERS
 from repowise.core.docs_mode import docs_mode_state_fields, resolve_docs_mode
 from repowise.core.generation.languages import SUPPORTED_LANGUAGES
 from repowise.core.generation.styles import DEFAULT_STYLE, list_styles, resolve_style
@@ -761,7 +762,7 @@ def _interactive_gate(
     multiple=True,
     metavar="PATH",
     help=(
-        "Test-coverage report(s) to ingest (lcov / Cobertura / Clover). "
+        f"Test-coverage report(s) to ingest ({' / '.join(COVERAGE_PARSERS)}). "
         "Repeatable. When omitted, common locations (coverage/lcov.info, "
         "**/cobertura.xml, ...) are auto-discovered. This is test coverage for "
         "code-health, not a documentation-breadth knob."
@@ -1859,7 +1860,7 @@ def init_command(
     base_state["git_tier"] = git_tier_for_run_mode(run_mode)
     apply_git_history_coverage_state(base_state, result)
     from repowise.core.generation.selection import count_documentable_files
-    from repowise.core.index_scope import file_page_scope, stamp_index_scope
+    from repowise.core.index_scope import dropped_files_scope, file_page_scope, stamp_index_scope
 
     _scope_embedder = embedder_name_resolved if not effective_index_only else _index_only_embedder
     _unavailable = []
@@ -1875,6 +1876,7 @@ def init_command(
         ],
         git_tier=git_tier_for_run_mode(run_mode),
         git_commit_cap=resolved_commit_limit,
+        dropped_files=dropped_files_scope(getattr(result, "traversal_stats", None)),
         file_pages={
             "configured_cap": max_file_pages,
             **(
@@ -1999,6 +2001,11 @@ def init_command(
         options=editor_options,
         no_editor_setup=not editor_setup,
     )
+    if editor_setup:
+        # The index may carry a coverage ingest now; see ``sync_repo_hook``.
+        from repowise.cli.commands.augment_cmd.coverage_reingest import sync_repo_hook
+
+        sync_repo_hook(repo_path, console)
 
     _record_init_outcome(
         result=result,

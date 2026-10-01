@@ -74,18 +74,18 @@ per-line blame index built for every file.
 
 ## The markers, and what each is allowed to do
 
-Repowise ships **51 registered detectors (54 marker ids)**, but only **26 are
+Repowise ships **51 registered detectors (54 marker ids)**, but only **25 are
 permitted to move the headline number**. That restriction is deliberate: the
 defect score carries published accuracy claims, so only markers that earned
 their weight against a bug corpus may affect it.
 
 | Tier | Markers | What it may do |
 |---|---:|---|
-| **Defect-scoring** | **26** | Calibrated weights; moves the 1-10 score |
+| **Defect-scoring** | **25** | Calibrated weights; moves the 1-10 score |
 | **Performance** | **20** | Own pillar, own cap; never touches the defect score |
 | **Maintainability-only (SQL)** | **3** | Maintainability only |
 | **Governance** | **3** | Surfaces as a finding; never deducts |
-| **Advisory** | **2** | Measured and reported; never deducts, and stays out of impact-ranked lists unless asked for |
+| **Advisory** | **3** | Measured and reported; never deducts, and stays out of impact-ranked lists unless asked for |
 
 Nothing is inert, but "doesn't move the number" means three different things:
 
@@ -134,7 +134,7 @@ capped per category, so no single category can dominate:
 
 | Category | Cap |
 |---|---|
-| Organizational | −3.5 |
+| Organizational | −3.5, less on cleaner code (below) |
 | Structural complexity | −2.5 |
 | Test coverage | −2.0 |
 | Test coverage gradient | −2.0 |
@@ -156,6 +156,11 @@ history deduction climbs, and the headline barely moves. Each file therefore
 stores its deduction as two numbers, `structure_deduction` and
 `history_deduction`, which sum to the total. Nothing is hidden: the split is on
 every metric row, and the Counts control below reads it back.
+
+Git history on its own measures activity, so its cap follows the code: history
+can cost a file at most 1.0, plus one point for each point the other categories
+deduct, up to 3.5. A file with no code-shape finding never reads below 9.0 from
+history alone.
 
 Three repo-level KPIs: **Hotspot Health** (NLOC-weighted average over files the
 git layer classifies as hotspots), **Average Health** (NLOC-weighted over all
@@ -441,6 +446,12 @@ editor, or a list already filtered to one marker -- gets it without asking.
 |---|---|---|
 | `assertion_free_test` | Python · TypeScript / JavaScript | A test case that runs the code under test and checks nothing |
 | `mock_saturated_test` | Python · TypeScript / JavaScript | Mock-setup statements per assertion in a test function |
+| `hidden_coupling` | every language with git history | Files that change together with no import between them |
+
+`hidden_coupling` is here for the other reason: it was measured and carried no
+signal. Alone it ranks defect-prone files near chance (AUC about 0.55), and a
+pre-registered test on 12 repositories no earlier health study used found the
+score without it non-inferior at predicting defects, so it stopped deducting.
 
 A marker earns weight by clearing the house precision bar (roughly 70%
 hand-labelled) on a real corpus. `mock_saturated_test` has not, and precision is
@@ -624,7 +635,8 @@ repowise health --trend
 ```
 
 Coverage reports light up the test-coverage markers. **LCOV**, **Cobertura**,
-**Clover** and a normalized JSON format are auto-detected:
+**Clover**, **JaCoCo**, **Go coverprofile** and a normalized JSON format are
+auto-detected:
 
 ```bash
 pytest --cov --cov-report=lcov:coverage.lcov

@@ -583,10 +583,11 @@ async def _resolve_range_read(
             ),
         }
 
-    if is_excluded(path, _get_exclude_spec(ctx.path)):
-        return _err(f"'{path}' is excluded from indexing.")
+    # Before the exclusion spec: it is built from the repo path.
     if not ctx.path:
         return _err("MCP server has no repo path configured")
+    if is_excluded(path, _get_exclude_spec(ctx.path)):
+        return _err(f"'{path}' is excluded from indexing.")
 
     text = _read_file_text(Path(str(ctx.path)), path)
     if text is None:
@@ -1160,6 +1161,14 @@ async def _serve_symbol(
     # more of the chain, and the useful reply is the deepest walk we will do.
     depth = max(1, min(_MAX_CALLEE_DEPTH, depth))
 
+    # Before the exclusion spec: it is built from the repo path.
+    if not ctx.path:
+        return {
+            "symbol_id": symbol_id,
+            "error": "MCP server has no repo path configured",
+            "_meta": _build_meta(timing_ms=(time.perf_counter() - t0) * 1000),
+        }
+
     exclude_spec = _get_exclude_spec(ctx.path)
     async with get_session(ctx.session_factory) as session:
         repository = await _get_repo(session)
@@ -1221,16 +1230,6 @@ async def _serve_symbol(
                 "available symbols in the file, then try again with the "
                 "exact symbol_id from that response."
             ),
-            "_meta": _build_meta(
-                timing_ms=(time.perf_counter() - t0) * 1000,
-                repository=repository,
-            ),
-        }
-
-    if not ctx.path:
-        return {
-            "symbol_id": symbol_id,
-            "error": "MCP server has no repo path configured",
             "_meta": _build_meta(
                 timing_ms=(time.perf_counter() - t0) * 1000,
                 repository=repository,

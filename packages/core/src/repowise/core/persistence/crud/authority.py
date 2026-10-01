@@ -31,6 +31,7 @@ from sqlalchemy.orm import load_only
 from repowise.core.analysis.decisions.lifecycle import (
     ACCEPTANCE_ACTIONS,
     ACCEPTER_SESSION_MAX,
+    HISTORY_CURRENCIES,
     NO_SCOPE_BLOCKER,
     STORED_CURRENCIES,
     AcceptanceRequirement,
@@ -188,8 +189,8 @@ async def accepted_decision_ids(
 ) -> set[str]:
     """Ids of every accepted decision in *repository_id*.
 
-    With *governing_only*, drops the ones whose authority has been withdrawn
-    (``superseded``, ``dismissed``) so the caller is left with what still binds.
+    With *governing_only*, drops the ones in the history lane (withdrawn, or
+    naming only files gone at HEAD) so the caller is left with what still binds.
     Journal confirmations and native acceptance events share the same rule.
     """
     stored = await _stored_acceptance_currencies(session, repository_id)
@@ -212,7 +213,40 @@ async def accepted_decision_ids(
             stored.setdefault(record.id, currency)
     if not governing_only:
         return set(stored)
-    return {did for did, currency in stored.items() if currency not in ("superseded", "dismissed")}
+    rows = await session.execute(
+        select(DecisionRecord.id, *_CURRENCY_COLUMNS).where(
+            DecisionRecord.repository_id == repository_id
+        )
+    )
+    return {
+        did
+        for did, *cols in rows.all()
+        if did in stored and _row_currency(stored[did], *cols) not in HISTORY_CURRENCIES
+    }
+
+
+#: The record columns :func:`effective_currency` reads, for queries that skip the ORM row.
+_CURRENCY_COLUMNS = (
+    DecisionRecord.affected_files_json,
+    DecisionRecord.affected_modules_json,
+    DecisionRecord.staleness_score,
+    DecisionRecord.kind,
+    DecisionRecord.artifacts_gone,
+)
+
+
+def _row_currency(
+    stored: str, files_json: Any, modules_json: Any, staleness: Any, kind: Any, gone: Any
+) -> str:
+    """:func:`effective_currency` over the :data:`_CURRENCY_COLUMNS` of one record."""
+    fields = {"affected_files": files_json, "affected_modules": modules_json, "kind": kind}
+    return effective_currency(
+        stored,
+        has_scope=bool(record_scope(fields)),
+        staleness=staleness or 0.0,
+        repo_wide=is_repo_wide(fields),
+        artifacts_gone=bool(gone),
+    )
 
 
 async def _stored_acceptance_currencies(
@@ -284,13 +318,13 @@ async def decision_currencies(
         currency = stored.get(record.id) or journal_stored_currency(record)
         if currency is None:
             continue
-        out[record.id] = effective_currency(
-            currency,
-            has_scope=bool(_record_scope(record)),
-            staleness=record.staleness_score,
-            repo_wide=_is_repo_wide(record),
-        )
+        out[record.id] = _record_currency(currency, record)
     return out
+
+
+def _record_currency(stored: str, record: DecisionRecord) -> str:
+    """:func:`effective_currency` for an ORM *record* stored at *stored*."""
+    return _row_currency(stored, *(getattr(record, c.key) for c in _CURRENCY_COLUMNS))
 
 
 def _latest_acceptance_join(repository_id: str) -> tuple[Any, Any]:
@@ -390,6 +424,7 @@ async def count_decisions_by_lane(session: AsyncSession, repository_id: str) -> 
                     DecisionRecord.affected_modules_json,
                     DecisionRecord.staleness_score,
                     DecisionRecord.kind,
+                    DecisionRecord.artifacts_gone,
                 )
             )
         )
@@ -410,7 +445,7 @@ async def count_decisions_by_lane(session: AsyncSession, repository_id: str) -> 
         if currency is None:
             counts["candidates"] += 1
             continue
-        counts["history" if currency in ("superseded", "dismissed") else currency] += 1
+        counts["history" if currency in HISTORY_CURRENCIES else currency] += 1
         if is_governing(currency):
             counts["governing"] += 1
     return counts
@@ -422,13 +457,7 @@ async def current_currency(session: AsyncSession, record: DecisionRecord) -> str
     stored = acceptance.currency if acceptance is not None else journal_stored_currency(record)
     if stored is None:
         return None
-    has_scope = bool(_record_scope(record))
-    return effective_currency(
-        stored,
-        has_scope=has_scope,
-        staleness=record.staleness_score,
-        repo_wide=_is_repo_wide(record),
-    )
+    return _record_currency(stored, record)
 
 
 async def resolve_decision_id(session: AsyncSession, decision_id: str) -> str | None:

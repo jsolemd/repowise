@@ -426,6 +426,7 @@ async def _incremental_repo_update(
     """
     from ..ingestion.change_detector import ChangeDetector, merge_file_diffs
     from ..pipeline.incremental import (
+        DocDriftUpdate,
         persist_incremental_index,
         rebuild_graph_and_git,
         run_doc_drift_partial,
@@ -534,7 +535,13 @@ async def _incremental_repo_update(
         coverage_map=stored_coverage_map,
         log=_log.info,
     )
-    doc_drift_report = run_doc_drift_partial(graph_builder, source_map, log=_log.info)
+    doc_drift_report = run_doc_drift_partial(
+        graph_builder,
+        source_map,
+        repo_path=repo_path,
+        log=_log.info,
+        update=DocDriftUpdate.from_file_diffs(base_ref, file_diffs),
+    )
 
     # Partial health has consumed the per-file ``BlameIndex``; drop it before
     # the metadata reaches persistence so the transient, non-serializable

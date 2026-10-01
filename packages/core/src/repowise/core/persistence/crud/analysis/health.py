@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 if TYPE_CHECKING:
     from ....analysis.health.perf.coverage import PerfCoverage
 
+from ....analysis.finding_registry import excluded_types
 from ....analysis.health.finding_identity import finding_public_id
 from ....analysis.health.governance import GOVERNANCE_BIOMARKERS
 
@@ -30,6 +31,7 @@ from ....analysis.health.scope import scores_language
 from ....analysis.health.scoring import ADVISORY_DIMENSION, nloc_weighted_attr
 from ....test_paths import is_test_related_path
 from ...models import (
+    DocDriftFinding,
     GraphNode,
     HealthFileMetric,
     HealthFinding,
@@ -386,8 +388,14 @@ async def get_health_findings(
     dimension: str | None = None,
     exclude_dimensions: tuple[str, ...] | None = None,
     status: str = "open",
+    include_withheld: bool = False,
 ) -> list[HealthFinding]:
     """Findings for one repository, ordered by health impact.
+
+    Finding types the registry withholds (``finding_registry``) are left out,
+    so every surface built on this read shows only what has earned a place; a
+    provisional type named in ``biomarker_type`` is an explicit request and is
+    returned. ``include_withheld`` is for analysis that must see every row.
 
     ``exclude_dimensions`` is how a general queue keeps a dimension out of a
     ranking it does not share units with. It is ignored when ``dimension``
@@ -412,13 +420,14 @@ async def get_health_findings(
                 HealthFinding.dimension.not_in(list(exclude_dimensions)),
             )
         )
-    if biomarker_type is not None:
-        # Accept a comma-separated list so a caller can pull several biomarker
-        # types in one request (e.g. the function-level + coupling panels).
-        # A single value with no comma still matches exactly (``IN`` of one).
-        types = [t.strip() for t in biomarker_type.split(",") if t.strip()]
-        if types:
-            q = q.where(HealthFinding.biomarker_type.in_(types))
+    # Accept a comma-separated list so a caller can pull several biomarker
+    # types in one request (e.g. the function-level + coupling panels).
+    # A single value with no comma still matches exactly (``IN`` of one).
+    types = [t.strip() for t in (biomarker_type or "").split(",") if t.strip()]
+    if types:
+        q = q.where(HealthFinding.biomarker_type.in_(types))
+    if not include_withheld:
+        q = q.where(HealthFinding.biomarker_type.not_in(excluded_types(requested=types)))
     if file_path is not None:
         q = q.where(HealthFinding.file_path == file_path)
     if dimension is not None:
@@ -771,6 +780,20 @@ HEALTH_SNAPSHOT_RETENTION: int = 50
 FILE_TREND_SNAPSHOT_WINDOW: int = 20
 
 
+async def _doc_drift_count(session: AsyncSession, repository_id: str) -> int | None:
+    """Stored drift findings; ``None`` when the drift pass has never run here."""
+    from .doc_drift import doc_drift_pass_ran
+
+    count = await session.scalar(
+        select(func.count(DocDriftFinding.id)).where(
+            DocDriftFinding.repository_id == repository_id
+        )
+    )
+    if not count and not await doc_drift_pass_ran(session, repository_id):
+        return None
+    return int(count or 0)
+
+
 async def save_health_snapshot(
     session: AsyncSession,
     repository_id: str,
@@ -801,6 +824,9 @@ async def save_health_snapshot(
 
     ``structure_average`` / ``history_average`` are ``average_health``'s two
     halves in deduction points, so a later trend can name which one moved.
+
+    The stored doc drift count is read here rather than passed in, so every
+    writer records it without a new argument; write drift before calling this.
     """
     snap = HealthSnapshot(
         id=_new_uuid(),
@@ -818,6 +844,7 @@ async def save_health_snapshot(
         history_average=history_average,
         production_average=production_average,
         maintainability_average=maintainability_average,
+        doc_drift_count=await _doc_drift_count(session, repository_id),
     )
     session.add(snap)
     await session.flush()

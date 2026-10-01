@@ -7,7 +7,7 @@ import contextlib
 import contextvars
 import logging
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Container
 from typing import Any
 
 from sqlalchemy import select
@@ -55,6 +55,7 @@ from repowise.server.mcp_server._query_shape import (
     _DECISION_DOWNWEIGHT,
     _MIN_RELEVANCE_SCORE,
     _VALID_MODES,
+    NOT_THE_NAMED_SYMBOL,
     _caller_mode,
     _canonical_symbol_query,
     _embedded_identifiers,
@@ -62,7 +63,10 @@ from repowise.server.mcp_server._query_shape import (
     _has_exact_symbol,
     _identifier_candidates,
     _is_why_shaped,
+    _looks_like_code_name,
     _looks_like_exact_token,
+    _mark_not_the_named_symbol,
+    _names_a_path,
     _qual_norm,
     _resolve_mode,
     _symbol_matches_name,
@@ -70,6 +74,7 @@ from repowise.server.mcp_server._query_shape import (
 from repowise.server.mcp_server._references import path_identity, symbol_identity
 from repowise.server.mcp_server._retrieval_rank import rerank_by_context_coverage
 from repowise.server.mcp_server.tool_search_symbols import (
+    indexed_names,
     search_paths_single,
     search_symbols_single,
 )
@@ -133,7 +138,12 @@ def _prose_dominates(query: str, identifiers: list[str]) -> bool:
 
 
 def _interleave_hybrid(
-    query: str, symbols: list[dict], concepts: list[dict], limit: int, exact: bool
+    query: str,
+    symbols: list[dict],
+    concepts: list[dict],
+    limit: int,
+    exact: bool,
+    names: Container[str] | None = None,
 ) -> list[dict]:
     """Order one hybrid result window from the two incomparable score scales.
 
@@ -149,7 +159,7 @@ def _interleave_hybrid(
     synthesis in get_answer". There, concept pages lead and the fuzzy symbols
     fall to the tail (nothing is dropped, only reordered within the window).
     """
-    if not exact and concepts and _prose_dominates(query, _embedded_identifiers(query)):
+    if not exact and concepts and _prose_dominates(query, _embedded_identifiers(query, names)):
         reserved = min(len(symbols), limit // 2)
         return (concepts[: max(1, limit - reserved)] + symbols)[:limit]
     reserved = min(len(concepts), limit // 2)
@@ -1054,7 +1064,7 @@ def _result_paths(results: list[dict]) -> list[str]:
     return paths
 
 
-def _grep_hint_for(query: str) -> str | None:
+def _grep_hint_for(query: str, names: Container[str] | None = None) -> str | None:
     """Zero-result recovery hint for identifier-shaped queries, else ``None``.
 
     Only attached when the search produced nothing (see call sites) — a
@@ -1067,7 +1077,7 @@ def _grep_hint_for(query: str) -> str | None:
             f"No indexed match for identifier {query!r}. Retry with "
             'mode="symbol" (or check spelling/casing). ' + EXHAUSTIVE_SWEEP_HINT
         )
-    if idents := _embedded_identifiers(query):
+    if idents := _embedded_identifiers(query, names):
         shown = ", ".join(repr(t) for t in idents[:3])
         return (
             f"Query names identifier(s) {shown} but nothing matched. Search "
@@ -1090,6 +1100,30 @@ def _tag_repo(items: list[dict], ctx, multi: bool) -> None:
             item["repo"] = ctx.alias
 
 
+def _missing_named_symbols(
+    candidates: list[str], symbols: list[dict], canonical: bool, concepts: list[dict]
+) -> list[str]:
+    """Code-shaped names the query asks after that no returned symbol matches
+    exactly (or returned module path carries): they do not exist here. Judged
+    per name, so an indexed name beside a missing one hides nothing. Their
+    fuzzy neighbours would stand in for them, so the caller keeps only exact
+    symbols; the pages are marked here as related to the question, not the
+    symbol."""
+    if canonical:
+        return []
+    page_paths = [c.get("target_path") or "" for c in concepts]
+    missing = [
+        c
+        for c in candidates
+        if _looks_like_code_name(c)
+        and not _has_exact_symbol([c], symbols)
+        and not _names_a_path(c, page_paths)
+    ]
+    if missing:
+        _mark_not_the_named_symbol(concepts)
+    return missing
+
+
 async def _structured_search(
     query: str,
     limit: int,
@@ -1099,6 +1133,7 @@ async def _structured_search(
     repo: str | None,
     mode: str,
     grep_hint: str | None,
+    names: Container[str] | None = None,
 ) -> dict:
     """Run symbol / path / hybrid search and shape the response.
 
@@ -1125,7 +1160,7 @@ async def _structured_search(
     if canonical_symbol:
         symbol_query = canonical_symbol[1]
     if mode == "hybrid":
-        _idents = _embedded_identifiers(query)
+        _idents = _embedded_identifiers(query, names)
         if _idents:
             symbol_query = " ".join(_idents)
 
@@ -1149,7 +1184,7 @@ async def _structured_search(
 
     symbols.sort(key=lambda x: -(x.get("score") or 0.0))
     files.sort(key=lambda x: -(x.get("score") or 0.0))
-    candidates = _identifier_candidates(query, mode)
+    candidates = _identifier_candidates(query, mode, names)
     if mode == "symbol":
         symbols = _protect_exact_symbols(query, symbols)
     elif mode == "hybrid" and candidates:
@@ -1161,6 +1196,9 @@ async def _structured_search(
     # Computed once here so the hybrid interleave and the exact-match note below
     # agree on the same signal.
     exact = _has_exact_symbol(candidates, symbols) if candidates else False
+    missing = _missing_named_symbols(candidates, symbols, bool(canonical_symbol), concepts)
+    if missing:
+        symbols = [s for s in symbols if _has_exact_symbol(candidates, [s])]
 
     if mode == "symbol":
         results = symbols[:limit]
@@ -1179,7 +1217,7 @@ async def _structured_search(
         # re-sorted on score alone is just as unpartitioned as two repos'.
         _classify_concept = noise_classifier(query)
         concepts.sort(key=lambda x: (_classify_concept(x), -(x.get("relevance_score") or 0.0)))
-        results = _interleave_hybrid(query, symbols, concepts, limit, exact)
+        results = _interleave_hybrid(query, symbols, concepts, limit, exact, names)
 
     repository = None
     if not multi:
@@ -1214,8 +1252,15 @@ async def _structured_search(
     # there is no exact hit to distinguish from the fuzz. ``candidates`` /
     # ``exact`` were computed above so ordering and this note stay consistent.
     if candidates:
-        response["exact_match"] = exact
-        if not exact:
+        response["exact_match"] = exact and not missing
+        if missing:
+            shown = ", ".join(repr(c) for c in missing[:3])
+            response["note"] = (
+                f"No indexed symbol is named {shown}, so no symbol is returned "
+                f"for it. Any page here is {NOT_THE_NAMED_SYMBOL}. Recheck the "
+                "spelling, or search a shorter part of the name. " + EXHAUSTIVE_SWEEP_HINT
+            )
+        elif not exact:
             shown = ", ".join(repr(c) for c in candidates[:3])
             response["note"] = (
                 f"No indexed symbol exactly matches {shown}. The results are "
@@ -1279,7 +1324,6 @@ async def search_codebase(
     # Before any branch: every lane below that reaches the vector leg reports
     # into this record, and the response it builds reads it back.
     _begin_retrieval_record()
-    grep_hint = _grep_hint_for(query)
     # An unknown kind used to take the same ``return False`` as a kind that is
     # simply inapplicable, so a typo and a real empty result looked identical.
     ignored: list[dict[str, Any]] = []
@@ -1290,8 +1334,6 @@ async def search_codebase(
     if mode is not None and mode.lower() in _VALID_MODES:
         mode = mode.lower()
     mode = resolve_enum_argument(mode, _VALID_MODES, argument="mode", ignored=ignored)
-    resolved_mode = _resolve_mode(query, mode)
-
     caller_mode = _caller_mode(mode)
 
     # ``repo`` is a workspace argument: without a registry there is one repo,
@@ -1311,6 +1353,11 @@ async def search_codebase(
     # not a revert to one of them.
     if repo == "all" and not _is_workspace_mode():
         repo = None
+
+    # Loaded once so routing, candidates, ordering and the hint validate alike.
+    names = await indexed_names(await _contexts_for(repo), query)
+    grep_hint = _grep_hint_for(query, names)
+    resolved_mode = _resolve_mode(query, mode, names)
 
     # Exact symbol/path lookup and filtered searches already have native
     # resolvers. Preserve their argument semantics; the source coordinator
@@ -1370,7 +1417,7 @@ async def search_codebase(
 
     if resolved_mode in ("symbol", "path", "hybrid"):
         structured = await _structured_search(
-            query, limit, page_type, kind, symbol_kind, repo, resolved_mode, grep_hint
+            query, limit, page_type, kind, symbol_kind, repo, resolved_mode, grep_hint, names
         )
         attach_ignored_arguments(structured, ignored)
         return structured
