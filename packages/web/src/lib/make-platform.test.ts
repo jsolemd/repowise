@@ -3,7 +3,7 @@ import { createServer, type Server } from "node:http";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { getMakeOperations, getMakeSummary, MakeReportError } from "./make-platform";
+import { getMakeBuilds, getMakeSummary, MakeReportError } from "./make-platform";
 
 let server: Server | undefined;
 let directory: string | undefined;
@@ -29,17 +29,17 @@ afterEach(async () => {
 });
 
 describe("Make read-only reporting boundary", () => {
-  it("makes a bounded GET against the operation report", async () => {
+  it("makes a bounded GET against the builds report", async () => {
     const seen: [string | undefined, string | undefined][] = [];
-    await serve(200, { schema_version: 1, catalog_revision: 7, items: [], next_cursor: null }, (method, url) => seen.push([method, url]));
-    const result = await getMakeOperations({ status: "ambiguous", cursor: "opaque+cursor" });
+    await serve(200, { schema_version: 1, catalog_revision: 7, items: [], next_cursor: null, groups: [] }, (method, url) => seen.push([method, url]));
+    const result = await getMakeBuilds({ limit: 1, cursor: "opaque+cursor" });
     expect(result.items).toEqual([]);
-    expect(seen).toEqual([["GET", "/v1/report/operations?limit=50&cursor=opaque%2Bcursor&status=ambiguous"]]);
+    expect(seen).toEqual([["GET", "/v1/report/builds?limit=1&cursor=opaque%2Bcursor"]]);
   });
 
   it("retains a catalog conflict so the UI asks for a refresh", async () => {
     await serve(409, { error: "refresh" });
-    await expect(getMakeOperations()).rejects.toMatchObject({ status: 409 });
+    await expect(getMakeBuilds()).rejects.toMatchObject({ status: 409 });
   });
 
   it("does not turn an unavailable service into empty counts", async () => {

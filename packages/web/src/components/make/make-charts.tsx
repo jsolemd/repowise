@@ -5,8 +5,19 @@
  * Colour follows the house theme's rules (ui/styles/globals.css): shares of a
  * whole step down the accent ramp, supporting marks use the neutral steps, and
  * state uses the node-* fills, which are tuned as fills where the status ink
- * vars are tuned as type. Hover text rides on `title`; every figure a reader
- * needs is also printed, so nothing depends on hovering.
+ * vars are tuned as type. One exception is deliberate: the Evidence panel's
+ * certainty bar steps clear, uncertain and contested down the ramp in that
+ * fixed order, an ordered certainty scale fading toward gray rather than a
+ * ranking by share.
+ *
+ * Hover text rides on `title`, and the aria-label of each chart carries its
+ * values for a screen reader. Printed: every headline figure, each StackBar
+ * legend's values, each BarRows row total and the largest spend day. Only hover
+ * carries a DayColumns day's own value (spend per day, bytes expiring per day),
+ * the split inside a BarRows row (an owner's pending against blocked, a
+ * family's operations by outcome), the failure codes behind Activity's failed
+ * share, the expiring bytes inside each storage class, and a meeting stage's
+ * done-of-total.
  */
 import type { CSSProperties, ReactNode } from "react";
 
@@ -52,6 +63,21 @@ export interface Segment {
   /** Part of `value` drawn hatched: the share that is expiring or failed. */
   hatched?: number;
   title?: string;
+}
+
+/** Swatches naming the colours in rows that print only their totals. */
+export function Legend({ items, lead }: { items: Pick<Segment, "key" | "label" | "color">[]; lead?: ReactNode }) {
+  return (
+    <div className="flex flex-wrap gap-x-3 text-[11px] text-[var(--color-text-secondary)]">
+      {lead && <span className="text-[var(--color-text-tertiary)]">{lead}</span>}
+      {items.map((s) => (
+        <span key={s.key} className="inline-flex items-center gap-1">
+          <span aria-hidden className="inline-block h-2 w-2 rounded-[2px]" style={{ background: s.color }} />
+          {s.label}
+        </span>
+      ))}
+    </div>
+  );
 }
 
 /** One horizontal bar split into shares, 2px surface gaps between them. */

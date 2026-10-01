@@ -14,7 +14,7 @@ import {
   getMakeOperationMix,
   getMakeSpend,
   getMakeStorage,
-  getMakeSummary,
+  type MakeDoctor,
 } from "@/lib/make-platform";
 import {
   ActivityPanel,
@@ -46,8 +46,8 @@ const value = <T,>(result: PromiseSettledResult<T>): T | null =>
   result.status === "fulfilled" ? result.value : null;
 
 /** The doctor is slow (live checks), so it streams in behind the rest. */
-async function Doctor() {
-  const doctor = await getMakeDoctor().catch(() => null);
+async function Doctor({ report }: { report: Promise<MakeDoctor | null> }) {
+  const doctor = await report;
   return doctor ? (
     <DoctorGrid doctor={doctor} />
   ) : (
@@ -58,24 +58,27 @@ async function Doctor() {
 /**
  * The Make platform: Jon's window onto what Make built, spent and kept.
  *
- * Charts first, prose on hover. Agents read make-api directly and act on the
- * doctor's findings, so this page shows shapes and counts, not instructions.
+ * Charts first, with the doctor's open findings in a list that opens by touch
+ * and the rest of the prose on hover. Agents read make-api directly and act on
+ * the doctor's findings, so this page shows shapes and counts, not a queue.
  * Read-only by contract (SoleMD.Make native-catalog-cutover): every figure is
  * a make-api report reached through a private socket from this server render,
  * and the page re-renders when Make's catalog revision moves (LiveRefresh).
  */
 export default async function MakePlatformPage() {
+  // Started with the others and awaited only inside its Suspense boundary.
+  const doctor = getMakeDoctor().catch(() => null);
   const results = await Promise.allSettled([
-    getMakeSummary(),
     getMakeSpend(SPEND_DAYS, TIME_ZONE),
-    getMakeBuilds({ limit: 100 }),
+    // The panel prints only the latest build's time; the groups carry the rest.
+    getMakeBuilds({ limit: 1 }),
     getMakeEvidence(),
     getMakeMedia(),
     getMakeMeetings(),
     getMakeStorage(),
     getMakeOperationMix(MIX_DAYS),
   ] as const);
-  const [summary, spend, builds, evidence, media, meetings, storage, mix] = [
+  const [spend, builds, evidence, media, meetings, storage, mix] = [
     value(results[0]),
     value(results[1]),
     value(results[2]),
@@ -83,17 +86,19 @@ export default async function MakePlatformPage() {
     value(results[4]),
     value(results[5]),
     value(results[6]),
-    value(results[7]),
   ];
-  const reachable = [summary, spend, builds, evidence, media, meetings, storage, mix].some(Boolean);
+  const fulfilled = [spend, builds, evidence, media, meetings, storage, mix].filter((r) => r !== null);
+  // The oldest revision any section was drawn at, so a write that landed
+  // mid-render still refreshes the page.
+  const revision = fulfilled.length ? Math.min(...fulfilled.map((r) => r.catalog_revision)) : null;
 
   return (
     <PageShell
       title="Make platform"
       icon={<Activity className="h-5 w-5 text-[var(--color-text-tertiary)]" />}
-      actions={<LiveRefresh initialRevision={summary?.catalog_revision ?? null} />}
+      actions={<LiveRefresh initialRevision={revision} />}
     >
-      {!reachable ? (
+      {!fulfilled.length ? (
         <ApiError
           title="Make reporting is unavailable"
           message="make-api did not answer on its private socket. Repository reporting is unaffected."
@@ -101,7 +106,7 @@ export default async function MakePlatformPage() {
       ) : (
         <>
           <Suspense fallback={<DoctorPending />}>
-            <Doctor />
+            <Doctor report={doctor} />
           </Suspense>
 
           <div className="grid grid-cols-2 divide-[var(--color-border-default)] lg:grid-cols-4 lg:divide-x [&>*:first-child]:pl-0 max-lg:[&>*:nth-child(odd)]:pl-0">
