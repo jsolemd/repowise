@@ -283,6 +283,11 @@ check_untyped_defs = true
 # pytest
 # ---------------------------------------------------------------------------
 [tool.pytest.ini_options]
+# Keep temp folders only for failed tests, and only from the last run: /tmp is
+# RAM-backed (tmpfs), and parallel runs otherwise leave gigabytes under
+# /tmp/pytest-of-<user>.
+tmp_path_retention_count = 1
+tmp_path_retention_policy = "failed"
 asyncio_mode = "auto"
 testpaths = ["tests"]
 markers = ["unit: isolated unit test", "integration: requires running backing services", "eval: live retrieval quality checks"]

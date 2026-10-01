@@ -33,5 +33,10 @@ packages = ["src/repowise"]
 dev = ["pytest>=8,<9", "pytest-asyncio>=0.23,<1", "ruff>=0.6,<1"]
 
 [tool.pytest.ini_options]
+# Keep temp folders only for failed tests, and only from the last run: /tmp is
+# RAM-backed (tmpfs), and parallel runs otherwise leave gigabytes under
+# /tmp/pytest-of-<user>.
+tmp_path_retention_count = 1
+tmp_path_retention_policy = "failed"
 asyncio_mode = "auto"
 markers = ["integration: requires running backing services", "eval: live retrieval quality checks"]
