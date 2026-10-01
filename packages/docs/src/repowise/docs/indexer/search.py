@@ -62,6 +62,10 @@ async def search_hybrid(
     query_filter = build_library_filter(library_id, chunk_types)
 
     prefetch_limit = max(200, limit * 10)
+    # One RRF fusion of both lanes. Never merge a raw BM25 list into the fused one by
+    # score: BM25 scores (5-60) dwarf RRF's (~0.03), so the BM25 list wins every merge
+    # and the dense lane goes silent (2026-10-01: recall@5 28/41 with such a rescue,
+    # 35/41 without, on the live corpus).
     response = await client.query_points(
         collection_name=settings.qdrant_collection,
         prefetch=[
