@@ -244,6 +244,7 @@ class PageGenerator(PerTypeGenerationMixin, StructuralRenderMixin):
         kg_data: dict | None = None,
         only_page_ids: set[str] | None = None,
         preserved_page_ids: set[str] | None = None,
+        selected_page_ids: set[str] | None = None,
         timings: Any | None = None,
         on_warning: Callable[[str], None] | None = None,
     ) -> list[GeneratedPage]:
@@ -266,6 +267,10 @@ class PageGenerator(PerTypeGenerationMixin, StructuralRenderMixin):
         caller hands the set to persistence, which must not sweep those ids as
         stale. Harmless to pass on a non-resume run (nothing is skipped for that
         reason, so nothing is added); None when the caller has no use for it.
+
+        ``selected_page_ids`` is an out-parameter too: every page id the run
+        set out to write, including one whose render then failed. None when
+        the caller has no use for it.
 
         ``timings`` is the run's shared ``PhaseTimings`` table. Generation
         records its per-level and checkpoint spans into it so they report
@@ -304,6 +309,7 @@ class PageGenerator(PerTypeGenerationMixin, StructuralRenderMixin):
             kg_data=kg_data,
             only_page_ids=only_page_ids,
             preserved_page_ids=preserved_page_ids,
+            selected_page_ids=selected_page_ids,
             timings=timings,
             on_warning=on_warning,
         )

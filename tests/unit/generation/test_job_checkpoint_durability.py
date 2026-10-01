@@ -63,6 +63,7 @@ async def test_interrupt_between_page_and_flush_costs_no_resume_coverage(tmp_pat
         vector_store=store,
         completed_ids=set(),
         preserved_page_ids=set(),
+        selected_page_ids=None,
         only_page_ids=None,
     )
     await _GenerationRun._seed_resume(run)
@@ -92,6 +93,7 @@ async def test_a_page_whose_rows_never_landed_is_regenerated(tmp_path):
         vector_store=store,
         completed_ids=set(),
         preserved_page_ids=set(),
+        selected_page_ids=None,
         only_page_ids=None,
     )
     await _GenerationRun._seed_resume(run)

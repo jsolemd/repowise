@@ -30,6 +30,7 @@ def _run(
         completed_ids=completed_ids,
         only_page_ids=only_page_ids,
         preserved_page_ids=preserved,
+        selected_page_ids=None,
     )
 
 

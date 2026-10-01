@@ -109,6 +109,7 @@ class _GenerationRun:
         kg_data: dict | None = None,
         only_page_ids: set[str] | None = None,
         preserved_page_ids: set[str] | None = None,
+        selected_page_ids: set[str] | None = None,
         timings: Any | None = None,
         on_warning: Callable[[str], None] | None = None,
     ) -> None:
@@ -128,6 +129,11 @@ class _GenerationRun:
         # wiki the resumed run was there to protect. None when the caller does
         # not care (every non-resume path).
         self.preserved_page_ids = preserved_page_ids
+        # Out-parameter: every page id this run set out to write, whether or
+        # not its render then succeeded. A caller replacing a file's page set
+        # needs exactly this, so a page that failed is kept for a retry while
+        # one the selection dropped can be retired.
+        self.selected_page_ids = selected_page_ids
         self.parsed_files = parsed_files
         self.source_map = source_map
         self.graph_builder = graph_builder
@@ -261,7 +267,10 @@ class _GenerationRun:
             if self.preserved_page_ids is not None:
                 self.preserved_page_ids.add(page_id)
             return False
-        return self.only_page_ids is None or page_id in self.only_page_ids
+        emit = self.only_page_ids is None or page_id in self.only_page_ids
+        if emit and self.selected_page_ids is not None:
+            self.selected_page_ids.add(page_id)
+        return emit
 
     async def _seed_resume(self) -> None:
         if self.job_system is not None and self.resume and self.vector_store is not None:

@@ -1775,6 +1775,7 @@ def run_update(
             # page that predates the single-renderer change re-renders to its
             # structural form here, which is the shape it now has.
             degraded_before_render = len(degraded)
+            page_sets: dict[str, set[str]] = {}
             with timed(timings, "render"):
                 det_pages = regenerate_deterministic_pages(
                     repo_path=repo_path,
@@ -1790,6 +1791,7 @@ def run_update(
                     dead_code_report=dead_code_report,
                     prior_page_ids=prior_ids,
                     full_scope=generation_config_changed,
+                    page_sets=page_sets,
                 )
                 if stale_deterministic_ids and not generation_config_changed:
                     det_pages.extend(
@@ -1814,7 +1816,7 @@ def run_update(
                     "fingerprint was retained so the next update retries."
                 )
 
-            if det_pages or affected.decay_only:
+            if det_pages or affected.decay_only or page_sets:
                 # Its own session, apart from the index persist below, so it
                 # is its own row rather than a ``persist.*`` one.
                 with timed(timings, "render.persist"):
@@ -1825,6 +1827,7 @@ def run_update(
                         # skipped or failed pages still need their stale bit.
                         decay_paths=affected.decay_only,
                         degraded=degraded,
+                        page_sets=page_sets,
                     )
                 if head:
                     state["last_docs_commit"] = head

@@ -618,3 +618,86 @@ def test_exact_structural_refresh_uses_full_context_without_model(
     assert captured["parsed"] == parsed
     assert captured["source"] == source
     assert captured["only_page_ids"] == {"scc_page:scc-current"}
+
+
+def test_rerender_replaces_a_files_page_set_so_it_stops_looking_stale(repo, monkeypatch):
+    """A row the selection dropped must not pin its file stale forever.
+
+    The renderer-staleness sweep flags a file when any of its stored spotlight
+    keys differs from what this release writes. A spotlight for a symbol that
+    was removed (or ranked out) is never rewritten by the re-render, so before
+    the re-render replaced the file's whole page set, every update re-rendered
+    the same file again and found it just as stale.
+    """
+    from repowise.cli.commands.update_cmd.deterministic import (
+        load_spotlight_render_keys,
+        persist_deterministic_pages,
+        regenerate_deterministic_pages,
+    )
+    from repowise.core.generation.page_generator.structural import (
+        RENDER_KEY,
+        stale_spotlight_paths,
+    )
+    from repowise.core.pipeline.incremental import build_repo_graph
+
+    monkeypatch.setattr(deterministic, "deterministic_embedder_name", lambda _cfg: "mock")
+    (repo / "lib.py").write_text(
+        "def kept(x):\n    return x\n",
+        encoding="utf-8",
+    )
+
+    async def _seed_removed_symbol() -> None:
+        engine = create_engine(resolve_db_url(repo))
+        try:
+            await init_db(engine)
+            async with get_session(create_session_factory(engine)) as session:
+                row = await upsert_repository(session, name=repo.name, local_path=str(repo))
+                await upsert_page(
+                    session,
+                    page_id="symbol_spotlight:lib.py::removed",
+                    repository_id=row.id,
+                    page_type="symbol_spotlight",
+                    title="removed",
+                    content="# removed",
+                    summary="",
+                    target_path="lib.py::removed",
+                    source_hash="h",
+                    model_name="template",
+                    provider_name="template",
+                    metadata={RENDER_KEY: "written-by-an-older-version-of-lib.py"},
+                )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(_seed_removed_symbol())
+    parsed, source_map, graph_builder, repo_structure, _ = build_repo_graph(
+        repo, [], collect_sources=True
+    )
+    assert stale_spotlight_paths(load_spotlight_render_keys(repo), parsed) == ["lib.py"]
+
+    degraded: list[str] = []
+    page_sets: dict[str, set[str]] = {}
+    pages = regenerate_deterministic_pages(
+        repo_path=repo,
+        parsed_files=parsed,
+        source_map=source_map,
+        graph_builder=graph_builder,
+        repo_structure=repo_structure,
+        git_meta_map={},
+        regenerate_paths=["lib.py"],
+        cfg={},
+        concurrency=2,
+        degraded=degraded,
+        page_sets=page_sets,
+    )
+    persist_deterministic_pages(
+        repo_path=repo,
+        generated_pages=pages,
+        decay_paths=[],
+        degraded=degraded,
+        page_sets=page_sets,
+    )
+
+    assert not degraded
+    assert "file_page:lib.py" in page_sets["lib.py"]
+    assert stale_spotlight_paths(load_spotlight_render_keys(repo), parsed) == []

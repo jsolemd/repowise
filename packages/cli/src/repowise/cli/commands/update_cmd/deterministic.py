@@ -97,6 +97,7 @@ def regenerate_deterministic_pages(
     dead_code_report: Any = None,
     prior_page_ids: dict | None = None,
     full_scope: bool = False,
+    page_sets: dict[str, set[str]] | None = None,
 ) -> list:
     """Re-render the template pages for *regenerate_paths*. Never raises.
 
@@ -108,6 +109,10 @@ def regenerate_deterministic_pages(
     A failure here degrades the run rather than failing it: the index half of
     an index-only update is the half the post-commit hook depends on, and it
     has already been computed by the time this runs.
+
+    ``page_sets`` is filled, only when the render completes, with each
+    re-rendered file's page ids as this run selected them. Persistence uses it
+    to replace the file's whole page set rather than only the pages written.
     """
     return _render_pages(
         repo_path=repo_path,
@@ -124,6 +129,7 @@ def regenerate_deterministic_pages(
         prior_page_ids=prior_page_ids,
         degrade_label="Template page refresh",
         full_scope=full_scope,
+        page_sets=page_sets,
     )
 
 
@@ -217,6 +223,7 @@ def _render_pages(
     full_scope: bool = False,
     only_page_ids: set[str] | None = None,
     vector_store: Any = None,
+    page_sets: dict[str, set[str]] | None = None,
 ) -> list:
     """Render the changed files' pages from structure (free, no LLM).
 
@@ -289,8 +296,9 @@ def _render_pages(
         # Deterministic mode bypasses the budget, so the only scoping that
         # ever applies here is the caller's explicit ``only_page_ids`` — the
         # default None still means "take every page it is fed".
+        selected: set[str] = set()
         with console.status("  Re-rendering wiki pages from structure…"):
-            return run_async(
+            pages = run_async(
                 generator.generate_all(
                     affected_parsed,
                     affected_source,
@@ -302,8 +310,22 @@ def _render_pages(
                     dead_code_report=dead_code_report,
                     only_page_ids=only_page_ids,
                     kg_modules=kg_modules,
+                    selected_page_ids=selected,
                 )
             )
+        if page_sets is not None:
+            # Filled only here, after the render completed: a run that raised
+            # leaves it empty, and an empty map replaces nothing. A file whose
+            # pages the selection dropped entirely still gets its empty set.
+            for parsed in affected_parsed:
+                if parsed.file_info.path in regen_set:
+                    page_sets[parsed.file_info.path] = set()
+            for page_id in selected:
+                target = page_id.partition(":")[2]
+                owner = page_sets.get(target.partition("::")[0])
+                if owner is not None:
+                    owner.add(page_id)
+        return pages
     except Exception as exc:
         degraded.append(f"{degrade_label}: {exc}")
         return []
@@ -401,8 +423,16 @@ def persist_deterministic_pages(
     generated_pages: list,
     decay_paths: list[str],
     degraded: list[str],
+    page_sets: dict[str, set[str]] | None = None,
 ) -> int:
     """Write the re-rendered pages, decay the rest, and index them for search.
+
+    With ``page_sets`` (see :func:`regenerate_deterministic_pages`) each listed
+    file's page set is replaced, not just overwritten: a file page or symbol
+    spotlight of that file the render did not select is deleted. Without
+    that, a spotlight for a symbol that was removed or fell out of the
+    ranking keeps its old render key, no render ever rewrites it, and the
+    renderer-staleness sweep sends its file back here on every run.
 
     Returns the repository's total page count, so the caller can stamp
     ``state["total_pages"]`` with the real DB number rather than accumulating.
@@ -417,6 +447,7 @@ def persist_deterministic_pages(
             generated_pages=generated_pages,
             decay_paths=decay_paths,
             degraded=degraded,
+            page_sets=page_sets or {},
         )
     )
 
@@ -427,6 +458,7 @@ async def _persist_async(
     generated_pages: list,
     decay_paths: list[str],
     degraded: list[str],
+    page_sets: dict[str, set[str]],
 ) -> int:
     from repowise.cli.helpers import get_db_url_for_repo
     from repowise.core.persistence import (
@@ -449,6 +481,8 @@ async def _persist_async(
             repo = await upsert_repository(session, name=repo_path.name, local_path=str(repo_path))
             repo_id = repo.id
             await upsert_pages_from_generated(session, generated_pages, repo_id)
+            if page_sets:
+                await _retire_unselected_file_pages(repo_path, session, repo_id, page_sets)
 
             # No related-pages backfill here. ``persist_incremental_index``
             # runs one repo-wide immediately after this, unskipped, so it
@@ -525,6 +559,43 @@ async def _persist_async(
     finally:
         await engine.dispose()
     return total
+
+
+async def _retire_unselected_file_pages(
+    repo_path: Path, session: Any, repo_id: str, page_sets: dict[str, set[str]]
+) -> None:
+    """Delete each re-rendered file's pages that its render did not select.
+
+    Tombstones included: a tombstone of a file that still exists is a page the
+    selection dropped, and its stale render key loops the same way. The ids go
+    into the cleanup ledger before the delete, so the index persist that runs
+    next drops their full-text and vector rows (a restored id is excluded
+    there).
+    """
+    from sqlalchemy import delete, select
+
+    from repowise.core.persistence.models import Page, PageVersion
+    from repowise.core.pipeline.cleanup_debt import record_cleanup_debt
+
+    rows = await session.execute(
+        select(Page.id, Page.target_path).where(
+            Page.repository_id == repo_id,
+            Page.page_type.in_(("file_page", "symbol_spotlight")),
+        )
+    )
+    retired: set[str] = set()
+    for page_id, target in rows:
+        # A spotlight's target is ``<file>::<symbol>``; a file page's is the file.
+        keep = page_sets.get((target or "").partition("::")[0])
+        if keep is not None and page_id not in keep:
+            retired.add(page_id)
+    if not retired:
+        return
+    for kind in ("fts", "vectors"):
+        record_cleanup_debt(repo_path, kind, retired)
+    await session.execute(delete(PageVersion).where(PageVersion.page_id.in_(retired)))
+    await session.execute(delete(Page).where(Page.repository_id == repo_id, Page.id.in_(retired)))
+    console.print(f"  Retired [cyan]{len(retired)}[/cyan] page(s) the selection no longer makes")
 
 
 def load_file_page_render_keys(repo_path: Path) -> dict[str, str]:
