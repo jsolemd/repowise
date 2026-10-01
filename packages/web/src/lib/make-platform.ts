@@ -108,8 +108,7 @@ const buildShape = obj({
   locator: str,
   project: nullable(str),
   project_status: nullable(str),
-  topic: nullable(str),
-  topic_title: nullable(str),
+  group: nullable(str),
   engine: str,
   status: str,
   built_at: str,
@@ -121,10 +120,10 @@ const buildShape = obj({
 const buildsShape = report({
   items: list(buildShape),
   next_cursor: nullable(str),
-  topics: list(
+  // Make retired topics for groups (a9d7f62b); a project names its group.
+  groups: list(
     obj({
-      topic: nullable(str),
-      title: nullable(str),
+      group: nullable(str),
       documents: num,
       failed: num,
       latest_built_at: str,
@@ -132,36 +131,23 @@ const buildsShape = report({
   ),
 });
 
-const runShape = obj({
-  run_slug: str,
-  question: str,
-  created_at: str,
-  updated_at: str,
-  stage: str,
-  searches: num,
-  references: num,
-  abstracts_screened: num,
-  abstracts_included: num,
-  abstracts_uncertain: num,
-  fulltexts_screened: num,
-  fulltexts_included: num,
-  fulltexts_uncertain: num,
-});
+/**
+ * Schema 2 since Make migration 100 (2026-09-30): the evidence pipeline's map. Open
+ * questions; published claims and concepts by the certainty readers see (concepts carry
+ * none, so they count as unlabelled); what changed under them; and the papers whose body a
+ * claim needs, with how many still wait for a library copy (Make migration 103).
+ */
 const evidenceShape = report({
-  runs: obj({ total: num, recent: list(runShape) }),
+  questions: obj({ total: num, by_state: counts }),
   claims: obj({
     total: num,
-    by_status: counts,
-    quotes: num,
-    quotes_reviewed: num,
-    quotes_independent: num,
-    review_queue: obj({
-      claims: num,
-      oldest: list(
-        obj({ slug: str, status: str, quotes: num, quotes_independent: num, committed_at: str }),
-      ),
-    }),
+    by_kind: counts,
+    by_certainty: counts,
+    reviewed: num,
+    stale_concepts: num,
+    documents_changed: num,
   }),
+  fulltext: obj({ needed: num, waiting: num }),
   quotas: list(obj({ provider: str, day: str, daily_limit: num, spent: num, reserved: num })),
 });
 
@@ -302,15 +288,27 @@ export class MakeReportError extends Error {
 
 const MAX_BODY_BYTES = 256 * 1024;
 const DEADLINE_MS = 2500;
+/**
+ * The doctor runs live checks (systemd units, files on the watched roots) and
+ * took 3.1 s on 2026-09-26, so the common deadline turned every render into
+ * "findings unavailable". The page streams it behind Suspense instead of
+ * holding every other report hostage to it.
+ */
+const DOCTOR_DEADLINE_MS = 10_000;
 
 export function makeApiSocket(): string {
   return process.env.SOLEMD_MAKE_API_SOCKET || join(homedir(), ".local/share/solemd-make/run/api.sock");
 }
 
-function readReport<T>(path: string, shape: Check<T>): Promise<T> {
+function readReport<T>(
+  path: string,
+  shape: Check<T>,
+  deadlineMs = DEADLINE_MS,
+  schemaVersion = 1,
+): Promise<T> {
   return new Promise((resolve, reject) => {
     const req = request({ socketPath: makeApiSocket(), path, method: "GET", headers: { accept: "application/json" } });
-    const deadline = setTimeout(() => req.destroy(new MakeReportError(503)), DEADLINE_MS);
+    const deadline = setTimeout(() => req.destroy(new MakeReportError(503)), deadlineMs);
     req.on("error", () => { clearTimeout(deadline); reject(new MakeReportError(503)); });
     req.on("response", (res) => {
       let bytes = 0;
@@ -326,7 +324,7 @@ function readReport<T>(path: string, shape: Check<T>): Promise<T> {
         if (res.statusCode !== 200) { reject(new MakeReportError(res.statusCode ?? 503)); return; }
         try {
           const value = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { schema_version?: unknown };
-          if (value?.schema_version !== 1) throw new ContractError("unsupported schema_version");
+          if (value?.schema_version !== schemaVersion) throw new ContractError("unsupported schema_version");
           resolve(shape(value, path));
         } catch (error) {
           // A drifted contract is a Make/RepoWise mismatch to fix, not an outage
@@ -345,15 +343,18 @@ export const OPERATION_STATUSES = [
 ] as const;
 
 export const getMakeSummary = () => readReport("/v1/report/summary", summaryShape);
-export const getMakeEvidence = () => readReport("/v1/report/evidence", evidenceShape);
+export const getMakeEvidence = () =>
+  readReport("/v1/report/evidence", evidenceShape, DEADLINE_MS, 2);
 export const getMakeMedia = () => readReport("/v1/report/media", mediaShape);
 export const getMakeMeetings = () => readReport("/v1/report/meetings", meetingsShape);
 export const getMakeStorage = () => readReport("/v1/report/storage", storageShape);
-export const getMakeDoctor = () => readReport("/v1/report/doctor", doctorShape);
+export const getMakeDoctor = () => readReport("/v1/report/doctor", doctorShape, DOCTOR_DEADLINE_MS);
 
 export function getMakeSpend(days = 30, timeZone = "America/Los_Angeles") {
   const params = new URLSearchParams({ days: String(days), tz: timeZone });
-  return readReport(`/v1/report/spend?${params}`, spendShape);
+  // Spend is schema 2 since Make 072 (2026-09-26): total_micros is recorded plus
+  // estimated cost, so a charged call without a recorded cost is no longer free.
+  return readReport(`/v1/report/spend?${params}`, spendShape, DEADLINE_MS, 2);
 }
 
 export function getMakeOperationMix(days = 7) {
