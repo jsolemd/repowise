@@ -267,9 +267,11 @@ export function NeedsYou({
  * The evidence map: published claims by how clear the literature is on each, with
  * the concepts and open questions beside them. The certainty bar is the ordinal
  * exception make-charts.tsx describes: clear, uncertain and contested step down
- * the ramp in that fixed order whatever their counts. They take the first, third
- * and fourth steps: two apart for the two large shares, and short of the fifth,
- * which all but vanishes into the dark theme's inset.
+ * the ramp in that fixed order whatever their counts. They take the first, second
+ * and fourth steps, the one choice that holds each pair apart in both themes: the
+ * light ramp spans little lightness (OKLab ΔE about 8.6 between neighbours here,
+ * where the third and fourth steps were 4), and the fifth all but vanishes into
+ * the dark theme's inset.
  */
 export function EvidencePanel({ evidence }: { evidence: MakeEvidence | null }) {
   if (!evidence) return <Unavailable what="Evidence" />;
@@ -288,7 +290,7 @@ export function EvidencePanel({ evidence }: { evidence: MakeEvidence | null }) {
       <StackBar
         segments={[
           { key: "clear", value: certainty.clear ?? 0, color: RAMP[0], label: "clear" },
-          { key: "uncertain", value: certainty.uncertain ?? 0, color: RAMP[2], label: "uncertain" },
+          { key: "uncertain", value: certainty.uncertain ?? 0, color: RAMP[1], label: "uncertain" },
           { key: "contested", value: certainty.contested ?? 0, color: RAMP[3], label: "contested" },
         ]}
         legend
