@@ -39,6 +39,11 @@ SAMPLE_PAYLOAD = {
     },
 }
 EXPECTED_FLAT = {
+    # Degraded retrieval leads the payload with a warning an agent reads first.
+    "warning": (
+        "Keyword-only results: semantic retrieval did not run for this query. "
+        "A miss here is not evidence of absence."
+    ),
     "answer": SAMPLE_PAYLOAD["answer"],
     "citations": SAMPLE_PAYLOAD["citations"],
     "rows": SAMPLE_PAYLOAD["rows"],
@@ -93,6 +98,7 @@ def test_every_tool_serves_flat_structured_content_with_visible_trust():
     for fn in _registered_callables():
         result = _convert(fn)
         assert result.structuredContent == EXPECTED_FLAT, fn.__name__
+        assert next(iter(result.structuredContent)) == "warning", fn.__name__
         assert result.structuredContent == json.loads(result.content[0].text), fn.__name__
         assert "result" not in result.structuredContent, fn.__name__
         assert "_meta" not in result.structuredContent, fn.__name__

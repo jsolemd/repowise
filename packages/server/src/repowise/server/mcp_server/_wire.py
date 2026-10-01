@@ -24,17 +24,26 @@ FastMCP passes a returned ``CallToolResult`` straight through
 ``lowlevel/server.py``), validating only its ``structuredContent`` against the
 advertised ``outputSchema`` — which :mod:`._signature` has just made the flat
 payload's schema. The two halves of the wire change are one change.
+
+A response whose semantic lane did not run leads with a top-level ``warning``.
+The embedder notes its own failures on the request (``embedding.outage``), so
+every tool that embeds is covered, including the paths that swallow the error
+and return keyword hits; a vector leg that failed for another reason is read
+from the envelope's ``retrieval_degraded``. ``trust`` alone was not enough: an
+agent reads results before metadata, and a lexical miss reads as an absence.
 """
 
 from __future__ import annotations
 
 import functools
 import inspect
+from collections.abc import Sequence
 from typing import Annotated, Any
 
 import pydantic_core
 from mcp.types import CallToolResult, TextContent
 
+from repowise.core.providers.embedding.outage import keyword_only_notices
 from repowise.server.mcp_server._meta import agent_trust
 from repowise.server.mcp_server._signature import PAYLOAD_ANNOTATION, evaluated_signature, freeze
 
@@ -46,7 +55,9 @@ def wire(fn: Any) -> Any:
 
     @functools.wraps(fn)
     async def _wrapped(*args: Any, **kwargs: Any) -> Any:
-        return as_call_tool_result(await fn(*args, **kwargs))
+        with keyword_only_notices() as notices:
+            payload = await fn(*args, **kwargs)
+        return as_call_tool_result(payload, keyword_only=notices)
 
     return freeze(_wrapped, _wire_signature(fn))
 
@@ -75,13 +86,19 @@ def _wire_signature(fn: Any) -> inspect.Signature | None:
     return signature.replace(return_annotation=Annotated[CallToolResult, payload])
 
 
-def as_call_tool_result(payload: Any) -> Any:
-    """*payload* as a protocol result, with its ``_meta`` promoted off it."""
+def as_call_tool_result(payload: Any, *, keyword_only: Sequence[str] = ()) -> Any:
+    """*payload* as a protocol result, with its ``_meta`` promoted off it.
+
+    *keyword_only* holds the warnings the embedder noted on this request.
+    """
     if not isinstance(payload, dict):
         # No tool returns one. For a shape this was not written for, FastMCP's
         # own conversion is a better answer than a hand-built result.
         return payload
     envelope = payload.get("_meta")
+    warning = _keyword_only_warning(keyword_only, envelope)
+    if warning is not None:
+        payload = _lead_with(warning, payload)
     if not isinstance(envelope, dict) or not envelope:
         return CallToolResult(content=text_block(payload), structuredContent=payload)
     # A copy rather than a ``pop``: the layers below have already measured,
@@ -102,6 +119,29 @@ def as_call_tool_result(payload: Any) -> Any:
     # the model allows extras. The SDK passes the alias for the same reason
     # (``mcp/server/lowlevel/server.py``, on ``ResourceContents``).
     return CallToolResult(content=text_block(flat), structuredContent=flat, **{"_meta": envelope})
+
+
+def _keyword_only_warning(notices: Sequence[str], envelope: Any) -> str | None:
+    if notices:
+        return " ".join(notices)
+    if isinstance(envelope, dict) and envelope.get("retrieval_degraded"):
+        return str(
+            envelope.get("retrieval_degraded_reason")
+            or "Keyword-only results: semantic retrieval did not run for this query. "
+            "A miss here is not evidence of absence."
+        )
+    return None
+
+
+def _lead_with(warning: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """A copy of *payload* whose first key is ``warning``, keeping any it had."""
+    existing = payload.get("warning")
+    if existing:
+        warning = f"{warning} {existing}"
+    return {
+        "warning": warning,
+        **{key: value for key, value in payload.items() if key != "warning"},
+    }
 
 
 def text_block(payload: dict[str, Any]) -> list[TextContent]:

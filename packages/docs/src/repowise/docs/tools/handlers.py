@@ -16,6 +16,7 @@ from repowise.docs.indexer import (
     get_chunk_by_id,
     get_code_chunks_for_section,
     get_sibling_chunks,
+    search_bm25,
     search_exact_match,
     search_hybrid,
 )
@@ -75,12 +76,14 @@ async def handle_query_docs(
     get_library_fn: GetLibraryFn | None = None,
     search_exact_match_fn: SearchFn | None = None,
     search_hybrid_fn: SearchFn | None = None,
+    search_bm25_fn: SearchFn | None = None,
     get_code_chunks_for_section_fn: CodeChunksFn | None = None,
     get_sibling_chunks_fn: SiblingChunksFn | None = None,
 ) -> dict[str, Any]:
     get_library_fn = get_library_fn or get_library
     search_exact_match_fn = search_exact_match_fn or search_exact_match
     search_hybrid_fn = search_hybrid_fn or search_hybrid
+    search_bm25_fn = search_bm25_fn or search_bm25
     get_code_chunks_for_section_fn = get_code_chunks_for_section_fn or get_code_chunks_for_section
     get_sibling_chunks_fn = get_sibling_chunks_fn or get_sibling_chunks
     return await search_tools.handle_query_docs(
@@ -88,6 +91,7 @@ async def handle_query_docs(
         get_library_fn=get_library_fn,
         search_exact_match_fn=search_exact_match_fn,
         search_hybrid_fn=search_hybrid_fn,
+        search_bm25_fn=search_bm25_fn,
         get_code_chunks_for_section_fn=get_code_chunks_for_section_fn,
         get_sibling_chunks_fn=get_sibling_chunks_fn,
     )
@@ -98,13 +102,16 @@ async def handle_query_docs_multi(
     *,
     get_library_fn: GetLibraryFn | None = None,
     search_hybrid_fn: SearchFn | None = None,
+    search_bm25_fn: SearchFn | None = None,
 ) -> dict[str, Any]:
     get_library_fn = get_library_fn or get_library
     search_hybrid_fn = search_hybrid_fn or search_hybrid
+    search_bm25_fn = search_bm25_fn or search_bm25
     return await search_tools.handle_query_docs_multi(
         arguments,
         get_library_fn=get_library_fn,
         search_hybrid_fn=search_hybrid_fn,
+        search_bm25_fn=search_bm25_fn,
     )
 
 

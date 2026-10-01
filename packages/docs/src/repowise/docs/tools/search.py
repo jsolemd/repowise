@@ -11,8 +11,10 @@ from repowise.docs.chunking.models import canonicalize_section_anchor
 from repowise.docs.db import get_library
 from repowise.docs.db import list_libraries as db_list_libraries
 from repowise.docs.indexer import (
+    QueryEmbeddingUnavailableError,
     get_code_chunks_for_section,
     get_sibling_chunks,
+    search_bm25,
     search_exact_match,
     search_hybrid,
 )
@@ -42,6 +44,19 @@ _DEFAULT_SEARCH_DOCS_MULTI_LIMIT = 3
 _RELATED_SECTION_FILE_LIMIT = 2
 _RELATED_SECTION_PER_FILE_LIMIT = 4
 _MAX_CODE_BLOCKS_PER_HIT = 1
+
+
+def _keyword_only_warning(cause: str) -> str:
+    """Why a search answered from BM25 alone. Keyword hits beat an error, never silently."""
+    return (
+        "Keyword-only results: semantic search did not run because the embedding server "
+        f"failed ({cause}). A miss here is not evidence of absence."
+    )
+
+
+def _mark_keyword_only(response: dict[str, Any], cause: str) -> dict[str, Any]:
+    """*response* led by the warning, with the cause where a proxy can act on it."""
+    return {"warning": _keyword_only_warning(cause), "keyword_only": cause, **response}
 
 
 def _resolve_output_format(arguments: dict[str, Any], *, default: str = "json") -> str:
@@ -123,6 +138,7 @@ async def handle_query_docs(
     list_libraries_fn=db_list_libraries,
     search_exact_match_fn=search_exact_match,
     search_hybrid_fn=search_hybrid,
+    search_bm25_fn=search_bm25,
     get_code_chunks_for_section_fn=get_code_chunks_for_section,
     get_sibling_chunks_fn=get_sibling_chunks,
 ) -> dict[str, Any]:
@@ -173,6 +189,7 @@ async def handle_query_docs(
     intent = detect_intent(query)
     logger.debug("Detected intent for '%s': %s", query[:30], intent.value)
 
+    keyword_only: str | None = None
     if exact_match:
         points = await search_exact_match_fn(
             library_id=library_id,
@@ -182,13 +199,19 @@ async def handle_query_docs(
             phrase_boost=2.0,
         )
     else:
-        points = await search_hybrid_fn(
-            library_id=library_id,
-            query=query,
-            limit=limit,
-            chunk_types=chunk_types,
-            intent=intent,
-        )
+        try:
+            points = await search_hybrid_fn(
+                library_id=library_id,
+                query=query,
+                limit=limit,
+                chunk_types=chunk_types,
+                intent=intent,
+            )
+        except QueryEmbeddingUnavailableError as exc:
+            keyword_only = str(exc)
+            points = await search_bm25_fn(
+                library_id=library_id, query=query, limit=limit, chunk_types=chunk_types
+            )
 
     freshness_factor = _freshness_decay_factor(library.indexed_at)
     if freshness_factor != 1.0:
@@ -248,7 +271,7 @@ async def handle_query_docs(
         "library_id": library_id,
         "normalized_library_id": canonical_library_id,
         "query": query,
-        "search_mode": "exact" if exact_match else "hybrid",
+        "search_mode": "exact" if exact_match else ("keyword_only" if keyword_only else "hybrid"),
         "detected_intent": intent.value,
     }
 
@@ -320,8 +343,10 @@ async def handle_query_docs(
     if warnings:
         response["warnings"] = warnings
 
+    if keyword_only:
+        warning = " | ".join([_keyword_only_warning(keyword_only), *warnings])
     if output_format == "markdown":
-        return {
+        markdown = {
             "content": _format_as_markdown(
                 results,
                 query,
@@ -331,7 +356,8 @@ async def handle_query_docs(
             ),
             "format": "markdown",
         }
-    return response
+        return _mark_keyword_only(markdown, keyword_only) if keyword_only else markdown
+    return _mark_keyword_only(response, keyword_only) if keyword_only else response
 
 
 async def handle_query_docs_multi(
@@ -340,6 +366,7 @@ async def handle_query_docs_multi(
     get_library_fn=get_library,
     list_libraries_fn=db_list_libraries,
     search_hybrid_fn=search_hybrid,
+    search_bm25_fn=search_bm25,
 ) -> dict[str, Any]:
     """Search across multiple documentation libraries simultaneously."""
     library_ids = get_arg(arguments, "library_ids", aliases=("libraryIds",), default=[])
@@ -402,6 +429,8 @@ async def handle_query_docs_multi(
             )
         raise ToolError(f"No searchable libraries found. Errors: {'; '.join(failure_bits)}")
 
+    keyword_only: list[str] = []
+
     async def search_one_library(lib: LibraryState) -> tuple[str, list[dict], str | None]:
         warnings: list[str] = []
         if lib.status == LibraryStatus.INDEXING:
@@ -412,13 +441,22 @@ async def handle_query_docs_multi(
             warnings.append(f"Indexed with warnings: {lib.error_message}")
 
         try:
-            points = await search_hybrid_fn(
-                library_id=lib.library_id,
-                query=query,
-                limit=limit_per_library,
-                chunk_types=chunk_types,
-                intent=intent,
-            )
+            try:
+                points = await search_hybrid_fn(
+                    library_id=lib.library_id,
+                    query=query,
+                    limit=limit_per_library,
+                    chunk_types=chunk_types,
+                    intent=intent,
+                )
+            except QueryEmbeddingUnavailableError as exc:
+                keyword_only.append(str(exc))
+                points = await search_bm25_fn(
+                    library_id=lib.library_id,
+                    query=query,
+                    limit=limit_per_library,
+                    chunk_types=chunk_types,
+                )
             freshness_factor = _freshness_decay_factor(lib.indexed_at)
             if freshness_factor != 1.0:
                 for point in points:
@@ -460,7 +498,7 @@ async def handle_query_docs_multi(
         "total": len(all_results),
         "libraries": library_summaries,
         "query": query,
-        "search_mode": "hybrid_multi",
+        "search_mode": "keyword_only_multi" if keyword_only else "hybrid_multi",
         "detected_intent": intent.value,
     }
     if unmatched_library_ids:
@@ -479,8 +517,10 @@ async def handle_query_docs_multi(
             warning_lines.append(f"Library {skipped['library_id']} skipped ({skipped['reason']})")
         if warnings:
             warning_lines.extend(warnings)
+        if keyword_only:
+            warning_lines.insert(0, _keyword_only_warning(keyword_only[0]))
         warning_text = " | ".join(warning_lines) if warning_lines else None
-        return {
+        markdown = {
             "content": _format_as_markdown(
                 all_results,
                 query,
@@ -489,4 +529,5 @@ async def handle_query_docs_multi(
             ),
             "format": "markdown",
         }
-    return response
+        return _mark_keyword_only(markdown, keyword_only[0]) if keyword_only else markdown
+    return _mark_keyword_only(response, keyword_only[0]) if keyword_only else response

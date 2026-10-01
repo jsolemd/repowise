@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+import httpx
 from qdrant_client import AsyncQdrantClient, models
 
 from repowise.docs.config import get_settings
@@ -22,6 +23,10 @@ if TYPE_CHECKING:
     from repowise.docs.search.intent import QueryIntent
 
 logger = logging.getLogger(__name__)
+
+
+class QueryEmbeddingUnavailableError(RuntimeError):
+    """The embedding server could not embed the query, so only the keyword lane can run."""
 
 
 def _sort_results(
@@ -57,7 +62,14 @@ async def search_hybrid(
 
     settings = get_settings()
     logger.debug("Embedding query: %s...", query[:50])
-    query_embedding = await embed_query(query)
+    try:
+        query_embedding = await embed_query(query)
+    except httpx.HTTPError as exc:
+        if isinstance(exc, httpx.HTTPStatusError):
+            cause = f"HTTP {exc.response.status_code} from the embedding server"
+        else:
+            cause = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+        raise QueryEmbeddingUnavailableError(cause) from exc
 
     query_filter = build_library_filter(library_id, chunk_types)
 

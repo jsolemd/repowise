@@ -6,15 +6,21 @@ from typing import Annotated, Any, Literal
 
 from pydantic import Field
 
+from repowise.core.providers.embedding.outage import (
+    ensure_embedder,
+    keyword_only_warning,
+    note_keyword_only,
+)
 from repowise.core.registry import mcp_tool_registry as mcp
 from repowise.docs.client import DocsClient, DocsUnavailable
 
 
 async def _call(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    arguments = {key: value for key, value in arguments.items() if value is not None}
     try:
-        result = await DocsClient().call_tool(
-            name, {key: value for key, value in arguments.items() if value is not None}
-        )
+        result = await DocsClient().call_tool(name, arguments)
+        if result.get("keyword_only"):
+            result = await _recover_semantic_lane(name, arguments, result)
     except DocsUnavailable as exc:
         return {
             "status": "unavailable",
@@ -24,6 +30,26 @@ async def _call(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
             "trust": {"evidence_kind": "documentation", "unavailable": True},
         }
     result.setdefault("trust", {})["evidence_kind"] = "documentation"
+    return result
+
+
+async def _recover_semantic_lane(
+    name: str, arguments: dict[str, Any], result: dict[str, Any]
+) -> dict[str, Any]:
+    """Retry a keyword-only docs search once the host has the embedder back.
+
+    The worker runs in a container and cannot reach the host's ensure command,
+    so it answers from BM25 and says why; this side asks for recovery and
+    retries once if the server is serving again. Otherwise the request carries
+    the host's verdict, which names the remedy, in place of the worker's.
+    """
+    verdict = await ensure_embedder()
+    if verdict is not None and verdict.state == "serving":
+        result = await DocsClient().call_tool(name, arguments)
+        if not result.get("keyword_only"):
+            return result
+    note_keyword_only(keyword_only_warning(f"docs search: {result['keyword_only']}", verdict))
+    result.pop("warning", None)
     return result
 
 

@@ -14,6 +14,15 @@ model's special tokens.
 A router-mode server serves several models and routes each request by its
 ``model`` field, so every call names the model, and the context is read from
 that model's ``/props``.
+
+A request the server cannot serve is retried briefly when the failure is the
+kind that passes (a 503 while a model loads, a timeout). If it still fails, the
+host's ensure command is asked to bring the server back (see
+:mod:`~repowise.core.providers.embedding.outage`), and the request is retried
+once if it reports the server serving. Otherwise the call raises
+:class:`~repowise.core.providers.embedding.outage.EmbedderUnavailableError`,
+whose message says why semantic search is off and how to restore it, and the
+current MCP request is marked keyword-only.
 """
 
 from __future__ import annotations
@@ -21,13 +30,17 @@ from __future__ import annotations
 import asyncio
 import math
 import os
-from typing import Any
 
 import httpx
 import structlog
 
 from repowise.core.providers.embedding.base import resolve_embedding_timeout
 from repowise.core.providers.embedding.ollama import _infer_dimensions
+from repowise.core.providers.embedding.outage import (
+    EmbedderUnavailableError,
+    ensure_embedder,
+    note_keyword_only,
+)
 
 log = structlog.get_logger(__name__)
 
@@ -40,6 +53,10 @@ _DEFAULT_TIMEOUT = 60.0
 _CONTEXT_RESERVE = 8
 #: Inputs tokenized at once while fitting a batch.
 _TOKENIZE_CONCURRENCY = 16
+#: Retries of a failure that passes on its own (a 503 while a model loads, a
+#: timeout), before the server is treated as down.
+_TRANSIENT_RETRIES = 2
+_RETRY_BACKOFF_S = 0.5
 
 
 class LlamaCppEmbedder:
@@ -117,10 +134,48 @@ class LlamaCppEmbedder:
         return response.json()["content"], len(tokens)
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
-        """Embed a batch, cutting each input to the model's context first."""
+        """Embed a batch, cutting each input to the model's context first.
+
+        Raises :class:`EmbedderUnavailableError` when the server cannot serve
+        it after a retry and any recovery the host can make.
+        """
         if not texts:
             return []
+        try:
+            return await self._embed_retrying(texts)
+        except httpx.HTTPError as exc:
+            if not _server_failure(exc):
+                raise
+            failure = exc
+        verdict = await ensure_embedder()
+        if verdict is not None and verdict.state == "serving":
+            try:
+                return await self._embed_retrying(texts)
+            except httpx.HTTPError as exc:
+                if not _server_failure(exc):
+                    raise
+                failure = exc
+        error = EmbedderUnavailableError(_describe(failure), verdict)
+        log.warning(
+            "llamacpp_embed_unavailable",
+            cause=error.cause,
+            state=verdict.state if verdict else None,
+            model=self._model,
+        )
+        note_keyword_only(error.warning)
+        raise error from failure
 
+    async def _embed_retrying(self, texts: list[str]) -> list[list[float]]:
+        for attempt in range(_TRANSIENT_RETRIES + 1):
+            try:
+                return await self._embed_once(texts)
+            except httpx.HTTPError as exc:
+                if attempt == _TRANSIENT_RETRIES or not _transient(exc):
+                    raise
+            await asyncio.sleep(_RETRY_BACKOFF_S * (attempt + 1))
+        raise AssertionError("unreachable")  # pragma: no cover
+
+    async def _embed_once(self, texts: list[str]) -> list[list[float]]:
         async with httpx.AsyncClient(timeout=self._timeout) as client:
             budget = await self._token_budget(client)
             gate = asyncio.Semaphore(_TOKENIZE_CONCURRENCY)
@@ -130,7 +185,7 @@ class LlamaCppEmbedder:
                     return await self._fit(client, text, budget)
 
             fitted = await asyncio.gather(*(fit(text) for text in texts))
-            cut = [count for text, (kept, count) in zip(texts, fitted) if kept != text]
+            cut = [count for text, (kept, count) in zip(texts, fitted, strict=True) if kept != text]
             if cut:
                 log.debug(
                     "llamacpp_embed_input_truncated",
@@ -148,7 +203,9 @@ class LlamaCppEmbedder:
             rows = sorted(response.json()["data"], key=lambda row: row["index"])
 
         if len(rows) != len(texts):
-            raise ValueError(f"llama-server returned {len(rows)} embeddings for {len(texts)} inputs.")
+            raise ValueError(
+                f"llama-server returned {len(rows)} embeddings for {len(texts)} inputs."
+            )
         vectors = [[float(value) for value in row["embedding"]] for row in rows]
         widths = {len(vector) for vector in vectors}
         if widths != {self._dimensions}:
@@ -158,6 +215,25 @@ class LlamaCppEmbedder:
                 f"model {self._model!r} returned {actual}. Set REPOWISE_EMBEDDING_DIMS={actual}."
             )
         return [_l2_normalize(vector) for vector in vectors]
+
+
+def _transient(exc: httpx.HTTPError) -> bool:
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code == 503
+    return isinstance(exc, httpx.TimeoutException)
+
+
+def _server_failure(exc: httpx.HTTPError) -> bool:
+    """A failure of the server rather than of the request: down, hung or erroring."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code >= 500
+    return isinstance(exc, httpx.TransportError)
+
+
+def _describe(exc: httpx.HTTPError) -> str:
+    if isinstance(exc, httpx.HTTPStatusError):
+        return f"HTTP {exc.response.status_code} from {exc.request.url.path}"
+    return f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
 
 
 def _l2_normalize(vec: list[float]) -> list[float]:

@@ -25,6 +25,7 @@ from repowise.docs.indexer.mutations import (
     upsert_chunks,
 )
 from repowise.docs.indexer.search import (
+    QueryEmbeddingUnavailableError,
     get_chunk_by_id,
     get_code_chunks_for_section,
     get_sibling_chunks,
@@ -38,6 +39,7 @@ __all__ = [
     # Collection management
     "COLLECTION_NAME",
     "ChangeSet",
+    "QueryEmbeddingUnavailableError",
     "close_qdrant_client",
     "compute_changes",
     # Incremental indexing
