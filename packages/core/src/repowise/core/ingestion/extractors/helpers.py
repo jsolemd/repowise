@@ -233,6 +233,9 @@ def find_preceding_jsdoc(node: Node, src: str) -> str | None:
         parent is not None
         and parent.type in _JSDOC_WRAPPER_TYPES
         and _leads_statement(node, parent)
+        # A comment inside the wrapper is nearer than any outside it and owns
+        # the position, JSDoc or not: never borrow the outer one across it.
+        and not (node.prev_sibling is not None and node.prev_sibling.type == "comment")
     ):
         node, parent = parent, parent.parent
     prev = node.prev_sibling
