@@ -178,6 +178,27 @@ def _affected_files(decision: JournalDecision) -> list[str]:
     return list(dict.fromkeys(anchor.file for anchor in decision.anchors))
 
 
+def _vector_item(decision: JournalDecision) -> tuple[str, str, dict] | None:
+    return decision_vector_item(
+        decision.id,
+        title=decision.title,
+        decision=decision.decision,
+        evidence_file=decision.anchors[0].file if decision.anchors else None,
+    )
+
+
+def _projected_vector_item(record: DecisionRecord) -> tuple[str, str, dict] | None:
+    """The item a projected row was embedded from, before this refresh rewrites it."""
+
+    anchors = json.loads(record.anchors_json or "[]")
+    return decision_vector_item(
+        record.id,
+        title=record.title,
+        decision=record.decision or "",
+        evidence_file=anchors[0].get("file") if anchors else None,
+    )
+
+
 def _anchor_stale(repo_root: Path, anchor: DecisionAnchor) -> bool:
     if anchor.file_sha is None:
         return False
@@ -304,6 +325,12 @@ async def refresh_decision_journal(
         )
         await session.execute(delete(DecisionRecord).where(DecisionRecord.id.in_(removed_ids)))
 
+    # Read before the projection below overwrites the rows they come from.
+    embedded = {
+        item[0]: item
+        for record in projected
+        if (item := _projected_vector_item(record)) is not None
+    }
     records: list[DecisionRecord] = []
     for decision in decisions:
         record = projected_by_id.get(decision.id)
@@ -381,19 +408,7 @@ async def refresh_decision_journal(
         vector_key = (str(snapshot.path), id(vector_store))
         with _state_lock:
             prior_vector_hash = _vector_hash_by_store.get(vector_key)
-        items = [
-            item
-            for decision in decisions
-            if (
-                item := decision_vector_item(
-                    decision.id,
-                    title=decision.title,
-                    decision=decision.decision,
-                    evidence_file=decision.anchors[0].file if decision.anchors else None,
-                )
-            )
-            is not None
-        ]
+        items = [item for decision in decisions if (item := _vector_item(decision)) is not None]
         expected_vector_ids = {item[0] for item in items}
         stored_decision_ids: set[str] | None = None
         list_page_ids = getattr(vector_store, "list_page_ids", None)
@@ -409,13 +424,22 @@ async def refresh_decision_journal(
                 # a safe fallback for stores that cannot enumerate ids.
                 stored_decision_ids = None
 
-        vectors_missing = stored_decision_ids is not None and not expected_vector_ids.issubset(
-            stored_decision_ids
-        )
-        if prior_vector_hash != snapshot.content_hash or vectors_missing:
-            await upsert_decision_vectors(vector_store, items)
-            with _state_lock:
-                _vector_hash_by_store[vector_key] = snapshot.content_hash
+        if stored_decision_ids is None:
+            pending = items if prior_vector_hash != snapshot.content_hash else []
+        else:
+            # Only a decision whose vector is missing or whose title, text or
+            # first anchor changed is written. Re-embedding the whole journal on
+            # every change rewrote ~150 unchanged rows per recorded decision:
+            # 1,487 of SoleMD.Make's 3,357 wiki-table row writes on 2026-10-01.
+            pending = [
+                item
+                for item in items
+                if item[0] not in stored_decision_ids or embedded.get(item[0]) != item
+            ]
+        if pending:
+            await upsert_decision_vectors(vector_store, pending)
+        with _state_lock:
+            _vector_hash_by_store[vector_key] = snapshot.content_hash
 
         stale_vector_ids = {f"{DECISION_VECTOR_PREFIX}{decision_id}" for decision_id in removed_ids}
         if stored_decision_ids is not None:

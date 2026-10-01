@@ -459,6 +459,75 @@ async def test_automatic_evolution_is_disabled_before_any_provider_call(
     }
 
 
+async def test_refresh_embeds_only_the_decisions_that_changed(
+    async_session,
+    journal_projection_repo,
+    in_memory_vector_store,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Recording one decision used to re-embed the whole journal.
+
+    Each recorded decision then rewrote every unchanged decision's vector row,
+    and a fresh process, which remembers no journal hash, did the same.
+    """
+    from repowise.core.analysis.decisions import journal_projection
+
+    repo, root = journal_projection_repo
+    journal = DecisionJournal(root)
+    first = journal.record(
+        decision_id="dec-00000001",
+        title="Keep the journal canonical",
+        decision="Project decisions out of the tracked JSONL file.",
+        why="A rebuild must never lose governance history.",
+        anchors=[{"file": "src/service.py", "symbol": "VALUE"}],
+    )
+    journal.record(
+        decision_id="dec-00000002",
+        title="Use a replacement implementation",
+        decision="Move the implementation to replacement.py.",
+        why="The replacement has the corrected contract.",
+        anchors=[{"file": "src/replacement.py", "symbol": None}],
+    )
+    await refresh_decision_journal(async_session, repo.id, vector_store=in_memory_vector_store)
+
+    written: list[str] = []
+    upsert_vectors = in_memory_vector_store.upsert_vectors
+    embed_batch = in_memory_vector_store.embed_batch
+
+    async def spy_upsert(items):
+        written.extend(page_id for page_id, _vector, _metadata in items)
+        return await upsert_vectors(items)
+
+    async def spy_embed(items):
+        written.extend(page_id for page_id, _text, _metadata in items)
+        return await embed_batch(items)
+
+    monkeypatch.setattr(in_memory_vector_store, "upsert_vectors", spy_upsert)
+    monkeypatch.setattr(in_memory_vector_store, "embed_batch", spy_embed)
+
+    journal.record(
+        decision_id="dec-00000003",
+        title="Embed only what changed",
+        decision="Write a decision vector only when its inputs change.",
+        why="Unchanged rewrites bloat the vector store.",
+        anchors=[{"file": "src/service.py", "symbol": None}],
+    )
+    await refresh_decision_journal(async_session, repo.id, vector_store=in_memory_vector_store)
+    assert written == [f"{DECISION_VECTOR_PREFIX}dec-00000003"]
+
+    written.clear()
+    journal.replace_anchor_files(first.id, ["src/replacement.py"])
+    await refresh_decision_journal(async_session, repo.id, vector_store=in_memory_vector_store)
+    assert written == [f"{DECISION_VECTOR_PREFIX}{first.id}"]
+
+    # A new process starts with no journal hash in memory.
+    written.clear()
+    monkeypatch.setattr(journal_projection, "_vector_hash_by_store", {})
+    await refresh_decision_journal(async_session, repo.id, vector_store=in_memory_vector_store)
+    assert written == []
+    assert len(await in_memory_vector_store.list_page_ids()) == 3
+
+
 async def test_unchanged_journal_refresh_writes_nothing(
     async_session,
     journal_projection_repo,
