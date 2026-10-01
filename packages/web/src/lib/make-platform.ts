@@ -302,15 +302,27 @@ export class MakeReportError extends Error {
 
 const MAX_BODY_BYTES = 256 * 1024;
 const DEADLINE_MS = 2500;
+/**
+ * The doctor runs live checks (systemd units, files on the watched roots) and
+ * took 3.1 s on 2026-09-26, so the common deadline turned every render into
+ * "findings unavailable". The page streams it behind Suspense instead of
+ * holding every other report hostage to it.
+ */
+const DOCTOR_DEADLINE_MS = 10_000;
 
 export function makeApiSocket(): string {
   return process.env.SOLEMD_MAKE_API_SOCKET || join(homedir(), ".local/share/solemd-make/run/api.sock");
 }
 
-function readReport<T>(path: string, shape: Check<T>): Promise<T> {
+function readReport<T>(
+  path: string,
+  shape: Check<T>,
+  deadlineMs = DEADLINE_MS,
+  schemaVersion = 1,
+): Promise<T> {
   return new Promise((resolve, reject) => {
     const req = request({ socketPath: makeApiSocket(), path, method: "GET", headers: { accept: "application/json" } });
-    const deadline = setTimeout(() => req.destroy(new MakeReportError(503)), DEADLINE_MS);
+    const deadline = setTimeout(() => req.destroy(new MakeReportError(503)), deadlineMs);
     req.on("error", () => { clearTimeout(deadline); reject(new MakeReportError(503)); });
     req.on("response", (res) => {
       let bytes = 0;
@@ -326,7 +338,7 @@ function readReport<T>(path: string, shape: Check<T>): Promise<T> {
         if (res.statusCode !== 200) { reject(new MakeReportError(res.statusCode ?? 503)); return; }
         try {
           const value = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { schema_version?: unknown };
-          if (value?.schema_version !== 1) throw new ContractError("unsupported schema_version");
+          if (value?.schema_version !== schemaVersion) throw new ContractError("unsupported schema_version");
           resolve(shape(value, path));
         } catch (error) {
           // A drifted contract is a Make/RepoWise mismatch to fix, not an outage
@@ -349,11 +361,13 @@ export const getMakeEvidence = () => readReport("/v1/report/evidence", evidenceS
 export const getMakeMedia = () => readReport("/v1/report/media", mediaShape);
 export const getMakeMeetings = () => readReport("/v1/report/meetings", meetingsShape);
 export const getMakeStorage = () => readReport("/v1/report/storage", storageShape);
-export const getMakeDoctor = () => readReport("/v1/report/doctor", doctorShape);
+export const getMakeDoctor = () => readReport("/v1/report/doctor", doctorShape, DOCTOR_DEADLINE_MS);
 
 export function getMakeSpend(days = 30, timeZone = "America/Los_Angeles") {
   const params = new URLSearchParams({ days: String(days), tz: timeZone });
-  return readReport(`/v1/report/spend?${params}`, spendShape);
+  // Spend is schema 2 since Make 072 (2026-09-26): total_micros is recorded plus
+  // estimated cost, so a charged call without a recorded cost is no longer free.
+  return readReport(`/v1/report/spend?${params}`, spendShape, DEADLINE_MS, 2);
 }
 
 export function getMakeOperationMix(days = 7) {
