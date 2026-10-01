@@ -50,8 +50,14 @@ def mcp_guard(monkeypatch):
     async def _stock(*args: Any, **kwargs: Any) -> dict:
         return STOCK
 
+    async def _no_contexts(_repo: Any) -> list:
+        return []
+
     monkeypatch.setattr(tool_search, "mcp_coordinator", _spy)
     monkeypatch.setattr(tool_search, "_structured_search", _stock)
+    # The native lanes validate names against the wiki symbol table (v0.54);
+    # with no store stubbed there are none to load.
+    monkeypatch.setattr(tool_search, "_contexts_for", _no_contexts)
     monkeypatch.delenv(SOURCE_SEARCH_ENV, raising=False)
     return asked, slot
 

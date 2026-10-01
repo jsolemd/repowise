@@ -1354,10 +1354,9 @@ async def search_codebase(
     if repo == "all" and not _is_workspace_mode():
         repo = None
 
-    # Loaded once so routing, candidates, ordering and the hint validate alike.
-    names = await indexed_names(await _contexts_for(repo), query)
-    grep_hint = _grep_hint_for(query, names)
-    resolved_mode = _resolve_mode(query, mode, names)
+    # The source lane routes on query shape alone and never reads the wiki's
+    # symbol table; only the native lanes below validate names against it.
+    resolved_mode = _resolve_mode(query, mode)
 
     # Exact symbol/path lookup and filtered searches already have native
     # resolvers. Preserve their argument semantics; the source coordinator
@@ -1414,6 +1413,10 @@ async def search_codebase(
                 attach_ignored_arguments(response, ignored)
                 return response
 
+    # Loaded once so routing, candidates, ordering and the hint validate alike.
+    names = await indexed_names(await _contexts_for(repo), query)
+    grep_hint = _grep_hint_for(query, names)
+    resolved_mode = _resolve_mode(query, mode, names)
 
     if resolved_mode in ("symbol", "path", "hybrid"):
         structured = await _structured_search(

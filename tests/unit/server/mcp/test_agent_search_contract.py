@@ -23,6 +23,7 @@ async def test_explicit_lookup_contract_uses_native_resolver(monkeypatch, argume
     native = AsyncMock(return_value={"results": [], "mode": arguments["mode"]})
     source = AsyncMock()
     monkeypatch.setattr(tool_search, "_structured_search", native)
+    monkeypatch.setattr(tool_search, "_contexts_for", AsyncMock(return_value=[]))
     monkeypatch.setattr(tool_search, "mcp_coordinator", source)
     await tool_search.search_codebase("SourceSearchCoordinator", **arguments)
     native.assert_awaited_once()
@@ -65,6 +66,7 @@ async def test_an_auto_mode_identifier_still_reaches_the_source_lane(monkeypatch
     coordinator = AsyncMock()
     coordinator.search = AsyncMock(return_value=owned)
     monkeypatch.setattr(tool_search, "_structured_search", native)
+    monkeypatch.setattr(tool_search, "_contexts_for", AsyncMock(return_value=[]))
     monkeypatch.setattr(tool_search, "mcp_coordinator", AsyncMock(return_value=coordinator))
 
     result = await tool_search.search_codebase(query)
@@ -85,6 +87,7 @@ async def test_an_auto_resolved_path_stays_on_the_native_resolver(monkeypatch):
     native = AsyncMock(return_value={"results": [], "mode": "path"})
     source = AsyncMock()
     monkeypatch.setattr(tool_search, "_structured_search", native)
+    monkeypatch.setattr(tool_search, "_contexts_for", AsyncMock(return_value=[]))
     monkeypatch.setattr(tool_search, "mcp_coordinator", source)
 
     await tool_search.search_codebase("src/repowise/core/foo.py")
