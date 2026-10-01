@@ -113,7 +113,7 @@ export default async function MakePlatformPage() {
               <Meter label="Notes to file" value={meetings.recordings.awaiting_summary} of={meetings.recordings.total} color="var(--color-node-needs-work)" />
             ) : <div />}
             {evidence ? (
-              <Meter label="Claims unreviewed" value={evidence.claims.review_queue.claims} of={evidence.claims.total} color={RAMP[2]} />
+              <Meter label="Papers awaiting a copy" value={evidence.fulltext.waiting} of={evidence.fulltext.needed} color={RAMP[2]} />
             ) : <div />}
             <div className="flex min-w-0 flex-col gap-2 p-4">
               <Label>Spend</Label>

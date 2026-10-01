@@ -146,88 +146,96 @@ export function DoctorPending() {
 
 // --- Pipelines ----------------------------------------------------------------------
 
-const STAGE_LABEL: Record<string, string> = {
-  scoped: "scoped",
-  searching: "search",
-  screening: "abstracts",
-  fulltext: "full text",
-};
-
+/**
+ * The evidence map's state. Its fingerprint first: the published claims by how clear the
+ * literature is on each, ordered from clear to contested down the ramp. Then what asks for
+ * a hand: concepts a changed claim made stale, documents citing a claim whose sentence
+ * moved since they were built, and papers whose body a claim needs that have no copy yet.
+ */
 export function EvidencePanel({ evidence }: { evidence: MakeEvidence | null }) {
   if (!evidence) return <Unavailable what="Evidence" />;
-  const { claims, runs } = evidence;
-  const ratified = claims.by_status.ratified ?? 0;
-  const drafterOnly = claims.quotes_reviewed - claims.quotes_independent;
-  const active = runs.recent.filter((r) => r.abstracts_screened > 0).slice(0, 6);
+  const { questions, claims, fulltext } = evidence;
+  const certainty = claims.by_certainty;
+  const attention = [
+    {
+      key: "stale",
+      value: claims.stale_concepts,
+      label: "concepts stale",
+      title: "Concepts resting on a claim that changed since they pinned it. A final build refuses them.",
+      alert: true,
+    },
+    {
+      key: "documents",
+      value: claims.documents_changed,
+      label: "documents to rebuild",
+      title: "Documents citing a claim whose sentence changed since they were last built.",
+      alert: true,
+    },
+    {
+      key: "copies",
+      value: fulltext.waiting,
+      label: `of ${count(fulltext.needed)} papers await a copy`,
+      title: "Papers whose body a claim needs, with no full text yet: a library copy settles them.",
+      alert: false,
+    },
+  ];
   return (
-    <Panel label="Evidence" aside={`${count(runs.total)} runs`}>
+    <Panel label="Evidence" aside={`${count(questions.total)} open questions`}>
       <div className="grid grid-cols-2 gap-4">
         <div className="flex flex-col gap-2">
-          <Figure value={count(claims.total)} unit="claims" />
+          <Figure value={count(claims.by_kind.claim ?? 0)} unit="claims" />
           <StackBar
             segments={[
-              { key: "ratified", value: ratified, color: RAMP[0], label: "ratified" },
-              { key: "proposed", value: claims.total - ratified, color: RAMP[3], label: "proposed" },
+              { key: "clear", value: certainty.clear ?? 0, color: RAMP[0], label: "clear" },
+              { key: "uncertain", value: certainty.uncertain ?? 0, color: RAMP[2], label: "uncertain" },
+              { key: "contested", value: certainty.contested ?? 0, color: RAMP[4], label: "contested" },
             ]}
             legend
           />
         </div>
         <div className="flex flex-col gap-2">
-          <Figure value={count(claims.quotes)} unit="quotes" />
-          <StackBar
-            segments={[
-              { key: "independent", value: claims.quotes_independent, color: FILL.ok, label: "independent" },
-              { key: "drafter", value: drafterOnly, color: RAMP[2], label: "self-checked" },
-              { key: "none", value: claims.quotes - claims.quotes_reviewed, color: FILL.faint, label: "unchecked" },
-            ]}
-            legend
-          />
+          <Figure value={count(claims.by_kind.concept ?? 0)} unit="concepts" />
+          <ul className="m-0 flex list-none flex-col gap-1 p-0 text-xs text-[var(--color-text-secondary)]">
+            {attention.map((a) => (
+              <li key={a.key} title={a.title} className="tabular-nums">
+                <span
+                  className="font-semibold"
+                  style={a.alert && a.value ? { color: FILL.warn } : { color: "var(--color-text-primary)" }}
+                >
+                  {count(a.value)}
+                </span>{" "}
+                {a.label}
+              </li>
+            ))}
+          </ul>
         </div>
       </div>
-      {active.length > 0 && (
-        <BarRows
-          rows={active.map((r) => ({
-            key: r.run_slug,
-            label: <span title={`${r.question} (${STAGE_LABEL[r.stage] ?? r.stage})`}>{r.run_slug.replace(/-\d{4}-\d{2}$/, "")}</span>,
-            segments: [
-              { key: "in", value: r.abstracts_included, color: RAMP[0], label: "included" },
-              { key: "maybe", value: r.abstracts_uncertain, color: RAMP[3], label: "uncertain" },
-              {
-                key: "out",
-                value: r.abstracts_screened - r.abstracts_included - r.abstracts_uncertain,
-                color: FILL.faint,
-                label: "excluded",
-              },
-            ],
-          }))}
-        />
-      )}
     </Panel>
   );
 }
 
 export function BuildsPanel({ builds }: { builds: MakeBuilds | null }) {
   if (!builds) return <Unavailable what="Builds" />;
-  const documents = builds.topics.reduce((n, t) => n + t.documents, 0);
+  const documents = builds.groups.reduce((n, g) => n + g.documents, 0);
   const latest = builds.items[0];
   return (
-    <Panel label="Builds by topic" aside={latest ? `last ${formatRelativeTimeOrNull(latest.built_at, "never")}` : undefined}>
+    <Panel label="Builds by group" aside={latest ? `last ${formatRelativeTimeOrNull(latest.built_at, "never")}` : undefined}>
       <Figure value={count(documents)} unit="documents" />
       <BarRows
-        rows={builds.topics.map((t) => ({
-          key: t.topic ?? "none",
-          label: t.title ?? "No topic",
+        rows={builds.groups.map((g) => ({
+          key: g.group ?? "none",
+          label: g.group ?? "No group",
           segments: [
             {
               key: "docs",
-              value: t.documents,
+              value: g.documents,
               color: RAMP[1],
               label: "documents",
-              hatched: t.failed,
-              title: `${t.title ?? "No topic"}: ${t.documents} documents${t.failed ? `, ${t.failed} failed` : ""}`,
+              hatched: g.failed,
+              title: `${g.group ?? "No group"}: ${g.documents} documents${g.failed ? `, ${g.failed} failed` : ""}`,
             },
           ],
-          note: t.failed ? <span className="ml-1 text-[var(--color-error)]">!</span> : undefined,
+          note: g.failed ? <span className="ml-1 text-[var(--color-error)]">!</span> : undefined,
         }))}
       />
     </Panel>

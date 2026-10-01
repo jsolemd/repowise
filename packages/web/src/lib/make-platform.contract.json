@@ -1,5 +1,5 @@
 {
- "_note": "Responses captured from make-api (SoleMD.Make integ/w8-make, schema 048) on 2026-09-26 against a copy of the production catalog; text redacted, shapes kept.",
+ "_note": "Responses captured from make-api (SoleMD.Make integ/w8-make, schema 048) on 2026-09-26 against a copy of the production catalog; text redacted, shapes kept. Builds (groups, Make a9d7f62b) and evidence (schema 2, Make 100 and 103) recaptured from the live make-api on 2026-10-01, text redacted the same way; the evidence report carries counts only.",
  "reports": {
   "/v1/report/summary": {
    "schema_version": 1,
@@ -215,8 +215,7 @@
      "locator": "redacted",
      "project": "redacted",
      "project_status": "redacted",
-     "topic": "redacted",
-     "topic_title": "redacted",
+     "group": "redacted",
      "engine": "slides",
      "status": "completed",
      "built_at": "2026-09-25T19:14:20.231770-07:00",
@@ -235,8 +234,7 @@
      "locator": "redacted",
      "project": "redacted",
      "project_status": "redacted",
-     "topic": "redacted",
-     "topic_title": "redacted",
+     "group": "redacted",
      "engine": "slides",
      "status": "completed",
      "built_at": "2026-09-25T19:13:42.300734-07:00",
@@ -255,8 +253,7 @@
      "locator": "redacted",
      "project": "redacted",
      "project_status": "redacted",
-     "topic": "redacted",
-     "topic_title": "redacted",
+     "group": "redacted",
      "engine": "slides",
      "status": "completed",
      "built_at": "2026-09-25T19:13:34.391824-07:00",
@@ -272,24 +269,21 @@
     }
    ],
    "next_cursor": "redacted",
-   "topics": [
+   "groups": [
     {
-     "topic": "redacted",
-     "title": "redacted",
+     "group": "redacted",
      "documents": 6,
      "failed": 0,
      "latest_built_at": "2026-09-25T19:14:20.231770-07:00"
     },
     {
-     "topic": "redacted",
-     "title": "redacted",
+     "group": "redacted",
      "documents": 2,
      "failed": 0,
      "latest_built_at": "2026-09-25T19:13:34.391824-07:00"
     },
     {
-     "topic": "redacted",
-     "title": "redacted",
+     "group": "redacted",
      "documents": 2,
      "failed": 0,
      "latest_built_at": "2026-09-25T19:12:45.712613-07:00"
@@ -297,93 +291,33 @@
    ]
   },
   "/v1/report/evidence": {
-   "schema_version": 1,
-   "catalog_revision": 62203,
-   "runs": {
-    "total": 22,
-    "recent": [
-     {
-      "run_slug": "redacted",
-      "question": "redacted",
-      "created_at": "2026-09-24T19:01:52.703354-07:00",
-      "updated_at": "2026-09-24T19:03:52.717497-07:00",
-      "searches": 8,
-      "references": 75,
-      "abstracts_screened": 22,
-      "abstracts_included": 7,
-      "abstracts_uncertain": 5,
-      "fulltexts_screened": 0,
-      "fulltexts_included": 0,
-      "fulltexts_uncertain": 0,
-      "stage": "screening"
-     },
-     {
-      "run_slug": "redacted",
-      "question": "redacted",
-      "created_at": "2026-09-23T11:04:02.328207-07:00",
-      "updated_at": "2026-09-23T11:04:02.328207-07:00",
-      "searches": 8,
-      "references": 0,
-      "abstracts_screened": 9,
-      "abstracts_included": 9,
-      "abstracts_uncertain": 0,
-      "fulltexts_screened": 0,
-      "fulltexts_included": 0,
-      "fulltexts_uncertain": 0,
-      "stage": "screening"
-     },
-     {
-      "run_slug": "redacted",
-      "question": "redacted",
-      "created_at": "2026-09-23T11:04:02.328207-07:00",
-      "updated_at": "2026-09-23T11:04:02.328207-07:00",
-      "searches": 19,
-      "references": 0,
-      "abstracts_screened": 13,
-      "abstracts_included": 3,
-      "abstracts_uncertain": 0,
-      "fulltexts_screened": 0,
-      "fulltexts_included": 0,
-      "fulltexts_uncertain": 0,
-      "stage": "screening"
-     }
-    ]
+   "schema_version": 2,
+   "catalog_revision": 76416,
+   "questions": {
+    "total": 9,
+    "by_state": {
+     "open": 9
+    }
    },
    "claims": {
-    "total": 319,
-    "by_status": {
-     "proposed": 131,
-     "ratified": 188
+    "total": 323,
+    "by_kind": {
+     "claim": 305,
+     "concept": 18
     },
-    "quotes": 887,
-    "quotes_reviewed": 662,
-    "quotes_independent": 0,
-    "review_queue": {
-     "claims": 284,
-     "oldest": [
-      {
-       "slug": "redacted",
-       "status": "ratified",
-       "quotes": 6,
-       "quotes_independent": 0,
-       "committed_at": "2026-09-23T11:04:02.328207-07:00"
-      },
-      {
-       "slug": "redacted",
-       "status": "ratified",
-       "quotes": 3,
-       "quotes_independent": 0,
-       "committed_at": "2026-09-23T11:04:02.328207-07:00"
-      },
-      {
-       "slug": "redacted",
-       "status": "ratified",
-       "quotes": 1,
-       "quotes_independent": 0,
-       "committed_at": "2026-09-23T11:04:02.328207-07:00"
-      }
-     ]
-    }
+    "by_certainty": {
+     "clear": 86,
+     "contested": 22,
+     "uncertain": 197,
+     "unlabelled": 18
+    },
+    "reviewed": 0,
+    "stale_concepts": 0,
+    "documents_changed": 0
+   },
+   "fulltext": {
+    "needed": 142,
+    "waiting": 96
    },
    "quotas": [
     {
