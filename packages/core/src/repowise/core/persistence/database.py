@@ -496,7 +496,12 @@ def _reconcile_schema(connection: object) -> None:
             )
             data_step = _DATA_STEPS_ON_ADD.get(what)
             if data_step is not None and not any(name == what for name, _ in failures):
-                _run(f"{what}:data", lambda data_step=data_step: data_step(connection) and None)
+                # A data step returns its row count; ``_run`` executes anything
+                # but None, and ``0 and None`` is 0, so the call must not leak it.
+                _run(
+                    f"{what}:data",
+                    lambda data_step=data_step: (data_step(connection), None)[1],
+                )
 
         # --- Indexes ---------------------------------------------------
         # Only model-declared indexes (i.e. ``Index(...)`` on the table
