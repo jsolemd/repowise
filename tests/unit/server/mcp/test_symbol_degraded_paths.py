@@ -264,10 +264,13 @@ async def test_ambiguous_candidate_in_a_vanished_file_is_listed_not_dropped(tmp_
             end_line=2,
         )
 
+    from repowise.server.mcp_server._symbol_lookup import SymbolMatch
+
     ctx = SimpleNamespace(path=str(tmp_path), alias="", session_factory=None)
-    result = await tool_symbol._render_ambiguous(
-        [_row("a.py"), _row("b.py")], "run", ctx, None, 0.0, 0
-    )
+    rows = [_row("a.py"), _row("b.py")]
+    # The fork's renderer decides bodies from how the target matched.
+    match = SymbolMatch(query="run", rows=rows, rung="name", total_count=len(rows))
+    result = await tool_symbol._render_ambiguous(rows, "run", ctx, None, 0.0, 0, match)
     assert result["match_count"] == 2
     assert [c["file"] for c in result["candidates"]] == ["b.py"]
     assert result["not_rendered"] == [
@@ -277,7 +280,11 @@ async def test_ambiguous_candidate_in_a_vanished_file_is_listed_not_dropped(tmp_
             "name": "run",
             "kind": "function",
             "qualified_name": "run",
+            # The fork's candidate rows also carry lexical identity and span.
+            "visibility": None,
+            "parent_symbol_id": None,
             "signature": "def run():",
+            "start_line": 1,
             "note": "source file could not be read",
         }
     ]

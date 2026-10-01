@@ -22,7 +22,9 @@ from repowise.core.cancellation import (
 
 def _analyzer(paths=("first.py",)):
     return HealthAnalyzer(None, parsed_files=[
-        SimpleNamespace(file_info=SimpleNamespace(path=path, language="python"))
+        SimpleNamespace(
+            file_info=SimpleNamespace(path=path, abs_path=path, language="python", is_test=False)
+        )
         for path in paths
     ])
 

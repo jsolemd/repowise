@@ -736,7 +736,8 @@ async def test_get_why_targets_do_not_bind_a_record_whose_files_are_gone(session
         await accept_decision(session, record, accepter="test", evidence=["pr#1"])
     await session.flush()
 
-    result = await get_why("why legacy", targets=[path])
+    # Target context is supporting evidence in the fork's compact search.
+    result = await get_why("why legacy", targets=[path], include=["supporting"])
 
     governing = result["target_context"][path]["governing_decisions"]
     assert [d["id"] for d in governing] == ["goneFalse"]

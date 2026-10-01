@@ -420,8 +420,14 @@ class TestNamedFiles:
             assert finding.confidence == RISK_CAP_CONFIDENCE
             assert finding.safe_to_delete is False
             assert "src/make/engines/pandoc.py" in finding.evidence[-1]
-        assert findings["src/make/filters/unused.lua"].safe_to_delete is True
-        assert source.scans == 1  # One source scan, not one per candidate.
+        # Upstream v0.54 makes every whole-file finding review-only, so the
+        # unnamed filter is told apart by its uncapped confidence instead.
+        unused = findings["src/make/filters/unused.lua"]
+        assert unused.confidence > RISK_CAP_CONFIDENCE
+        assert not any("is written at" in line for line in unused.evidence)
+        # One scan per pass, not one per candidate: the fork's basename pass
+        # and upstream's path-mention pass (v0.54) each read the source once.
+        assert source.scans == 2
 
     @pytest.mark.parametrize(
         "reference",

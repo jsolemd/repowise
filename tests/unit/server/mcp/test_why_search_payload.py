@@ -172,7 +172,7 @@ async def test_search_caps_full_bodies(session, setup_mcp):
 async def test_primary_search_does_not_build_weaker_supporting_lanes(
     session, setup_mcp, monkeypatch
 ):
-    import repowise.server.mcp_server.tool_why as why_mod
+    import repowise.server.mcp_server.tool_why.search as why_mod
     from repowise.server.mcp_server import get_why
 
     await _seed(
