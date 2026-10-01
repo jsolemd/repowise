@@ -70,25 +70,6 @@ const report = <S extends Record<string, Check<unknown>>>(version: number, field
 
 // --- The reports ------------------------------------------------------------
 
-const backup = obj({
-  stream: str,
-  healthy: bool,
-  state: str,
-  last_success_at: nullable(str),
-  bytes_total: nullable(num),
-});
-
-const summaryShape = report(1, {
-  as_of: str,
-  media: counts,
-  evidence: counts,
-  meetings: obj({ recordings: num, summarized: num, awaiting_summary: num }),
-  operations: counts,
-  spend_24h_micros: num,
-  objects: obj({ count: num, bytes: num, unavailable: num }),
-  backup_health: list(backup),
-});
-
 /**
  * Schema 2 since Make 072 (2026-09-26): total_micros is recorded plus estimated
  * cost, so a charged call without a recorded cost is no longer free.
@@ -257,7 +238,6 @@ const doctorShape = report(1, {
   counts: obj({ ok: num, warn: num, fail: num }),
 });
 
-export type MakeSummary = Shape<typeof summaryShape>;
 export type MakeSpend = Shape<typeof spendShape>;
 export type MakeOperationMix = Shape<typeof mixShape>;
 export type MakeBuilds = Shape<typeof buildsShape>;
@@ -321,7 +301,6 @@ function readReport<T>(path: string, shape: Check<T>, deadlineMs = DEADLINE_MS):
   });
 }
 
-export const getMakeSummary = () => readReport("/v1/report/summary", summaryShape);
 export const getMakeEvidence = () => readReport("/v1/report/evidence", evidenceShape);
 export const getMakeMedia = () => readReport("/v1/report/media", mediaShape);
 export const getMakeMeetings = () => readReport("/v1/report/meetings", meetingsShape);
@@ -389,3 +368,6 @@ export function operationLabel(kind: string): string {
 }
 
 export const microsToUsd = (micros: number) => micros / 1_000_000;
+
+/** Where Jon gives verdicts on renders: SoleMD.Web's review library. */
+export const REVIEW_LIBRARY_URL = process.env.MAKE_REVIEW_LIBRARY_URL || "https://solemd-web.taild0afc1.ts.net/make";

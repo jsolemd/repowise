@@ -13,7 +13,6 @@ import {
   getMakeOperationMix,
   getMakeSpend,
   getMakeStorage,
-  getMakeSummary,
   operationLabel,
 } from "./make-platform";
 
@@ -29,7 +28,6 @@ const reports = captured.reports as Record<string, { schema_version: number }>;
  * schema version each report declares as well as its shape.
  */
 const GETTERS: Record<string, () => Promise<unknown>> = {
-  "/v1/report/summary": getMakeSummary,
   "/v1/report/spend": () => getMakeSpend(),
   "/v1/report/operations/mix": () => getMakeOperationMix(),
   "/v1/report/builds": () => getMakeBuilds(),
@@ -107,12 +105,12 @@ describe("Make report contract", () => {
   });
 
   it("refuses a count that arrives as a string instead of rendering it", async () => {
-    const drifted = structuredClone(reports["/v1/report/summary"]) as unknown as { objects: { bytes: unknown } };
-    drifted.objects.bytes = "25329733882";
+    const drifted = structuredClone(reports["/v1/report/media"]) as unknown as { queue: { pending: unknown } };
+    drifted.queue.pending = "4";
     const logged = vi.spyOn(console, "error").mockImplementation(() => {});
-    await serve({ "/v1/report/summary": drifted });
-    await expect(getMakeSummary()).rejects.toMatchObject({ status: 503 });
-    expect(logged.mock.calls[0]![0]).toContain("objects.bytes: expected a number");
+    await serve({ "/v1/report/media": drifted });
+    await expect(getMakeMedia()).rejects.toMatchObject({ status: 503 });
+    expect(logged.mock.calls[0]![0]).toContain("queue.pending: expected a number");
   });
 
   it("refuses a retired field's absence being read as a value", async () => {

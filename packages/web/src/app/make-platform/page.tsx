@@ -13,6 +13,7 @@ import {
   getMakeOperationMix,
   getMakeSpend,
   getMakeStorage,
+  REVIEW_LIBRARY_URL,
   type MakeDoctor,
 } from "@/lib/make-platform";
 import {
@@ -37,8 +38,6 @@ const SPEND_DAYS = 30;
 /** Days the operation mix covers. */
 const MIX_DAYS = 7;
 const TIME_ZONE = process.env.MAKE_REPORT_TIME_ZONE || "America/Los_Angeles";
-/** Where Jon gives verdicts on renders: SoleMD.Web's review library. */
-const REVIEW_LIBRARY_URL = process.env.MAKE_REVIEW_LIBRARY_URL || "https://solemd-web.taild0afc1.ts.net/make";
 
 const value = <T,>(result: PromiseSettledResult<T>): T | null =>
   result.status === "fulfilled" ? result.value : null;

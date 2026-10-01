@@ -3,7 +3,7 @@ import { createServer, type Server } from "node:http";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { getMakeBuilds, getMakeSummary, MakeReportError } from "./make-platform";
+import { getMakeBuilds, getMakeMedia, MakeReportError } from "./make-platform";
 
 let server: Server | undefined;
 let directory: string | undefined;
@@ -44,11 +44,11 @@ describe("Make read-only reporting boundary", () => {
 
   it("does not turn an unavailable service into empty counts", async () => {
     vi.stubEnv("SOLEMD_MAKE_API_SOCKET", "/no/such/make-report.sock");
-    await expect(getMakeSummary()).rejects.toBeInstanceOf(MakeReportError);
+    await expect(getMakeMedia()).rejects.toBeInstanceOf(MakeReportError);
   });
 
   it("refuses incompatible and oversized reports", async () => {
     await serve(200, { schema_version: 2, padding: "x".repeat(300_000) });
-    await expect(getMakeSummary()).rejects.toMatchObject({ status: 503 });
+    await expect(getMakeMedia()).rejects.toMatchObject({ status: 503 });
   });
 });

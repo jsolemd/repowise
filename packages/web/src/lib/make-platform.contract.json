@@ -1,56 +1,6 @@
 {
  "_note": "Responses captured from make-api (SoleMD.Make integ/w8-make, schema 048) on 2026-09-26 against a copy of the production catalog; text and owner identifiers redacted, shapes kept, lists cut to three entries. Builds (groups, Make a9d7f62b), evidence (schema 2, Make 100 and 103) and spend (schema 2, Make 072) recaptured from the live make-api on 2026-10-01, text redacted the same way; the evidence report carries counts only.",
  "reports": {
-  "/v1/report/summary": {
-   "schema_version": 1,
-   "catalog_revision": 62203,
-   "as_of": "2026-09-25T23:06:56.875641-07:00",
-   "media": {
-    "selected": 603,
-    "pending": 4,
-    "accepted": 496,
-    "rejected": 103,
-    "revised": 0,
-    "legacy_approvals": 136,
-    "stale": 7,
-    "ambiguous_dispatches": 0,
-    "interrupted_dispatches": 1
-   },
-   "evidence": {
-    "works": 34931,
-    "citation_edges": 9245,
-    "research_runs": 22,
-    "search_executions": 234,
-    "claims": 319,
-    "screening_conflicts": 0
-   },
-   "meetings": {
-    "recordings": 29,
-    "summarized": 26,
-    "awaiting_summary": 3
-   },
-   "operations": {
-    "failed": 3,
-    "running": 2,
-    "cancelled": 70,
-    "completed": 726
-   },
-   "spend_24h_micros": 888084,
-   "objects": {
-    "count": 8545,
-    "bytes": 25329733882,
-    "unavailable": 3534
-   },
-   "backup_health": [
-    {
-     "stream": "database",
-     "healthy": true,
-     "state": "ok",
-     "last_success_at": "2026-09-26T05:34:00Z",
-     "bytes_total": 17057767
-    }
-   ]
-  },
   "/v1/report/spend": {
    "schema_version": 2,
    "catalog_revision": 76426,

@@ -1,28 +1,36 @@
 import Link from "next/link";
 import { OverviewSection, SectionLink } from "@repowise-dev/ui/overview";
-import { formatCost, formatNumber } from "@repowise-dev/ui/lib/format";
-import { getMakeSummary, microsToUsd } from "@/lib/make-platform";
+import { getMakeEvidence, getMakeMedia, getMakeMeetings, REVIEW_LIBRARY_URL } from "@/lib/make-platform";
+import { NeedsYou } from "@/components/make/make-sections";
+
+const value = <T,>(result: PromiseSettledResult<T>): T | null =>
+  result.status === "fulfilled" ? result.value : null;
 
 /**
- * Make, beside the repositories: one line and the way in.
+ * Make, beside the repositories: what waits on Jon's hand, and the way in.
  *
- * An independent operational section: these figures never enter code-health
- * scores. Read from the summary alone so the dashboard pays one small request.
+ * The same five tiles that open the Make platform page, from the same three
+ * reports, so the two never disagree; the summary report counts pending image
+ * selections rather than the library's cards and carries no copies or
+ * documents, so it cannot stand in. The three answered in about 125 ms in
+ * parallel on 2026-10-01, media the slowest. An independent operational
+ * section: these figures never enter code-health scores.
  */
 export async function MakePlatformSummary() {
-  let report;
-  try { report = await getMakeSummary(); } catch { report = null; }
+  const results = await Promise.allSettled([getMakeMedia(), getMakeMeetings(), getMakeEvidence()] as const);
+  const [media, meetings, evidence] = [value(results[0]), value(results[1]), value(results[2])];
   return (
     <OverviewSection
       title="Make platform"
-      description="Documents, evidence, images and recordings, reported by Make."
       action={<SectionLink href="/make-platform" LinkComponent={Link}>Open Make platform</SectionLink>}
     >
-      <p className="text-sm text-[var(--color-text-secondary)] [text-wrap:pretty]">
-        {report
-          ? `${formatNumber(report.media.pending ?? 0)} images await review, ${formatNumber(report.meetings.awaiting_summary)} transcripts await a note, and ${formatCost(microsToUsd(report.spend_24h_micros))} was spent in the last 24 hours${report.media.interrupted_dispatches ? `; ${formatNumber(report.media.interrupted_dispatches)} paid generations were interrupted and need reconciling` : ""}.`
-          : "Make reporting is unavailable. Repository reporting is unaffected."}
-      </p>
+      {media || meetings || evidence ? (
+        <NeedsYou media={media} meetings={meetings} evidence={evidence} libraryUrl={REVIEW_LIBRARY_URL} />
+      ) : (
+        <p role="status" className="m-0 text-xs text-[var(--color-text-tertiary)]">
+          Make · no answer
+        </p>
+      )}
     </OverviewSection>
   );
 }
