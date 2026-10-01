@@ -3,15 +3,18 @@
 import { render, within } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import captured from "@/lib/make-platform.contract.json";
-import type { MakeBuilds, MakeDoctor, MakeEvidence, MakeMedia, MakeMeetings, MakeSpend } from "@/lib/make-platform";
+import type { MakeBuilds, MakeDoctor, MakeEvidence, MakeMedia, MakeMeetings, MakeSpend, MakeStorage } from "@/lib/make-platform";
 import {
   BuildsPanel,
   DoctorStrip,
   EvidencePanel,
+  ImagesPanel,
+  MeetingsPanel,
   NeedsYou,
   SpendPanel,
+  StoragePanel,
   compactAge,
-  meetingShares,
+  stageTrouble,
 } from "./make-sections";
 
 // Queries are scoped to each render's container: there is no global cleanup.
@@ -113,26 +116,70 @@ describe("Builds", () => {
     builds.groups = [{ group: "lectures", documents: 5, failed: 2, latest_built_at: "2026-10-01T00:00:00Z" }];
     const { container } = render(<BuildsPanel builds={builds} />);
     expect(container.textContent).toContain("2 failed");
-    expect(within(container).getByRole("img", { name: "built 3, failed 2" })).toBeTruthy();
+    expect(within(container).getByRole("img", { name: "other documents 3, failed 2" })).toBeTruthy();
+  });
+
+  it("never calls a document built when Make counts only its failures", () => {
+    // A queued, running or cancelled latest build is among the documents that did not fail.
+    const builds = capture<MakeBuilds>("/v1/report/builds");
+    builds.items = [{ ...builds.items[0]!, status: "running" }];
+    builds.groups = [{ group: "test", documents: 1, failed: 0, latest_built_at: "2026-10-01T00:00:00Z" }];
+    const { container } = render(<BuildsPanel builds={builds} />);
+    expect(container.innerHTML).not.toMatch(/\bbuilt\b/);
+  });
+});
+
+describe("Images", () => {
+  it("draws every verdict Make reports, revised ones included, and names a state it does not know", () => {
+    const media = capture<MakeMedia>("/v1/report/media");
+    media.cards = { accept: 4, revise: 2, pending: 1, retired: 3 };
+    const { container } = render(<ImagesPanel media={media} />);
+    expect(within(container).getByRole("img", { name: "accepted 4, revised 2, rejected 0, pending 1, other 3" })).toBeTruthy();
+    expect(container.textContent).toMatch(/10\s*renders/);
   });
 });
 
 describe("Meetings", () => {
-  it("partitions the recordings, taking stuck and failed ones out of the pipeline's share", () => {
-    const meetings = capture<MakeMeetings>("/v1/report/meetings");
-    meetings.recordings = { total: 10, summarized: 5, awaiting_summary: 2, in_pipeline: 3, released: 5 };
-    meetings.stages = [{ stage: "transcribe", statuses: { completed: 2, failed: 1 } }];
-    meetings.stuck = [{ recording: "r1", stage: "diarize", status: "running", updated_at: "2026-10-01T00:00:00Z" }];
-    const shares = meetingShares(meetings);
-    expect(shares).toEqual({ filed: 5, waiting: 2, flowing: 1, stuck: 2 });
-    expect(shares.filed + shares.waiting + shares.flowing + shares.stuck).toBe(meetings.recordings.total);
+  const meetings = () => {
+    const m = capture<MakeMeetings>("/v1/report/meetings");
+    m.recordings = { total: 4, summarized: 1, awaiting_summary: 1, in_pipeline: 2, released: 1 };
+    return m;
+  };
+
+  it("keeps the report's three recording shares and counts stuck stage runs apart", () => {
+    // Two stuck stages of one recording: stage runs cannot say how many recordings they hold back.
+    const m = meetings();
+    m.stages = [];
+    m.stuck = ["transcribe", "diarize"].map((stage) => ({ recording: "same-id", stage, status: "running", updated_at: "2026-10-01T00:00:00Z" }));
+    const { container } = render(<MeetingsPanel meetings={m} />);
+    expect(within(container).getByRole("img", { name: "filed 1, to file 1, in pipeline 2" })).toBeTruthy();
+    expect(container.querySelector("[data-stage-trouble]")!.textContent).toMatch(/stage runs\s*2 stuck$/);
   });
 
-  it("never draws more stuck recordings than the pipeline holds", () => {
-    const meetings = capture<MakeMeetings>("/v1/report/meetings");
-    meetings.recordings = { total: 4, summarized: 3, awaiting_summary: 0, in_pipeline: 1, released: 3 };
-    meetings.stages = [{ stage: "transcribe", statuses: { failed: 3 } }];
-    expect(meetingShares(meetings)).toEqual({ filed: 3, waiting: 0, flowing: 0, stuck: 1 });
+  it("counts failed stage runs, retries included, and shows nothing when none stuck or failed", () => {
+    const m = meetings();
+    m.stuck = [];
+    m.stages = [{ stage: "transcribe", statuses: { completed: 2, failed: 3 } }];
+    expect(stageTrouble(m)).toEqual({ stuck: 0, failed: 3, where: ["transcribe failed ×3"] });
+    m.stages = [{ stage: "transcribe", statuses: { completed: 2 } }];
+    const { container } = render(<MeetingsPanel meetings={m} />);
+    expect(container.querySelector("[data-stage-trouble]")).toBeNull();
+  });
+});
+
+describe("Empty charts", () => {
+  it("leave a bar with nothing drawn out of the accessibility tree instead of naming it with nothing", () => {
+    const storage = capture<MakeStorage>("/v1/report/storage");
+    storage.classes = [];
+    const spend = capture<MakeSpend>("/v1/report/spend");
+    spend.by_provider = [];
+    const { container } = render(
+      <>
+        <StoragePanel storage={storage} />
+        <SpendPanel spend={spend} />
+      </>,
+    );
+    expect(container.querySelectorAll('[role="img"]:not([aria-label]), [role="img"][aria-label=""]')).toHaveLength(0);
   });
 });
 

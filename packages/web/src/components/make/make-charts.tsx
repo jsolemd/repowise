@@ -139,13 +139,15 @@ export function StackBar({
 }) {
   const sum = segments.reduce((n, s) => n + s.value, 0);
   const scale = Math.max(total ?? sum, 1);
+  // With nothing drawn the bar is an empty track: the printed zero or legend says
+  // so, and an image with no name would only be noise to a screen reader.
+  const named = sum > 0 ? { role: "img", "aria-label": segments.map((s) => `${s.label} ${format(s.value)}`).join(", ") } : { "aria-hidden": true };
   return (
     <div className="flex flex-col gap-1.5">
       <div
         className="flex w-full gap-[2px] overflow-hidden rounded-[4px] bg-[var(--color-bg-inset)]"
         style={{ height }}
-        role="img"
-        aria-label={segments.map((s) => `${s.label} ${format(s.value)}`).join(", ")}
+        {...named}
       >
         {segments.map((s) =>
           s.value > 0 ? (

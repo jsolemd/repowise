@@ -10,7 +10,7 @@
  * keyboard. Agents read make-api and act on the findings themselves.
  */
 import type { ReactNode } from "react";
-import { BookOpen, Clock, FileStack, Images, Network, NotebookPen, RefreshCw, Stethoscope, type LucideIcon } from "lucide-react";
+import { AlertTriangle, BookOpen, Clock, FileStack, Images, Network, NotebookPen, RefreshCw, Stethoscope, type LucideIcon } from "lucide-react";
 import { formatBytes, formatCost, formatNumber, formatRelativeTimeOrNull, stripMarkdown } from "@repowise-dev/ui/lib/format";
 import {
   microsToUsd,
@@ -300,8 +300,10 @@ export function EvidencePanel({ evidence }: { evidence: MakeEvidence | null }) {
 }
 
 /**
- * Documents by group. Built documents are settled work and recede in the neutral
- * fill; a group's failed builds take the fail fill and are counted beside it.
+ * Documents by group. A group's documents whose latest build failed take the fail
+ * fill and are counted beside the row; the rest recede in the neutral fill as
+ * "other documents", because Make counts only failures, so a queued, running or
+ * cancelled latest build sits among them and none can be called built.
  */
 export function BuildsPanel({ builds }: { builds: MakeBuilds | null }) {
   if (!builds) return <Unavailable what="Builds" />;
@@ -320,7 +322,7 @@ export function BuildsPanel({ builds }: { builds: MakeBuilds | null }) {
             key: g.group ?? "none",
             label,
             segments: [
-              { key: "built", value: g.documents - g.failed, color: FILL.done, label: "built", title: `${label}: ${g.documents - g.failed} built` },
+              { key: "other", value: g.documents - g.failed, color: FILL.done, label: "other documents", title: `${label}: ${g.documents - g.failed} other documents` },
               { key: "failed", value: g.failed, color: FILL.fail, label: "failed", title: `${label}: ${g.failed} failed` },
             ],
             note: g.failed ? <span className="ml-1.5 text-[var(--color-error)]">· {formatNumber(g.failed)} failed</span> : undefined,
@@ -331,18 +333,42 @@ export function BuildsPanel({ builds }: { builds: MakeBuilds | null }) {
   );
 }
 
-/** Review cards by verdict: settled ones recede, the pending ones carry the wait fill. */
+/** The review verdicts Make knows (media_review_cards_v2), in the bar's order. */
+const VERDICTS = [
+  { key: "accept", label: "accepted", color: FILL.done },
+  { key: "revise", label: "revised", color: FILL.flight },
+  { key: "reject", label: "rejected", color: FILL.faint },
+  { key: "pending", label: "pending", color: FILL.wait },
+] as const;
+
+/**
+ * Listed renders by their review verdict: settled ones recede in the neutral
+ * steps, pending ones carry the wait fill. Make counts card members here (a day
+ * and its night are two), so the unit is renders; the needs-you tile counts the
+ * library's cards. A state Make adds later is drawn and named as "other", never
+ * dropped from a bar whose headline counts it.
+ */
 export function ImagesPanel({ media }: { media: MakeMedia | null }) {
   if (!media) return <Unavailable what="Images" />;
   const { cards } = media;
+  const known = new Set<string>(VERDICTS.map((v) => v.key));
+  const other = Object.entries(cards).filter(([state]) => !known.has(state));
+  const otherCount = other.reduce((n, [, count]) => n + count, 0);
   return (
     <Panel label="Images">
-      <Figure value={formatNumber(Object.values(cards).reduce((a, b) => a + b, 0))} unit="cards" />
+      <Figure value={formatNumber(Object.values(cards).reduce((a, b) => a + b, 0))} unit="renders" />
       <StackBar
         segments={[
-          { key: "accept", value: cards.accept ?? 0, color: FILL.done, label: "accepted" },
-          { key: "pending", value: cards.pending ?? 0, color: FILL.wait, label: "pending" },
-          { key: "reject", value: cards.reject ?? 0, color: FILL.faint, label: "rejected" },
+          ...VERDICTS.map((v) => ({ key: v.key, value: cards[v.key] ?? 0, color: v.color, label: v.label })),
+          ...(otherCount
+            ? [{
+                key: "other",
+                value: otherCount,
+                color: "var(--color-text-tertiary)",
+                label: "other",
+                title: other.map(([state, count]) => `${state}: ${formatNumber(count)}`).join(", "),
+              }]
+            : []),
         ]}
         legend
       />
@@ -360,24 +386,28 @@ const MEETING_STAGES: Record<string, string> = {
 };
 
 /**
- * Recordings by where they stand. Make partitions them into filed, awaiting a
- * note and still in the pipeline; a failed or stuck stage holds its recording in
- * the pipeline, so those come out of that share in the fail fill.
+ * Recordings by where they stand, in the three shares Make reports: filed,
+ * awaiting a note, and still in the pipeline. Stuck and failed stage runs are
+ * counted apart and never carved out of those shares, because Make reports them
+ * per stage run (every retry included), so they cannot say how many recordings
+ * they hold back.
  */
-export function meetingShares(meetings: MakeMeetings): { filed: number; waiting: number; flowing: number; stuck: number } {
-  const r = meetings.recordings;
-  const failed = meetings.stages.reduce((n, s) => n + (s.statuses.failed ?? 0), 0);
-  const stuck = Math.min(r.in_pipeline, failed + meetings.stuck.length);
-  return { filed: r.summarized, waiting: r.awaiting_summary, flowing: r.in_pipeline - stuck, stuck };
+export function stageTrouble(meetings: MakeMeetings): { stuck: number; failed: number; where: string[] } {
+  const failed = meetings.stages.filter((s) => s.statuses.failed);
+  return {
+    stuck: meetings.stuck.length,
+    failed: failed.reduce((n, s) => n + (s.statuses.failed ?? 0), 0),
+    where: [
+      ...meetings.stuck.map((s) => `stuck at ${MEETING_STAGES[s.stage] ?? s.stage}`),
+      ...failed.map((s) => `${MEETING_STAGES[s.stage] ?? s.stage} failed ×${s.statuses.failed}`),
+    ],
+  };
 }
 
 export function MeetingsPanel({ meetings }: { meetings: MakeMeetings | null }) {
   if (!meetings) return <Unavailable what="Meetings" />;
-  const { filed, waiting, flowing, stuck } = meetingShares(meetings);
-  const troubled = [
-    ...meetings.stages.filter((s) => s.statuses.failed).map((s) => `${MEETING_STAGES[s.stage] ?? s.stage} failed ×${s.statuses.failed}`),
-    ...meetings.stuck.map((s) => `stuck at ${MEETING_STAGES[s.stage] ?? s.stage}`),
-  ];
+  const r = meetings.recordings;
+  const trouble = stageTrouble(meetings);
   const poll = meetings.poll;
   return (
     <Panel
@@ -394,16 +424,27 @@ export function MeetingsPanel({ meetings }: { meetings: MakeMeetings | null }) {
         ) : undefined
       }
     >
-      <Figure value={formatNumber(meetings.recordings.total)} unit="recordings" />
+      <Figure value={formatNumber(r.total)} unit="recordings" />
       <StackBar
         segments={[
-          { key: "filed", value: filed, color: FILL.done, label: "filed" },
-          { key: "waiting", value: waiting, color: FILL.wait, label: "to file" },
-          { key: "flowing", value: flowing, color: FILL.flight, label: "in pipeline" },
-          { key: "stuck", value: stuck, color: FILL.fail, label: "stuck", title: troubled.join(", ") || "stuck" },
+          { key: "filed", value: r.summarized, color: FILL.done, label: "filed" },
+          { key: "waiting", value: r.awaiting_summary, color: FILL.wait, label: "to file" },
+          { key: "flowing", value: r.in_pipeline, color: FILL.flight, label: "in pipeline" },
         ]}
         legend
       />
+      {trouble.stuck + trouble.failed > 0 && (
+        <p
+          data-stage-trouble
+          title={trouble.where.join(", ")}
+          className="m-0 flex items-center gap-1.5 text-[11px] tabular-nums text-[var(--color-error)]"
+        >
+          <AlertTriangle aria-hidden className="h-3 w-3" />
+          stage runs
+          {trouble.stuck > 0 && <span>{formatNumber(trouble.stuck)} stuck</span>}
+          {trouble.failed > 0 && <span>{formatNumber(trouble.failed)} failed</span>}
+        </p>
+      )}
     </Panel>
   );
 }
