@@ -2,15 +2,16 @@
  * Chart primitives for the Make platform page. Server components, CSS-drawn:
  * no client JavaScript, so a revision-driven refresh redraws them for free.
  *
- * Colour follows the house theme's rules (ui/styles/globals.css): a panel's one
- * series and the shares of a whole step down the accent ramp, supporting marks
- * take the neutral steps, and state takes the node-* fills, which are tuned as
- * fills where the status ink vars are tuned as type. State reads the same in
- * every chart: work done or in flight recedes in the neutral steps (FILL.done,
+ * Colour follows the house theme's rules (ui/styles/globals.css): money by day and
+ * bytes by class step down the accent ramp, supporting marks take the neutral
+ * steps, and state takes the node-* fills, which are tuned as fills where the
+ * status ink vars are tuned as type. Counts of work are drawn as state, the same
+ * in every chart: work done or in flight recedes in the neutral steps (FILL.done,
  * FILL.flight, FILL.faint), work waiting on Jon takes FILL.wait and a failure
- * FILL.fail, so the eye lands on what is waiting or broken. No chart sets the
- * wait fill beside the ramp, because both are orange. Hatching means one thing
- * everywhere: bytes on their way out.
+ * FILL.fail, so the eye lands on what is waiting or broken. That keeps the ramp
+ * out of the Built panels, the certainty bar below excepted, where its orange
+ * would read as the wait fill's.
+ * Hatching means one thing everywhere: bytes on their way out.
  *
  * One exception is deliberate: the Evidence panel's certainty bar steps clear,
  * uncertain and contested down the ramp in that fixed order whatever their
@@ -57,7 +58,7 @@ export function Label({ children, className = "" }: { children: ReactNode; class
   );
 }
 
-const FIGURE_SIZE = { xl: "text-[34px]", lg: "text-[28px]", sm: "text-lg" } as const;
+const FIGURE_SIZE = { xl: "text-[34px]", lg: "text-[28px]", md: "text-xl", sm: "text-lg" } as const;
 
 /** A number and its unit. Proportional figures: a lone number is not a column. */
 export function Figure({
@@ -273,6 +274,7 @@ export function Tile({
   unit,
   of,
   href,
+  size = "xl",
 }: {
   icon: LucideIcon;
   label: string;
@@ -280,6 +282,8 @@ export function Tile({
   unit?: ReactNode;
   of?: number;
   href?: string;
+  /** The count's size: full on the Make page, quieter where Make is a guest. */
+  size?: "xl" | "md";
 }) {
   const waiting = value !== null && value > 0;
   const body = (
@@ -291,7 +295,7 @@ export function Tile({
         {label}
       </Label>
       <Figure
-        size="xl"
+        size={size}
         value={value === null ? "—" : formatNumber(value)}
         unit={value === null ? "no answer" : (unit ?? (of !== undefined ? `of ${formatNumber(of)}` : undefined))}
         color={waiting ? "var(--color-text-primary)" : "var(--color-text-tertiary)"}

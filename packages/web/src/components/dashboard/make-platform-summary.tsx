@@ -25,7 +25,7 @@ export async function MakePlatformSummary() {
       action={<SectionLink href="/make-platform" LinkComponent={Link}>Open Make platform</SectionLink>}
     >
       {media || meetings || evidence ? (
-        <NeedsYou media={media} meetings={meetings} evidence={evidence} libraryUrl={REVIEW_LIBRARY_URL} />
+        <NeedsYou media={media} meetings={meetings} evidence={evidence} libraryUrl={REVIEW_LIBRARY_URL} compact />
       ) : (
         <p role="status" className="m-0 text-xs text-[var(--color-text-tertiary)]">
           Make · no answer

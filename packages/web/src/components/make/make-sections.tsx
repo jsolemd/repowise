@@ -40,7 +40,7 @@ function Unavailable({ what }: { what: string }) {
 function Panel({ label, aside, children }: { label: string; aside?: ReactNode; children: ReactNode }) {
   return (
     <div className="flex min-w-0 flex-col gap-3">
-      <div className="flex min-h-4 items-baseline justify-between gap-3">
+      <div className="flex h-4 items-center justify-between gap-3">
         <Label>{label}</Label>
         {aside && <span className="text-[11px] tabular-nums text-[var(--color-text-tertiary)]">{aside}</span>}
       </div>
@@ -112,8 +112,10 @@ const STRIP = "flex min-h-11 flex-wrap items-center gap-x-4 gap-y-2";
 
 /**
  * Every make doctor check as one cell, failing first, then warning, then passing,
- * so the share of red and amber reads before any number. The legend gives the
- * three counts. When anything is open the whole strip is the summary of a native
+ * so the share of red and amber reads before any number. Each severity is its own
+ * run with a gap before the next, because the at-risk and needs-work fills sit
+ * close in hue and one red cell must not vanish into a run of amber. The legend
+ * gives the three counts. When anything is open the whole strip is the summary of a native
  * disclosure, so one tap or keypress lists every open finding's check, detail
  * and action, and the strip stays where it was.
  */
@@ -134,16 +136,24 @@ export function DoctorStrip({ doctor }: { doctor: MakeDoctor | null }) {
         <Stethoscope aria-hidden className="h-3.5 w-3.5" />
         Doctor
       </Label>
-      <span aria-hidden className="flex flex-wrap gap-[3px]">
-        {checks.map((f, i) => (
-          <span
-            key={`${f.check}-${i}`}
-            data-severity={f.severity}
-            title={findingTitle(f)}
-            className="block h-3.5 w-3.5 rounded-[3px] sm:h-4 sm:w-4"
-            style={{ background: CELL[f.severity], opacity: f.severity === "ok" ? 0.55 : 1 }}
-          />
-        ))}
+      <span aria-hidden className="flex flex-wrap gap-x-2 gap-y-[3px]">
+        {(["fail", "warn", "ok"] as const).map((severity) =>
+          checks.some((f) => f.severity === severity) ? (
+            <span key={severity} className="flex flex-wrap gap-[3px]">
+              {checks
+                .filter((f) => f.severity === severity)
+                .map((f, i) => (
+                  <span
+                    key={`${f.check}-${i}`}
+                    data-severity={f.severity}
+                    title={findingTitle(f)}
+                    className="block h-3.5 w-3.5 rounded-[3px] sm:h-4 sm:w-4"
+                    style={{ background: CELL[f.severity], opacity: f.severity === "ok" ? 0.55 : 1 }}
+                  />
+                ))}
+            </span>
+          ) : null,
+        )}
       </span>
       <Legend
         items={[
@@ -203,20 +213,24 @@ export function DoctorPending() {
  * What waits on Jon's hand, one tile each, always in the same place so the row
  * is learned once: images to review (the tile opens the review library), notes
  * to file, library copies to fetch against the papers a claim needs, concepts a
- * changed claim made stale, and documents citing a changed claim.
+ * changed claim made stale, and documents citing a changed claim. `compact` sets
+ * the counts at the size of a page's stat ribbon, for the dashboard's Make card.
  */
 export function NeedsYou({
   media,
   meetings,
   evidence,
   libraryUrl,
+  compact = false,
 }: {
   media: MakeMedia | null;
   meetings: MakeMeetings | null;
   evidence: MakeEvidence | null;
   libraryUrl: string;
+  compact?: boolean;
 }) {
   const oldest = media?.queue.oldest_seconds ?? null;
+  const size = compact ? "md" : "xl";
   return (
     <div className="-mx-3 grid grid-cols-2 gap-x-2 gap-y-1 sm:grid-cols-3 lg:grid-cols-5">
       <div className="col-span-2 sm:col-span-1">
@@ -225,6 +239,7 @@ export function NeedsYou({
           label="Images to review"
           value={media?.queue.pending ?? null}
           href={libraryUrl}
+          size={size}
           unit={
             media && media.queue.pending > 0 && oldest !== null ? (
               <Stamp icon={Clock} said="oldest waiting">{compactAge(oldest)}</Stamp>
@@ -232,15 +247,16 @@ export function NeedsYou({
           }
         />
       </div>
-      <Tile icon={NotebookPen} label="Notes to file" value={meetings?.recordings.awaiting_summary ?? null} />
+      <Tile icon={NotebookPen} label="Notes to file" value={meetings?.recordings.awaiting_summary ?? null} size={size} />
       <Tile
         icon={BookOpen}
         label="Copies to fetch"
         value={evidence?.fulltext.waiting ?? null}
         of={evidence?.fulltext.needed}
+        size={size}
       />
-      <Tile icon={Network} label="Stale concepts" value={evidence?.claims.stale_concepts ?? null} />
-      <Tile icon={FileStack} label="Docs to rebuild" value={evidence?.claims.documents_changed ?? null} />
+      <Tile icon={Network} label="Stale concepts" value={evidence?.claims.stale_concepts ?? null} size={size} />
+      <Tile icon={FileStack} label="Docs to rebuild" value={evidence?.claims.documents_changed ?? null} size={size} />
     </div>
   );
 }
@@ -251,7 +267,9 @@ export function NeedsYou({
  * The evidence map: published claims by how clear the literature is on each, with
  * the concepts and open questions beside them. The certainty bar is the ordinal
  * exception make-charts.tsx describes: clear, uncertain and contested step down
- * the ramp in that fixed order whatever their counts.
+ * the ramp in that fixed order whatever their counts. They take the first, third
+ * and fourth steps: two apart for the two large shares, and short of the fifth,
+ * which all but vanishes into the dark theme's inset.
  */
 export function EvidencePanel({ evidence }: { evidence: MakeEvidence | null }) {
   if (!evidence) return <Unavailable what="Evidence" />;
@@ -271,7 +289,7 @@ export function EvidencePanel({ evidence }: { evidence: MakeEvidence | null }) {
         segments={[
           { key: "clear", value: certainty.clear ?? 0, color: RAMP[0], label: "clear" },
           { key: "uncertain", value: certainty.uncertain ?? 0, color: RAMP[2], label: "uncertain" },
-          { key: "contested", value: certainty.contested ?? 0, color: RAMP[4], label: "contested" },
+          { key: "contested", value: certainty.contested ?? 0, color: RAMP[3], label: "contested" },
         ]}
         legend
       />
@@ -279,7 +297,10 @@ export function EvidencePanel({ evidence }: { evidence: MakeEvidence | null }) {
   );
 }
 
-/** Documents by group; a group's failed builds in the fail fill, and counted. */
+/**
+ * Documents by group. Built documents are settled work and recede in the neutral
+ * fill; a group's failed builds take the fail fill and are counted beside it.
+ */
 export function BuildsPanel({ builds }: { builds: MakeBuilds | null }) {
   if (!builds) return <Unavailable what="Builds" />;
   const documents = builds.groups.reduce((n, g) => n + g.documents, 0);
@@ -297,7 +318,7 @@ export function BuildsPanel({ builds }: { builds: MakeBuilds | null }) {
             key: g.group ?? "none",
             label,
             segments: [
-              { key: "built", value: g.documents - g.failed, color: RAMP[0], label: "built", title: `${label}: ${g.documents - g.failed} built` },
+              { key: "built", value: g.documents - g.failed, color: FILL.done, label: "built", title: `${label}: ${g.documents - g.failed} built` },
               { key: "failed", value: g.failed, color: FILL.fail, label: "failed", title: `${label}: ${g.failed} failed` },
             ],
             note: g.failed ? <span className="ml-1.5 text-[var(--color-error)]">· {formatNumber(g.failed)} failed</span> : undefined,
@@ -449,16 +470,16 @@ export function ActivityPanel({ mix }: { mix: MakeOperationMix | null }) {
 export function SpendPanel({ spend }: { spend: MakeSpend | null }) {
   if (!spend) return <Unavailable what="Spend" />;
   const usd = (micros: number) => formatCost(microsToUsd(micros));
-  const neutrals = [FILL.done, FILL.flight, FILL.faint];
+  const providers = spend.by_provider.filter((p) => p.micros > 0);
+  // Spread across the neutral steps, so two providers take the two ends.
+  const neutrals = providers.length <= 2 ? [FILL.done, FILL.faint] : [FILL.done, FILL.flight, FILL.faint];
   return (
     <>
       <Figure value={usd(spend.total_micros)} unit={`${spend.days} days`} />
       <DayColumns days={spend.daily.map((d) => ({ day: d.day, value: d.micros }))} height={56} format={usd} />
       <StackBar
         height={8}
-        segments={spend.by_provider
-          .filter((p) => p.micros > 0)
-          .map((p, i) => ({ key: p.provider, value: p.micros, color: neutrals[i] ?? FILL.faint, label: p.provider }))}
+        segments={providers.map((p, i) => ({ key: p.provider, value: p.micros, color: neutrals[i] ?? FILL.faint, label: p.provider }))}
         format={usd}
         legend
       />
