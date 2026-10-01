@@ -8,6 +8,7 @@ from pathlib import Path
 
 from repowise.docs import db
 from repowise.docs.bootstrap import seed_libraries
+from repowise.docs.indexer.mutations import reembed_all
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +63,11 @@ def main() -> None:
         help="List all libraries in the database",
     )
 
+    subparsers.add_parser(
+        "reembed",
+        help="Re-embed every indexed chunk after an embedding-model change (worker stopped)",
+    )
+
     args = parser.parse_args()
 
     # Configure logging
@@ -79,6 +85,8 @@ def main() -> None:
         )
     elif args.command == "list":
         asyncio.run(list_libraries_cmd())
+    elif args.command == "reembed":
+        print(f"Re-embedded {asyncio.run(reembed_all())} chunks.")
     else:
         parser.print_help()
         sys.exit(1)

@@ -40,7 +40,7 @@ The worker retains the internal `search_docs_multi` compatibility alias. On Repo
 
 ```
 MCP client → RepoWise :7350 ─┐
-                            ├→ Docs worker :8101 → PostgreSQL / Qdrant / TEI
+                            ├→ Docs worker :8101 → PostgreSQL / Qdrant / llama-server
 Dashboard → RepoWise API ────┘
 ```
 

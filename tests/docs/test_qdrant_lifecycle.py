@@ -212,7 +212,7 @@ async def test_chunk_upload_awaits_every_batch_once(monkeypatch, qdrant):
         for i in range(205)
     ]
     embed = AsyncMock(return_value=[[0.1, 0.2]] * len(chunks))
-    monkeypatch.setattr(mutations, "embed_texts", embed)
+    monkeypatch.setattr(mutations, "embed_documents", embed)
     assert await mutations.upsert_chunks(chunks, qdrant) == len(chunks)
     embed.assert_awaited_once()
     uploads = qdrant.upsert.await_args_list

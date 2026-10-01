@@ -9,7 +9,7 @@ from qdrant_client import AsyncQdrantClient, models
 
 from repowise.docs.config import get_settings
 from repowise.docs.indexer.collection import get_qdrant_client
-from repowise.docs.indexer.embedder import embed_single
+from repowise.docs.indexer.embedder import embed_query
 from repowise.docs.indexer.scoring import (
     ANCHOR_SPLIT_SUFFIX_PATTERN,
     apply_exact_match_boosts,
@@ -90,7 +90,7 @@ async def search_hybrid(
 
     settings = get_settings()
     logger.debug("Embedding query: %s...", query[:50])
-    query_embedding = await embed_single(query)
+    query_embedding = await embed_query(query)
 
     query_filter = build_library_filter(library_id, chunk_types)
 
@@ -164,7 +164,7 @@ async def search_dense(
         client = get_qdrant_client()
 
     settings = get_settings()
-    query_embedding = await embed_single(query)
+    query_embedding = await embed_query(query)
     query_filter = build_library_filter(library_id, chunk_types)
 
     response = await client.query_points(

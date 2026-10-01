@@ -148,7 +148,7 @@ async def import_bundle(
 
     The library must already exist in the database. This function:
     1. Reads the compressed bundle
-    2. Re-embeds all chunk content via TEI
+    2. Re-embeds all chunk content
     3. Upserts to Qdrant with fresh embeddings
 
     Args:

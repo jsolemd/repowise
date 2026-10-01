@@ -12,6 +12,7 @@ from repowise.docs.config import get_settings
 from repowise.docs.db import get_connection
 from repowise.docs.db import list_libraries as db_list_libraries
 from repowise.docs.graph_status import get_docs_graph_sync_status
+from repowise.docs.indexer import embedder
 from repowise.docs.jobs import (
     get_scheduler_status,
     get_unreachable_libraries,
@@ -41,9 +42,9 @@ class HealthChecker:
         """Initialize the health-check HTTP client."""
         self._http_client = httpx.AsyncClient(timeout=5.0)
         logger.info(
-            "Doc-search server initializing with Qdrant=%s, TEI=%s",
+            "Doc-search server initializing with Qdrant=%s, embedder=%s",
             self.settings.qdrant_host,
-            self.settings.tei_host,
+            self.settings.embedder_socket or self.settings.embedder_url,
         )
 
     async def close(self) -> None:
@@ -65,18 +66,9 @@ class HealthChecker:
         except Exception as exc:
             return {"status": "error", "error": str(exc)}
 
-    async def check_tei(self) -> dict:
-        """Check TEI health."""
-        if not self._http_client:
-            return {"status": "error", "error": "HTTP client not initialized"}
-
-        try:
-            response = await self._http_client.get(f"{self.settings.tei_host}/health")
-            if response.status_code == 200:
-                return {"status": "ok"}
-            return {"status": "error", "error": f"HTTP {response.status_code}"}
-        except Exception as exc:
-            return {"status": "error", "error": str(exc)}
+    async def check_embedder(self) -> dict:
+        """Check the embedding server."""
+        return await embedder.check_health()
 
     async def check_database(self) -> dict:
         """Check PostgreSQL availability for the docs job/control plane."""
@@ -98,14 +90,14 @@ class HealthChecker:
         ):
             return {key: dict(value) for key, value in self._cached_dependency_health.items()}
 
-        qdrant, tei, database = await asyncio.gather(
+        qdrant, embedding, database = await asyncio.gather(
             self.check_qdrant(),
-            self.check_tei(),
+            self.check_embedder(),
             self.check_database(),
         )
         result = {
             "qdrant": qdrant,
-            "tei": tei,
+            "embedder": embedding,
             "database": database,
         }
         self._cached_dependency_health = result
@@ -124,7 +116,7 @@ class HealthChecker:
 
         dependency_health = await self.get_dependency_health()
         qdrant = dependency_health["qdrant"]
-        tei = dependency_health["tei"]
+        embedding = dependency_health["embedder"]
         database = dependency_health["database"]
         registry: dict[str, object]
         if database["status"] != "ok":
@@ -160,7 +152,7 @@ class HealthChecker:
 
         all_ok = (
             qdrant["status"] == "ok"
-            and tei["status"] == "ok"
+            and embedding["status"] == "ok"
             and database["status"] == "ok"
             and registry["status"] == "ok"
             and runtime_ok
@@ -170,13 +162,13 @@ class HealthChecker:
         result: dict = {
             "status": "ok" if all_ok else "degraded",
             "qdrant": qdrant["status"],
-            "tei": tei["status"],
+            "embedder": embedding["status"],
             "database": database["status"],
             "runtime_mode": "native" if require_background else "reads_only",
             "runtime": runtime,
             "details": {
                 "qdrant": qdrant,
-                "tei": tei,
+                "embedder": embedding,
                 "database": database,
                 "registry": registry,
                 "docs_graph": docs_graph,
@@ -226,7 +218,7 @@ async def get_health_status(*, require_background: bool = True) -> tuple[dict, i
 async def get_dependency_status() -> dict[str, str]:
     """Return dependency-only statuses for low-churn readiness checks."""
     if _health_checker is None:
-        return {"qdrant": "starting", "tei": "starting", "database": "starting"}
+        return {"qdrant": "starting", "embedder": "starting", "database": "starting"}
 
     health = await _health_checker.get_dependency_health()
     return {key: value["status"] for key, value in health.items()}

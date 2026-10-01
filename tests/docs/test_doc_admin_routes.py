@@ -151,7 +151,7 @@ def _patch_libraries_route(
         {
             "status": "ok",
             "qdrant": "ok",
-            "tei": "ok",
+            "embedder": "ok",
             "database": "ok",
             "runtime": {"worker": "ok", "scheduler": "ok", "recovery": "ok"},
         },
@@ -225,7 +225,7 @@ def test_libraries_route_returns_every_freshness_field(monkeypatch, client: Test
     assert payload["worker"] == {"running": True, "id": "worker-1"}
     assert payload["unreachable_libraries"] == {"/dead/repo": 4}
     assert payload["runtime"] == {"worker": "ok", "scheduler": "ok", "recovery": "ok"}
-    assert payload["dependencies"] == {"qdrant": "ok", "tei": "ok", "database": "ok"}
+    assert payload["dependencies"] == {"qdrant": "ok", "embedder": "ok", "database": "ok"}
     assert payload["health_status"] == "ok"
     assert [job["id"] for job in payload["jobs"]["pending"]] == ["job-1"]
     assert [job["id"] for job in payload["jobs"]["running"]] == ["job-2"]
@@ -281,6 +281,6 @@ def test_libraries_route_degrades_when_job_listing_fails(monkeypatch, client: Te
     assert payload["runtime"] == {}
     assert payload["dependencies"] == {
         "qdrant": "starting",
-        "tei": "starting",
+        "embedder": "starting",
         "database": "starting",
     }

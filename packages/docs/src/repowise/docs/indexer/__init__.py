@@ -8,7 +8,7 @@ from repowise.docs.indexer.collection import (
     get_collection_info,
     get_qdrant_client,
 )
-from repowise.docs.indexer.embedder import embed_single, embed_texts
+from repowise.docs.indexer.embedder import embed_documents, embed_query
 from repowise.docs.indexer.incremental import (
     ChangeSet,
     compute_changes,
@@ -47,9 +47,9 @@ __all__ = [
     "delete_collection",
     "delete_files_outside_scope",
     "delete_stale_file_chunks",
-    "embed_single",
     # Embedding
-    "embed_texts",
+    "embed_documents",
+    "embed_query",
     "ensure_collection",
     "get_chunk_by_id",
     "get_chunk_count",

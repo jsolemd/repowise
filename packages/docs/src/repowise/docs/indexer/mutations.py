@@ -9,7 +9,7 @@ from qdrant_client import AsyncQdrantClient, models
 from repowise.docs.chunking.models import DocChunk
 from repowise.docs.config import get_settings
 from repowise.docs.indexer.collection import get_qdrant_client
-from repowise.docs.indexer.embedder import embed_texts
+from repowise.docs.indexer.embedder import embed_documents
 from repowise.docs.indexer.shared import (
     build_file_filter,
     build_library_filter,
@@ -33,8 +33,9 @@ async def upsert_chunks(
     settings = get_settings()
 
     logger.info("Embedding %d chunks...", len(chunks))
-    texts = [c.content for c in chunks]
-    embeddings = await embed_texts(texts)
+    embeddings = await embed_documents(
+        [c.content for c in chunks], [c.breadcrumb_text for c in chunks]
+    )
 
     points: list[models.PointStruct] = []
     for chunk, embedding in zip(chunks, embeddings, strict=True):
@@ -64,6 +65,51 @@ async def upsert_chunks(
 
     logger.info("Upserted %d points to '%s'", len(points), settings.qdrant_collection)
     return len(points)
+
+
+async def reembed_all(client: AsyncQdrantClient | None = None, page_size: int = 256) -> int:
+    """Re-embed every stored chunk with the current embedder, in place.
+
+    Run once after the embedding model changes, with the worker stopped, so no
+    query meets a mix of two models' vectors. Chunk text, payloads and BM25
+    vectors stay as they are; only the dense vectors are replaced.
+    """
+    if client is None:
+        client = get_qdrant_client()
+
+    settings = get_settings()
+    total = 0
+    offset = None
+    while True:
+        points, offset = await client.scroll(
+            collection_name=settings.qdrant_collection,
+            limit=page_size,
+            offset=offset,
+            with_payload=["content", "breadcrumb_text"],
+            with_vectors=False,
+        )
+        if points:
+            payloads = [point.payload or {} for point in points]
+            embeddings = await embed_documents(
+                [str(payload.get("content") or "") for payload in payloads],
+                [payload.get("breadcrumb_text") or None for payload in payloads],
+            )
+            await client.update_vectors(
+                collection_name=settings.qdrant_collection,
+                points=[
+                    models.PointVectors(id=point.id, vector={"dense": embedding})
+                    for point, embedding in zip(points, embeddings, strict=True)
+                ],
+                wait=True,
+            )
+            total += len(points)
+            if total % 10_000 < len(points):
+                logger.info("Re-embedded %d chunks", total)
+        if offset is None:
+            break
+
+    logger.info("Re-embedded %d chunks in '%s'", total, settings.qdrant_collection)
+    return total
 
 
 async def delete_by_file(

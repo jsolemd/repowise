@@ -619,7 +619,9 @@ class TestWorkerModule:
         import repowise.docs.jobs.worker as worker_module
         import repowise.docs.server.health as health_module
 
-        dependency_status = AsyncMock(return_value={"qdrant": "ok", "tei": "ok", "database": "ok"})
+        dependency_status = AsyncMock(
+            return_value={"qdrant": "ok", "embedder": "ok", "database": "ok"}
+        )
         full_health = AsyncMock()
 
         monkeypatch.setattr(health_module, "get_dependency_status", dependency_status)

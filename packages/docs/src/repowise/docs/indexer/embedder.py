@@ -1,10 +1,25 @@
-"""TEI batch embedding client for doc-search."""
+"""Doc-search embeddings from llama.cpp's ``llama-server`` serving EmbeddingGemma.
+
+The server speaks the OpenAI embeddings API at ``/v1/embeddings`` and routes each
+request by its ``model`` field. This client adds the two things the server leaves
+to its caller. EmbeddingGemma was trained with a prompt naming each text's role,
+``task: search result | query: ...`` for a query and ``title: ... | text: ...``
+for a document, and retrieves worse without it. And the server refuses an input
+longer than the model's context instead of truncating it, which fails the whole
+batch, so an over-long document is cut first with the server's own tokenizer
+(``/tokenize`` and ``/detokenize``), keeping its opening tokens.
+
+On the host the worker reaches the server over TCP (``embedder_url``). In a
+container it uses the Unix socket the server also listens on
+(``embedder_socket``), so the server never listens beyond loopback.
+"""
 
 import asyncio
 import logging
 import math
 import threading
 from collections import OrderedDict
+from typing import Any
 
 import httpx
 
@@ -12,8 +27,16 @@ from repowise.docs.config import get_settings
 
 logger = logging.getLogger(__name__)
 
-# Query embedding LRU cache — avoids redundant TEI round-trips for repeated queries.
-# Inspired by NornicDB's embedding cache pattern. Thread-safe via lock.
+# EmbeddingGemma's retrieval prompts (its sentence-transformers configuration).
+QUERY_PROMPT = "task: search result | query: "
+
+
+def document_prompt(title: str | None) -> str:
+    """The document-role prompt, naming the section the text sits under."""
+    return f"title: {title or 'none'} | text: "
+
+
+# Query embedding LRU cache: repeated queries skip the server round-trip.
 _QUERY_CACHE_MAX_SIZE = 256
 _query_cache: OrderedDict[str, list[float]] = OrderedDict()
 _query_cache_lock = threading.Lock()
@@ -21,24 +44,18 @@ _query_cache_hits = 0
 _query_cache_misses = 0
 _http_client: httpx.AsyncClient | None = None
 _http_client_lock = threading.Lock()
+_token_budget: int | None = None
 
 _HTTP_CONNECT_TIMEOUT_SECONDS = 5.0
+# The first request after the server's idle sleep waits for the model to load.
 _HTTP_READ_TIMEOUT_SECONDS = 60.0
 _HTTP_LIMITS = httpx.Limits(max_keepalive_connections=20, max_connections=100)
 _EMBED_MAX_RETRIES = 2
 _RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
-
-
-def _max_embed_chars(settings) -> int:
-    """Return the per-input character budget used for TEI requests."""
-    return max(512, settings.chunk_max_tokens * 4)
-
-
-def _prepare_embed_text(text: str, *, max_chars: int) -> str:
-    """Trim pathological inputs so one bad chunk cannot 413 the whole batch."""
-    if len(text) <= max_chars:
-        return text
-    return text[:max_chars]
+# Tokens held back from the context: the special tokens the server adds around
+# every input, and a few for a cut that re-tokenizes slightly longer.
+_CONTEXT_RESERVE = 8
+_TOKENIZE_CONCURRENCY = 16
 
 
 def _cache_get(text: str) -> list[float] | None:
@@ -75,11 +92,19 @@ def get_cache_stats() -> dict[str, int]:
 
 
 def _get_http_client() -> httpx.AsyncClient:
-    """Return a process-local AsyncClient for TEI connection reuse."""
+    """Return the process-local client for the embedding server."""
     global _http_client
     with _http_client_lock:
         if _http_client is None or _http_client.is_closed:
+            settings = get_settings()
+            transport = (
+                httpx.AsyncHTTPTransport(uds=settings.embedder_socket, limits=_HTTP_LIMITS)
+                if settings.embedder_socket
+                else None
+            )
             _http_client = httpx.AsyncClient(
+                base_url=settings.embedder_url,
+                transport=transport,
                 timeout=httpx.Timeout(
                     connect=_HTTP_CONNECT_TIMEOUT_SECONDS,
                     read=_HTTP_READ_TIMEOUT_SECONDS,
@@ -92,10 +117,7 @@ def _get_http_client() -> httpx.AsyncClient:
 
 
 async def close_http_client() -> None:
-    """Close the shared TEI client.
-
-    Primarily useful for tests and controlled shutdown hooks.
-    """
+    """Close the shared embedding client (controlled shutdown and tests)."""
     global _http_client
     with _http_client_lock:
         client = _http_client
@@ -105,44 +127,27 @@ async def close_http_client() -> None:
         await client.aclose()
 
 
-def _validate_embedding_batch(
-    vectors: object, *, input_count: int, dimensions: int
-) -> list[list[float]]:
-    """Reject incomplete or malformed successful responses before publication."""
-    if not isinstance(vectors, list) or len(vectors) != input_count:
-        raise ValueError(f"TEI must return one embedding for each of {input_count} inputs")
-    for vector in vectors:
-        if not isinstance(vector, list) or len(vector) != dimensions:
-            raise ValueError(f"TEI must return {dimensions}-dimensional embeddings")
-        if any(
-            isinstance(value, bool)
-            or not isinstance(value, (int, float))
-            or not math.isfinite(value)
-            for value in vector
-        ):
-            raise ValueError("TEI embeddings must contain finite numbers")
-    return vectors
+async def check_health() -> dict:
+    """Report whether the embedding server answers (without loading the model)."""
+    try:
+        response = await _get_http_client().get("/health", timeout=5.0)
+    except Exception as exc:
+        return {"status": "error", "error": str(exc)}
+    if response.status_code == 200:
+        return {"status": "ok"}
+    return {"status": "error", "error": f"HTTP {response.status_code}"}
 
 
-async def _post_embed_batch(
-    *,
-    settings,
-    batch: list[str],
-) -> list[list[float]]:
-    """Embed one batch with light retry/backoff for transient TEI failures."""
+async def _request(method: str, path: str, **kwargs: Any) -> Any:
+    """One server call, retried with light backoff on transient failures."""
     client = _get_http_client()
     last_exc: Exception | None = None
 
     for attempt in range(_EMBED_MAX_RETRIES + 1):
         try:
-            response = await client.post(
-                f"{settings.tei_host}/embed",
-                json={"inputs": batch},
-            )
+            response = await client.request(method, path, **kwargs)
             response.raise_for_status()
-            return _validate_embedding_batch(
-                response.json(), input_count=len(batch), dimensions=settings.embedding_dimensions
-            )
+            return response.json()
         except httpx.HTTPStatusError as exc:
             last_exc = exc
             if (
@@ -163,79 +168,107 @@ async def _post_embed_batch(
     raise last_exc
 
 
-async def embed_texts(
-    texts: list[str],
-    batch_size: int | None = None,
+async def _get_token_budget(model: str) -> int:
+    """Tokens one input may hold: the model's context less the reserve."""
+    global _token_budget
+    if _token_budget is None:
+        props = await _request("GET", "/props", params={"model": model})
+        _token_budget = int(props["default_generation_settings"]["n_ctx"]) - _CONTEXT_RESERVE
+    return _token_budget
+
+
+async def _fit(text: str, *, model: str, budget: int) -> str:
+    """*text* cut to *budget* tokens. A token is at least one byte, so a text of
+    no more bytes than the budget fits without asking the server."""
+    if len(text.encode("utf-8")) <= budget:
+        return text
+    tokens = (await _request("POST", "/tokenize", json={"model": model, "content": text}))["tokens"]
+    if len(tokens) <= budget:
+        return text
+    logger.debug("Cutting a %d-token input to %d tokens", len(tokens), budget)
+    detokenized = await _request(
+        "POST", "/detokenize", json={"model": model, "tokens": tokens[:budget]}
+    )
+    return detokenized["content"]
+
+
+def _validate_embedding_response(
+    payload: object, *, input_count: int, dimensions: int
 ) -> list[list[float]]:
-    """
-    Batch embed texts via TEI (Text Embeddings Inference).
+    """Reject incomplete or malformed successful responses before publication."""
+    rows = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(rows, list) or len(rows) != input_count:
+        raise ValueError(f"llama-server must return one embedding for each of {input_count} inputs")
+    try:
+        vectors = [row["embedding"] for row in sorted(rows, key=lambda row: row["index"])]
+    except (KeyError, TypeError) as exc:
+        raise ValueError("llama-server returned a malformed embeddings response") from exc
+    for vector in vectors:
+        if not isinstance(vector, list) or len(vector) != dimensions:
+            raise ValueError(f"llama-server must return {dimensions}-dimensional embeddings")
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            for value in vector
+        ):
+            raise ValueError("llama-server embeddings must contain finite numbers")
+    return vectors
 
-    Args:
-        texts: List of text strings to embed
-        batch_size: Optional batch size override (default from settings)
 
-    Returns:
-        List of embedding vectors (768 dimensions each)
-
-    Raises:
-        httpx.HTTPStatusError: If TEI returns an error
-    """
-    if not texts:
+async def _embed(inputs: list[str], *, batch_size: int | None = None) -> list[list[float]]:
+    """Embed prompted inputs in batches, each cut to the model's context."""
+    if not inputs:
         return []
 
     settings = get_settings()
     batch_size = settings.embedding_batch_size if batch_size is None else batch_size
     if batch_size < 1:
         raise ValueError("Embedding batch size must be positive")
-    max_chars = _max_embed_chars(settings)
+    model = settings.embedding_model
+    budget = await _get_token_budget(model)
+    gate = asyncio.Semaphore(_TOKENIZE_CONCURRENCY)
+
+    async def fit(text: str) -> str:
+        async with gate:
+            return await _fit(text, model=model, budget=budget)
 
     embeddings: list[list[float]] = []
-    for i in range(0, len(texts), batch_size):
-        batch = [
-            _prepare_embed_text(text, max_chars=max_chars) for text in texts[i : i + batch_size]
-        ]
-
-        logger.debug(
-            "Embedding batch %d (%d texts, chars: %d)",
-            i // batch_size + 1,
-            len(batch),
-            sum(len(text) for text in batch),
+    for i in range(0, len(inputs), batch_size):
+        batch = await asyncio.gather(*(fit(text) for text in inputs[i : i + batch_size]))
+        payload = await _request("POST", "/v1/embeddings", json={"model": model, "input": batch})
+        embeddings.extend(
+            _validate_embedding_response(
+                payload, input_count=len(batch), dimensions=settings.embedding_dimensions
+            )
         )
-
-        batch_embeddings = await _post_embed_batch(
-            settings=settings,
-            batch=batch,
-        )
-        embeddings.extend(batch_embeddings)
-
-    logger.info(
-        "Embedded %d texts in %d batches",
-        len(texts),
-        (len(texts) - 1) // batch_size + 1,
-    )
-
     return embeddings
 
 
-async def embed_single(text: str) -> list[float]:
-    """
-    Embed a single text, with LRU cache for query embeddings.
+async def embed_documents(
+    texts: list[str],
+    titles: list[str | None] | None = None,
+    *,
+    batch_size: int | None = None,
+) -> list[list[float]]:
+    """Embed document chunks, each prompted with its section title when known."""
+    if titles is None:
+        titles = [None] * len(texts)
+    if len(titles) != len(texts):
+        raise ValueError("titles must match texts one for one")
+    inputs = [document_prompt(title) + text for title, text in zip(titles, texts, strict=True)]
+    embeddings = await _embed(inputs, batch_size=batch_size)
+    logger.debug("Embedded %d chunks", len(texts))
+    return embeddings
 
-    Caches up to 256 recent query embeddings to avoid redundant TEI calls.
-    Cache hits return in <1ms vs ~5-10ms for a TEI round-trip.
 
-    Args:
-        text: Text string to embed
-
-    Returns:
-        Embedding vector (768 dimensions)
-    """
-    cached = _cache_get(text)
+async def embed_query(query: str) -> list[float]:
+    """Embed a search query, through an LRU cache of recent queries."""
+    cached = _cache_get(query)
     if cached is not None:
-        logger.debug("Embedding cache hit for: %s...", text[:50])
+        logger.debug("Embedding cache hit for: %s...", query[:50])
         return cached
 
-    embeddings = await embed_texts([text])
-    result = embeddings[0]
-    _cache_put(text, result)
-    return result
+    (embedding,) = await _embed([QUERY_PROMPT + query])
+    _cache_put(query, embedding)
+    return embedding

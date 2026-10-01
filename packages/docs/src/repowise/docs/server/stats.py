@@ -211,13 +211,13 @@ async def build_docs_libraries_payload(
         health_status = str(health.get("status", "unknown"))
         runtime = dict(health.get("runtime") or {})
         dependencies = {
-            key: str(health.get(key, "starting")) for key in ("qdrant", "tei", "database")
+            key: str(health.get(key, "starting")) for key in ("qdrant", "embedder", "database")
         }
     except Exception as exc:
         logger.warning("Could not read docs health for the library index: %s", exc)
         health_status = "unknown"
         runtime = {}
-        dependencies = {"qdrant": "unknown", "tei": "unknown", "database": "unknown"}
+        dependencies = {"qdrant": "unknown", "embedder": "unknown", "database": "unknown"}
 
     payload.update(
         {

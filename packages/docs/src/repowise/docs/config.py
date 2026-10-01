@@ -48,8 +48,16 @@ class Settings(BaseSettings):
     qdrant_host: Annotated[str, Field(description="Qdrant API host")] = "http://qdrant:6333"
     qdrant_collection: Annotated[str, Field(description="Qdrant collection name")] = "doc-search"
 
-    # TEI (Text Embeddings Inference) configuration
-    tei_host: Annotated[str, Field(description="TEI API host")] = "http://tei:80"
+    # Embedding server: llama.cpp's llama-server, over TCP or its Unix socket
+    embedder_url: Annotated[str, Field(description="llama-server base URL")] = (
+        "http://127.0.0.1:8090"
+    )
+    embedder_socket: Annotated[
+        str, Field(description="llama-server Unix socket; when set, requests go through it")
+    ] = ""
+    embedding_model: Annotated[str, Field(description="Model the server routes on")] = (
+        "embeddinggemma"
+    )
     embedding_dimensions: Annotated[int, Field(description="Embedding vector dimensions")] = 768
 
     # PostgreSQL direct connection (for asyncpg)

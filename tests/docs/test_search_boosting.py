@@ -55,9 +55,7 @@ class TestDocCategoryBoosting:
         )
 
         with (
-            patch(
-                "repowise.docs.indexer.search.embed_single", new_callable=AsyncMock
-            ) as mock_embed,
+            patch("repowise.docs.indexer.search.embed_query", new_callable=AsyncMock) as mock_embed,
             patch("repowise.docs.indexer.search.get_settings") as mock_settings,
         ):
             mock_embed.return_value = [0.1] * 768
@@ -237,7 +235,7 @@ async def test_search_hybrid_rescues_exact_component_surface_candidates(mock_qdr
     ]
 
     with (
-        patch("repowise.docs.indexer.search.embed_single", new_callable=AsyncMock) as mock_embed,
+        patch("repowise.docs.indexer.search.embed_query", new_callable=AsyncMock) as mock_embed,
         patch("repowise.docs.indexer.search.get_settings") as mock_settings,
     ):
         mock_embed.return_value = [0.1] * 768
@@ -289,7 +287,7 @@ async def test_search_hybrid_api_lookup_demotes_weak_paths_when_stronger_surface
     ]
 
     with (
-        patch("repowise.docs.indexer.search.embed_single", new_callable=AsyncMock) as mock_embed,
+        patch("repowise.docs.indexer.search.embed_query", new_callable=AsyncMock) as mock_embed,
         patch("repowise.docs.indexer.search.get_settings") as mock_settings,
     ):
         mock_embed.return_value = [0.1] * 768
@@ -353,7 +351,7 @@ async def test_search_hybrid_api_lookup_prefers_canonical_component_page_over_co
     ]
 
     with (
-        patch("repowise.docs.indexer.search.embed_single", new_callable=AsyncMock) as mock_embed,
+        patch("repowise.docs.indexer.search.embed_query", new_callable=AsyncMock) as mock_embed,
         patch("repowise.docs.indexer.search.get_settings") as mock_settings,
     ):
         mock_embed.return_value = [0.1] * 768

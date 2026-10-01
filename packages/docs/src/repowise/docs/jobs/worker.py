@@ -52,7 +52,7 @@ async def _dependencies_ready() -> bool:
         logger.warning("Docs dependency health unavailable: %s", exc)
         return False
 
-    return all(health.get(key) == "ok" for key in ("qdrant", "tei", "database"))
+    return all(health.get(key) == "ok" for key in ("qdrant", "embedder", "database"))
 
 
 async def _heartbeat_loop(job_id: str, stop_event: asyncio.Event) -> None:
