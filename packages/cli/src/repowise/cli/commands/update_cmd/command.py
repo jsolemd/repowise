@@ -757,6 +757,10 @@ def run_update(
             if emitter is not None:
                 emitter.error(str(exc))
             raise
+        if not dry_run and target.ws_root is not None and target.ws_config is not None:
+            from .lance_retention import sweep_workspace_lance_versions
+
+            sweep_workspace_lance_versions(target.ws_root, target.ws_config, target.repo_filter)
         if emitter is not None:
             emitter.done(
                 ok=True,

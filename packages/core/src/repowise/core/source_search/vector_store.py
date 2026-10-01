@@ -14,6 +14,7 @@ from dataclasses import asdict, dataclass, fields
 from datetime import timedelta
 from typing import Any
 
+from repowise.core.lance_retention import READ_CONSISTENCY_INTERVAL, prune_versions
 from repowise.core.providers.embedding.base import Embedder
 
 from .chunks import SourceChunk
@@ -176,7 +177,9 @@ class SourceChunkVectorStore:
         async with self._connect_lock:
             if self._db is not None:
                 return
-            db = await lancedb.connect_async(self._db_path)
+            db = await lancedb.connect_async(
+                self._db_path, read_consistency_interval=READ_CONSISTENCY_INTERVAL
+            )
             table = await self._open_table_if_present(db, self._table_name)
             generations = await self._open_table_if_present(db, SOURCE_GENERATIONS_TABLE)
             versioned = None
@@ -463,10 +466,12 @@ class SourceChunkVectorStore:
 
         Deleting in Lance only writes deletion vectors; the space returns when
         compaction rewrites the fragments and version cleanup drops the files
-        the old versions referenced. Readers pin the table version they opened,
-        so versions committed within *keep_versions_since* survive, and the
-        caller sizes that window to cover every reader of the generations it
-        keeps. The window is required: LanceDB reads a missing one as seven days.
+        the old versions referenced. Versions superseded within
+        *keep_versions_since* survive, and the caller sizes that window to cover
+        every reader of the generations it keeps. These readers reopen on a
+        manifest change, so the window reaches back only to the previous
+        publication, where the daily sweep keeps
+        :data:`~repowise.core.lance_retention.VERSION_RETENTION`.
 
         Returns the number of chunk rows removed.
         """
@@ -477,10 +482,10 @@ class SourceChunkVectorStore:
             removed = int(await self._table.count_rows(f"valid_to <= {floor}"))
             if removed:
                 await self._table.delete(f"valid_to <= {floor}")
-            await self._table.optimize(cleanup_older_than=keep_versions_since)
+            await prune_versions(self._table, retention=keep_versions_since)
         if self._generation_table is not None:
             await self._generation_table.delete(f"generation_sequence < {floor}")
-            await self._generation_table.optimize(cleanup_older_than=keep_versions_since)
+            await prune_versions(self._generation_table, retention=keep_versions_since)
         return removed
 
     async def retention_pressure(self, floor: int) -> tuple[int, int, int]:

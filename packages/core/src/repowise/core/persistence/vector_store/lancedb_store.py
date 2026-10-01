@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 
+from repowise.core.lance_retention import READ_CONSISTENCY_INTERVAL
 from repowise.core.providers.embedding.base import Embedder
 
 from ..search import _SNIPPET_LEN, SearchResult, snippet_around
@@ -107,7 +108,11 @@ class LanceDBVectorStore(VectorStore):
         async with self._connect_lock:
             if self._db is not None:
                 return
-            db = await lancedb.connect_async(self._db_path)
+            # Without a consistency interval the handle stays on the version
+            # it opened, which the version sweep later removes.
+            db = await lancedb.connect_async(
+                self._db_path, read_consistency_interval=READ_CONSISTENCY_INTERVAL
+            )
             table_names = await db.table_names()
             table = (
                 await db.open_table(self._table_name) if self._table_name in table_names else None

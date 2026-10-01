@@ -64,6 +64,7 @@ __all__ = [
     "SourceFileChangedError",
     "SourceIndexDeferredError",
     "SourceLifecycleResult",
+    "reconcile_lock_path",
     "reconcile_source_index",
     "record_source_index_error",
 ]
@@ -128,6 +129,12 @@ class _Plan:
     close_paths: tuple[str, ...]
     replace: tuple[SourceChange, ...]
     stale_files: dict[str, str]
+
+
+def reconcile_lock_path(repo: Path) -> Path:
+    """The lock a source publication holds, also taken by Lance version retention."""
+
+    return repo / ".repowise" / "source_search" / _LOCK_FILENAME
 
 
 def _inject(injector: Callable[[str], None] | None, stage: str) -> None:
@@ -555,7 +562,7 @@ async def reconcile_source_index(
         raise ValueError("source-index embedding batch size must be positive")
     started = time.perf_counter()
     repo = Path(repo_path).resolve()
-    lock_path = repo / ".repowise" / "source_search" / _LOCK_FILENAME
+    lock_path = reconcile_lock_path(repo)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     lock = FileLock(lock_path, timeout=0)
     try:

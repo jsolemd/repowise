@@ -15,6 +15,7 @@ import pytest
 from filelock import FileLock
 from sqlalchemy import delete, select
 
+from repowise.core import lance_retention
 from repowise.core.ingestion import ASTParser, FileTraverser
 from repowise.core.ingestion.parse_cache import parser_fingerprint
 from repowise.core.persistence.database import (
@@ -1466,6 +1467,10 @@ async def test_closed_rows_are_retired_once_no_kept_generation_sees_them(lifecyc
 async def test_version_cleanup_keeps_versions_inside_the_window(lifecycle_repo):
     repo = lifecycle_repo
     await _edit(repo, _APP_V2)
+    # Lance cleans against its own clock, a moment later, so the boundary keeps
+    # a margin; the first edit's versions must fall outside it.
+    margin = lance_retention._CLOCK_MARGIN
+    await asyncio.sleep(margin.total_seconds() + 0.2)
     await _edit(repo, _APP_V3)
     current = read_manifest(default_manifest_path(repo))
     assert current is not None
@@ -1478,11 +1483,16 @@ async def test_version_cleanup_keeps_versions_inside_the_window(lifecycle_repo):
         await store.retire_before(
             current.generation_sequence - 1, keep_versions_since=timedelta(hours=1)
         )
-        # Everything is younger than an hour: compaction adds versions and
-        # cleanup removes none.
+        # Everything is younger than an hour, so nothing is removed.
         assert len(await store._table.list_versions()) >= before
+        latest = (await store._table.list_versions())[-1]
         await store.retire_before(current.generation_sequence - 1, keep_versions_since=timedelta(0))
-        assert len(await store._table.list_versions()) == 1
+        # The version current at the cutoff survives, with what compaction
+        # wrote; everything older than the margin before it is gone.
+        remaining = await store._table.list_versions()
+        assert latest["version"] in {version["version"] for version in remaining}
+        assert len(remaining) < before
+        assert all(v["timestamp"] >= latest["timestamp"] - margin for v in remaining)
         assert await store.count() == current.symbol_chunks + current.file_window_chunks
     finally:
         await store.close()
