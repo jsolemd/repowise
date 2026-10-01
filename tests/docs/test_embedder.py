@@ -181,6 +181,20 @@ async def test_nonpositive_batch_size_is_rejected_before_http(monkeypatch, batch
         {"error": "bad response"},
         [[0.1, 0.2], [0.3, 0.4]],
         {"data": [{"embedding": [0.1, 0.2]}, {"embedding": [0.3, 0.4]}]},
+        {"data": [{"index": 0, "embedding": [0.1, 0.2]}, {"index": 0, "embedding": [0.3, 0.4]}]},
+        {"data": [{"index": 1, "embedding": [0.1, 0.2]}, {"index": 2, "embedding": [0.3, 0.4]}]},
+        {
+            "data": [
+                {"index": 0.0, "embedding": [0.1, 0.2]},
+                {"index": 1.0, "embedding": [0.3, 0.4]},
+            ]
+        },
+        {
+            "data": [
+                {"index": False, "embedding": [0.1, 0.2]},
+                {"index": True, "embedding": [0.3, 0.4]},
+            ]
+        },
         {"data": [{"index": 0, "embedding": [0.1]}, {"index": 1, "embedding": [0.2]}]},
         {"data": [{"index": 0, "embedding": [True, 0.2]}, {"index": 1, "embedding": [0.3, 0.4]}]},
         {"data": [{"index": 0, "embedding": ["a", 0.2]}, {"index": 1, "embedding": [0.3, 0.4]}]},

@@ -200,9 +200,16 @@ def _validate_embedding_response(
     if not isinstance(rows, list) or len(rows) != input_count:
         raise ValueError(f"llama-server must return one embedding for each of {input_count} inputs")
     try:
+        indices = [row["index"] for row in rows]
         vectors = [row["embedding"] for row in sorted(rows, key=lambda row: row["index"])]
     except (KeyError, TypeError) as exc:
         raise ValueError("llama-server returned a malformed embeddings response") from exc
+    # Rows are matched to inputs by index, so each index 0..n-1 must appear once.
+    integral = all(isinstance(index, int) and not isinstance(index, bool) for index in indices)
+    if not integral or sorted(indices) != list(range(input_count)):
+        raise ValueError(
+            f"llama-server must index its {input_count} embeddings 0..{input_count - 1}, once each"
+        )
     for vector in vectors:
         if not isinstance(vector, list) or len(vector) != dimensions:
             raise ValueError(f"llama-server must return {dimensions}-dimensional embeddings")
