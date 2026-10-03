@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 
 from repowise.core.lance_retention import READ_CONSISTENCY_INTERVAL
 from repowise.core.providers.embedding.base import Embedder
+from repowise.core.source_search.manifest import identify_embedder
 
 from ..search import _SNIPPET_LEN, SearchResult, snippet_around
 from ._base import (
+    EMBED_TEXT_MAX_CHARS,
     STORED_SNIPPET_CHARS,
     BatchChunkFailure,
     BatchEmbeddingError,
@@ -21,8 +24,18 @@ __all__ = ["STORED_SNIPPET_CHARS", "LanceDBVectorStore"]
 
 # DataFusion expands every literal in a large ``IN`` filter into native query
 # state. A several-thousand-path generation level can otherwise commit
-# gigabytes before returning even though the selected result is small.
+# gigabytes before returning even though the selected result is small. Every
+# ``IN`` read here is cut to this many literals, page ids as well as paths.
 _SUMMARY_PATH_BATCH_SIZE = 100
+
+# What a row's vector was computed from: the embedder's identity and the exact
+# text it was given, hashed. A row written by a build that predates the column,
+# or through ``upsert_vectors``, holds null and is never taken as current.
+_EMBED_KEY = "embed_key"
+
+# The columns a row carries besides its vector and key. A change to one of
+# them alone is rewritten under the stored vector rather than re-embedded.
+_METADATA_COLUMNS = ("title", "page_type", "target_path", "content_snippet")
 
 # ``STORED_SNIPPET_CHARS`` — how much of a page's content each row keeps — is
 # defined with the embed recipe and re-exported here so the historical import
@@ -94,6 +107,7 @@ class LanceDBVectorStore(VectorStore):
         self._db = None
         self._table = None
         self._connect_lock = asyncio.Lock()
+        self._embedder_identity: str | None = None
 
     async def _ensure_connected(self) -> None:
         if self._db is not None:
@@ -157,8 +171,14 @@ class LanceDBVectorStore(VectorStore):
         dim = len(sample_vector)
 
         if self._table is not None:
-            existing_dim = self._existing_vector_dim(await self._table.schema())
+            existing_schema = await self._table.schema()
+            existing_dim = self._existing_vector_dim(existing_schema)
             if existing_dim is None or existing_dim == dim:
+                if _EMBED_KEY not in existing_schema.names:
+                    # A table written before rows recorded their key. Null is
+                    # "unknown", so each row is re-embedded once, the next time
+                    # its page is rendered, and keyed from then on.
+                    await self._table.add_columns({_EMBED_KEY: "CAST(NULL AS STRING)"})
                 return
             # Embedder changed dimensions — the old vectors are unusable.
             await self._db.drop_table(self._table_name)  # type: ignore[union-attr]
@@ -172,6 +192,7 @@ class LanceDBVectorStore(VectorStore):
                 pa.field("page_type", pa.string()),
                 pa.field("target_path", pa.string()),
                 pa.field("content_snippet", pa.string()),
+                pa.field(_EMBED_KEY, pa.string()),
             ]
         )
         self._table = await self._db.create_table(  # type: ignore[union-attr]
@@ -179,7 +200,9 @@ class LanceDBVectorStore(VectorStore):
         )
 
     @staticmethod
-    def _row(page_id: str, vector: list[float], metadata: dict) -> dict:
+    def _row(
+        page_id: str, vector: list[float], metadata: dict, embed_key: str | None = None
+    ) -> dict:
         content = str(metadata.get("content", ""))
         return {
             "page_id": page_id,
@@ -188,7 +211,21 @@ class LanceDBVectorStore(VectorStore):
             "page_type": str(metadata.get("page_type", "")),
             "target_path": str(metadata.get("target_path", "")),
             "content_snippet": content[:STORED_SNIPPET_CHARS],
+            _EMBED_KEY: embed_key,
         }
+
+    def _embed_key(self, capped_text: str) -> str:
+        """The key of a vector this store's embedder computes from *capped_text*.
+
+        The text is the one the embedder is actually sent, after the cap, so a
+        change to the recipe in ``embed_item`` or to the cap changes the key.
+        The embedder's provider, model and width are in it for the same reason:
+        an unchanged page embedded by a different model is a different vector.
+        """
+        if self._embedder_identity is None:
+            identity = identify_embedder(self._embedder)
+            self._embedder_identity = f"{identity.provider}\n{identity.model}\n{identity.dims}\n"
+        return hashlib.sha256((self._embedder_identity + capped_text).encode()).hexdigest()
 
     async def _upsert_rows(self, rows: list[dict]) -> None:
         # merge_insert: upsert by page_id (LanceDB 0.12+)
@@ -208,11 +245,12 @@ class LanceDBVectorStore(VectorStore):
 
     async def embed_and_upsert(self, page_id: str, text: str, metadata: dict) -> None:
         await self._ensure_connected()
-        vectors = await self._embedder.embed([cap_embed_text(page_id, text)])
+        capped = cap_embed_text(page_id, text)
+        vectors = await self._embedder.embed([capped])
         vector = vectors[0]
         await self._ensure_table(vector)
         meta = {"content": text, **metadata}
-        await self._upsert_rows([self._row(page_id, vector, meta)])
+        await self._upsert_rows([self._row(page_id, vector, meta, self._embed_key(capped))])
 
     async def embed_batch(self, items: list[tuple[str, str, dict]]) -> None:
         """Embed and upsert in request-sized chunks with failure isolation.
@@ -236,14 +274,82 @@ class LanceDBVectorStore(VectorStore):
             try:
                 await self._ensure_table(vectors[0])
                 rows = [
-                    self._row(page_id, vector, {"content": text, **metadata})
-                    for (page_id, text, metadata), vector in zip(chunk, vectors, strict=True)
+                    self._row(
+                        page_id, vector, {"content": text, **metadata}, self._embed_key(capped)
+                    )
+                    for (page_id, text, metadata), capped, vector in zip(
+                        chunk, texts, vectors, strict=True
+                    )
                 ]
                 await self._upsert_rows(rows)
             except Exception as exc:  # preserve vectors' failure stage for callers
                 failures.append(BatchChunkFailure(tuple(chunk), "persistence", exc))
         if failures:
             raise BatchEmbeddingError(failures=failures, total_items=len(items))
+
+    async def refresh_batch(self, items: list[tuple[str, str, dict]]) -> int:
+        """Write only the items whose stored row is not already current.
+
+        An item whose row holds the key of its text under this embedder is
+        neither embedded nor written; if only its metadata columns differ, the
+        row is rewritten under the vector it already has. Everything else, a
+        missing row included, goes through :meth:`embed_batch`. Returns how many
+        items were sent to the embedder.
+        """
+        if not items:
+            return 0
+        await self._ensure_connected()
+        stored = await self._stored_rows([page_id for page_id, _text, _metadata in items])
+        pending: list[tuple[str, str, dict]] = []
+        rewrites: dict[str, tuple[tuple[str, str, dict], dict]] = {}
+        for item in items:
+            page_id, text, metadata = item
+            # The same cut ``cap_embed_text`` makes, without its truncation
+            # report: ``embed_batch`` reports it for the items it embeds.
+            key = self._embed_key(text[:EMBED_TEXT_MAX_CHARS])
+            row = stored.get(page_id)
+            if row is None or row[_EMBED_KEY] != key:
+                pending.append(item)
+                continue
+            fresh = self._row(page_id, [], {"content": text, **metadata}, key)
+            if any(row[column] != fresh[column] for column in _METADATA_COLUMNS):
+                rewrites[page_id] = (item, fresh)
+        if rewrites:
+            # Read only for the rewrites: a level's worth of vectors held as
+            # Python floats would cost tens of megabytes to change nothing.
+            vectors = await self._stored_rows(list(rewrites), columns=("vector",))
+            rows: list[dict] = []
+            for page_id, (item, fresh) in rewrites.items():
+                if page_id in vectors:
+                    rows.append({**fresh, "vector": vectors[page_id]["vector"]})
+                else:  # deleted since the first read
+                    pending.append(item)
+            if rows:
+                await self._upsert_rows(rows)
+        await self.embed_batch(pending)
+        return len(pending)
+
+    async def _stored_rows(
+        self, page_ids: list[str], columns: tuple[str, ...] = (_EMBED_KEY, *_METADATA_COLUMNS)
+    ) -> dict[str, dict]:
+        """*columns* of the stored rows for *page_ids* that carry an embed key."""
+        if self._table is None:
+            return {}
+        schema = await self._table.schema()  # type: ignore[union-attr]
+        if _EMBED_KEY not in schema.names:
+            return {}
+        out: dict[str, dict] = {}
+        unique_ids = list(dict.fromkeys(page_ids))
+        for index in range(0, len(unique_ids), _SUMMARY_PATH_BATCH_SIZE):
+            batch = unique_ids[index : index + _SUMMARY_PATH_BATCH_SIZE]
+            rows = (
+                await self._table.query()  # type: ignore[union-attr]
+                .where(f"{_page_ids_in_filter(batch)} AND {_EMBED_KEY} IS NOT NULL")
+                .select(["page_id", *columns])
+                .to_list()
+            )
+            out.update((row["page_id"], row) for row in rows)
+        return out
 
     async def _search_by_vector(
         self, q_vec: list[float], limit: int, query: str | None = None

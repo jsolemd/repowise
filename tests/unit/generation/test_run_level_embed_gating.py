@@ -46,8 +46,9 @@ class _RecordingStore:
         self.persists_across_runs = persists
         self.batches: list[list[tuple]] = []
 
-    async def embed_batch(self, items):
+    async def refresh_batch(self, items):
         self.batches.append(list(items))
+        return len(items)
 
 
 def _fake_run(store) -> SimpleNamespace:
@@ -93,3 +94,38 @@ def test_ephemeral_store_still_embeds_reused_pages() -> None:
     embedded = _run_level(store)
     assert "fresh.py" in embedded
     assert "reused.py" in embedded
+
+
+def test_a_re_rendered_page_that_did_not_change_is_not_written_again(tmp_path) -> None:
+    """Template pages are never marked reused, but re-render identically.
+
+    Each run used to embed and upsert every one of them again: 4,320 identical
+    rows in one store on 2026-09-28.
+    """
+    import pytest
+
+    pytest.importorskip("lancedb")
+    from repowise.core.persistence.vector_store import LanceDBVectorStore
+    from repowise.core.providers.embedding.base import MockEmbedder
+
+    calls: list[int] = []
+
+    class _Counting(MockEmbedder):
+        async def embed(self, texts):
+            calls.append(len(texts))
+            return await super().embed(texts)
+
+    store = LanceDBVectorStore(str(tmp_path / "lance"), _Counting())
+
+    async def _render_twice() -> tuple[int, int]:
+        async def rendered():
+            return _page("template.py")
+
+        await _GenerationRun.run_level(_fake_run(store), [("p", rendered())], level=2)
+        version = await store._table.version()
+        await _GenerationRun.run_level(_fake_run(store), [("p", rendered())], level=2)
+        return version, await store._table.version()
+
+    first, second = asyncio.run(_render_twice())
+    assert calls == [1]
+    assert second == first

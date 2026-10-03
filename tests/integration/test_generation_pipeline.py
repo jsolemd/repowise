@@ -88,6 +88,10 @@ class _SlowVectorStore:
         for pid, text, meta in items:
             await self.embed_and_upsert(pid, text, meta)
 
+    async def refresh_batch(self, items: list[tuple[str, str, dict[str, Any]]]) -> int:
+        await self.embed_batch(items)
+        return len(items)
+
     async def list_page_ids(self) -> set[str]:
         return set()
 

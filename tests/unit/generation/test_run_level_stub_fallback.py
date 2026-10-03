@@ -46,8 +46,9 @@ class _RecordingStore:
     def __init__(self) -> None:
         self.batches: list[list[tuple]] = []
 
-    async def embed_batch(self, items):
+    async def refresh_batch(self, items):
         self.batches.append(list(items))
+        return len(items)
 
 
 class _RecordingJobSystem:

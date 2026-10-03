@@ -281,6 +281,18 @@ class VectorStore(ABC):
         for page_id, text, metadata in items:
             await self.embed_and_upsert(page_id, text, metadata)
 
+    async def refresh_batch(self, items: list[tuple[str, str, dict]]) -> int:
+        """Bring the stored vectors for *items* up to date; return how many were embedded.
+
+        Unlike :meth:`embed_batch`, which always writes, this may leave alone an
+        item whose stored vector was computed from the same text by the same
+        embedder. Generation uses it, because it re-renders template pages that
+        have not changed on every run. A store that cannot tell embeds them all,
+        which is this default, and always correct.
+        """
+        await self.embed_batch(items)
+        return len(items)
+
     async def embed_texts(self, texts: list[str]) -> list[list[float]] | None:
         """Embed *texts* in batched embedder requests, without upserting.
 

@@ -733,10 +733,15 @@ class _GenerationRun:
                 # not abort generation — but it MUST be visible: a debug-level
                 # swallow here hid a 300k-token request rejection that silently lost
                 # every file-page embedding on init (`repowise reindex` repairs).
+                #
+                # ``refresh_batch`` rather than ``embed_batch``: template pages are
+                # re-rendered on every run without being marked reused, and writing
+                # each one again put 4,320 identical rows into one store on
+                # 2026-09-28. The store skips a page whose vector is already current.
                 if embed_items and self.vector_store is not None:
                     with timed(self.timings, "generation.embed"):
                         try:
-                            await self.vector_store.embed_batch(embed_items)
+                            await self.vector_store.refresh_batch(embed_items)
                         except Exception as e:
                             log.warning(
                                 "rag.embed_batch_failed",
