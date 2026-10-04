@@ -13,6 +13,7 @@ from repowise.core.source_search.query_log import (
     QueryLog,
     TopEntry,
     default_query_log_path,
+    query_origin,
 )
 
 
@@ -82,6 +83,8 @@ def test_the_record_carries_the_evidence_not_the_prose(tmp_path):
         "error_code",
         "failed_legs",
         "generation",
+        "client",
+        "suite",
     }
     assert record["top"][0] == {
         "file": "src/a.py",
@@ -219,3 +222,20 @@ def test_one_event_larger_than_the_hard_cap_is_dropped(tmp_path):
     path = tmp_path / "query_log.jsonl"
     assert QueryLog(path, max_bytes=32).append(_event()) is False
     assert not path.exists()
+
+
+def test_a_record_says_who_asked_and_under_which_suite(tmp_path):
+    log = QueryLog(tmp_path / QUERY_LOG_FILENAME)
+    with query_origin(client="codex"):
+        log.append(_event(query="live"))
+        # A suite run inside an agent's call keeps the agent and adds the suite.
+        with query_origin(suite="health-dogfood.json"):
+            log.append(_event(query="suite"))
+    log.append(_event(query="in process"))
+
+    rows = [json.loads(line) for line in log.path.read_text().splitlines()]
+    assert [(row["query"], row["client"], row["suite"]) for row in rows] == [
+        ("live", "codex", None),
+        ("suite", "codex", "health-dogfood.json"),
+        ("in process", None, None),
+    ]

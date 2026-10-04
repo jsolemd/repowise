@@ -12,10 +12,12 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+
+from repowise.core.agents.identity import UNKNOWN_AGENT, resolve_client_identity
 
 from .buckets import (
     BUCKET_DEFINITIONS,
@@ -36,6 +38,7 @@ __all__ = [
     "MAX_QUERY_CHARS",
     "REPORT_SCHEMA_VERSION",
     "TIME_WINDOWS",
+    "TRAFFIC_SCOPES",
     "Offender",
     "QualityReport",
     "build_report",
@@ -43,6 +46,13 @@ __all__ = [
 ]
 
 REPORT_SCHEMA_VERSION = 1
+
+#: ``agents`` (the default) reports what agents asked: rows from a recognised
+#: agent, plus rows with no client, which are in-process callers and lines
+#: written before the log recorded one. Suite runs and other MCP clients, such
+#: as health probes, are counted under ``traffic`` and left out of the rates.
+#: ``all`` reports every row.
+TRAFFIC_SCOPES = ("agents", "all")
 
 #: Offenders listed per bucket unless the caller asks for more. The exact
 #: group count sits beside the list, so this cap never hides the size of a
@@ -274,6 +284,7 @@ class QualityReport:
     window: str
     offender_limit: int
     verdicts_applied: int
+    traffic: dict[str, Any] = field(default_factory=dict)
 
     def bucket_records(self, bucket: str) -> list[QueryRecord]:
         return [
@@ -395,6 +406,7 @@ class QualityReport:
                 "with_field_warnings": self.parsed.warned,
                 "verdicts_applied": self.verdicts_applied,
             },
+            "traffic": self.traffic,
             "buckets": buckets,
             "trend": {
                 "window": self.window,
@@ -432,16 +444,48 @@ class QualityReport:
         }
 
 
+def _origin(record: QueryRecord) -> str:
+    """``suite``, ``agent``, ``unattributed`` or ``other``, for the traffic scope."""
+    if record.suite is not None:
+        return "suite"
+    if record.client is None:
+        return "unattributed"
+    return "agent" if resolve_client_identity(record.client) != UNKNOWN_AGENT else "other"
+
+
+def _scope(parsed: ParsedLog, traffic: str) -> tuple[ParsedLog, dict[str, Any]]:
+    """*parsed* narrowed to *traffic*, and the counts of every origin in the log."""
+    origins = {record.line_number: _origin(record) for record in parsed.records}
+    excluded = {"suite", "other"} if traffic == "agents" else set()
+    kept = [record for record in parsed.records if origins[record.line_number] not in excluded]
+    summary = {
+        "scope": traffic,
+        "analysed": len(kept),
+        "by_origin": dict(sorted(Counter(origins.values()).items())),
+        "by_client": dict(
+            sorted(Counter(record.client or "none" for record in parsed.records).items())
+        ),
+        "suites": dict(
+            sorted(Counter(record.suite for record in parsed.records if record.suite).items())
+        ),
+    }
+    return replace(parsed, records=kept), summary
+
+
 def build_report(
     parsed: ParsedLog,
     *,
     window: str = "day",
     offender_limit: int = DEFAULT_OFFENDERS,
     verdicts: Mapping[str, str | None] | None = None,
+    traffic: str = "agents",
 ) -> QualityReport:
-    """Classify a parsed log and wrap it in a report."""
+    """Classify a parsed log, narrowed to *traffic*, and wrap it in a report."""
     if window not in TIME_WINDOWS:
         raise ValueError(f"window must be one of {TIME_WINDOWS}, got {window!r}")
+    if traffic not in TRAFFIC_SCOPES:
+        raise ValueError(f"traffic must be one of {TRAFFIC_SCOPES}, got {traffic!r}")
+    parsed, traffic_summary = _scope(parsed, traffic)
     classifications = classify_all(parsed.records, verdicts=verdicts)
     applied = (
         sum(
@@ -458,6 +502,7 @@ def build_report(
         window=window,
         offender_limit=offender_limit,
         verdicts_applied=applied,
+        traffic=traffic_summary,
     )
 
 
@@ -468,6 +513,7 @@ def report_from_path(
     offender_limit: int = DEFAULT_OFFENDERS,
     max_lines: int | None = None,
     verdicts: Mapping[str, str | None] | None = None,
+    traffic: str = "agents",
 ) -> QualityReport:
     """Read *path* and report on it. Never raises for a bad or missing log."""
     return build_report(
@@ -475,4 +521,5 @@ def report_from_path(
         window=window,
         offender_limit=offender_limit,
         verdicts=verdicts,
+        traffic=traffic,
     )

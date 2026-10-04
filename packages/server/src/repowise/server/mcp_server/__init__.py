@@ -118,6 +118,16 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
 _surface_applied = False
 
 
+def _query_client(live: Any) -> str | None:
+    """Who a logged search is attributed to: the agent's slug when the client is a
+    recognised agent, else the normalized name it announced, such as a probe's."""
+    from repowise.core.agents.identity import UNKNOWN_AGENT
+
+    if live.agent != UNKNOWN_AGENT:
+        return live.agent
+    return live.identity_metadata.get("client_info_normalized") or None
+
+
 def tool_middleware(fn: Any) -> Any:
     """Compose the layers wrapped around every registered MCP tool.
 
@@ -158,6 +168,7 @@ def tool_middleware(fn: Any) -> Any:
     import time
     from functools import wraps
 
+    from repowise.core.source_search.query_log import query_origin
     from repowise.server.mcp_server._budget import (
         enforce_response_budget,
         resolve_response_budget_repo_root,
@@ -240,7 +251,10 @@ def tool_middleware(fn: Any) -> Any:
         @wraps(inner)
         async def wrapped(*args: Any, **kwargs: Any) -> Any:
             started = time.perf_counter()
-            with savings_interaction.begin(fn.__name__) as live:
+            with (
+                savings_interaction.begin(fn.__name__) as live,
+                query_origin(client=_query_client(live)),
+            ):
                 result = await inner(*args, **kwargs)
                 if evidence_kind != "documentation":
                     record_final(live, result, int((time.perf_counter() - started) * 1000))

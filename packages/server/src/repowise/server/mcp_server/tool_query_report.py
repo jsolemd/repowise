@@ -25,7 +25,7 @@ from typing import Any
 
 from repowise.core.persistence.database import get_session
 from repowise.core.registry import mcp_tool_registry as mcp
-from repowise.core.source_search.query_log import default_query_log_path
+from repowise.core.source_search.query_log import default_query_log_path, query_origin
 from repowise.core.source_search.query_report import (
     BUCKETS,
     INTENTS,
@@ -106,9 +106,10 @@ async def get_query_quality(
 ) -> dict[str, Any]:
     """Report what retrieval got wrong, export a bucket as an eval suite, or run one.
 
-    ``report`` buckets the source-search query log into no-match,
-    low-confidence, wrong-owner and error, with counts, rates, a trend and the
-    worst offenders in each. Rows it could not use are declared in ``caveats``,
+    ``report`` buckets the agents' searches in the source-search query log into
+    no-match, low-confidence, wrong-owner and error, with counts, rates, a trend
+    and the worst offenders in each. Suite runs and clients that are not agents,
+    such as health probes, are counted under ``traffic`` and kept out of the rates. Rows it could not use are declared in ``caveats``,
     never dropped. ``export`` turns one bucket into fixture cases; where the log
     does not establish the right answer the case is ``expect.kind = "todo"`` and
     reports as pending. ``run`` executes a written suite; pending never fails.
@@ -297,8 +298,10 @@ async def _run_mode(
         payload["next_action"] = "Build one with 'repowise source-index', then run again."
         return
     payload["suite_path"] = target.as_posix()
+    # Tagged so the suite's queries stay out of the agent traffic the report rates.
     async with coordinator_lease(coordinator):
-        payload["run"] = (await run_suite(loaded, coordinator.search)).to_dict()
+        with query_origin(suite=target.name):
+            payload["run"] = (await run_suite(loaded, coordinator.search)).to_dict()
 
 
 __all__ = ["get_query_quality"]

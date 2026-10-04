@@ -262,3 +262,7 @@ def test_the_shipped_registry_is_the_six_integrated_agents() -> None:
         "opencode",
         "hermes",
     ]
+
+
+def test_codex_is_recognised_by_the_name_its_mcp_client_announces() -> None:
+    assert resolve_client_identity("codex-mcp-client") == "codex"

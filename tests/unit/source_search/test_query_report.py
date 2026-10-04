@@ -10,6 +10,7 @@ impossible to catch in captured traffic.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -938,3 +939,38 @@ async def test_an_errored_search_is_not_reported_as_a_ranking_defect(tmp_path):
     run = await run_suite(load_suite(suite_path), broken)
     assert run.outcomes[0].outcome == "error"
     assert "status=error" in run.outcomes[0].message
+
+
+def test_the_report_rates_agent_traffic_and_counts_suites_and_probes_apart(tmp_path):
+    path = _write(
+        tmp_path / "query_log.jsonl",
+        [
+            _event(query="claude asks", client="claude_code", ts=_ts(1)),
+            _event(query="codex asks", client="codex", ts=_ts(2)),
+            _event(query="written before the field", ts=_ts(3)),
+            _event(query="probe asks", confidence=CAUTION, client="solemdconsumercheck", ts=_ts(4)),
+            replace(_no_match("suite asks", 5), client="codex", suite="health-dogfood.json"),
+        ],
+    )
+
+    agents = report_from_path(path).to_dict()
+    assert agents["totals"]["analysed"] == 3
+    assert agents["buckets"][BUCKET_NO_MATCH]["count"] == 0
+    assert agents["buckets"][BUCKET_LOW_CONFIDENCE]["count"] == 0
+    assert agents["traffic"] == {
+        "scope": "agents",
+        "analysed": 3,
+        "by_origin": {"agent": 2, "other": 1, "suite": 1, "unattributed": 1},
+        "by_client": {"claude_code": 1, "codex": 2, "none": 1, "solemdconsumercheck": 1},
+        "suites": {"health-dogfood.json": 1},
+    }
+
+    everything = report_from_path(path, traffic="all").to_dict()
+    assert everything["totals"]["analysed"] == 5
+    assert everything["buckets"][BUCKET_NO_MATCH]["count"] == 1
+    assert everything["buckets"][BUCKET_LOW_CONFIDENCE]["count"] == 1
+
+
+def test_an_unknown_traffic_scope_is_refused(tmp_path):
+    with pytest.raises(ValueError, match="traffic must be one of"):
+        report_from_path(tmp_path / "missing.jsonl", traffic="probes")

@@ -144,6 +144,8 @@ CLAUDE_CODE = AgentIdentity(
 CODEX = AgentIdentity(
     slug="codex",
     display_name="Codex CLI",
+    #: Codex's MCP client announces itself under its own name.
+    announced_as=frozenset({"codexmcpclient"}),
     hook_adapter="codex",
     session_adapter="codex",
 )

@@ -104,6 +104,8 @@ class QueryRecord:
     failed_legs: tuple[dict[str, Any], ...]
     generation: str | None
     warnings: tuple[str, ...] = ()
+    client: str | None = None
+    suite: str | None = None
 
     @property
     def normalized_query(self) -> str:
@@ -333,6 +335,8 @@ def parse_line(raw: str, line_number: int) -> QueryRecord | MalformedLine | None
         error_code=_as_str(payload.get("error_code"), "error_code", warnings),
         failed_legs=_parse_failed_legs(payload.get("failed_legs"), warnings),
         generation=_as_str(payload.get("generation"), "generation", warnings),
+        client=_as_str(payload.get("client"), "client", warnings),
+        suite=_as_str(payload.get("suite"), "suite", warnings),
         warnings=tuple(warnings),
     )
 

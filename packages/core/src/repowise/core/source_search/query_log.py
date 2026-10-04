@@ -20,6 +20,11 @@ package that does.
 
 Appends and compaction share a file lock, and each append remains one write
 under ``O_APPEND``. A logging or lock failure never affects retrieval.
+
+Each record says who asked. The MCP server opens :func:`query_origin` per call
+with the calling agent, and a suite run opens it with the suite's name, so an
+evaluation or a health probe is told apart from an agent's search when the row
+is written rather than guessed from its text afterwards.
 """
 
 from __future__ import annotations
@@ -27,7 +32,10 @@ from __future__ import annotations
 import json
 import logging
 import os
-from dataclasses import dataclass, field
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -47,8 +55,11 @@ __all__ = [
     "TOP_EVENTS_LOGGED",
     "QueryEvent",
     "QueryLog",
+    "QueryOrigin",
     "TopEntry",
+    "current_query_origin",
     "default_query_log_path",
+    "query_origin",
 ]
 
 QUERY_LOG_FILENAME = "query_log.jsonl"
@@ -86,6 +97,34 @@ TOP_EVENTS_LOGGED = 10
 FAILED_LEGS_LOGGED = 8
 
 _log = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class QueryOrigin:
+    """Who is asking: the MCP client's agent, and the eval suite if one is running."""
+
+    client: str | None = None
+    suite: str | None = None
+
+
+_UNATTRIBUTED = QueryOrigin()
+_ORIGIN: ContextVar[QueryOrigin] = ContextVar("repowise_query_origin", default=_UNATTRIBUTED)
+
+
+def current_query_origin() -> QueryOrigin:
+    return _ORIGIN.get()
+
+
+@contextmanager
+def query_origin(*, client: str | None = None, suite: str | None = None) -> Iterator[None]:
+    """Attribute the queries made inside this block; unset fields keep the outer value."""
+    outer = _ORIGIN.get()
+    changes = {k: v for k, v in (("client", client), ("suite", suite)) if v is not None}
+    token = _ORIGIN.set(replace(outer, **changes))
+    try:
+        yield
+    finally:
+        _ORIGIN.reset(token)
 
 
 def default_query_log_path(repo_path: Path | str) -> Path:
@@ -160,6 +199,14 @@ class QueryEvent:
     #: one, which every line written before this field existed did not.
     generation: str | None = None
 
+    #: The calling agent's slug (``claude_code``, ``codex``), or the normalized
+    #: name a client announced that is not an agent, such as a health probe.
+    #: ``None`` for an in-process caller and for every line older than the field.
+    client: str | None = field(default_factory=lambda: _ORIGIN.get().client)
+
+    #: The eval suite this query ran under; ``None`` for live traffic.
+    suite: str | None = field(default_factory=lambda: _ORIGIN.get().suite)
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "ts": self.ts,
@@ -177,6 +224,8 @@ class QueryEvent:
             "error_code": self.error_code,
             "failed_legs": list(self.failed_legs[:FAILED_LEGS_LOGGED]),
             "generation": self.generation,
+            "client": self.client,
+            "suite": self.suite,
         }
 
 
