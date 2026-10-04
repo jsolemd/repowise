@@ -14,6 +14,7 @@ from typing import Any
 
 import pytest
 
+from repowise.core.providers.embedding.outage import EmbedderUnavailableError, EmbedderVerdict
 from repowise.core.source_search.coordinator import (
     AGREEMENT_DENSE_COSINE,
     CONFIDENT_DENSE_COSINE,
@@ -1978,6 +1979,30 @@ async def test_a_dead_embedder_takes_both_dense_legs_down_by_name(tmp_path):
     assert "status" not in response
     assert _files(response) == ["src/a.py"]
     assert response["confidence"] == "caution"
+
+
+async def test_a_diagnosed_embedder_outage_logs_one_warning_without_a_traceback(tmp_path, caplog):
+    """The embedder already named the cause and the remedy; the legs still fail."""
+
+    class _OffEmbedder:
+        dimensions = 4
+
+        async def embed(self, texts: list[str]) -> list[list[float]]:
+            raise EmbedderUnavailableError(
+                "ConnectTimeout", EmbedderVerdict("off_by_design", gaming=True)
+            )
+
+    coordinator = _coordinator(tmp_path, embedder=_OffEmbedder())
+    coordinator._wiki_fts = _WikiFTS([_PageHit("file_page:src/a.py", "src/a.py", 4.0)])
+
+    with caplog.at_level(logging.WARNING, logger="repowise.core.source_search.coordinator"):
+        response = await coordinator.search("how the thing works", limit=5)
+
+    source_meta = response["_meta"]["source_search"]
+    assert {f["leg"] for f in source_meta["failed_legs"]} == {"source dense", "wiki dense"}
+    assert "gaming mode" in source_meta["degraded_reason"]
+    records = [r for r in caplog.records if getattr(r, "leg", None) == "query embedding"]
+    assert [(r.levelno, r.exc_info) for r in records] == [(logging.WARNING, None)]
 
 
 async def test_losing_only_the_chunk_metadata_lookup_degrades_without_erroring(tmp_path):

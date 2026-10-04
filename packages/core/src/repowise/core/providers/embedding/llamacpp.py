@@ -16,8 +16,11 @@ A router-mode server serves several models and routes each request by its
 that model's ``/props``.
 
 A request the server cannot serve is retried briefly when the failure is the
-kind that passes (a 503 while a model loads, a timeout). If it still fails, the
-host's ensure command is asked to bring the server back (see
+kind that passes (a 503 while a model loads, a read timeout). A connection the
+server does not accept is not retried: on loopback a live server accepts at
+once, even mid-load, so a refused or slow connect means nothing is serving, and
+the connect waits seconds rather than the full request timeout. If it still
+fails, the host's ensure command is asked to bring the server back (see
 :mod:`~repowise.core.providers.embedding.outage`), and the request is retried
 once if it reports the server serving. Otherwise the call raises
 :class:`~repowise.core.providers.embedding.outage.EmbedderUnavailableError`,
@@ -47,6 +50,9 @@ log = structlog.get_logger(__name__)
 _DEFAULT_BASE_URL = "http://127.0.0.1:8080"  # llama-server's own default
 _DEFAULT_MODEL = "embeddinggemma"
 _DEFAULT_TIMEOUT = 60.0
+#: Seconds to wait for the server to accept a connection, within the request
+#: timeout. Past it the server is down or wedged, and recovery is the next step.
+_CONNECT_TIMEOUT_S = 2.0
 #: Tokens held back from the context: the special tokens the server adds around
 #: every input (embeddinggemma adds two) and a few for a cut that re-tokenizes
 #: slightly longer than the prefix it was taken from.
@@ -54,7 +60,7 @@ _CONTEXT_RESERVE = 8
 #: Inputs tokenized at once while fitting a batch.
 _TOKENIZE_CONCURRENCY = 16
 #: Retries of a failure that passes on its own (a 503 while a model loads, a
-#: timeout), before the server is treated as down.
+#: read timeout), before the server is treated as down.
 _TRANSIENT_RETRIES = 2
 _RETRY_BACKOFF_S = 0.5
 
@@ -176,7 +182,8 @@ class LlamaCppEmbedder:
         raise AssertionError("unreachable")  # pragma: no cover
 
     async def _embed_once(self, texts: list[str]) -> list[list[float]]:
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
+        timeout = httpx.Timeout(self._timeout, connect=min(_CONNECT_TIMEOUT_S, self._timeout))
+        async with httpx.AsyncClient(timeout=timeout) as client:
             budget = await self._token_budget(client)
             gate = asyncio.Semaphore(_TOKENIZE_CONCURRENCY)
 
@@ -220,7 +227,8 @@ class LlamaCppEmbedder:
 def _transient(exc: httpx.HTTPError) -> bool:
     if isinstance(exc, httpx.HTTPStatusError):
         return exc.response.status_code == 503
-    return isinstance(exc, httpx.TimeoutException)
+    # A connect that timed out found nothing serving; retrying it only delays recovery.
+    return isinstance(exc, httpx.TimeoutException) and not isinstance(exc, httpx.ConnectTimeout)
 
 
 def _server_failure(exc: httpx.HTTPError) -> bool:

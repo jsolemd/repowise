@@ -31,11 +31,13 @@ class _Server:
         self.up = up
         self.statuses = list(statuses or [])
         self.requests = 0
+        self.connect_error: type[httpx.TransportError] = httpx.ConnectError
+        self.timeouts: list[httpx.Timeout] = []
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         self.requests += 1
         if not self.up.exists():
-            raise httpx.ConnectError("Connection refused", request=request)
+            raise self.connect_error("Connection refused", request=request)
         if self.statuses:
             return httpx.Response(self.statuses.pop(0), request=request)
         if request.url.path == "/props":
@@ -50,7 +52,10 @@ def server(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _Server:
     fake = _Server(tmp_path / "up")
     monkeypatch.setattr(
         "repowise.core.providers.embedding.llamacpp.httpx.AsyncClient",
-        lambda timeout: _REAL_CLIENT(timeout=timeout, transport=httpx.MockTransport(fake)),
+        lambda timeout: (
+            fake.timeouts.append(timeout)
+            or _REAL_CLIENT(timeout=timeout, transport=httpx.MockTransport(fake))
+        ),
     )
     monkeypatch.setattr(llamacpp, "_RETRY_BACKOFF_S", 0.0)
     monkeypatch.setattr(outage, "_last_verdict", None)
@@ -208,3 +213,35 @@ async def test_a_refused_request_is_not_an_outage(server, tmp_path, monkeypatch)
         await _embedder().embed(["query"])
     assert notices == []
     assert not runs.exists()
+
+
+async def test_a_connection_that_hangs_goes_to_recovery_without_retrying(
+    server, tmp_path, monkeypatch
+) -> None:
+    # A server that never accepts times out on connect. Retrying that would
+    # wait out the connect again for each retry before recovery could say why.
+    server.connect_error = httpx.ConnectTimeout
+    runs = _ensure(
+        tmp_path,
+        monkeypatch,
+        exit_code=3,
+        reply={"state": "off_by_design", "gaming": True, "remedy": "`solemd gaming resume`"},
+    )
+
+    with pytest.raises(EmbedderUnavailableError) as raised:
+        await _embedder().embed(["query"])
+    assert server.requests == 1
+    assert runs.read_text() == "x"
+    assert raised.value.verdict is not None and raised.value.verdict.state == "off_by_design"
+
+
+async def test_the_connect_wait_is_seconds_within_the_request_timeout(server) -> None:
+    server.up.touch()
+
+    await LlamaCppEmbedder(base_url="http://llama.test", dimensions=4, timeout=60).embed(["q"])
+    await LlamaCppEmbedder(base_url="http://llama.test", dimensions=4, timeout=1).embed(["q"])
+
+    assert [(t.connect, t.read) for t in server.timeouts] == [
+        (llamacpp._CONNECT_TIMEOUT_S, 60),
+        (1, 1),
+    ]

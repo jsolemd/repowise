@@ -53,6 +53,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from repowise.core.providers.embedding.base import Embedder
+from repowise.core.providers.embedding.outage import EmbedderUnavailableError
 
 from .chunks import SOURCE_FILE_WINDOW, SOURCE_SYMBOL, language_for_path, window_eligible
 from .fts import SourceFTSIndex, tokenize
@@ -2281,12 +2282,16 @@ def _classify_failure(leg: str, exc: Exception) -> LegFailure:
 
     A hard failure logs at ERROR with the leg on the record, because it is an
     operational event someone has to see; a timeout logs at WARNING and is
-    otherwise carried on from.
+    otherwise carried on from. An embedder outage is still a hard failure of
+    the leg, but the embedder has already diagnosed it and named the remedy,
+    so it logs at WARNING without a traceback.
     """
     detail = (str(exc).strip() or type(exc).__name__)[:_FAILURE_DETAIL_CHARS]
     hard = not isinstance(exc, _SOFT_LEG_ERRORS)
     extra = {"leg": leg, "error_type": type(exc).__name__, "detail": detail}
-    if hard:
+    if isinstance(exc, EmbedderUnavailableError):
+        log.warning("source-search leg %s unavailable: %s", leg, detail, extra=extra)
+    elif hard:
         log.error("source-search leg %s failed: %s", leg, detail, exc_info=True, extra=extra)
     else:
         log.warning("source-search leg %s timed out", leg, extra=extra)
