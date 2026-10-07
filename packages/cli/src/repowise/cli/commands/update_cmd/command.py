@@ -1533,10 +1533,15 @@ def run_update(
                     degraded=source_degraded,
                     outcome=UpdateOutcome.NOOP.value,
                 )
-            return UpdateOutcome.NOOP
         finally:
             atexit.unregister(release_run_markers)
             release_run_markers()
+        # Source publication can remain pending while retired-page debt is
+        # independently recoverable. Retry only after releasing this run's
+        # markers, so the cleanup owner can acquire fresh writer authority.
+        if not dry_run:
+            retry_retired_page_cleanup(repo_path, head)
+        return UpdateOutcome.NOOP
 
     if health_config_changed or prune_retry:
         # Full re-score (not the partial update) so unchanged files pick up the

@@ -24,10 +24,15 @@ from repowise.core.update_lock import (
 from repowise.core.workspace.config import RepoEntry, WorkspaceConfig
 
 
-@pytest.fixture(params=["single", "workspace"])
-def idle_update(request, tmp_path):
+@pytest.fixture(params=[
+    "single", "workspace", "source_ready", "source_busy", "source_degraded", "source_error"
+])
+def idle_update(request, tmp_path, monkeypatch):
     from repowise.core.pipeline.full_index import index_repo_full
 
+    # True-idle cases own their lane. Source cases explicitly exercise the
+    # independent publication queue without reaching an embedding provider.
+    monkeypatch.setenv("REPOWISE_SOURCE_SEARCH", "0")
     repo = tmp_path / "repo"
     repo.mkdir()
 
@@ -58,15 +63,38 @@ def idle_update(request, tmp_path):
         repos=[RepoEntry(path="repo", alias="repo", last_commit_at_index=head)]
     )
 
+    if request.param.startswith("source_"):
+        from repowise.cli import source_search_runtime
+
+        monkeypatch.setenv("REPOWISE_SOURCE_SEARCH", "1")
+        monkeypatch.setattr(
+            source_search_runtime, "configured_source_pending_updates", AsyncMock(return_value=True)
+        )
+        state = request.param.removeprefix("source_")
+        reconcile = AsyncMock(
+            return_value=SimpleNamespace(status=state, error=f"injected source {state}")
+        )
+        if state == "error":
+            reconcile.side_effect = OSError("injected source failure")
+        monkeypatch.setattr(source_search_runtime, "reconcile_configured_source_index", reconcile)
+
     def run(*, dry_run=False):
-        if request.param == "single":
+        if request.param != "workspace":
             result = CliRunner().invoke(
                 cli,
                 ["update", str(repo), "--no-workspace", "--index-only"]
                 + (["--dry-run"] if dry_run else []),
             )
             assert result.exit_code == 0, result.output
-            assert "Already up to date" in result.output
+            if request.param.startswith("source_"):
+                # A foreign writer can reject the command before publication.
+                if "already running" not in result.output:
+                    assert "No changed files detected" in result.output
+                    assert "Retrying pending source index publication" in result.output
+                    if not dry_run and request.param != "source_ready":
+                        assert "Source search reconcile deferred" in result.output
+            else:
+                assert "Already up to date" in result.output
             return result.output
         else:
             workspace._workspace_update(
@@ -257,3 +285,39 @@ def test_unavailable_authority_discloses_both_pending_indexes(tmp_path, monkeypa
     assert load_cleanup_debt(tmp_path) == {"fts": {"retired"}, "vectors": {"retired"}}
     assert read_update_lock(tmp_path) is None
     build.assert_not_called()
+
+
+@pytest.mark.parametrize("idle_update", ["source_ready"], indirect=True)
+@pytest.mark.parametrize("failure_boundary", ["metadata", "release"])
+def test_source_retry_failure_releases_lock_without_starting_cleanup(
+    idle_update, monkeypatch, failure_boundary
+):
+    from repowise.cli.commands.update_cmd import command
+
+    repo, _head, _run = idle_update
+    record_cleanup_debt(repo, "vectors", {"retired"})
+    cleanup = Mock(side_effect=AssertionError("cleanup must not mask the original failure"))
+    monkeypatch.setattr(command, "retry_retired_page_cleanup", cleanup)
+    error = RuntimeError(f"injected {failure_boundary} failure")
+    if failure_boundary == "metadata":
+        monkeypatch.setattr(command, "stamp_head_commit", Mock(side_effect=error))
+    else:
+        original = command.clear_update_queued
+        calls = 0
+
+        def clear(path):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise error
+            original(path)
+
+        monkeypatch.setattr(command, "clear_update_queued", clear)
+
+    result = CliRunner().invoke(cli, ["update", str(repo), "--no-workspace", "--index-only"])
+
+    assert result.exit_code != 0
+    assert result.exception is error
+    cleanup.assert_not_called()
+    assert load_cleanup_debt(repo)["vectors"] == {"retired"}
+    assert read_update_lock(repo) is None
