@@ -12,6 +12,10 @@ pipelines in `packages/core` and starts the API and MCP servers from
 `packages/server`. Commands live in `src/repowise/cli/commands/`, and the entry
 point is `src/repowise/cli/main.py`.
 
+Exposes 41 registered MCP tools (11 advertised by default in single-repo mode:
+the eleven flagship tools). Workspace mode adds `list_repos`; specialist tools
+are opt-in. See [the MCP reference](../../docs/agent/MCP_TOOLS.md).
+
 It is not published to PyPI on its own. Users get it inside the single
 `repowise` distribution built from the root `pyproject.toml`.
 

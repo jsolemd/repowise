@@ -235,6 +235,7 @@ COUNT_CLAIMS: tuple[tuple[str, str, str], ...] = (
     ("README.md", "flagship", "**{w} task-shaped MCP tools**"),
     ("README.md", "flagship", "## The {w} MCP tools"),
     ("README.md", "flagship", "{W} is a deliberate ceiling"),
+    ("README.md", "opt_in", "{W} further tools are opt-in"),
     ("docs/README.md", "flagship", "decisions, and {w} MCP tools"),
     ("docs/README.md", "flagship", "The {w} task-shaped tools,"),
     ("docs/agent/MCP_TOOLS.md", "total", "{n} tools are registered in total"),
@@ -264,8 +265,6 @@ COUNT_CLAIMS: tuple[tuple[str, str, str], ...] = (
     ("docs/agent/MCP_TOOLS.md", "single_repo", "those {n} plus"),
     ("docs/architecture/ARCHITECTURE.md", "single_repo", "advertises **{n}** tools by default"),
     ("docs/reference/CLI_REFERENCE.md", "lean", "the {w}-tool agent-lean profile"),
-    ("packages/server/README.md", "total", "{n} registered MCP tools"),
-    ("packages/server/README.md", "single_repo", "({n} advertised by default"),
     # The CLI help text is the copy every user reads, and it was the only place
     # publishing the opt-in and lean counts outside a doc.
     (

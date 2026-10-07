@@ -14,8 +14,8 @@ REST routes, and `mcp_server/` holds the tools. It reads indexes built by
 `packages/core`.
 
 Seen from an MCP client, repowise registers 41 MCP tools and advertises **11 by default**.
-Workspace mode adds `list_repos`, and specialist tools are opt-in through
-`repowise mcp --tools` or the `mcp:` config block. See
+Workspace mode adds `list_repos`; twenty-nine further tools are opt-in through
+`repowise mcp --tools` or the `mcp:` config block, subject to mode eligibility. See
 [docs/agent/MCP_TOOLS.md](../../docs/agent/MCP_TOOLS.md).
 
 It is not published to PyPI on its own. Users get it inside the single

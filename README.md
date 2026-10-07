@@ -573,9 +573,9 @@ map needs `repowise serve --no-ui` running. [Lens guide →](docs/agent/LENS.md)
 
 ## The eleven MCP tools
 
-Every response carries a `_meta` envelope with the indexed commit, the index age and a
-stale warning when the index has fallen behind your checkout, so your agent always
-knows how much to trust what it just read.
+Response metadata describes trust and retrieval limits. Freshness details appear when
+relevant to the request; diagnostic timing and accounting are opt-in. The full field
+contract is in [the MCP reference](docs/agent/MCP_TOOLS.md).
 
 <details>
 <summary><strong>See the MCP tool surface</strong></summary>
@@ -592,13 +592,12 @@ knows how much to trust what it just read.
 | `get_why(query?, targets?)` | Architectural decisions with their verbatim evidence. Falls back to git archaeology when no decision exists. |
 | `get_dead_code(...)` | Unreachable code by confidence tier, with cross-repo consumers in workspace mode. |
 | `get_health(targets?, include?)` | Health scores and findings across all three lenses, Fix first, coverage, trends, doc drift and refactoring plans. |
-
-Ten is a deliberate ceiling: a small, task-shaped surface is easier for an agent to
-choose from than a large one. Seven more tools (dependency paths, execution flows,
-refactoring code generation, finding triage, and three workspace architecture tools)
-are opt-in. Parameters, examples and when to use which:
-**[docs/agent/MCP_TOOLS.md →](docs/agent/MCP_TOOLS.md)**
 | `get_index_status()` | Source publication, parser/recipe and working-tree trust before relying on indexed results. |
+
+Eleven is a deliberate ceiling: a small, task-shaped surface is easier for an agent to
+choose from than a large one. Twenty-nine further tools are opt-in, including dependency
+paths, execution flows, decision management and documentation-library operations. Parameters, examples and when to use which:
+**[docs/agent/MCP_TOOLS.md →](docs/agent/MCP_TOOLS.md)**
 
 </details>
 

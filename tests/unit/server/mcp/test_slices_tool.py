@@ -72,7 +72,14 @@ async def symbol_slice(slice_env, factory, setup_mcp):
 # ---------------------------------------------------------------------------
 
 
-async def test_build_returns_a_ranked_slice_under_a_reusable_id(built) -> None:
+@pytest.mark.parametrize("debug_meta", [False, True])
+async def test_build_returns_a_ranked_slice_under_a_reusable_id(
+    slice_env, monkeypatch, debug_meta
+) -> None:
+    from repowise.server.mcp_server._meta import DEBUG_META_ENV
+
+    monkeypatch.setenv(DEBUG_META_ENV, "1" if debug_meta else "0")
+    built = await build_task_slice(task=TASK, entry_points=["src/auth/service.py"], view="card")
     assert built["status"] == "ok"
     assert re.fullmatch(r"sl_[0-9a-f]{12}", built["slice_id"])
     assert built["task"] == TASK
@@ -80,7 +87,9 @@ async def test_build_returns_a_ranked_slice_under_a_reusable_id(built) -> None:
     assert built["members"], "the seed alone is already a member"
     assert built["ranking"]["drop_order"] == "lowest rank first"
     assert built["summary"]["total_members"] == built["budget"]["total_members"]
-    assert built["_meta"]["timing_ms"] >= 0
+    assert ("timing_ms" in built["_meta"]) is debug_meta
+    if debug_meta:
+        assert built["_meta"]["timing_ms"] >= 0
 
 
 async def test_the_walk_reaches_both_directions(slice_env) -> None:
