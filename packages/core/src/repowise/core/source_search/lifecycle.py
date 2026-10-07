@@ -778,9 +778,18 @@ async def _reconcile_source_index_unlocked(
 
         embed_started = time.perf_counter()
         try:
+            # Parser/chunk/tokenizer changes still need a new generation and
+            # stores. Rebuilt chunks can nevertheless reuse exact text hashes
+            # from the verified parent when the embedding identity is unchanged.
+            can_reuse_vectors = bool(
+                managed_active
+                and not active_invalid
+                and active is not None
+                and active.embedder == embedder_identity
+            )
             reusable = (
                 await prior_store.vectors_by_content_hash([chunk.content_hash for chunk in chunks])
-                if same_recipe and chunks
+                if can_reuse_vectors and chunks
                 else {}
             )
         except Exception:

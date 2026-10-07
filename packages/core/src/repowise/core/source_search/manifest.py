@@ -104,10 +104,11 @@ def identify_embedder(
 
 
 def recipe_fingerprint(embedder: EmbedderIdentity) -> str:
-    """Hash of everything that decides a vector except the repository's text.
+    """Hash of the source generation's extraction, retrieval and embedding recipe.
 
-    A change to any of it means the stored vectors were computed by a
-    different recipe and cannot be reused, however unchanged the source is.
+    A change requires a fresh generation with rebuilt chunks and stores. The
+    lifecycle may reuse individual vectors from a verified prior generation
+    when exact chunk text hashes and the complete embedding identity match.
     Built from ``(name, value)`` pairs rather than a positional tuple so that
     adding a knob cannot silently reorder the ones already there and
     invalidate every index in the field for no reason.

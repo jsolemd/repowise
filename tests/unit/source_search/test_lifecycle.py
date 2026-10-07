@@ -1201,6 +1201,169 @@ async def test_model_recipe_change_builds_beside_and_flips_once(lifecycle_repo):
     await new_store.close()
 
 
+async def _refresh_symbols_after_parser_change(repo: Path) -> None:
+    from repowise.core.persistence.parser_state import complete_symbol_parser_refresh
+    from repowise.core.source_search.outbox import enqueue_full_update
+
+    parsed = _parse(repo, "src/app.py")
+    engine, factory = await _factory(repo)
+    try:
+        async with get_session(factory) as session:
+            refresh = await persist_incremental_symbols(session, "r1", [parsed], [])
+            assert refresh is not None
+            await complete_symbol_parser_refresh(
+                session, "r1", refresh, required_paths={"src/app.py"}
+            )
+            await enqueue_full_update(session, "r1", repo)
+    finally:
+        await engine.dispose()
+
+
+def _change_parser(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "repowise.core.ingestion.parse_cache.parser_fingerprint",
+        lambda: parser_fingerprint() + "-next-parser",
+    )
+
+
+@pytest.mark.parametrize("edited", [False, True])
+async def test_parser_recipe_reuses_only_identical_embedding_inputs(
+    lifecycle_repo, monkeypatch, edited
+):
+    repo = lifecycle_repo
+    old = read_manifest(default_manifest_path(repo))
+    old_chunks = await _full_chunks(repo, None)
+    old_store = _vector(repo, old)
+    try:
+        old_vectors = await old_store.vectors_by_content_hash(
+            [chunk.content_hash for chunk in old_chunks]
+        )
+    finally:
+        await old_store.close()
+    if edited:
+        (repo / "src/app.py").write_text(_APP_V2)
+    _change_parser(monkeypatch)
+    counter = _CountingEmbedder()
+
+    with pytest.raises(SourceIndexDeferredError, match="Persisted SQL symbols"):
+        await reconcile_source_index(repo, embedder=counter, embedder_identity=_IDENTITY)
+    assert read_manifest(default_manifest_path(repo)) == old
+    assert counter.texts == 0
+    await _refresh_symbols_after_parser_change(repo)
+
+    with _fts(repo, old) as prior:
+        result = await reconcile_source_index(repo, embedder=counter, embedder_identity=_IDENTITY)
+        current = read_manifest(default_manifest_path(repo))
+        assert current.recipe_fingerprint != old.recipe_fingerprint
+        assert current.lance_table != old.lance_table and current.fts_path != old.fts_path
+        assert result.status == "published"
+        assert (result.embedded, result.reused, result.chunks) == (int(edited), 3 - int(edited), 3)
+        assert counter.texts == int(edited)
+        assert prior.query("oldquasar") and not prior.query("newnebula")
+        with _fts(repo, current) as fresh:
+            assert bool(fresh.query("newnebula")) is edited
+            assert bool(fresh.query("oldquasar")) is not edited
+            assert fresh.query("stablecomet")
+    new_chunks = await _full_chunks(repo, None)
+    store = _vector(repo, current)
+    try:
+        vectors = await store.vectors_by_content_hash([chunk.content_hash for chunk in new_chunks])
+        assert len(vectors) == 3
+        for digest in old_vectors.keys() & vectors.keys():
+            assert vectors[digest] == old_vectors[digest]
+    finally:
+        await store.close()
+    assert all(row.state == PUBLISHED for row in await _updates(repo))
+    assert await _physical_counts(repo, current) == (3, 3)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("provider", "other"),
+        ("model", "other"),
+        ("dims", 16),
+        ("document_prefix", "document: "),
+        ("query_prefix", "query: "),
+    ],
+)
+async def test_recipe_reuse_rejects_every_changed_embedder_identity_field(
+    lifecycle_repo, field, value
+):
+    identity = replace(_IDENTITY, **{field: value})
+    embedder = _WideEmbedder() if field == "dims" else _CountingEmbedder()
+    result = await reconcile_source_index(
+        lifecycle_repo, embedder=embedder, embedder_identity=identity
+    )
+    assert (result.embedded, result.reused, result.chunks) == (3, 0, 3)
+    assert read_manifest(default_manifest_path(lifecycle_repo)).embedder == identity
+
+
+async def test_parser_recipe_does_not_reuse_an_invalid_active_generation(
+    lifecycle_repo, monkeypatch
+):
+    repo = lifecycle_repo
+    old = read_manifest(default_manifest_path(repo))
+    with _fts(repo, old) as fts:
+        fts.delete_by_file(["src/app.py"])
+        fts._conn.commit()
+    _change_parser(monkeypatch)
+    await _refresh_symbols_after_parser_change(repo)
+    counter = _CountingEmbedder()
+    result = await reconcile_source_index(repo, embedder=counter, embedder_identity=_IDENTITY)
+    assert (counter.texts, result.embedded, result.reused) == (3, 3, 0)
+    assert await _physical_counts(repo, read_manifest(default_manifest_path(repo))) == (3, 3)
+
+
+async def test_parser_recipe_reembeds_a_cached_vector_with_wrong_width(lifecycle_repo, monkeypatch):
+    repo = lifecycle_repo
+    _change_parser(monkeypatch)
+    await _refresh_symbols_after_parser_change(repo)
+    lookup = SourceChunkVectorStore.vectors_by_content_hash
+
+    async def wrong_width(self, hashes):
+        vectors = await lookup(self, hashes)
+        digest = next(iter(vectors))
+        vectors[digest] = vectors[digest][:-1]
+        return vectors
+
+    monkeypatch.setattr(SourceChunkVectorStore, "vectors_by_content_hash", wrong_width)
+    counter = _CountingEmbedder()
+    result = await reconcile_source_index(repo, embedder=counter, embedder_identity=_IDENTITY)
+    assert (counter.texts, result.embedded, result.reused) == (1, 1, 2)
+
+
+@pytest.mark.parametrize("stage", ["after_fts", "after_vector", "after_ready"])
+async def test_parser_recipe_reuse_retry_keeps_previous_readers(lifecycle_repo, monkeypatch, stage):
+    repo = lifecycle_repo
+    old = read_manifest(default_manifest_path(repo))
+    _change_parser(monkeypatch)
+    await _refresh_symbols_after_parser_change(repo)
+    counter = _CountingEmbedder()
+
+    def crash(boundary):
+        if boundary == stage:
+            raise _Crash(boundary)
+
+    with _fts(repo, old) as prior:
+        with pytest.raises(_Crash):
+            await reconcile_source_index(
+                repo, embedder=counter, embedder_identity=_IDENTITY, failure_injector=crash
+            )
+        assert read_manifest(default_manifest_path(repo)) == old
+        assert prior.query("oldquasar")
+        assert await _physical_counts(repo, old) == (3, 3)
+        result = await reconcile_source_index(repo, embedder=counter, embedder_identity=_IDENTITY)
+        assert result.status == "published"
+        assert counter.texts == 0
+        current = read_manifest(default_manifest_path(repo))
+        assert current.recipe_fingerprint != old.recipe_fingerprint
+        assert current.fts_path != old.fts_path and current.lance_table != old.lance_table
+        assert await _physical_counts(repo, current) == (3, 3)
+        assert prior.query("oldquasar")
+    assert all(row.state == PUBLISHED for row in await _updates(repo))
+
+
 @pytest.mark.parametrize("stage", ["after_fts", "after_ready"])
 async def test_recipe_change_retries_with_fresh_fts_and_keeps_old_readers(lifecycle_repo, stage):
     repo = lifecycle_repo
