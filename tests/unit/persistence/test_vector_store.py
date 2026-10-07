@@ -7,6 +7,7 @@ LanceDB-specific tests are skipped if lancedb is not installed.
 
 from __future__ import annotations
 
+import logging
 import math
 
 import pytest
@@ -272,12 +273,22 @@ async def test_in_memory_embed_batch_searchable(in_memory_vector_store):
             (
                 "p1",
                 "Python decorator pattern",
-                {"title": "Dec", "page_type": "file_page", "target_path": "a.py", "content": "Python decorator pattern"},
+                {
+                    "title": "Dec",
+                    "page_type": "file_page",
+                    "target_path": "a.py",
+                    "content": "Python decorator pattern",
+                },
             ),
             (
                 "p2",
                 "Rust ownership model",
-                {"title": "Rust", "page_type": "file_page", "target_path": "b.py", "content": "Rust ownership model"},
+                {
+                    "title": "Rust",
+                    "page_type": "file_page",
+                    "target_path": "b.py",
+                    "content": "Rust ownership model",
+                },
             ),
         ]
     )
@@ -352,6 +363,32 @@ async def test_lancedb_embed_batch(tmp_path, mock_embedder):
         )
         ids = await store.list_page_ids()
         assert ids == {"p1", "p2"}
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_lancedb_connects_with_bounded_metadata_cache(tmp_path, mock_embedder, monkeypatch):
+    # Every upsert adds a table version whose manifest the session caches, so
+    # the library's 1 GiB default grew with the page count until exit.
+    lancedb = pytest.importorskip("lancedb")
+    if not hasattr(lancedb, "Session"):
+        pytest.skip("LanceDB without Session keeps its default cache")
+    from repowise.core.persistence.vector_store import LanceDBVectorStore
+
+    seen: dict = {}
+    original = lancedb.connect_async
+
+    async def _spy(*args, **kwargs):
+        seen.update(kwargs)
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(lancedb, "connect_async", _spy)
+    store = LanceDBVectorStore(str(tmp_path / "lance"), mock_embedder)
+    try:
+        await store.embed_batch([("p1", "Python async generators", {"target_path": "a.py"})])
+        assert isinstance(seen.get("session"), lancedb.Session)
+        assert await store.list_page_ids() == {"p1"}
     finally:
         await store.close()
 
@@ -498,3 +535,137 @@ async def test_lancedb_embed_batch_isolates_failed_chunk(tmp_path):
         assert len(ids) == EMBED_BATCH_MAX_ITEMS * 2
     finally:
         await store.close()
+
+
+@pytest.mark.asyncio
+async def test_lancedb_list_page_ids_reports_unknown_corrupt_inventory(
+    tmp_path, mock_embedder, caplog
+):
+    """A damaged table is unknown, not a verified empty inventory."""
+    caplog.set_level(logging.WARNING, logger="repowise.core.persistence.vector_store.lancedb_store")
+    pytest.importorskip("lancedb")
+    from repowise.core.persistence.vector_store import LanceDBVectorStore
+
+    db_path = tmp_path / "lance"
+
+    store = LanceDBVectorStore(str(db_path), mock_embedder)
+
+    try:
+        await store.embed_and_upsert(
+            "p1",
+            "test content",
+            {"target_path": "a.py"},
+        )
+
+        # Healthy store still returns its page IDs.
+        assert await store.list_page_ids() == {"p1"}
+
+        # Simulate a corrupted LanceDB read.
+        class BrokenQuery:
+            def select(self, columns):
+                return self
+
+            async def to_list(self):
+                raise RuntimeError("simulated LanceDB corruption")
+
+        class BrokenTable:
+            def query(self):
+                return BrokenQuery()
+
+        store._table = BrokenTable()
+
+        # Callers choose recovery; the store preserves failure as distinct from empty.
+        with pytest.raises(RuntimeError, match="simulated LanceDB corruption"):
+            await store.list_page_ids()
+
+        assert "vector store may be damaged" in caplog.text.lower()
+        assert "repowise reindex" in caplog.text.lower()
+
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_lancedb_embed_batch_writes_in_few_versions(tmp_path):
+    # Each write is a table version and merge_insert joins the whole table,
+    # so one write per embedder chunk made a large level quadratic.
+    pytest.importorskip("lancedb")
+    from repowise.core.persistence.vector_store import LanceDBVectorStore, lancedb_store
+    from repowise.core.persistence.vector_store._base import EMBED_BATCH_MAX_ITEMS
+
+    emb = _RecordingEmbedder()
+    store = LanceDBVectorStore(str(tmp_path / "lance"), emb)
+    try:
+        await store.embed_batch(_items(EMBED_BATCH_MAX_ITEMS * 20))
+        assert len(emb.calls) == 20  # embedder requests stay request-sized
+        assert len(await store.list_page_ids()) == EMBED_BATCH_MAX_ITEMS * 20
+        # create_table + one write, not one write per chunk.
+        assert await store._table.version() <= 3
+        assert lancedb_store._UPSERT_BATCH_ROWS > EMBED_BATCH_MAX_ITEMS
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_lancedb_embed_batch_repeated_page_keeps_last_row(tmp_path):
+    pytest.importorskip("lancedb")
+    from repowise.core.persistence.vector_store import LanceDBVectorStore
+    from repowise.core.persistence.vector_store._base import EMBED_BATCH_MAX_ITEMS
+
+    items = _items(EMBED_BATCH_MAX_ITEMS)
+    items.append(("p0", "later", {"target_path": "moved.py"}))
+    store = LanceDBVectorStore(str(tmp_path / "lance"), _RecordingEmbedder())
+    try:
+        await store.embed_batch(items)
+        # A second pass over an existing table must not trip LanceDB's
+        # ambiguous-merge check either.
+        await store.embed_batch(items)
+        rows = await store._table.query().select(["page_id", "target_path"]).to_list()
+        assert len(rows) == EMBED_BATCH_MAX_ITEMS
+        assert {r["target_path"] for r in rows if r["page_id"] == "p0"} == {"moved.py"}
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_lancedb_embed_batch_failed_write_reports_every_chunk(tmp_path, monkeypatch):
+    pytest.importorskip("lancedb")
+    from repowise.core.persistence.vector_store import BatchEmbeddingError, LanceDBVectorStore
+    from repowise.core.persistence.vector_store._base import EMBED_BATCH_MAX_ITEMS
+
+    store = LanceDBVectorStore(str(tmp_path / "lance"), _RecordingEmbedder())
+
+    async def broken_upsert(rows):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(store, "_upsert_rows", broken_upsert)
+    try:
+        with pytest.raises(BatchEmbeddingError) as caught:
+            await store.embed_batch(_items(EMBED_BATCH_MAX_ITEMS * 3))
+        assert [f.stage for f in caught.value.failures] == ["persistence"] * 3
+        assert caught.value.successful_count == 0
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_lancedb_partial_install_fails_with_a_named_cause(
+    tmp_path, monkeypatch, mock_embedder
+):
+    """A partial install imports fine and lacks the async API.
+
+    That used to raise a bare ``AttributeError`` from deep inside the first
+    write, which the embed step reported with no hint that the install was
+    the problem.
+    """
+    import sys
+    import types
+
+    from repowise.core.persistence.vector_store import LanceDBVectorStore
+
+    monkeypatch.setitem(sys.modules, "lancedb", types.ModuleType("lancedb"))
+    store = LanceDBVectorStore(str(tmp_path / "lance"), mock_embedder)
+
+    with pytest.raises(RuntimeError, match="connect_async") as excinfo:
+        await store._ensure_connected()
+    assert "pip install --force-reinstall lancedb" in str(excinfo.value)

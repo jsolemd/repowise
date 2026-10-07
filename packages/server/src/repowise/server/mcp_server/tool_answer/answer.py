@@ -91,8 +91,12 @@ from repowise.server.mcp_server._answer_pipeline import (
     hybrid_retrieve as _hybrid_retrieve,
 )
 from repowise.server.mcp_server._answer_pipeline import hydrate_hits as _hydrate_hits
+from repowise.server.mcp_server._answer_pipeline import native_store_disclosure
 from repowise.server.mcp_server._answer_pipeline import (
     retrieval_legs as _retrieval_legs,
+)
+from repowise.server.mcp_server._entry_trace import (
+    expand_via_entry_trace as _expand_via_entry_trace,
 )
 from repowise.server.mcp_server._flow_path import expand_via_flow_path as _expand_via_flow_path
 from repowise.server.mcp_server._helpers import (
@@ -167,9 +171,6 @@ from repowise.server.mcp_server.tool_answer.retrieval import (
     _attach_page_excerpts,
     _intersection_boost,
     _rerank_by_coverage,
-)
-from repowise.server.mcp_server.tool_answer.retrieval import (
-    serialize_candidates as _serialize_candidates,
 )
 from repowise.server.mcp_server.tool_answer.symbols import (
     _anchor_symbol_hits,
@@ -271,20 +272,31 @@ async def _run_retrieval_pipeline(
     # cannot. This and the stages below run before the cap so an injected file
     # can take a top-5 slot.
     flow_paths: list[list[str]] = []
+    # A sequence question ("what happens when ...") is answered by the call
+    # order of the entry it names; when that resolves, it is the flow served.
     with contextlib.suppress(Exception):
         async with get_session(ctx.session_factory) as session:
-            hits, flow_paths = await _expand_via_flow_path(
-                session, repo_id, hits, question, question_ids
+            hits, flow_paths = await _expand_via_entry_trace(
+                session, repo_id, hits, question, exclude_spec
             )
+    traced = bool(flow_paths)
+    if not traced:
+        with contextlib.suppress(Exception):
+            async with get_session(ctx.session_factory) as session:
+                hits, flow_paths = await _expand_via_flow_path(
+                    session, repo_id, hits, question, question_ids
+                )
     # Neighborhood re-rank: for flow questions whose target file is never named,
     # re-rank the 1-2 hop neighborhood of the top hits. No-op on other shapes.
     with contextlib.suppress(Exception):
         async with get_session(ctx.session_factory) as session:
             hits = await _expand_via_neighbor_rerank(session, repo_id, hits, question, ctx)
     # Parent-concept surfacing: a subsystem-shaped question leads with the
-    # rollup page for the subsystem. No-op on other shapes.
-    with contextlib.suppress(Exception):
-        hits = await _expand_via_parent_page(hits, question, ctx)
+    # rollup page for the subsystem. No-op on other shapes, and skipped once a
+    # call trace answers the question: its entry file must keep the lead.
+    if not traced:
+        with contextlib.suppress(Exception):
+            hits = await _expand_via_parent_page(hits, question, ctx)
     # Demote noise (decisions on non-why, test pages on non-test questions)
     # below real pages. Non-dropping; after anchoring, which never injects noise.
     hits = _demote_noise_hits(hits, question, is_why=_is_why_question(question))
@@ -335,7 +347,7 @@ async def get_answer(
 
     Responses fit 24,000 serialized chars. Pass ``include=["evidence"]`` for
     the deduplicated expanded evidence projection (32,000 chars). Reductions
-    carry counts and an exact recovery call.
+    carry counts and a recovery: repeat the call with that include.
 
     Args:
         question: developer question.
@@ -427,7 +439,7 @@ async def get_answer(
                 "symbol from another file, to avoid a confidently-wrong answer. "
                 'Re-check the qualifier, or call search_codebase mode="symbol" '
                 "on the base name to see every definition. The files retrieval "
-                "ranked for this question are in candidates.",
+                "ranked for this question are in candidate_files.",
                 repository=repository,
                 t0=t0,
             ),
@@ -586,7 +598,7 @@ async def get_answer(
         return await _degrade("synthesis-failed", failure_note)
 
     citations = [
-        h["target_path"] for h in hits if h["target_path"] and h["target_path"] in answer_text
+        h["target_path"] for h in hits if h.get("target_path") and h["target_path"] in answer_text
     ]
     if not citations:
         # Fall back to top-2 retrieval paths so the agent always has something to verify.
@@ -636,9 +648,7 @@ async def get_answer(
 
     # Where to look next, always: navigation, not evidence, so it survives the
     # shrinking of ``retrieval`` on high-confidence answers.
-    candidates = _serialize_candidates(resolved_pool)
-    if candidates:
-        payload["candidates"] = candidates
+    _with_candidates(payload, resolved_pool)
 
     # Persist only the trust-relevant retrieval state. The cache read rebuilds
     # timing/freshness metadata for the current request, then restores this
@@ -666,6 +676,7 @@ async def get_answer(
         hint=_answer_hint(confidence),
         repository=repository,
         targets=[*citations, *fallback_targets],
+        extra=native_store_disclosure(),
     )
     # Legs are best-effort, so a lexical-only answer would otherwise look whole.
     # Named only when a leg fell over.
@@ -710,13 +721,14 @@ async def get_answer(
 
     High confidence is content-grounded and may be used directly. Medium
     confidence keeps the smallest verification evidence; low confidence leads
-    with an actionable local conclusion and ranked evidence. Provider keys and
+    with an actionable local conclusion and ranked evidence. ``candidate_files``
+    ranks the files worth opening that the citations do not name. Provider keys and
     network access are optional: local source, symbols, FTS, rationale, and
     data-shape evidence remain usable when embeddings or synthesis fail.
 
     Responses fit 24,000 serialized characters. Pass ``include=["evidence"]``
     for the deduplicated expanded projection, capped at 32,000. Reductions carry
-    totals, emitted counts, reasons, and an exact one-call recovery.
+    totals, emitted counts, reasons, and a recovery: the same call with that include.
 
     Args:
         question: Developer question.

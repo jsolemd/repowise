@@ -46,7 +46,7 @@ from repowise.cli.helpers import (
     save_config_partial,
     save_state,
 )
-from repowise.cli.providers import resolve_embedder
+from repowise.cli.providers import resolve_embedder, semantic_search_status
 from repowise.cli.state_persistence import build_kg_state, save_knowledge_graph_json
 from repowise.cli.ui import (
     BRAND,
@@ -303,6 +303,8 @@ class _RepoOutcome:
     symbol_count: int = 0
     pages_generated: int = 0
     docs_outcome: tuple[int, str | None] = (0, None)
+    #: Pages a real embedder failed to write; the repo is still persisted.
+    embed_failed_pages: int = 0
 
 
 def _ingest_and_generate_repo(repo: Any, idx: int, total: int, ctx: _WorkspaceCtx) -> _RepoOutcome:
@@ -488,7 +490,25 @@ def _ingest_and_generate_repo(repo: Any, idx: int, total: int, ctx: _WorkspaceCt
         )
 
     # Persist to repo-local DB
-    run_async(persist_result(result, repo.path, timings=callback.table))
+    persist_warnings: list[str] = []
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        TimeElapsedColumn(),
+        console=console,
+        transient=True,
+    ) as persist_bar:
+        persist_callback = callback.rebind(RichProgressCallback(persist_bar, console))
+        persist_callback.on_phase_start("persist", None)
+        try:
+            run_async(persist_result(result, repo.path, persist_callback, callback.table))
+        finally:
+            try:
+                persist_callback.on_phase_done("persist")
+                persist_warnings.extend(persist_callback.warnings)
+            except RuntimeError as e:
+                if "Event loop is closed" not in str(e):
+                    raise
 
     # Write state.json so `repowise update` knows the base commit
     head = get_head_commit(repo.path)
@@ -568,8 +588,8 @@ def _ingest_and_generate_repo(repo: Any, idx: int, total: int, ctx: _WorkspaceCt
         search={
             "full_text": "available" if result.generated_pages else "unavailable",
             "semantic": (
-                "available"
-                if result.generated_pages and scope_embedder not in {None, "mock"}
+                semantic_search_status(scope_embedder, getattr(result, "embed_failed_pages", 0))
+                if result.generated_pages
                 else "unavailable"
             ),
             "next_command": "repowise reindex" if result.generated_pages else None,
@@ -583,6 +603,9 @@ def _ingest_and_generate_repo(repo: Any, idx: int, total: int, ctx: _WorkspaceCt
     kg = getattr(result, "knowledge_graph_result", None)
     if kg is not None:
         state["knowledge_graph"] = build_kg_state(kg)
+    state.pop("degraded", None)
+    if persist_warnings:
+        state["degraded"] = persist_warnings
     # A workspace repo is fully indexed here (concept tree included), so stamp
     # the terminal store format rather than clamping below the reindex gate.
     save_state(repo.path, state, full_index=True)
@@ -643,11 +666,15 @@ def _ingest_and_generate_repo(repo: Any, idx: int, total: int, ctx: _WorkspaceCt
             embedding_model=(resolve_embedding_model(det_embedder) if det_embedder else None),
         )
 
+    from repowise.cli.providers import embed_failure_message
+
+    failed = getattr(result, "embed_failed_pages", 0)
     return _RepoOutcome(
         file_count=result.file_count,
         symbol_count=result.symbol_count,
         pages_generated=pages_generated,
         docs_outcome=docs_outcome,
+        embed_failed_pages=failed if embed_failure_message(scope_embedder, failed) else 0,
     )
 
 
@@ -931,6 +958,7 @@ def _workspace_init(
         run_mode=run_mode,
     )
 
+    embed_failures: dict[str, int] = {}
     for i, repo in enumerate(selected, 1):
         outcome = _ingest_and_generate_repo(repo, i, len(selected), ctx)
         if outcome.error:
@@ -940,6 +968,8 @@ def _workspace_init(
         total_symbols += outcome.symbol_count
         total_pages += outcome.pages_generated
         docs_outcomes[repo.alias] = outcome.docs_outcome
+        if outcome.embed_failed_pages:
+            embed_failures[repo.alias] = outcome.embed_failed_pages
 
     # Save workspace config with updated timestamps. On a dry run nothing is
     # written for any repo (see _ingest_and_generate_repo), so nothing is
@@ -998,6 +1028,16 @@ def _workspace_init(
             no_editor_setup=not editor_setup,
         )
     console.print()
+    # Raised after every repo is persisted, as single-repo init does: the
+    # other repos and full-text search are fine, but a scripted run must see
+    # that these semantic indexes were not built.
+    if embed_failures:
+        listed = ", ".join(f"{alias} ({n} page(s))" for alias, n in embed_failures.items())
+        raise click.ClickException(
+            f"Embedding failed for {listed}, so semantic search is unavailable there "
+            "(full-text search still works). Fix the cause in the warnings above, "
+            "then run: repowise reindex in each."
+        )
     if hard_no_generative:
         console.print(NO_GENERATIVE_INIT_COMPLETE_MARKER)
         console.print(NO_GENERATIVE_INDEX_MARKER)

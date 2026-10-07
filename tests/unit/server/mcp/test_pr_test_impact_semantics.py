@@ -122,4 +122,8 @@ async def test_sealed_pr_payload_is_directive_first_typed_and_count_exact(setup_
     assert directive["test_recommendations_repository_id"] == setup_mcp
     assert relation["dependency"]["source"] in directive["may_break"]
     assert relation["co_change"]["source"] not in directive["may_break"]
-    assert external["_meta"]["contract_version"]
+    # The fork keeps the versioned protocol envelope while omitting routine diagnostics.
+    from repowise.server.mcp_server._meta import MCP_CONTRACT_VERSION
+
+    assert external["_meta"]["contract_version"] == MCP_CONTRACT_VERSION
+    assert "timing_ms" not in external["_meta"]

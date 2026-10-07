@@ -174,14 +174,40 @@ class TestScanFile:
         findings = asyncio.run(scanner.scan_file("spawn.ts", source, symbols=[]))
         assert {row["kind"] for row in findings if row["kind"].endswith("_call")} == expected
 
-    def test_combined_prefilter_uses_the_same_safe_call_boundaries(self) -> None:
+    def test_combined_prefilter_leaves_calls_to_the_call_scan(self) -> None:
         from repowise.core.analysis.security_scan import _ANY_PATTERN
 
-        assert _ANY_PATTERN.search("eval (")
-        assert _ANY_PATTERN.search("exec(")
-        assert _ANY_PATTERN.search("window.eval(")
-        assert not _ANY_PATTERN.search("retrieval (")
-        assert not _ANY_PATTERN.search("my_eval(")
+        assert not _ANY_PATTERN.search("eval (")
+        assert not _ANY_PATTERN.search("window.exec(")
+        assert _ANY_PATTERN.search("os.system(cmd)")
+
+    @pytest.mark.parametrize(
+        ("source", "code", "uncommented"),
+        [
+            ('x = "a\\"b"  # c\ny', "x =            \ny", 'x = "a\\"b"     \ny'),
+            ("a /* b\nc */ d", "a     \n     d", "a     \n     d"),
+            ("s = '''q\n\"\"\" ''' + k", "s =     \n        + k", "s = '''q\n\"\"\" ''' + k"),
+            ('t = `a${f({b: "c"})}d` // e', "t =     f({b:     )        ", 't = `a${f({b: "c"})}d`     '),
+            ('open "abc\\', "open      ", 'open "abc\\'),
+            ("u = '#' # z", "u =        ", "u = '#'    "),
+        ],
+    )
+    def test_masking_blanks_comments_and_strings_in_place(
+        self, source: str, code: str, uncommented: str
+    ) -> None:
+        from repowise.core.analysis.security_scan import _mask_comments_and_strings
+
+        assert _mask_comments_and_strings(source) == code
+        assert _mask_comments_and_strings(source, strings=False) == uncommented
+
+    def test_file_without_a_call_word_skips_the_call_scan(self) -> None:
+        from repowise.core.analysis.security_scan import _call_findings
+
+        def unreachable() -> str:
+            raise AssertionError("masked source built for a file with no call")
+
+        assert _call_findings("a.ts", "run(executor);\n", unreachable) == []
+        assert _call_findings("a.py", "x = 1\n", unreachable) == []
 
     @pytest.mark.parametrize(
         "source",
@@ -485,12 +511,27 @@ class TestScanFile:
             ("const agent = new https.Agent({ rejectUnauthorized: false });\n", True),
             ("axios.get(url, { httpsAgent, rejectUnauthorized: false });\n", True),
             ("const agent = new https.Agent({ rejectUnauthorized: true });\n", False),
+            ('const doc = "TLS off (rejectUnauthorized: false).";\n', False),
+            ("// rejectUnauthorized: false would disable TLS checks\n", False),
         ],
     )
     def test_reject_unauthorized_false(self, source: str, expected: bool) -> None:
         scanner = SecurityScanner(session=None, repo_id="r1")  # type: ignore[arg-type]
         findings = asyncio.run(scanner.scan_file("client.ts", source, symbols=[]))
         assert bool([f for f in findings if f["kind"] == "reject_unauthorized_false"]) is expected
+
+    @pytest.mark.parametrize(
+        ("source", "expected"),
+        [
+            ("requests.get(url, verify=False)\n", True),
+            ('"tls_verify_false": "TLS verification turned off (verify=False).",\n', False),
+            ("# verify=False disables certificate checks\n", False),
+        ],
+    )
+    def test_tls_verify_false_ignores_prose(self, source: str, expected: bool) -> None:
+        scanner = SecurityScanner(session=None, repo_id="r1")  # type: ignore[arg-type]
+        findings = asyncio.run(scanner.scan_file("client.py", source, symbols=[]))
+        assert bool([f for f in findings if f["kind"] == "tls_verify_false"]) is expected
 
 
 class TestPersistSecurityFindings:
@@ -1024,6 +1065,8 @@ class TestSecretPrecision:
         [
             'client = OpenAI(api_key="ollama")\n',
             'client = OpenAI(api_key="lmstudio")\n',
+            '_IGNORE_TOKEN = "repowise-security-ignore"\n',
+            'API_KEY_HEADER = "x-api-key"\n',
             '<Bar token="--chart-1" />\n',
         ],
     )
@@ -1034,6 +1077,8 @@ class TestSecretPrecision:
         "source",
         [
             'TOKEN = "sk-live-9f8a7b6c5d4e"\n',
+            'SECRET = "k3y-9f8a-7b6c-5d4e-a1b2"\n',
+            'API_KEY = "Ab-cd-Ef-gh-ij-kl"\n',
             'API_KEY = "sk-a****"\n',
             f'API_KEY = "{"q" * 40}"\n',
         ],

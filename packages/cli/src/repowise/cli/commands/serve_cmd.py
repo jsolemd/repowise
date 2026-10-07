@@ -624,13 +624,13 @@ def serve_command(
 
     _setup_embedder()
 
-    # Respect both explicit database settings. At a workspace root, leave
+    # Respect both explicit database settings. Anywhere inside a workspace, leave
     # selection to the app's primary-repository resolver: an old .repowise/
     # directory there is not the workspace's active source index.
     from repowise.core.persistence.database import get_configured_db_url
     from repowise.core.workspace.config import find_workspace_root
 
-    if get_configured_db_url() is None and find_workspace_root() != Path.cwd().resolve():
+    if get_configured_db_url() is None and find_workspace_root() is None:
         local_repowise = Path.cwd() / ".repowise"
         if local_repowise.exists():
             local_db = local_repowise / "wiki.db"
@@ -722,9 +722,7 @@ def serve_command(
                 ready = _download_web(__version__)
 
             if ready:
-                frontend_proc = _start_frontend(
-                    node, port, ui_port, local_web=local_web, host=host
-                )
+                frontend_proc = _start_frontend(node, port, ui_port, local_web=local_web, host=host)
                 if frontend_proc:
                     console.print(f"[green]Web UI starting on http://localhost:{ui_port}[/green]")
                 else:

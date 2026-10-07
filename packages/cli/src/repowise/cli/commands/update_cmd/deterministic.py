@@ -98,6 +98,7 @@ def regenerate_deterministic_pages(
     prior_page_ids: dict | None = None,
     full_scope: bool = False,
     page_sets: dict[str, set[str]] | None = None,
+    stats_out: dict[str, int] | None = None,
 ) -> list:
     """Re-render the template pages for *regenerate_paths*. Never raises.
 
@@ -130,6 +131,7 @@ def regenerate_deterministic_pages(
         degrade_label="Template page refresh",
         full_scope=full_scope,
         page_sets=page_sets,
+        stats_out=stats_out,
     )
 
 
@@ -148,6 +150,7 @@ def regenerate_deterministic_page_ids(
     dead_code_report: Any = None,
     prior_page_ids: dict | None = None,
     vector_store: Any = None,
+    stats_out: dict[str, int] | None = None,
 ) -> list:
     """Render exact deterministic page ids from the complete repository view.
 
@@ -175,6 +178,7 @@ def regenerate_deterministic_page_ids(
         degrade_label="Structural page refresh",
         only_page_ids=page_ids,
         vector_store=vector_store,
+        stats_out=stats_out,
     )
 
 
@@ -224,6 +228,7 @@ def _render_pages(
     only_page_ids: set[str] | None = None,
     vector_store: Any = None,
     page_sets: dict[str, set[str]] | None = None,
+    stats_out: dict[str, int] | None = None,
 ) -> list:
     """Render the changed files' pages from structure (free, no LLM).
 
@@ -235,6 +240,9 @@ def _render_pages(
     re-renders a page it found missing — the repo-wide levels open up, and the
     id scope keeps the run to the handful of pages that actually drifted rather
     than regenerating the wiki.
+    ``stats_out["embed_failed_pages"]`` accumulates the pages whose vectors
+    failed to land, so the caller can fail the run instead of reporting a
+    healthy semantic index.
     """
     from repowise.core.generation import ContextAssembler, PageGenerator
     from repowise.core.providers.llm.template import TemplateProvider
@@ -311,6 +319,7 @@ def _render_pages(
                     only_page_ids=only_page_ids,
                     kg_modules=kg_modules,
                     selected_page_ids=selected,
+                    on_warning=degraded.append,
                 )
             )
         if page_sets is not None:
@@ -325,6 +334,10 @@ def _render_pages(
                 owner = page_sets.get(target.partition("::")[0])
                 if owner is not None:
                     owner.add(page_id)
+        if stats_out is not None:
+            stats_out["embed_failed_pages"] = (
+                stats_out.get("embed_failed_pages", 0) + generator.embed_failed_pages
+            )
         return pages
     except Exception as exc:
         degraded.append(f"{degrade_label}: {exc}")
@@ -546,14 +559,7 @@ async def _persist_async(
         try:
             fts = FullTextSearch(engine)
             await fts.ensure_index()
-            for page in generated_pages:
-                await fts.index(
-                    page.page_id,
-                    page.title,
-                    page.content,
-                    summary=page.summary,
-                    target_path=page.target_path,
-                )
+            await fts.index_pages(generated_pages)
         except Exception as exc:
             degraded.append(f"Full-text index: {exc}")
     finally:

@@ -62,11 +62,13 @@ from repowise.server.mcp_server._graph_files import (
     is_symbol_node,
     keep_projected_edge,
     node_to_file,
+    per_index,
 )
 from repowise.server.mcp_server._helpers import (
     _EMBED_TIMEOUT_ENV,
     _VECTOR_TIMEOUT_ENV,
     embed_timeout_s,
+    native_vector_store_issue,
     vector_search_timeout_s,
 )
 from repowise.server.mcp_server._prose_symbols import symbol_backed_pages
@@ -157,6 +159,9 @@ _GRAPH_EXPAND_DAMPING = 0.7
 _LEG_RECORD: contextvars.ContextVar[dict[str, str] | None] = contextvars.ContextVar(
     "repowise_retrieval_legs", default=None
 )
+_NATIVE_STORE_ISSUES: contextvars.ContextVar[dict[str, str] | None] = contextvars.ContextVar(
+    "repowise_native_store_issues", default=None
+)
 
 
 def _record_leg(leg: str, outcome: str) -> None:
@@ -175,7 +180,36 @@ def begin_leg_record() -> dict[str, str]:
     """
     record: dict[str, str] = {}
     _LEG_RECORD.set(record)
+    _NATIVE_STORE_ISSUES.set({})
     return record
+
+
+def record_native_store_issue(ctx: Any) -> str | None:
+    """Record a load failure only for a native store this request consulted."""
+    issue = native_vector_store_issue(ctx)
+    if issue:
+        _record_leg("vector", "error")
+        issues = _NATIVE_STORE_ISSUES.get()
+        if issues is not None:
+            issues[getattr(ctx, "alias", "default")] = issue
+    return issue
+
+
+def native_store_disclosure() -> dict[str, Any]:
+    """Keep affected aliases and their repair hints on native fallback answers."""
+    issues = dict(_NATIVE_STORE_ISSUES.get() or {})
+    if not issues:
+        return {}
+    return {
+        "retrieval_degraded": degraded_legs(retrieval_legs()),
+        "retrieval_degraded_repos": issues,
+        "retrieval_degraded_reason": (
+            "Native semantic retrieval is unavailable for the affected repositories: "
+            + " ".join(issues.values())
+            + " A miss in those repositories is not evidence of absence."
+        ),
+        "semantic_search": False,
+    }
 
 
 def retrieval_legs() -> dict[str, str]:
@@ -374,6 +408,7 @@ async def hybrid_retrieve(question: str, ctx: Any) -> list[dict]:
         entry["score"] = entry.get("score", 0.0) + 1.0 / (rank + _SYMBOL_LEG_RRF_K)
         entry["_sources"].add("symbol")
         entry["_sym_rank"] = rank
+        entry["_symbol_names"] = h.symbol_names
 
     # Scale to BM25-range so downstream confidence/dominance gates (tuned
     # against the prior single-mode BM25 retrieval) keep behaving sanely.
@@ -449,22 +484,24 @@ async def _safe_vector_search(ctx: Any, question: str) -> list[Any]:
     Also waits for vector-store readiness when the lifespan event is set —
     skipping the wait would race a background-loading store on cold start.
 
-    Returns nothing on a keyless index, before the readiness wait and before the
-    question is embedded: there is no vector worth computing when there is
+    Returns nothing on a settled keyless index before the question is embedded:
+    there is no vector worth computing when there is
     nothing discriminative to compare it against. See
     ``store_has_semantic_vectors``. This leg is the only entry to vector
     retrieval here, so guarding it covers every caller.
     """
+    ready = getattr(ctx, "vector_store_ready", None)
+    if ready is not None:
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(ready.wait(), timeout=30.0)
+    if record_native_store_issue(ctx):
+        return []
     if ctx.vector_store is None:
         _record_leg("vector", "absent")
         return []
     if not store_has_semantic_vectors(ctx.vector_store):
         _record_leg("vector", "keyless")
         return []
-    ready = getattr(ctx, "vector_store_ready", None)
-    if ready is not None:
-        with contextlib.suppress(TimeoutError):
-            await asyncio.wait_for(ready.wait(), timeout=30.0)
     # Embedded here, before the store is asked anything: this is the first stage
     # to need the vector, and every later stage reads the same one back.
     vector = await question_vector(ctx, question)
@@ -502,13 +539,16 @@ class _SymbolLegResult:
     way FTS and the vector store present theirs.
     """
 
-    __slots__ = ("page_id", "page_type", "snippet", "title")
+    __slots__ = ("page_id", "page_type", "snippet", "symbol_names", "title")
 
-    def __init__(self, page_id: str, title: str, snippet: str, page_type: str) -> None:
+    def __init__(
+        self, page_id: str, title: str, snippet: str, page_type: str, symbol_names: list[str]
+    ) -> None:
         self.page_id = page_id
         self.title = title
         self.snippet = snippet
         self.page_type = page_type
+        self.symbol_names = symbol_names
 
 
 async def _safe_symbol_search(ctx: Any, question: str) -> list[_SymbolLegResult]:
@@ -544,7 +584,13 @@ async def _safe_symbol_search(ctx: Any, question: str) -> list[_SymbolLegResult]
         return []
     _record_leg("symbol", "ok")
     return [
-        _SymbolLegResult(p["page_id"], p["title"], (p.get("summary") or "")[:200], p["page_type"])
+        _SymbolLegResult(
+            p["page_id"],
+            p["title"],
+            (p.get("summary") or "")[:200],
+            p["page_type"],
+            p.get("symbol_names") or [],
+        )
         for p in pages
     ]
 
@@ -824,7 +870,9 @@ async def expand_via_graph(hits: list[dict], ctx: Any, repo_id: str) -> list[dic
         # and its siblings join ``path::Name`` nodes, so an equality test against
         # a seed path matched none of them and the call graph was invisible here.
         seed_set = set(seed_paths)
-        pairs = await _projected_edges(session, repo_id)
+        pairs = await per_index(
+            session, repo_id, "projected_edges", lambda: _projected_edges(session, repo_id)
+        )
 
         neighbors: set[str] = set()
         degree: dict[str, int] = {}

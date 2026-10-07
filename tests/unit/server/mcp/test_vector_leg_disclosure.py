@@ -31,10 +31,10 @@ _QUERY = "authentication service"
 
 #: Every served field of every row the healthy fixture ranks. Hardcoded rather
 #: than derived: this is the roster-stability assertion, and a roster computed
-#: from the code it is checking cannot fail. It passes unchanged against the
-#: code from before the disclosure existed, which is what makes "zero ranking
-#: change" a measurement rather than a claim — scores included, since the
-#: freshness tiebreak and the fused scale are what a careless edit here moves.
+#: from the code it is checking cannot fail. v0.55 gives native file rows a
+#: `path` and retains their page_id after dropping redundant target_path. The
+#: ranked identities and scores remain the pre-disclosure baseline; changing
+#: the wire vocabulary must not conceal a ranking or recovery regression.
 _HEALTHY_ROSTER = [
     {
         "title": "Auth Service",
@@ -42,7 +42,8 @@ _HEALTHY_ROSTER = [
         "snippet": "Auth Service",
         "relevance_score": 6.03,
         "sources": ["fts", "vector"],
-        "target_path": "src/auth/service.py",
+        "path": "src/auth/service.py",
+        "page_id": "file_page:src/auth/service.py",
         "confidence_score": 1.0,
     },
     {
@@ -55,7 +56,8 @@ _HEALTHY_ROSTER = [
         # fork's disclosure code is not what moved it (program ticket F37).
         "relevance_score": 1.4754,
         "sources": ["vector"],
-        "target_path": "src/db/models.py",
+        "path": "src/db/models.py",
+        "page_id": "file_page:src/db/models.py",
         "confidence_score": 0.98,
     },
 ]
@@ -435,3 +437,113 @@ def test_cli_still_calls_a_missing_embedder_what_it_is() -> None:
     said = " ".join(notices.said)
     assert "No embedder configured" in said
     assert "reindex" in said
+
+
+@pytest.fixture
+async def native_workspace(setup_mcp, monkeypatch):
+    """Two participating native stores and one scoped-only member."""
+    from dataclasses import replace
+
+    import repowise.server.mcp_server as mcp_mod
+    from repowise.server.mcp_server import _helpers, _state
+
+    base = await _helpers._resolve_repo_context()
+    contexts = {alias: replace(base, alias=alias) for alias in ("good", "bad", "private")}
+    loaded = []
+
+    async def get(alias):
+        loaded.append(alias)
+        return contexts[alias]
+
+    registry = SimpleNamespace(
+        get=get,
+        get_all_aliases=lambda: list(contexts),
+        get_federated_aliases=lambda: ["good", "bad"],
+        resolve_repo_param=lambda repo: repo or "good",
+    )
+    monkeypatch.setattr(_state, "_registry", registry)
+    monkeypatch.setattr(_state, "_vector_store_errors", {})
+    monkeypatch.setattr(_state, "_embedder_status", {"active": "llamacpp", "degraded": False})
+    _install(mcp_mod, _vector_rows)
+    return contexts, loaded
+
+
+async def test_native_healthy_scope_ignores_another_store_failure(native_workspace):
+    from repowise.server.mcp_server import _state, search_codebase
+    from repowise.server.mcp_server._meta import finalize_trust_envelope
+    from repowise.server.mcp_server._savings.wrapper import _telemetry_properties
+
+    _state._vector_store_errors["bad"] = "bad index cannot open; repair and restart"
+    response = finalize_trust_envelope(await search_codebase(_QUERY, repo="good"))
+    assert _roster(response) == _HEALTHY_ROSTER
+    assert response["trust"]["embedder_degraded"] is False
+    assert "retrieval_degraded" not in response["trust"]
+    assert "semantic_search" not in response["_meta"]
+    assert _telemetry_properties("search_codebase", response, 1)["semantic_search"] is True
+
+
+async def test_native_failed_scope_discloses_fallback_and_repair(native_workspace):
+    from repowise.server.mcp_server import _state, search_codebase
+    from repowise.server.mcp_server._meta import finalize_trust_envelope
+    from repowise.server.mcp_server._savings.wrapper import _result_signals
+    from repowise.server.mcp_server._wire import as_call_tool_result
+
+    reason = "bad index cannot open; repair and restart"
+    _state._vector_store_errors["bad"] = reason
+    response = await search_codebase(_QUERY, repo="bad")
+    assert response["results"]
+    assert all(row["sources"] == ["fts"] for row in response["results"])
+    wire = as_call_tool_result(finalize_trust_envelope(response))
+    assert wire.structuredContent["trust"]["retrieval_degraded_repos"] == {"bad": reason}
+    assert reason in wire.structuredContent["warning"]
+    assert wire.meta["semantic_search"] is False
+    assert wire.meta["embedder_degraded"] is False  # configuration itself is healthy
+    assert _result_signals(response)[2] is True
+
+    _state._vector_store_errors.clear()
+    recovered = await search_codebase(_QUERY, repo="bad")
+    assert _roster(recovered) == _HEALTHY_ROSTER
+    assert "retrieval_degraded" not in recovered["_meta"]
+
+
+async def test_loading_native_store_is_not_a_settled_empty_index(monkeypatch):
+    from repowise.server.mcp_server import _state
+
+    monkeypatch.setattr(_state, "_vector_store_errors", {})
+    ctx = _Ctx(None)
+    ctx.alias = "loading"
+    ctx.vector_store_ready = asyncio.Event()
+    tool_search._begin_retrieval_record()
+    assert await tool_search._safe_vector(ctx, "q", 5) == []
+    disclosure = tool_search._retrieval_disclosure()
+    assert disclosure["retrieval_degraded"] == ["vector"]
+    assert "still loading" in disclosure["retrieval_degraded_repos"]["loading"]
+    ctx.vector_store_ready.set()
+    tool_search._begin_retrieval_record()
+    assert await tool_search._safe_vector(ctx, "q", 5) == []
+    assert tool_search._retrieval_disclosure() == {}
+
+
+async def test_answer_native_fallback_keeps_failure_on_early_return(native_workspace):
+    from repowise.server.mcp_server import _answer_pipeline, _state
+    from repowise.server.mcp_server.tool_answer.payload import _with_candidates
+
+    contexts, _ = native_workspace
+    _state._vector_store_errors["bad"] = "bad index cannot open; repair and restart"
+    _answer_pipeline.begin_leg_record()
+    assert await _answer_pipeline._safe_vector_search(contexts["bad"], "q") == []
+    response = _with_candidates({"answer": "", "_meta": {}}, [])
+    assert response["_meta"]["retrieval_degraded"] == ["vector"]
+    assert "repair and restart" in response["_meta"]["retrieval_degraded_reason"]
+
+
+async def test_embedded_settled_store_does_not_invent_a_background_load(setup_mcp, monkeypatch):
+    from repowise.server.mcp_server import _helpers, _state
+
+    monkeypatch.setattr(_state, "_vector_store_ready", None)
+    monkeypatch.setattr(_state, "_vector_store_errors", {})
+    ctx = await _helpers._resolve_repo_context()
+    assert ctx.vector_store_ready.is_set()
+    tool_search._begin_retrieval_record()
+    await tool_search._safe_vector(ctx, "q", 5)
+    assert tool_search._retrieval_disclosure() == {}

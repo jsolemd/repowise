@@ -760,14 +760,7 @@ async def _refresh_fts(fts: Any, pages: list) -> None:
     the cleanup debt in :func:`_publish_after_commit`."""
     if fts is None:
         return
-    for page in pages:
-        await fts.index(
-            page.page_id,
-            page.title,
-            page.content,
-            summary=page.summary,
-            target_path=page.target_path,
-        )
+    await fts.index_pages(pages)
 
 
 async def _record_index_completion(

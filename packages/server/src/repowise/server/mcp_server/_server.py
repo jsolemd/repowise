@@ -379,6 +379,30 @@ async def _warm_lancedb() -> None:
             _state._lancedb_ready.set()
 
 
+def _mark_vector_store_unreadable(exc: BaseException | None, alias: str | None = None) -> None:
+    """Record a current store failure, or clear it after a successful load.
+
+    Native retrieval reads the selected alias's failure from
+    ``_state._vector_store_errors`` and discloses it on that request. This
+    survives later embedder resolution without marking unrelated repositories
+    or the separate source reader as degraded.
+    """
+    from repowise.core.persistence.vector_store.lancedb_store import store_open_fix_hint
+
+    if exc is None:
+        _state._vector_store_errors.pop(alias or "", None)
+        return
+    where = f" for '{alias}'" if alias else ""
+    reason = (
+        f"The semantic index{where} exists but could not be opened "
+        f"({type(exc).__name__}: {exc}). Semantic search (search_codebase, "
+        "get_answer) is off; full-text search still works. To fix: "
+        f"{store_open_fix_hint(exc)}, then restart the MCP server."
+    )
+    _log.error(reason)
+    _state._vector_store_errors[alias or ""] = reason
+
+
 async def _load_vector_stores(repo_path: str | None) -> None:
     """Load embedder + vector stores in the background.
 
@@ -403,25 +427,26 @@ async def _load_vector_stores(repo_path: str | None) -> None:
         embedder = _query_embedder()
         vector_store: Any = InMemoryVectorStore(embedder=embedder)
 
+        from pathlib import Path
+
+        lance_dir = Path(repo_path) / ".repowise" / "lancedb" if repo_path else None
         try:
             # Step 1 — import lancedb in a thread to keep event loop free.
             await _asyncio.to_thread(__import__, "lancedb")
 
             from repowise.core.persistence.vector_store import LanceDBVectorStore
 
-            if repo_path:
-                from pathlib import Path
-
-                lance_dir = Path(repo_path) / ".repowise" / "lancedb"
-                if lance_dir.exists():
-                    vs = LanceDBVectorStore(str(lance_dir), embedder=embedder)
-                    # Step 2 — pre-connect so first search() is instant.
-                    await vs._ensure_connected()
-                    vector_store = vs
-        except ImportError:
-            pass
-        except Exception:
-            _log.warning("LanceDB pre-connect failed — using InMemory fallback")
+            if lance_dir is not None and lance_dir.exists():
+                vs = LanceDBVectorStore(str(lance_dir), embedder=embedder)
+                # Step 2: pre-connect so first search() is instant.
+                await vs._ensure_connected()
+                vector_store = vs
+                _state._vector_store_errors.pop("", None)
+        except Exception as exc:
+            # ImportError included: with an index on disk, a missing lancedb
+            # is as broken as an unreadable one. No index is a keyless repo.
+            if lance_dir is not None and lance_dir.exists():
+                _mark_vector_store_unreadable(exc)
 
         # decision_store is repointed to the shared page store — decisions are
         # now embedded under the "decision:" namespace within the same table.
@@ -541,6 +566,7 @@ async def _runtime_lifespan(server: FastMCP):
 
 
 def _clear_runtime_state() -> None:
+    _state._vector_store_errors.clear()
     for field in (
         "_session_factory",
         "_fts",
@@ -597,6 +623,7 @@ async def _initialize_runtime(server: FastMCP, resources: AsyncExitStack) -> Non
             workspace_root=ws_root,
             ws_config=ws_config,
             embedder_factory=_query_embedder,
+            on_vector_store_error=lambda alias, exc: _mark_vector_store_unreadable(exc, alias),
         )
         resources.push_async_callback(registry.close)
         from repowise.server.mcp_server._test_impact import close_test_impact_indexes
@@ -684,7 +711,7 @@ async def _initialize_runtime(server: FastMCP, resources: AsyncExitStack) -> Non
         db_url = resolve_db_url(_state._repo_path)
 
         _log.info("repowise MCP: initialising database…")
-        engine = create_engine(db_url)
+        engine = create_engine(db_url, short_lived=False)
         resources.push_async_callback(engine.dispose)
         await init_db(engine)
     except (OSError, OperationalError) as exc:

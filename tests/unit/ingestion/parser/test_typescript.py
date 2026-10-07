@@ -198,8 +198,8 @@ export function Card() {
         result = parser.parse_file(fi, src)
         assert result.parse_errors == []
         targets = {c.target_name for c in result.calls}
-        assert "StatRow" in targets   # self-closing JSX captured as call
-        assert "Section" in targets   # paired JSX captured as call
+        assert "StatRow" in targets  # self-closing JSX captured as call
+        assert "Section" in targets  # paired JSX captured as call
 
     def test_ts_file_unrelated_syntax_error_with_html_in_string_preserves_original_parse(
         self, parser: ASTParser
@@ -224,7 +224,6 @@ export function f() {
         result = parser.parse_file(fi, src)
         # The real TypeScript error must still be reported — fallback did not clear it.
         assert result.parse_errors != []
-
 
     def test_jsx_element_registers_as_call_target(self, parser: ASTParser) -> None:
         # Regression: ``<StatRow ... />`` inside the same file as the
@@ -310,9 +309,7 @@ export function MyForm() {
         assert "form" not in targets
         assert "input" not in targets
 
-    def test_jsx_motion_and_styled_components_filtered(
-        self, parser: ASTParser
-    ) -> None:
+    def test_jsx_motion_and_styled_components_filtered(self, parser: ASTParser) -> None:
         # Regression: framer-motion / styled-components bring lowercase member
         # expressions like <motion.div>, <motion.span>, <styled.button> which
         # are HTML wrappers and must NOT be emitted as call targets.
@@ -342,11 +339,10 @@ export function AnimatedCard() {
         assert "Item" in targets
         assert "Form" in receivers
         # Lowercase member properties are HTML wrappers — must be filtered
-        assert "div" not in targets    # motion.div
-        assert "span" not in targets   # motion.span
-        assert "button" not in targets # styled.button
+        assert "div" not in targets  # motion.div
+        assert "span" not in targets  # motion.span
+        assert "button" not in targets  # styled.button
         assert "input" not in targets  # motion.input
-
 
     def test_class_methods_still_extracted(self, parser: ASTParser) -> None:
         # Negative for D5: methods inside class bodies must still be
@@ -383,9 +379,7 @@ const priv = x => x;
         assert fn_symbols["double"].visibility == "public"
         assert fn_symbols["priv"].visibility == "private"
 
-    def test_unparenthesized_arrow_functions_extracted_javascript(
-        self, parser: ASTParser
-    ) -> None:
+    def test_unparenthesized_arrow_functions_extracted_javascript(self, parser: ASTParser) -> None:
         # javascript.scm was also patched — verify the same fix works for .js files.
         src = b"""
 export const double = x => x * 2;
@@ -740,9 +734,7 @@ class Thing {
         assert "label" not in names
         assert "items" not in names
 
-    def test_existing_type_annotation_capture_still_intact(
-        self, parser: ASTParser
-    ) -> None:
+    def test_existing_type_annotation_capture_still_intact(self, parser: ASTParser) -> None:
         # The type-annotation pattern is untouched; the new definition pattern
         # sits beside it. ``f: Field`` must still emit its field_type ref.
         src = b"""\
@@ -756,9 +748,7 @@ class Holder {
         refs = {(r.type_name, r.origin) for r in result.type_refs}
         assert ("Field", "field_type") in refs
 
-    def test_class_field_function_visibility_follows_modifier(
-        self, parser: ASTParser
-    ) -> None:
+    def test_class_field_function_visibility_follows_modifier(self, parser: ASTParser) -> None:
         src = b"""\
 class Svc {
   private handler = () => 1;
@@ -777,9 +767,7 @@ class Svc {
         assert "create" in from_tsx
         assert "count" not in from_tsx
 
-    def test_method_inside_a_class_expression_field_stays_out(
-        self, parser: ASTParser
-    ) -> None:
+    def test_method_inside_a_class_expression_field_stays_out(self, parser: ASTParser) -> None:
         """A consequence of the kind, pinned so it is deliberate.
 
         ``public_field_definition`` is now a callable kind, so it joins the
@@ -799,3 +787,116 @@ class Outer {
         symbols = parser.parse_file(fi, src).symbols
         assert [s.name for s in symbols] == ["Outer"]
         assert "inner" not in {s.name for s in symbols}
+
+
+class TestObjectLiteralMethods:
+    """An object-literal method no named function encloses is a symbol.
+
+    Its calls are keyed to it, not to whatever binding encloses the whole
+    expression, and it is qualified by that binding so same-named methods of
+    two objects in one file keep distinct ids.
+    """
+
+    MIXIN = b"""\
+import * as checks from "./checks";
+export const ZodNumber = $constructor("ZodNumber", (inst, def) => {
+  install(inst, {
+    gt(v, p) { return checks.gtCheck(v, p); },
+    positive(p) { return checks.gtCheck(0, p); },
+  });
+});
+export const ZodBigInt = $constructor("ZodBigInt", (inst, def) => {
+  install(inst, {
+    gt(v, p) { return checks.gtCheck(v, p); },
+  });
+});
+export const api = {
+  get(url) { return fetchIt(url); },
+};
+"""
+
+    def _parse(self, parser: ASTParser, src: bytes, path: str, language: str = "typescript"):
+        return parser.parse_file(_make_file_info(path, language), src)
+
+    def test_mixin_methods_are_symbols_under_their_binding(self, parser: ASTParser) -> None:
+        result = self._parse(parser, self.MIXIN, "src/schemas.ts")
+        ids = {s.id: s for s in result.symbols}
+        for sid in (
+            "src/schemas.ts::ZodNumber::gt",
+            "src/schemas.ts::ZodNumber::positive",
+            "src/schemas.ts::ZodBigInt::gt",
+            "src/schemas.ts::api::get",
+        ):
+            assert sid in ids, sid
+            assert ids[sid].kind == "method"
+
+    def test_calls_inside_are_keyed_to_the_method(self, parser: ASTParser) -> None:
+        result = self._parse(parser, self.MIXIN, "src/schemas.ts")
+        callers = {(c.line, c.target_name): c.caller_symbol_id for c in result.calls}
+        assert callers[(4, "gtCheck")] == "src/schemas.ts::ZodNumber::gt"
+        assert callers[(5, "gtCheck")] == "src/schemas.ts::ZodNumber::positive"
+        assert callers[(10, "gtCheck")] == "src/schemas.ts::ZodBigInt::gt"
+        assert callers[(3, "install")] == "src/schemas.ts::ZodNumber"
+
+    def test_javascript_shares_the_rule(self, parser: ASTParser) -> None:
+        result = self._parse(parser, self.MIXIN, "src/schemas.js", "javascript")
+        ids = {s.id for s in result.symbols}
+        assert "src/schemas.js::ZodNumber::gt" in ids
+        assert "src/schemas.js::ZodBigInt::gt" in ids
+
+    def test_methods_inside_a_named_function_stay_local(self, parser: ASTParser) -> None:
+        src = b"""\
+export function outer() {
+  const helper = () => 1;
+  return { inner() { return helper(); } };
+}
+export const arrow = () => ({ viaArrow() { return 1; } });
+export const table = { handler: () => ({ viaPair() { return 1; } }) };
+export class K {
+  m() { return { deep() { return 1; } }; }
+}
+"""
+        symbols = self._parse(parser, src, "src/local.ts").symbols
+        by_name = {s.name: s for s in symbols}
+        # The fork retains named lexical locals for agent navigation; it does
+        # not publish them as top-level exports or cross anonymous callbacks.
+        for name, parent in (
+            ("helper", "outer"),
+            ("inner", "outer"),
+            ("viaArrow", "arrow"),
+            ("deep", "K::m"),
+        ):
+            assert by_name[name].visibility == "local"
+            assert by_name[name].parent_symbol_id == f"src/local.ts::{parent}"
+        assert "viaPair" not in by_name
+        assert {"outer", "arrow", "K", "m"} <= by_name.keys()
+
+    def test_nested_object_is_owned_by_its_property_key(self, parser: ASTParser) -> None:
+        src = b"""\
+export const useStore = defineStore("s", {
+  actions: { inc() { return 1; } },
+  getters: { inc() { return 2; } },
+});
+"""
+        ids = {s.id for s in self._parse(parser, src, "src/store.ts").symbols}
+        assert "src/store.ts::actions::inc" in ids
+        assert "src/store.ts::getters::inc" in ids
+        assert "src/store.ts::inc" not in ids
+
+    def test_no_symbol_without_a_plain_owner_name(self, parser: ASTParser) -> None:
+        src = b"""\
+export const a = f({ "odd-key": { m() { return 1; } } });
+export const { b } = f({ n() { return 2; } });
+"""
+        names = {s.name for s in self._parse(parser, src, "src/owners.ts").symbols}
+        assert "m" not in names
+        assert "n" not in names
+
+    def test_methods_kept_before_keep_their_ids(self, parser: ASTParser) -> None:
+        # No callable encloses these, so they were symbols already: unchanged.
+        src = b"""\
+export default { data() { return {}; }, methods: { inc() { return 1; } } };
+var legacy = { run() { return 1; } };
+"""
+        ids = {s.id for s in self._parse(parser, src, "src/options.ts").symbols}
+        assert {"src/options.ts::data", "src/options.ts::inc", "src/options.ts::run"} <= ids

@@ -263,3 +263,20 @@ async def test_memory_fallback_cannot_clear_persisted_vector_debt(catalog, monke
         assert load_cleanup_debt(catalog.root) == {"fts": set(), "vectors": set()}
     finally:
         await durable.close()
+
+
+async def test_postcommit_fts_refresh_publishes_changed_page_content(catalog):
+    from repowise.server.job_executor import _refresh_fts
+
+    page = SimpleNamespace(
+        page_id=PAGE_ID,
+        title="neutrinoprobe",
+        content="neutrinoprobe replaces the committed page contents",
+        summary=None,
+        target_path="src/main.py",
+        digest="",
+    )
+    await _refresh_fts(catalog.fts, [page])
+    hits = await catalog.fts.search("neutrinoprobe")
+    assert [hit.page_id for hit in hits] == [PAGE_ID]
+    assert await catalog.fts.search("quartzprobe") == []

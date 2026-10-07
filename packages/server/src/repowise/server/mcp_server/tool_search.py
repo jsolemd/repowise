@@ -28,6 +28,8 @@ from repowise.server.mcp_server._answer_pipeline import (
     _record_leg,
     begin_leg_record,
     degraded_legs,
+    native_store_disclosure,
+    record_native_store_issue,
     retrieval_legs,
 )
 from repowise.server.mcp_server._budget import (
@@ -49,7 +51,7 @@ from repowise.server.mcp_server._helpers import (
 )
 from repowise.server.mcp_server._meta import EXHAUSTIVE_SWEEP_HINT, federated_freshness
 from repowise.server.mcp_server._meta import build_meta as _build_meta
-from repowise.server.mcp_server._page_paths import file_candidates, hit_file_path
+from repowise.server.mcp_server._page_paths import add_row_paths, file_candidates, hit_file_path
 from repowise.server.mcp_server._prose_symbols import symbol_backed_pages
 from repowise.server.mcp_server._query_shape import (
     _DECISION_DOWNWEIGHT,
@@ -164,6 +166,70 @@ def _interleave_hybrid(
         return (concepts[: max(1, limit - reserved)] + symbols)[:limit]
     reserved = min(len(concepts), limit // 2)
     return (symbols[: max(1, limit - reserved)] + concepts)[:limit]
+
+
+# Code-location windows over-fetch this many times ``limit`` so collapsing
+# same-file hits still leaves ``limit`` distinct files to serve.
+_FILE_WINDOW_OVERFETCH = 2
+# Other symbol names a collapsed row carries in ``symbols``.
+_MERGED_SYMBOL_CAP = 5
+
+
+def _collapse_by_file(hits: list[dict]) -> list[dict]:
+    """One row per (repo, file), best first; rows naming no file pass through.
+
+    The first row of a file wins. A later symbol hit in the same file folds
+    into the winner's ``symbols`` as ``name:line`` (capped) instead of taking a
+    slot of its own, so ``limit`` buys distinct files; past the cap a trailing
+    ``+N more`` entry counts the rest. Precedent:
+    ``symbol_backed_pages`` collapses the same way for the concept tail.
+    """
+    first_of: dict[tuple, dict] = {}
+    extra: dict[int, int] = {}
+    out: list[dict] = []
+    for hit in hits:
+        path = hit_file_path(hit)
+        if path is None:
+            out.append(hit)
+            continue
+        key = (hit.get("repo"), path)
+        first = first_of.get(key)
+        if first is None:
+            first_of[key] = hit
+            out.append(hit)
+        elif hit.get("type") == "symbol" and first.get("type") == "symbol":
+            merged = first.setdefault("symbols", [])
+            if len(merged) < _MERGED_SYMBOL_CAP:
+                merged.append(f"{hit.get('name')}:{hit.get('start_line')}")
+            else:
+                extra[id(first)] = extra.get(id(first), 0) + 1
+    for hit in out:
+        if id(hit) in extra:
+            hit["symbols"].append(f"+{extra[id(hit)]} more")
+    return out
+
+
+def _hybrid_window(
+    query: str,
+    symbols: list[dict],
+    concepts: list[dict],
+    limit: int,
+    exact: bool,
+    names: Container[str] | None = None,
+) -> list[dict]:
+    """The hybrid window, with no page for a file a shown symbol row covers.
+
+    Pages are dropped only for symbols the window actually shows, then the
+    window is rebuilt so the freed slots backfill. Concepts only shrink and the
+    symbol share only grows, so this settles in a few passes.
+    """
+    while True:
+        window = _interleave_hybrid(query, symbols, concepts, limit, exact, names)
+        shown = {item.get("file") for item in window if item.get("type") == "symbol"}
+        kept = [c for c in concepts if c.get("target_path") not in shown]
+        if len(kept) == len(concepts):
+            return window
+        concepts = kept
 
 
 def _downweight_decisions(output: list[dict], query: str) -> None:
@@ -294,19 +360,8 @@ async def _non_decision_fallback(ctx, query: str, fetch_limit: int) -> list[dict
     non-why query returns zero implementation pages. Fetch 4x wider, drop
     decisions, and let the caller merge the survivors.
     """
-    results = []
     src = "vector"
-    # Skipped on a keyless index, which then falls through to the FTS branch.
-    if store_has_semantic_vectors(ctx.vector_store):
-        try:
-            results = await asyncio.wait_for(
-                ctx.vector_store.search(query, limit=fetch_limit * 4),
-                timeout=vector_search_timeout_s(),
-            )
-        except TimeoutError:
-            _log.warning("Vector re-fetch timed out; falling back to full-text")
-        except Exception:
-            _log.debug("Vector re-fetch failed; falling back to full-text", exc_info=True)
+    results = await _safe_vector(ctx, query, fetch_limit * 4)
     if not results:
         src = "fts"
         with contextlib.suppress(Exception):
@@ -716,6 +771,9 @@ def _retrieval_disclosure() -> dict[str, Any]:
     degraded = degraded_legs(retrieval_legs())
     if not degraded:
         return {}
+    if native := native_store_disclosure():
+        native["retrieval_degraded"] = degraded
+        return native
     detail = (_VECTOR_LEG_DETAIL.get() or {}).get("vector")
     reason = "Semantic (vector) retrieval did not run for this query"
     if detail:
@@ -749,6 +807,9 @@ async def _safe_vector(ctx, query: str, limit: int) -> list:
     above records anything, because both are configuration rather than failure
     and ``_meta`` reports a keyless index on its own.
     """
+    if issue := record_native_store_issue(ctx):
+        _record_vector_leg("error", issue)
+        return []
     if ctx.vector_store is None or not store_has_semantic_vectors(ctx.vector_store):
         return []
     try:
@@ -900,7 +961,7 @@ async def _search_single_repo(
     output = _dedup_decisions(output)
 
     output = _filter_by_kind(output, kind)
-    return output[:limit]
+    return _collapse_by_file(output)[:limit]
 
 
 def _federated_rank_key_for(query: str) -> Callable[[dict], tuple]:
@@ -1018,8 +1079,9 @@ async def _federated_search(
     # name files.
     if candidates := file_candidates(all_results, limit=limit):
         response["candidates"] = candidates
-    # Last, so nothing above has to know the fields are on their way out.
+    # Last, after ranking and candidate collection have used these fields.
     _strip_ranking_internals(output)
+    add_row_paths(output)
     _drop_derivable_page_ids(output)
     return response
 
@@ -1146,6 +1208,9 @@ async def _structured_search(
     multi = len(contexts) > 1
 
     symbols: list[dict] = []
+    # Symbol rows past each repo's ``limit``: they only backfill slots that
+    # collapsing same-file rows frees, and never steer the exact-match signal.
+    spare: list[dict] = []
     files: list[dict] = []
     concepts: list[dict] = []
 
@@ -1164,13 +1229,17 @@ async def _structured_search(
         if _idents:
             symbol_query = " ".join(_idents)
 
+    # Only the hybrid window collapses symbol rows, so only it over-fetches
+    # them; path hits are file pages, already one row per file.
+    fetch = limit * _FILE_WINDOW_OVERFETCH if mode == "hybrid" else limit
     for ctx in contexts:
         if mode in ("symbol", "hybrid"):
             s = await search_symbols_single(
-                ctx, symbol_query, limit, symbol_kind=symbol_kind, kind=kind
+                ctx, symbol_query, fetch, symbol_kind=symbol_kind, kind=kind
             )
             _tag_repo(s, ctx, multi)
-            symbols.extend(s)
+            symbols.extend(s[:limit])
+            spare.extend(s[limit:])
         if mode == "path":
             f = await search_paths_single(ctx, query, limit)
             _tag_repo(f, ctx, multi)
@@ -1183,6 +1252,7 @@ async def _structured_search(
             concepts.extend(c)
 
     symbols.sort(key=lambda x: -(x.get("score") or 0.0))
+    spare.sort(key=lambda x: -(x.get("score") or 0.0))
     files.sort(key=lambda x: -(x.get("score") or 0.0))
     candidates = _identifier_candidates(query, mode, names)
     if mode == "symbol":
@@ -1199,14 +1269,13 @@ async def _structured_search(
     missing = _missing_named_symbols(candidates, symbols, bool(canonical_symbol), concepts)
     if missing:
         symbols = [s for s in symbols if _has_exact_symbol(candidates, [s])]
+        spare = [s for s in spare if _has_exact_symbol(candidates, [s])]
 
     if mode == "symbol":
         results = symbols[:limit]
     elif mode == "path":
         results = files[:limit]
     else:  # hybrid: interleave symbol matches and concept pages for new files
-        sym_files = {s.get("file") for s in symbols}
-        concepts = [c for c in concepts if c.get("target_path") not in sym_files]
         # Federation appends per-repo concept lists in repo order — re-rank by
         # relevance so a strong page in repo B isn't buried under repo A's weak
         # ones. Carries the noise class first for the same reason the federated
@@ -1217,7 +1286,21 @@ async def _structured_search(
         # re-sorted on score alone is just as unpartitioned as two repos'.
         _classify_concept = noise_classifier(query)
         concepts.sort(key=lambda x: (_classify_concept(x), -(x.get("relevance_score") or 0.0)))
-        results = _interleave_hybrid(query, symbols, concepts, limit, exact, names)
+        window = _hybrid_window(query, symbols, concepts, limit, exact, names)
+        # One row per file, so ``limit`` buys distinct files (mode "symbol"
+        # stays row-per-symbol: overloads there are the answer). Collapsing
+        # keeps the window's order and frees the slots same-file rows took;
+        # the next pages, then the next symbols, fill them.
+        served = {id(item) for item in window}
+        rest = [item for item in concepts + symbols + spare if id(item) not in served]
+        results = _collapse_by_file(window + rest)[:limit]
+        # A code-location query wants files to open, so a module, onboarding
+        # or decision page is dropped from the window. Its slot is not
+        # refilled: on the retrieval guard a refill bought +0.01 coverage at
+        # limit 5 for -0.01 precision at limit 10. Kept when the caller asked
+        # for pages by type or kind="doc".
+        if not page_type and kind != "doc":
+            results = [item for item in results if hit_file_path(item)]
 
     repository = None
     if not multi:
@@ -1255,10 +1338,14 @@ async def _structured_search(
         response["exact_match"] = exact and not missing
         if missing:
             shown = ", ".join(repr(c) for c in missing[:3])
+            # An empty window has no page to qualify, and its grep_hint
+            # already carries the sweep advice.
+            pages = f" Any page here is {NOT_THE_NAMED_SYMBOL}." if results else ""
+            sweep = "" if (grep_hint and not results) else " " + EXHAUSTIVE_SWEEP_HINT
             response["note"] = (
                 f"No indexed symbol is named {shown}, so no symbol is returned "
-                f"for it. Any page here is {NOT_THE_NAMED_SYMBOL}. Recheck the "
-                "spelling, or search a shorter part of the name. " + EXHAUSTIVE_SWEEP_HINT
+                f"for it.{pages} Recheck the spelling, or search a shorter part "
+                f"of the name.{sweep}"
             )
         elif not exact:
             shown = ", ".join(repr(c) for c in candidates[:3])
@@ -1270,8 +1357,9 @@ async def _structured_search(
             )
     if grep_hint and not results:
         response["grep_hint"] = grep_hint
-    # Last, so nothing above has to know the fields are on their way out.
+    # Paths first, so a page whose target_path is dropped keeps its page_id.
     _strip_ranking_internals(results)
+    add_row_paths(results)
     _drop_derivable_page_ids(results)
     return response
 
@@ -1301,7 +1389,8 @@ async def search_codebase(
     """Find code by concept, symbol, or path — hybrid codebase search.
 
     Find an owner, then use get_symbol for a named body or get_context for
-    file triage. `candidates` lists distinct openable files, best first.
+    file triage. Native rows naming a file carry `path`; `candidates` lists
+    distinct openable files, best first.
 
     Explicit symbol/path modes, filename lookups and filters use native indexed
     resolvers, never semantic fallback for an exact miss. With source search
@@ -1314,7 +1403,8 @@ async def search_codebase(
 
     Args:
         query: identifier, path, or natural-language query.
-        limit: max results (default 5).
+        limit: max results (default 5); native hybrid rows group same-file
+            symbols, while mode="symbol" preserves separate overloads.
         page_type: one stored page type, e.g. file_page or module_page.
         kind: implementation | test | config | doc (concept/symbol modes).
         repo: workspace only. Alias, or "all" (rows carry `repo`).
@@ -1486,6 +1576,8 @@ async def search_codebase(
         output = _dedup_decisions(output)
 
     output = _filter_by_kind(output, kind)
+    # A file page and a symbol page of one file are one place to look.
+    output = _collapse_by_file(output)
     # Files the page retrievers structurally cannot see (a private helper, a
     # local name, anything a file page's public-symbol table omits) get the
     # weakest tail slots. No-op when the symbol leg names nothing new.
@@ -1520,7 +1612,8 @@ async def search_codebase(
     if grep_hint and not output:
         response["grep_hint"] = grep_hint
     attach_ignored_arguments(response, ignored)
-    # Last, so nothing above has to know the fields are on their way out.
+    # Last, after ranking and candidate collection have used these fields.
     _strip_ranking_internals(output)
+    add_row_paths(output)
     _drop_derivable_page_ids(output)
     return response

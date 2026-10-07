@@ -301,3 +301,32 @@ def test_config_request_is_reported_as_suppressed_not_unknown(monkeypatch, caplo
     messages = [r.getMessage() for r in caplog.records if "get_answer" in r.getMessage()]
     assert messages, "a config naming a suppressed tool should say so"
     assert all("unknown" not in m.lower() for m in messages), messages
+
+
+@pytest.mark.parametrize(
+    "override", [None, "all", "lean", "+get_answer,+get_health", "get_answer,get_health"]
+)
+def test_availability_and_hard_generation_policy_both_apply(monkeypatch, override):
+    from dataclasses import replace
+
+    from repowise.core.registry.tool_selection import AvailabilityFacts
+
+    ensure_full_surface()
+    entries = [
+        replace(entry, available_when=lambda facts: False) if entry.name == "get_health" else entry
+        for entry in mcp_tool_registry.entries()
+    ]
+    monkeypatch.setenv(NO_GENERATIVE_ENV, "1")
+    enabled = resolve_enabled_tools(
+        entries, is_workspace=True, override=override, facts=AvailabilityFacts()
+    )
+    assert not enabled.intersection({"get_health", *GENERATIVE_TOOL_NAMES})
+
+
+def test_chat_selection_obeys_repository_generation_policy(monkeypatch, repo):
+    monkeypatch.setenv(NO_GENERATIVE_ENV, "0")
+    (Path(repo) / ".repowise" / ".env").write_text(f"{NO_GENERATIVE_ENV}=1\n", encoding="utf-8")
+    set_tool_override(repo, "all")
+    names = {entry.name for entry in _tool_selection.selected_tool_entries(repo)}
+    assert "search_codebase" in names
+    assert not names.intersection(GENERATIVE_TOOL_NAMES)

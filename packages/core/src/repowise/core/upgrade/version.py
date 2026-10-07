@@ -85,7 +85,9 @@ STORE_FORMAT_VERSION: int = 2
 #: ``is_declaration`` so lookups serve the implementation. Python qualified
 #: names use the importable module. Upstream's 4 and 5 are numerals the fork
 #: already sealed live caches with, so the merged schema moves past both.
-PARSER_SCHEMA_VERSION: int = 8
+#: v9: v0.55 adds overload arity identities, receiver-call deduplication and
+#: C++ template/container extraction; keep this distinct from upstream v6.
+PARSER_SCHEMA_VERSION: int = 9
 
 #: state.json key holding the store format version that wrote the store.
 STORE_FORMAT_VERSION_KEY = "store_format_version"

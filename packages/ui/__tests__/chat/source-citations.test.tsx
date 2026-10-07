@@ -17,6 +17,40 @@ function searchCall(results: Array<Record<string, unknown>>): ChatUIToolCall {
 }
 
 describe("extractSources", () => {
+  it.each([
+    { page_id: "file_page:src/auth.py", path: "src/auth.py" },
+    { path: "src/auth.py" },
+    { target_path: "src/auth.py" },
+  ])("keeps native and source search citation paths: %j", (row) => {
+    const sources = extractSources(
+      [searchCall([{ page_type: "file_page", title: "Authentication", ...row }])],
+      "repo1",
+    );
+
+    expect(sources).toHaveLength(1);
+    expect(sources[0]).toMatchObject({
+      pageId: "file_page:src/auth.py",
+      targetPath: "src/auth.py",
+      title: "Authentication",
+    });
+  });
+
+  it("preserves a symbol page's full target when native search also names its file", () => {
+    const sources = extractSources(
+      [searchCall([{
+        page_type: "symbol_spotlight",
+        target_path: "src/auth.py::authenticate",
+        path: "src/auth.py",
+      }])],
+      "repo1",
+    );
+
+    expect(sources[0]).toMatchObject({
+      pageId: "symbol_spotlight:src/auth.py::authenticate",
+      targetPath: "src/auth.py::authenticate",
+    });
+  });
+
   // These five tools produced no citation at all before: a reader could not
   // check the scored claim the answer was built on. Field names are the live
   // wire shapes, which differ per tool (`file` on get_symbol, `file_path`
@@ -41,7 +75,7 @@ describe("extractSources", () => {
         id: "d1",
         name: "get_dead_code",
         arguments: {},
-        result: { high_confidence: [{ file_path: "packages/web/unused.ts" }] },
+        result: { tiers: { high: { findings: [{ file_path: "packages/web/unused.ts" }] } } },
         status: "done",
       },
       {

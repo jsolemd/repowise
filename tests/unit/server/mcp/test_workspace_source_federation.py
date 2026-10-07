@@ -1096,7 +1096,7 @@ async def test_wiki_federated_merge_ranks_by_relevance_not_config_order(monkeypa
     monkeypatch.setattr(tool_search, "_build_meta", lambda **k: {})
 
     resp = await tool_search._federated_search("q", 5, None)
-    ordered = [(r["repo"], r["target_path"]) for r in resp["results"]]
+    ordered = [(r["repo"], r["path"]) for r in resp["results"]]
     assert ordered == [("beta", "b_strong.py"), ("alpha", "a_weak.py")]
 
 
@@ -1930,3 +1930,32 @@ async def test_source_routes_disclose_unknown_mode_before_return(monkeypatch, wo
     assert seen == ["concept"]
     assert result["ignored_arguments"][0]["argument"] == "mode"
     assert result["ignored_arguments"][0]["values"] == ["conecpt"]
+
+
+@pytest.mark.parametrize("repo", ["alpha", "beta", "all"])
+async def test_source_lane_does_not_inherit_native_store_failures(monkeypatch, repo):
+    from repowise.server.mcp_server import _state, search_codebase
+    from repowise.server.mcp_server._meta import finalize_trust_envelope
+
+    class MetaCoordinator(_StubCoordinator):
+        async def search(self, query, *, limit, mode, base_meta):
+            response = await super().search(query, limit=limit, mode=mode, base_meta=base_meta)
+            # The real coordinator retains the host envelope and adds its own
+            # source-reader state. An independent native reader may be broken.
+            response["_meta"] = {**base_meta, **response.get("_meta", {})}
+            return response
+
+    registry = _StubRegistry(["alpha", "beta"], default="alpha")
+    _wire(monkeypatch, {
+        alias: MetaCoordinator(_envelope([(f"{alias}.py", 1.0)], "caution"))
+        for alias in ("alpha", "beta")
+    })
+    monkeypatch.setenv("REPOWISE_SOURCE_SEARCH", "1")
+    monkeypatch.setattr(_state, "_registry", registry)
+    monkeypatch.setattr(_state, "_embedder_status", {"active": "llamacpp", "degraded": False})
+    monkeypatch.setattr(_state, "_vector_store_errors", {"alpha": "native wiki store failed"})
+    response = finalize_trust_envelope(await search_codebase("authentication service", repo=repo))
+    assert response["results"]
+    assert response["trust"]["embedder_degraded"] is False
+    assert "retrieval_degraded" not in response["trust"]
+    assert "semantic_search" not in response["_meta"]

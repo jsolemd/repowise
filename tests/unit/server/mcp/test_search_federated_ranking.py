@@ -85,7 +85,7 @@ async def test_the_federated_merge_keeps_every_repo_s_noise_demotion(monkeypatch
     _fake_repos(monkeypatch, _DEMOTED)
 
     response = await tool_search._federated_search(_QUERY, 5, None)
-    paths = [row["target_path"] for row in response["results"]]
+    paths = [row.get("path") or row["target_path"] for row in response["results"]]
 
     assert paths[:2] == ["alpha/impl.py", "beta/impl.py"]
     assert set(paths[2:]) == {"alpha/why.md", "beta/tests/test_impl.py"}
@@ -103,7 +103,7 @@ async def test_the_federated_merge_still_ranks_real_pages_by_relevance(monkeypat
 
     response = await tool_search._federated_search(_QUERY, 5, None)
 
-    assert [row["target_path"] for row in response["results"]] == [
+    assert [row["path"] for row in response["results"]] == [
         "beta/strong.py",
         "alpha/weak.py",
     ]
@@ -138,7 +138,7 @@ async def test_the_hybrid_concept_resort_keeps_the_noise_demotion(monkeypatch):
     response = await tool_search._structured_search(
         _QUERY, 5, None, None, None, "all", "hybrid", None
     )
-    paths = [row["target_path"] for row in response["results"]]
+    paths = [row.get("path") or row["target_path"] for row in response["results"]]
 
     assert paths[:2] == ["alpha/impl.py", "beta/impl.py"]
 

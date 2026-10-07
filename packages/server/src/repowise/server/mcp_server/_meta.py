@@ -37,7 +37,30 @@ from repowise.server.mcp_server._rounding import round_float
 # and its version field are unchanged, so a consumer reading the old shape has
 # no way to notice from index_scope itself — the envelope version is where a
 # wire-shape change is announced. REPOWISE_MCP_INDEX_SCOPE=full restores it.
-MCP_CONTRACT_VERSION = 2
+# 3: the lean envelope. Diagnostics (timing, budget accounting,
+# an uncapped completeness block, a complete index_scope digest, savings) leave
+# routine responses; get_overview and REPOWISE_MCP_DEBUG_META=1 keep them.
+# The fork keeps contract_version on every envelope. _wire promotes it to
+# protocol metadata, outside model-visible text, so consumers can identify
+# the contract without paying for a duplicate diagnostic payload.
+MCP_CONTRACT_VERSION = 3
+
+#: Restores the diagnostic ``_meta`` fields on every response, for diagnosis.
+DEBUG_META_ENV = "REPOWISE_MCP_DEBUG_META"
+
+#: Called once per session, so it is where the whole envelope is worth its bytes.
+_FULL_META_TOOLS = frozenset({"get_overview"})
+
+
+def full_meta(tool: str | None = None) -> bool:
+    """Whether *tool*'s response keeps the diagnostic ``_meta`` fields.
+
+    Read per call, like the scope switch, so a client-spawned server picks a
+    change up without a restart.
+    """
+    if tool in _FULL_META_TOOLS:
+        return True
+    return os.environ.get(DEBUG_META_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
 
 # Only warn about age when we have no other signal AND the index is genuinely
 # old. A short threshold here would nag on every call and train the agent to
@@ -459,15 +482,15 @@ def build_meta(
     serves) to scope ``stale_warning`` to actually-affected content — see
     :func:`freshness_from_repo`.
 
-    ``index_scope`` rides on every response, so it carries the compact
-    projection: the run mode, the provenance, the git tier, one word for
-    whether the index is whole, and a fingerprint identifying the canonical
-    object. See :func:`build_meta_with_full_scope` for the calls that are
+    ``index_scope`` carries the compact projection (the run mode, the
+    provenance, the git tier, one word for whether the index is whole, and a
+    fingerprint identifying the canonical object), and only when that word is
+    not ``complete``. See :func:`build_meta_with_full_scope` for the calls that are
     worth the whole thing.
 
     Stable shape:
       {
-        "timing_ms":       float,  # tool wall-time (omitted if None)
+        "timing_ms":       float,  # tool wall-time (REPOWISE_MCP_DEBUG_META only)
         "hint":            str,    # short follow-up suggestion (omitted if None)
         "cached":          bool,   # only included when True
         "index_age_days":  int,    # days since last `repowise update`
@@ -476,8 +499,9 @@ def build_meta(
         ...extras
       }
     """
+    full = full_meta()
     out: dict[str, Any] = {"contract_version": MCP_CONTRACT_VERSION}
-    if timing_ms is not None:
+    if timing_ms is not None and full:
         # Through the shared quantizer, not ``round(..., 2)``. A wall-clock
         # duration is a float like any other on this wire, and two decimal
         # places is not the same rule the rest of the payload follows: a
@@ -496,7 +520,10 @@ def build_meta(
     if repository is not None:
         out.update(freshness_from_repo(repository, targets=targets))
         scope = index_scope_for_response(getattr(repository, "local_path", None))
-        if scope is not None:
+        # A complete digest restates the default; only a gap is news.
+        if scope is not None and (
+            full or _canonical_scope_requested() or scope.get("status") != "complete"
+        ):
             out["index_scope"] = scope
     out.update(_embedder_meta())
     out.update(_release_meta())
@@ -513,7 +540,7 @@ def build_meta_with_full_scope(**kwargs: Any) -> dict[str, Any]:
     every caller must read past to learn it does not apply to them belongs
     beside the one caller it does.
     """
-    meta = build_meta(**kwargs)
+    meta = {"contract_version": MCP_CONTRACT_VERSION, **build_meta(**kwargs)}
     repository = kwargs.get("repository")
     if repository is not None:
         scope = read_index_scope(getattr(repository, "local_path", None))
@@ -606,6 +633,7 @@ def agent_trust(envelope: dict[str, Any]) -> dict[str, Any]:
         "embedder_degraded",
         "retrieval_degraded",
         "retrieval_degraded_reason",
+        "retrieval_degraded_repos",
         "evidence_kind",
         "runtime_breakage_proven",
         "existing_verified_code",
@@ -784,6 +812,9 @@ def _embedder_meta() -> dict[str, Any]:
         # Embedder never initialised, so there is nothing to report either way.
         # Absence means "not evaluated", distinct from an explicit ``false``.
         return {}
+    # Store failures belong to the request's native retrieval leg. Folding
+    # every workspace alias into embedder configuration falsely degrades a
+    # healthy alias, and source search may use an entirely healthy reader.
     if not status.get("degraded"):
         if status.get("active") == "mock":
             return {"embedder": "mock", "embedder_degraded": False, "semantic_search": False}
@@ -926,5 +957,8 @@ def answer_hint(
             "rates the ranked hits; start from the first one."
         )
     if confidence == "low":
-        return "Low confidence — Read the listed fallback_targets to verify before answering."
+        return (
+            "Low confidence. Read the top evidence row or candidate_files to "
+            "verify before answering."
+        )
     return None

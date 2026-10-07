@@ -44,9 +44,7 @@ async def test_interrupt_between_page_and_flush_costs_no_resume_coverage(tmp_pat
     js, job_id = _job(tmp_path)
 
     # The durable rows land first — this is the ordering a real level uses.
-    await store.embed_batch(
-        [("file_page:a.py", "a", {}), ("file_page:b.py", "b", {})]
-    )
+    await store.embed_batch([("file_page:a.py", "a", {}), ("file_page:b.py", "b", {})])
     js.complete_page(job_id, "file_page:a.py")
     js.complete_page(job_id, "file_page:b.py")
 
@@ -64,6 +62,7 @@ async def test_interrupt_between_page_and_flush_costs_no_resume_coverage(tmp_pat
         completed_ids=set(),
         preserved_page_ids=set(),
         selected_page_ids=None,
+        persisted_page_ids={"file_page:a.py", "file_page:b.py"},
         only_page_ids=None,
     )
     await _GenerationRun._seed_resume(run)
@@ -94,11 +93,36 @@ async def test_a_page_whose_rows_never_landed_is_regenerated(tmp_path):
         completed_ids=set(),
         preserved_page_ids=set(),
         selected_page_ids=None,
+        persisted_page_ids=None,
         only_page_ids=None,
     )
     await _GenerationRun._seed_resume(run)
 
     assert _GenerationRun._emit(run, "file_page:b.py") is True
+
+
+@pytest.mark.asyncio
+async def test_a_page_whose_vector_landed_but_row_did_not_is_regenerated(tmp_path):
+    """The vector and the page row are written separately. A kill between
+    the two leaves a vector with no row, and resume must regenerate it."""
+    store = InMemoryVectorStore(_StubEmbedder())
+    await store.embed_batch([("file_page:a.py", "a", {}), ("file_page:b.py", "b", {})])
+
+    run = SimpleNamespace(
+        job_system=JobSystem(tmp_path / "jobs"),
+        resume=True,
+        vector_store=store,
+        completed_ids=set(),
+        preserved_page_ids=set(),
+        persisted_page_ids={"file_page:a.py"},
+        selected_page_ids=None,
+        only_page_ids=None,
+    )
+    await _GenerationRun._seed_resume(run)
+
+    assert _GenerationRun._emit(run, "file_page:a.py") is False
+    assert _GenerationRun._emit(run, "file_page:b.py") is True
+    assert run.preserved_page_ids == {"file_page:a.py"}
 
 
 def test_a_flushed_level_survives_the_same_kill(tmp_path):
@@ -110,3 +134,28 @@ def test_a_flushed_level_survives_the_same_kill(tmp_path):
     del js
 
     assert _on_disk(tmp_path, job_id)["completed_page_ids"] == ["file_page:a.py"]
+
+
+@pytest.mark.asyncio
+async def test_unavailable_resume_inventory_regenerates_only_selected_pages():
+    class BrokenStore:
+        async def list_page_ids(self):
+            raise RuntimeError("inventory unavailable")
+
+    run = SimpleNamespace(
+        job_system=object(),
+        resume=True,
+        vector_store=BrokenStore(),
+        completed_ids={"file_page:stale.py"},
+        persisted_page_ids={"file_page:a.py"},
+        preserved_page_ids=set(),
+        selected_page_ids=set(),
+        only_page_ids={"file_page:a.py"},
+    )
+    await _GenerationRun._seed_resume(run)
+
+    assert run.completed_ids == set()
+    assert _GenerationRun._emit(run, "file_page:a.py")
+    assert not _GenerationRun._emit(run, "file_page:unselected.py")
+    assert run.selected_page_ids == {"file_page:a.py"}
+    assert run.preserved_page_ids == set()

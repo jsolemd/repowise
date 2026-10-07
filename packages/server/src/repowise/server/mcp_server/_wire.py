@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import functools
 import inspect
+import os
 from collections.abc import Sequence
 from typing import Annotated, Any
 
@@ -46,6 +47,8 @@ from mcp.types import CallToolResult, TextContent
 from repowise.core.providers.embedding.outage import keyword_only_notices
 from repowise.server.mcp_server._meta import agent_trust
 from repowise.server.mcp_server._signature import PAYLOAD_ANNOTATION, evaluated_signature, freeze
+
+PRETTY_JSON_ENV = "REPOWISE_MCP_PRETTY_JSON"
 
 
 def wire(fn: Any) -> Any:
@@ -99,7 +102,7 @@ def as_call_tool_result(payload: Any, *, keyword_only: Sequence[str] = ()) -> An
     warning = _keyword_only_warning(keyword_only, envelope)
     if warning is not None:
         payload = _lead_with(warning, payload)
-    if not isinstance(envelope, dict) or not envelope:
+    if not isinstance(envelope, dict):
         return CallToolResult(content=text_block(payload), structuredContent=payload)
     # A copy rather than a ``pop``: the layers below have already measured,
     # budgeted and recorded this exact dict, and a wrapper that mutates the
@@ -152,7 +155,8 @@ def text_block(payload: dict[str, Any]) -> list[TextContent]:
     The trust projection is visible; the full diagnostic envelope is not
     duplicated in the text.
     """
-    text = pydantic_core.to_json(payload, fallback=str).decode()
+    pretty = os.environ.get(PRETTY_JSON_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+    text = pydantic_core.to_json(payload, fallback=str, indent=2 if pretty else None).decode()
     return [TextContent(type="text", text=text)]
 
 

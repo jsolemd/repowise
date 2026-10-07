@@ -34,6 +34,7 @@ import logging
 from collections.abc import Callable
 from typing import Any
 
+from repowise.server.mcp_server._meta import full_meta
 from repowise.server.mcp_server._signature import preserve
 
 from . import counterfactual, interaction
@@ -155,8 +156,8 @@ def _emit_telemetry(tool: str, result: Any, duration_ms: int) -> None:
 
 
 #: ``_meta`` key a tool sets to declare its own counterfactual (see
-#: :func:`declare_replaced`). The wrapper reads and then leaves it in place as a
-#: transparency annotation.
+#: :func:`declare_replaced`). The wrapper reads it and, on a lean envelope,
+#: removes it, so it never reaches the agent.
 _DECLARED_KEY = "replaced_tokens"
 
 
@@ -175,14 +176,14 @@ def declare_replaced(result: dict[str, Any], tokens: int) -> None:
         meta[_DECLARED_KEY] = tokens
 
 
-def _declared_tokens(result: Any) -> int | None:
+def _declared_tokens(tool: str, result: Any) -> int | None:
     """Return a tool-declared counterfactual from ``_meta``, if present."""
     if not isinstance(result, dict):
         return None
     meta = result.get("_meta")
     if not isinstance(meta, dict):
         return None
-    value = meta.get(_DECLARED_KEY)
+    value = meta.get(_DECLARED_KEY) if full_meta(tool) else meta.pop(_DECLARED_KEY, None)
     return value if isinstance(value, int) and value > 0 else None
 
 
@@ -213,11 +214,9 @@ def _result_signals(result: Any) -> tuple[bool, bool, bool]:
     )
     meta = result.get("_meta")
     meta = meta if isinstance(meta, dict) else {}
-    degraded = any(
+    degraded = bool(result.get("retrieval_degraded") or meta.get("retrieval_degraded")) or any(
         value is True
         for value in (
-            result.get("retrieval_degraded"),
-            meta.get("retrieval_degraded"),
             meta.get("index_behind"),
             meta.get("embedder_degraded"),
         )
@@ -234,7 +233,7 @@ async def _record(
     kwargs: dict[str, Any],
 ) -> None:
     """Measure and aggregate one call in the repository selected by ``repo=``."""
-    declared = _declared_tokens(result)
+    declared = _declared_tokens(tool, result)
     replaced = (
         declared if declared is not None else counterfactual.replaced_tokens_for(tool, result)
     )
@@ -256,7 +255,7 @@ async def _record(
         # The outer middleware owns the final delivered measurement. Keep only
         # transient counters here; no per-interaction identity is persisted.
         live.repo_root = str(repo_root) if repo_root is not None else None
-        if replaced > delivered and isinstance(result, dict):
+        if replaced > delivered and isinstance(result, dict) and full_meta(tool):
             meta = result.setdefault("_meta", {})
             if isinstance(meta, dict):
                 meta["replaced_tokens"] = replaced
@@ -272,7 +271,7 @@ async def _record(
         replaced_tokens=max(0, replaced),
         delivered_tokens=delivered,
     )
-    if written and replaced > delivered and isinstance(result, dict):
+    if written and replaced > delivered and isinstance(result, dict) and full_meta(tool):
         meta = result.setdefault("_meta", {})
         if isinstance(meta, dict):
             # Stamped before the outer budget runs, so these bytes are budgeted

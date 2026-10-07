@@ -11,11 +11,12 @@ import type {
   NextAction,
 } from "@repowise-dev/types/actions";
 
+import { EFFORT_LABEL } from "../health/labels";
 import { SeverityMark } from "../health/severity-mark";
 import { CLICKABLE_ROW_CLS, clickableRowProps } from "../shared/responsive-table";
 import { RowOverflow } from "../shared/row-overflow";
 import { Segmented } from "../shared/segmented";
-import { ActionDrawer } from "./action-drawer";
+import { ActionDrawer, type ActionDrawerProps } from "./action-drawer";
 import { OverviewSection } from "./section";
 
 /** Rows shown before "Show all"; the response carries up to 20 per horizon. */
@@ -27,12 +28,6 @@ const TIER_HEADING: Record<ActionTier, string> = {
   improve_signal: "Improve what Repowise can see",
 };
 
-const EFFORT_LABEL: Record<NextAction["effort"], string> = {
-  S: "Small",
-  M: "Medium",
-  L: "Large",
-};
-
 export interface NextActionsProps {
   /** `null` when the server predates actions; the section then renders nothing. */
   data: ActionsResponse | null;
@@ -41,7 +36,15 @@ export interface NextActionsProps {
   fileHref?: ((path: string) => string | null) | undefined;
   /** Persist a dismissal, snooze, done, or (null) an undo. Omit to hide those verbs. */
   onSetState?: (action: NextAction, state: ActionStateValue | null) => Promise<void>;
-  repoName?: string | undefined;
+  /** An action's agent prompt as core renders it. Omit to hide the prompt. */
+  loadPrompt?: ActionDrawerProps["loadPrompt"];
+  /**
+   * Replaces the sentence after the "Not checked" list. Omit for the default
+   * `repowise update` hint; pass `null` to show only the list.
+   */
+  unavailableHint?: ReactNode | null;
+  /** Show each command's CLI line in the drawer. Set false for a host with no CLI. */
+  showCliCommands?: boolean;
   LinkComponent?: ElementType | undefined;
 }
 
@@ -111,7 +114,9 @@ export function NextActions({
   hrefFor,
   fileHref,
   onSetState,
-  repoName,
+  loadPrompt,
+  unavailableHint,
+  showCliCommands,
   LinkComponent,
 }: NextActionsProps) {
   // Open on the week unless it holds no work and the quarter does: a lone
@@ -241,9 +246,16 @@ export function NextActions({
         )}
         {unavailable.length > 0 && (
           <span>
-            {`Not checked: ${unavailable.join(", ").replace(/_/g, " ")}. Run `}
-            <code className="font-mono text-[0.85em]">repowise update</code>
-            {" to include them."}
+            {`Not checked: ${unavailable.join(", ").replace(/_/g, " ")}.`}
+            {unavailableHint === undefined ? (
+              <>
+                {" Run "}
+                <code className="font-mono text-[0.85em]">repowise update</code>
+                {" to include them."}
+              </>
+            ) : unavailableHint === null ? null : (
+              <> {unavailableHint}</>
+            )}
           </span>
         )}
       </div>
@@ -258,12 +270,27 @@ export function NextActions({
             ? (state, message) => answer(opened, state, message)
             : undefined
         }
-        repoName={repoName}
+        loadPrompt={loadPrompt}
+        showCliCommands={showCliCommands}
         LinkComponent={LinkComponent}
         renderTitle={renderActionTitle}
       />
     </OverviewSection>
   );
+}
+
+/**
+ * `path:line` for an action whose title does not already name its file, so a
+ * row like a Fix-first item ("Extract lines 60-122 of quick_repo_scan") says
+ * where without opening it. The line is the first piece of evidence in that
+ * file; titles that carry the path in backticks keep their own.
+ */
+export function actionLocation(action: NextAction): string | null {
+  const { kind, path } = action.target;
+  if ((kind !== "file" && kind !== "symbol") || !path) return null;
+  if (action.title.includes(path)) return null;
+  const line = action.details.find((d) => d.path === path && d.line)?.line;
+  return line ? `${path}:${line}` : path;
 }
 
 function groupByTier(actions: NextAction[]): [ActionTier, NextAction[]][] {
@@ -289,6 +316,7 @@ export function ActionRow({
   onAnswer?: ((state: ActionStateValue, message: string) => void) | undefined;
 }) {
   const plainTitle = action.title.replace(/`/g, "");
+  const location = actionLocation(action);
   const items = [
     { label: "Open details", icon: PanelRight, onSelect: onOpen },
     ...(onAnswer
@@ -329,6 +357,11 @@ export function ActionRow({
             {renderActionTitle(action.title)}
           </p>
         </div>
+        {location ? (
+          <p className="mt-0.5 font-mono text-xs text-[var(--color-text-tertiary)] [overflow-wrap:anywhere]">
+            {location}
+          </p>
+        ) : null}
         <p className="mt-1 max-w-[72ch] text-xs leading-relaxed text-[var(--color-text-secondary)] [text-wrap:pretty]">
           {renderActionTitle(action.impact)}
         </p>

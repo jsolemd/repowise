@@ -117,3 +117,32 @@ def test_every_served_signature_advertises_an_evaluated_flat_payload():
         schema = func_metadata(fn).output_schema
         assert schema["type"] == "object", fn.__name__
         assert "result" not in schema.get("properties", {}), fn.__name__
+
+
+def test_pretty_json_preserves_flat_payload_and_protocol_trust(monkeypatch):
+    from repowise.server.mcp_server._wire import PRETTY_JSON_ENV
+
+    monkeypatch.setenv(PRETTY_JSON_ENV, "1")
+    result = _convert(_registered_callables()[0])
+    assert result.content[0].text.startswith('{\n  "warning"')
+    assert json.loads(result.content[0].text) == EXPECTED_FLAT
+    assert result.structuredContent == EXPECTED_FLAT
+    assert result.meta == SAMPLE_PAYLOAD["_meta"]
+
+
+def test_compact_wire_has_no_presentation_whitespace(monkeypatch):
+    from repowise.server.mcp_server._wire import PRETTY_JSON_ENV
+
+    monkeypatch.delenv(PRETTY_JSON_ENV, raising=False)
+    for fn in _registered_callables():
+        result = _convert(fn)
+        assert result.content[0].text == json.dumps(EXPECTED_FLAT, separators=(",", ":"))
+
+
+def test_empty_protocol_envelope_does_not_leak_into_model_payload():
+    from repowise.server.mcp_server._wire import as_call_tool_result
+
+    result = as_call_tool_result({"answer": "ok", "_meta": {}})
+    assert result.structuredContent == {"answer": "ok"}
+    assert json.loads(result.content[0].text) == result.structuredContent
+    assert result.meta == {}

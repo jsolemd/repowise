@@ -73,9 +73,7 @@ def _run_level(store) -> list[str]:
             return _page("reused.py", reused=True)
 
         run = _fake_run(store)
-        await _GenerationRun.run_level(
-            run, [("p1", fresh()), ("p2", reused())], level=2
-        )
+        await _GenerationRun.run_level(run, [("p1", fresh()), ("p2", reused())], level=2)
         return [pid for batch in store.batches for (pid, *_rest) in batch]
 
     return asyncio.run(_go())
@@ -129,3 +127,34 @@ def test_a_re_rendered_page_that_did_not_change_is_not_written_again(tmp_path) -
     first, second = asyncio.run(_render_twice())
     assert calls == [1]
     assert second == first
+
+
+class _FailingStore:
+    persists_across_runs = True
+
+    async def refresh_batch(self, items):
+        raise AttributeError("module 'lancedb' has no attribute 'connect_async'")
+
+
+def test_a_failed_embed_is_counted_on_the_generator() -> None:
+    """Callers read the count to refuse calling semantic search healthy.
+
+    A warning string alone left init and update exiting 0 with a semantic
+    index that held none of the pages.
+    """
+    warnings: list[str] = []
+    gen = SimpleNamespace(embed_failed_pages=0)
+
+    async def _go():
+        async def fresh():
+            return _page("fresh.py")
+
+        run = _fake_run(_FailingStore())
+        run.gen = gen
+        run.on_warning = warnings.append
+        await _GenerationRun.run_level(run, [("p1", fresh())], level=2)
+
+    asyncio.run(_go())
+
+    assert gen.embed_failed_pages == 1
+    assert warnings and "Embedding failed for 1 page(s)" in warnings[0]

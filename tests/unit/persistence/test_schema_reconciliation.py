@@ -493,9 +493,7 @@ async def test_adding_owner_line_pct_moves_stale_blame_line_shares(tmp_path: Pat
 
     db_path = tmp_path / "wiki.db"
     engine = create_engine(f"sqlite+aiosqlite:///{db_path}")
-    authors = json.dumps(
-        [{"name": "Bob", "commit_count": 3}, {"name": "Ada", "commit_count": 1}]
-    )
+    authors = json.dumps([{"name": "Bob", "commit_count": 3}, {"name": "Ada", "commit_count": 1}])
     rows = {
         # blame owner Ada: 70% of lines, 1 of 4 commits
         "blame.py": ("Ada", 0.7),
@@ -540,8 +538,7 @@ async def test_adding_owner_line_pct_moves_stale_blame_line_shares(tmp_path: Pat
         path: (commit_pct, line_pct)
         for path, commit_pct, line_pct in _fetchall(
             db_path,
-            "SELECT file_path, primary_owner_commit_pct, primary_owner_line_pct "
-            "FROM git_metadata",
+            "SELECT file_path, primary_owner_commit_pct, primary_owner_line_pct FROM git_metadata",
         )
     }
     assert got == {

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -151,6 +152,20 @@ def _is_workspace_mode() -> bool:
     return _state._registry is not None
 
 
+def native_vector_store_issue(ctx: Any) -> str | None:
+    """The selected native store's load state, independent of other corpora.
+
+    Source search owns a separate vector reader and must not consult this.
+    An unfinished load is distinct from a settled keyless/no-index context.
+    """
+    alias = getattr(ctx, "alias", "default")
+    ready = getattr(ctx, "vector_store_ready", None)
+    if ready is not None and not ready.is_set():
+        return f"Native semantic index for '{alias}' is still loading; retry this request."
+    key = alias if _state._registry is not None else ""
+    return (_state._vector_store_errors or {}).get(key)
+
+
 async def _resolve_repo_context(repo: str | None = None) -> Any:
     """Resolve the per-repo resource context for the given ``repo`` parameter.
 
@@ -175,6 +190,12 @@ async def _resolve_repo_context(repo: str | None = None) -> Any:
             async with _get_session(_state._session_factory) as session:
                 await _get_repo(session, repo)  # raises LookupError if invalid
 
+        ready = _state._vector_store_ready
+        if ready is None:
+            # CLI/chat callers install a settled store without a background
+            # loader. An unset event here would invent a load that cannot finish.
+            ready = asyncio.Event()
+            ready.set()
         return RepoContext(
             alias="default",
             path=Path(_state._repo_path) if _state._repo_path else Path.cwd(),
@@ -182,7 +203,7 @@ async def _resolve_repo_context(repo: str | None = None) -> Any:
             fts=_state._fts,
             vector_store=_state._vector_store,
             decision_store=_state._decision_store,
-            vector_store_ready=_state._vector_store_ready or __import__("asyncio").Event(),
+            vector_store_ready=ready,
             _engine=None,
         )
 
