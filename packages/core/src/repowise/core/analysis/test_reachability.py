@@ -162,6 +162,7 @@ from repowise.core.analysis.execution_graph import (
     file_of_symbol,
 )
 from repowise.core.ingestion.models import EXECUTION_EDGE_TYPES, FILE_DEPENDENCY_EDGE_TYPES
+from repowise.core.persistence.batches import chunked
 from repowise.core.persistence.models import GraphNode
 from repowise.core.test_paths import paired_test_names
 
@@ -498,10 +499,9 @@ async def tests_reaching_by_tier(
     Both walks are attributed: they run backwards from the targets carrying the
     seed each visited node came from, so the answer says *which* target each
     test guards rather than only that some test does. That is why these are
-    separate walks rather than a filter over the forward one, and it stays cheap
-    because the seed set is a change's files, not the repository - one ``IN``
-    query per level, which is the shape ``pr_blast._transitive_affected``
-    already uses.
+    separate walks rather than a filter over the forward one. Each level reads
+    only its frontier, in bounded ``IN`` batches so a large file or repository
+    cannot exceed SQL bind limits.
     """
     seeds = sorted({t for t in targets if t})
     if not seeds:
@@ -665,35 +665,36 @@ async def imported_names_by_test(
 ) -> dict[str, dict[str, frozenset[str]]]:
     """The names each test file imports from each of *files*, keyed by file then test.
 
-    An empty set is an import of the module itself. One query, one hop: what a
-    test names, not what it reaches.
+    An empty set is an import of the module itself. Bounded queries, one hop:
+    what a test names, not what it reaches.
     """
     targets = sorted({path for path in files if path})
     if not targets or not test_files:
         return {}
-    params: dict[str, Any] = {"repo_id": repo_id}
-    tgt = _in_clause("p", targets, params)
-    ets = _in_clause("e", sorted(FILE_DEPENDENCY_EDGE_TYPES), params)
-    rows = await session.execute(
-        text(
-            "SELECT source_node_id, target_node_id, imported_names_json FROM graph_edges "
-            "WHERE repository_id = :repo_id "
-            f"AND target_node_id IN ({tgt}) AND edge_type IN ({ets})"
-        ),
-        params,
-    )
     out: dict[str, dict[str, frozenset[str]]] = {}
-    for source, target, names_json in rows:
-        if source not in test_files:
-            continue
-        try:
-            names = json.loads(names_json or "[]")
-        except (TypeError, ValueError):
-            names = []
-        by_test = out.setdefault(target, {})
-        by_test[source] = by_test.get(source, frozenset()) | frozenset(
-            name for name in names if isinstance(name, str)
+    for batch in chunked(targets):
+        params: dict[str, Any] = {"repo_id": repo_id}
+        tgt = _in_clause("p", list(batch), params)
+        ets = _in_clause("e", sorted(FILE_DEPENDENCY_EDGE_TYPES), params)
+        rows = await session.execute(
+            text(
+                "SELECT source_node_id, target_node_id, imported_names_json FROM graph_edges "
+                "WHERE repository_id = :repo_id "
+                f"AND target_node_id IN ({tgt}) AND edge_type IN ({ets})"
+            ),
+            params,
         )
+        for source, target, names_json in rows:
+            if source not in test_files:
+                continue
+            try:
+                names = json.loads(names_json or "[]")
+            except (TypeError, ValueError):
+                names = []
+            by_test = out.setdefault(target, {})
+            by_test[source] = by_test.get(source, frozenset()) | frozenset(
+                name for name in names if isinstance(name, str)
+            )
     return out
 
 
@@ -776,18 +777,21 @@ async def _edges_from(
     """``(source, target)`` pairs leaving *sources* along *edge_types*."""
     if not sources:
         return []
-    params: dict[str, Any] = {"repo_id": repo_id}
-    src = _in_clause("s", sources, params)
-    ets = _in_clause("e", edge_types, params)
-    rows = await session.execute(
-        text(
-            "SELECT DISTINCT source_node_id, target_node_id FROM graph_edges "
-            "WHERE repository_id = :repo_id "
-            f"AND source_node_id IN ({src}) AND edge_type IN ({ets})"
-        ),
-        params,
-    )
-    return [(s, t) for s, t in rows]
+    out: list[tuple[str, str]] = []
+    for batch in chunked(list(dict.fromkeys(sources))):
+        params: dict[str, Any] = {"repo_id": repo_id}
+        src = _in_clause("s", list(batch), params)
+        ets = _in_clause("e", edge_types, params)
+        rows = await session.execute(
+            text(
+                "SELECT DISTINCT source_node_id, target_node_id FROM graph_edges "
+                "WHERE repository_id = :repo_id "
+                f"AND source_node_id IN ({src}) AND edge_type IN ({ets})"
+            ),
+            params,
+        )
+        out.extend((s, t) for s, t in rows)
+    return out
 
 
 async def _edges_into(
@@ -799,31 +803,31 @@ async def _edges_into(
 ) -> list[tuple[str, str]]:
     """``(source, target)`` pairs arriving at *targets* along *edge_types*.
 
-    Raw text SQL with an ``IN`` list, matching ``pr_blast._transitive_affected``:
-    the edge table is the one place a per-level parameterised ``IN`` beats
-    loading every row, and the two walks should not disagree about how they read
-    it.
+    Bounded ``IN`` batches read the frontier without loading the whole edge
+    table. Deduplicate inputs before batching to preserve global DISTINCT.
     """
     if not targets:
         return []
-    params: dict[str, Any] = {"repo_id": repo_id}
-    tgt = _in_clause("p", targets, params)
-    ets = _in_clause("e", edge_types, params)
-    origin_filter = ""
-    if excluded_origins:
-        # NULL means the row predates the vocabulary, not "unknown", so it has
-        # to survive the filter, and a bare NOT IN would drop it.
-        bad = _in_clause("o", sorted(excluded_origins), params)
-        origin_filter = f" AND (resolution_origin IS NULL OR resolution_origin NOT IN ({bad}))"
-    rows = await session.execute(
-        text(
-            "SELECT DISTINCT source_node_id, target_node_id FROM graph_edges "
-            "WHERE repository_id = :repo_id "
-            f"AND target_node_id IN ({tgt}) AND edge_type IN ({ets}){origin_filter}"
-        ),
-        params,
-    )
-    return [(s, t) for s, t in rows]
+    out: list[tuple[str, str]] = []
+    for batch in chunked(list(dict.fromkeys(targets))):
+        params: dict[str, Any] = {"repo_id": repo_id}
+        tgt = _in_clause("p", list(batch), params)
+        ets = _in_clause("e", edge_types, params)
+        origin_filter = ""
+        if excluded_origins:
+            # NULL predates the vocabulary and must survive the origin filter.
+            bad = _in_clause("o", sorted(excluded_origins), params)
+            origin_filter = f" AND (resolution_origin IS NULL OR resolution_origin NOT IN ({bad}))"
+        rows = await session.execute(
+            text(
+                "SELECT DISTINCT source_node_id, target_node_id FROM graph_edges "
+                "WHERE repository_id = :repo_id "
+                f"AND target_node_id IN ({tgt}) AND edge_type IN ({ets}){origin_filter}"
+            ),
+            params,
+        )
+        out.extend((s, t) for s, t in rows)
+    return out
 
 
 def rank_tests(target: str, tests: Collection[str]) -> list[str]:
