@@ -6,6 +6,7 @@ import json
 from typing import Any
 
 from repowise.core.analysis.decisions.lifecycle import status_rank
+from repowise.core.analysis.decisions.scope import binds_to_paths
 from repowise.server.mcp_server._why_evidence import (
     decision_collapse_key,
 )
@@ -33,6 +34,8 @@ def _score_keyword_matches(
 
     scored_decisions: list[tuple[float, float, int, Any]] = []
     for d in all_decisions:
+        if _scope_conflicts_with_targets(d, target_set):
+            continue
         # Every record must clear the floor on what it says about the question;
         # naming a target only boosts the tie-break, never bypasses the floor.
         score = relevance(texts[id(d)], idf)
@@ -50,6 +53,29 @@ def _score_keyword_matches(
     return [((t[0], t[1], t[2]), t[3]) for t in scored_decisions]
 
 
+def _scope_conflicts_with_targets(record: Any, targets: set[str]) -> bool:
+    """Whether an explicit binding scope excludes every requested target.
+
+    Missing scope and nonbinding footprints cannot establish a contradiction.
+    Keep the full corpus for IDF: eligibility must not recalibrate the floor.
+    Directory targets intersect their descendants, on whole path boundaries.
+    """
+    if not targets or not binds_to_paths(getattr(record, "scope_basis", None)):
+        return False
+    files = json.loads(record.affected_files_json)
+    modules = json.loads(record.affected_modules_json)
+    if not files and not modules:
+        return False
+    return not any(
+        path == target
+        or path.startswith(target.rstrip("/") + "/")
+        or (is_module and target.startswith(path.rstrip("/") + "/"))
+        for target in targets
+        for paths, is_module in ((files, False), (modules, True))
+        for path in paths
+    )
+
+
 def _rank_keyword_matches(all_decisions: list, query: str, target_set: set[str]) -> list:
     """Records relevant enough to serve, best-first. Empty when none are.
 
@@ -61,6 +87,7 @@ def _rank_keyword_matches(all_decisions: list, query: str, target_set: set[str])
     gate would serve weak confirmed matches ahead of the relevant proposed ones.
 
     Records below the floor are dropped, so an empty return is an honest miss.
+    With targets, a binding scope explicitly naming other files is ineligible.
     The pool is wider than the serving cap because restatements collapse
     downstream.
     """

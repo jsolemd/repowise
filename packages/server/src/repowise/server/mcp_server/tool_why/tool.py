@@ -59,7 +59,8 @@ async def get_why(
 
     Args:
         query: question, file/module path, or omit for the dashboard.
-        targets: optional file paths to anchor the search, or to ask about on
+        targets: optional file paths to anchor the search, excluding records
+            explicitly scoped elsewhere, or to ask about on
             their own when there is no query.
         repo: usually omitted.
         id: decision or ``ev_...`` evidence id emitted by this or another tool.

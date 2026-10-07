@@ -48,6 +48,7 @@ from repowise.server.mcp_server.tool_why.ranking import (
     _collapse_restatements,
     _rank_keyword_matches,
     _record_text,
+    _scope_conflicts_with_targets,
 )
 
 
@@ -288,6 +289,17 @@ async def _why_search(
             query, targets, ctx, repository, all_decisions, accepted, collapsed, collector
         )
     decision_results, doc_results = await _semantic_lanes(ctx, query)
+    if target_set:
+        excluded_ids = {
+            record.id
+            for record in all_decisions
+            if _scope_conflicts_with_targets(record, target_set)
+        }
+        decision_results = [
+            hit
+            for hit in decision_results
+            if hit.page_id[len(DECISION_VECTOR_PREFIX) :] not in excluded_ids
+        ]
     lineage_by_id = await _lineage_for_matches(
         ctx, [d for d, _ in collapsed], all_decisions
     )

@@ -1018,6 +1018,13 @@ Architectural decision intelligence. Falls back to git archaeology when no decis
 3. **Health dashboard**: no `query`: `get_why()` -> stale decisions, conflicts, ungoverned hotspots, retired records and accepted records that name no file.
 4. **Reference lookup**: pass `id`: `get_why(id="ev_...")` -> the exact evidence and supporting decision in one call.
 
+An anchored question excludes records whose explicit binding file/module scope
+does not intersect any target, including known semantic hits in the supporting
+expansion. Repository-wide agreements, unscoped records and nonbinding
+footprints remain searchable. Keyword-ranked records must still clear the same
+question-relevance floor; naming a target cannot make an unrelated text answer.
+The returned record `confidence` describes that record, not query relevance.
+
 **Returns:** Matching decision records with title, rationale, alternatives considered, affected files, staleness score. Health mode returns stale decisions, conflicts, ungoverned hotspots, `retired_decisions` and `unscoped_decisions`.
 
 Two health-mode lanes `counts` reported as a bare number now name their records: `retired_decisions` (superseded, deprecated, dismissed — each row carries its `lane`) and `unscoped_decisions` (accepted records naming no file). Five rows each, ranked, remainder in `_meta.omitted`; full sizes stay in `counts`, split across the three status keys for the retired lane. `active` stays count-only.
