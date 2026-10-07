@@ -210,11 +210,18 @@ def test_card_keeps_the_keyless_note(tmp_path, monkeypatch):
 
 def _broken_store(monkeypatch):
     from repowise.core.persistence.vector_store import LanceDBVectorStore
+    from repowise.core.providers.embedding.ollama import OllamaEmbedder
 
     async def _boom(self, items):
         raise RuntimeError("LanceDB is missing or broken (AttributeError: connect_async)")
 
+    async def _source_failure(self, texts):
+        raise ConnectionRefusedError("injected source embedding failure")
+
     monkeypatch.setattr(LanceDBVectorStore, "embed_batch", _boom)
+    # Source publication uses its own embedder. Exercise its real failure and
+    # retry path without waiting on an unavailable network endpoint.
+    monkeypatch.setattr(OllamaEmbedder, "embed", _source_failure)
 
 
 def test_init_with_a_real_embedder_exits_nonzero_when_embedding_fails(tmp_path, monkeypatch):
@@ -345,7 +352,11 @@ def test_reindex_clears_the_unavailable_stamp(tmp_path, monkeypatch):
     repowise_dir.mkdir()
     save_state(
         tmp_path,
-        {"index_scope": {"search": {"semantic": "unavailable", "next_command": "repowise reindex"}}},
+        {
+            "index_scope": {
+                "search": {"semantic": "unavailable", "next_command": "repowise reindex"}
+            }
+        },
     )
 
     async def _seed():
@@ -371,7 +382,9 @@ def test_reindex_clears_the_unavailable_stamp(tmp_path, monkeypatch):
 
     asyncio.run(_seed())
     monkeypatch.setattr(
-        reindex_cmd, "get_db_url_for_repo", lambda p: f"sqlite+aiosqlite:///{repowise_dir / 'wiki.db'}"
+        reindex_cmd,
+        "get_db_url_for_repo",
+        lambda p: f"sqlite+aiosqlite:///{repowise_dir / 'wiki.db'}",
     )
 
     asyncio.run(reindex_cmd._reindex(tmp_path, "openai", 8))

@@ -22,7 +22,13 @@ from repowise.server.app import _build_embedder, _build_query_embedder
 
 @pytest.fixture(autouse=True)
 def _clean_embedder_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    for key in ("REPOWISE_EMBEDDER", "REPOWISE_EMBEDDING_MODEL", "EDENAI_API_KEY"):
+    for key in (
+        "REPOWISE_EMBEDDER",
+        "REPOWISE_EMBEDDING_MODEL",
+        "REPOWISE_EMBEDDING_DIMS",
+        "REPOWISE_EMBEDDING_DECLARED_DIMS",
+        "EDENAI_API_KEY",
+    ):
         monkeypatch.delenv(key, raising=False)
 
 

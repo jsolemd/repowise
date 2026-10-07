@@ -56,6 +56,9 @@ class _FakeAsyncClient:
 
 @pytest.fixture(autouse=True)
 def _reset_fake_client(monkeypatch: pytest.MonkeyPatch):
+    # Default-width tests must not inherit the host's deployed embedding recipe.
+    monkeypatch.delenv("REPOWISE_EMBEDDING_DIMS", raising=False)
+    monkeypatch.delenv("OLLAMA_EMBEDDING_DIMS", raising=False)
     monkeypatch.delenv("OLLAMA_EMBEDDING_NUM_THREAD", raising=False)
     _FakeAsyncClient.calls = []
     _FakeAsyncClient.response_data = {"embeddings": [[1.0, 0.0]]}

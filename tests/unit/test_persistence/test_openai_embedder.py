@@ -15,6 +15,14 @@ pytest.importorskip("openai", reason="openai SDK not installed")
 from repowise.core.providers.embedding.openai import OpenAIEmbedder, _token_counter_for
 from repowise.core.source_search.chunks import TRUNCATION_MARKER
 
+
+@pytest.fixture(autouse=True)
+def _clean_embedding_width_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Provider defaults are independent of the host's deployed embedding width."""
+    monkeypatch.delenv("REPOWISE_EMBEDDING_DIMS", raising=False)
+    monkeypatch.delenv("REPOWISE_EMBEDDING_DECLARED_DIMS", raising=False)
+
+
 # ---------------------------------------------------------------------------
 # Construction
 # ---------------------------------------------------------------------------

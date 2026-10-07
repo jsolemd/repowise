@@ -14,6 +14,13 @@ pytest.importorskip("openai", reason="openai SDK not installed")
 
 from repowise.core.providers.embedding.edenai import EdenAIEmbedder
 
+
+@pytest.fixture(autouse=True)
+def _clean_embedding_width_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Provider defaults are independent of the host's deployed embedding width."""
+    monkeypatch.delenv("REPOWISE_EMBEDDING_DIMS", raising=False)
+
+
 # ---------------------------------------------------------------------------
 # Construction
 # ---------------------------------------------------------------------------

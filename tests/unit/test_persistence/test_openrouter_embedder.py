@@ -14,6 +14,13 @@ pytest.importorskip("openai", reason="openai SDK not installed")
 
 from repowise.core.providers.embedding.openrouter import OpenRouterEmbedder
 
+
+@pytest.fixture(autouse=True)
+def _clean_embedding_width_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Provider defaults are independent of the host's deployed embedding width."""
+    monkeypatch.delenv("REPOWISE_EMBEDDING_DIMS", raising=False)
+
+
 # ---------------------------------------------------------------------------
 # Construction
 # ---------------------------------------------------------------------------
@@ -170,4 +177,3 @@ async def test_embed_raises_when_api_returns_wrong_width():
 async def test_embed_width_check_not_triggered_on_empty():
     emb = OpenRouterEmbedder(api_key="k")
     assert await emb.embed([]) == []
-
