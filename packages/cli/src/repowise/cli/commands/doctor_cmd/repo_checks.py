@@ -130,7 +130,7 @@ def _stale_page_guidance(counts: dict[str, int]) -> str:
 
 
 async def _all_pages_for_reconciliation(session: object, repo_id: str) -> list:
-    """Every page this repository has, for reconciling against the indexes.
+    """Every live page this repository has, for reconciling against the indexes.
 
     The reconciliation asks which store entries have no page behind them, so
     anything it cannot see it calls an orphan. It read the pages through
@@ -153,7 +153,8 @@ async def _all_pages_for_reconciliation(session: object, repo_id: str) -> list:
 
     result = await session.execute(  # type: ignore[attr-defined]
         select(Page.id, Page.content, Page.digest, Page.metadata_json, Page.target_path).where(
-            Page.repository_id == repo_id
+            Page.repository_id == repo_id,
+            Page.freshness_status != "tombstone",
         )
     )
     return list(result.all())
@@ -547,7 +548,9 @@ def _run_repo_checks(
                             store_open_fix_hint,
                         )
 
-                        vs_error = f"{type(exc).__name__}: {exc}; to fix: {store_open_fix_hint(exc)}"
+                        vs_error = (
+                            f"{type(exc).__name__}: {exc}; to fix: {store_open_fix_hint(exc)}"
+                        )
 
                 # An index on disk that holds none of the indexable pages is
                 # every one of them missing. Only no index at all (fast mode,
@@ -561,7 +564,7 @@ def _run_repo_checks(
                     fts_ids = await fts.list_indexed_ids()
                 except Exception:
                     fts_ids = set()
-                m_fts = indexable_ids - fts_ids if fts_ids else set()
+                m_fts = indexable_ids - fts_ids
                 o_fts = fts_ids - sql_ids if fts_ids else set()
 
                 await engine.dispose()
@@ -842,187 +845,219 @@ def _run_repo_checks(
     else:
         console.print("[bold yellow]Some checks failed.[/bold yellow]")
 
-    # --repair: fix detected mismatches
+    # --repair: diagnostics are a snapshot, never deletion authority. Every
+    # store write takes the native owner and rechecks committed live rows.
     has_mismatches = missing_from_fts or orphaned_fts or missing_from_vector or orphaned_vector
-    if repair and has_mismatches:
+    cleanup_warning = "Tombstone full-text removal"
+    old_scope = load_state(repo_path).get("index_scope") or {}
+    has_cleanup_warning = cleanup_warning in (old_scope.get("analysis") or {}).get(
+        "unavailable", []
+    ) or cleanup_warning in (load_state(repo_path).get("degraded") or [])
+    from repowise.core.pipeline.cleanup_debt import load_cleanup_debt
+
+    has_cleanup_debt = repair and any(load_cleanup_debt(repo_path).values())
+    if repair and (has_mismatches or has_cleanup_warning or has_cleanup_debt):
         console.print("\n[bold]Repairing store mismatches...[/bold]")
 
         async def _repair():
+            from sqlalchemy import select
+
             from repowise.core.persistence import (
                 FullTextSearch,
                 create_engine,
                 create_session_factory,
                 get_session,
             )
+            from repowise.core.persistence.information_floor import meets_information_floor
+            from repowise.core.persistence.models import Page
+            from repowise.core.pipeline.cleanup_debt import (
+                clear_cleanup_debt,
+                exclude_live_cleanup_ids,
+                load_cleanup_debt,
+                record_cleanup_debt,
+            )
 
-            url = get_db_url_for_repo(repo_path)
-            await reconcile_schema_best_effort(url)
-            engine = create_engine(url)
+            engine = create_engine(get_db_url_for_repo(repo_path))
             sf = create_session_factory(engine)
+            exclude_spec = build_exclude_spec(repo_path)
             repaired = 0
 
-            # Repair FTS: re-index missing pages, delete orphaned
-            if missing_from_fts or orphaned_fts:
+            async def missing_pages(ids, *, vectors=False):
+                # Re-read under native ownership: a page may have retired,
+                # become excluded/thin, or turned into a retryable stub since
+                # the diagnostic snapshot. Keep queries bounded too.
+                pages = []
+                ordered = sorted(ids)
+                async with get_session(sf) as session:
+                    for offset in range(0, len(ordered), 500):
+                        rows = await session.execute(
+                            select(Page).where(
+                                Page.id.in_(ordered[offset : offset + 500]),
+                                Page.freshness_status != "tombstone",
+                            )
+                        )
+                        pages.extend(
+                            p
+                            for p in rows.scalars()
+                            if meets_information_floor(p.content or "", digest=p.digest or "")
+                            and not is_excluded(
+                                (p.target_path or "").split("::", 1)[0], exclude_spec
+                            )
+                            and not (vectors and _is_stub_fallback_row(p))
+                        )
+                return pages
+
+            async def cleanup(store, kind, candidates):
+                # Both retries use the same native debt and live-authority
+                # check as indexing. A failure retains intent; a revived
+                # page or decision clears that intent without deletion.
+                ids = set(candidates) | load_cleanup_debt(repo_path)[kind]
+                record_cleanup_debt(repo_path, kind, ids)
+                ids = await exclude_live_cleanup_ids(repo_path, engine, ids)
+                present = await (
+                    store.list_indexed_ids() if kind == "fts" else store.list_page_ids()
+                )
+                await store.delete_many(sorted(ids & present))
+                clear_cleanup_debt(repo_path, kind, ids)
+                return len(ids & present)
+
+            try:
                 fts = FullTextSearch(engine)
                 try:
                     await fts.ensure_index()
                 except Exception as exc:
-                    # The schema upgrade is not what was asked for, and it must
-                    # not take the repair down with it. It used to: the upgrade
-                    # refused on a drifted store and the error it raised told
-                    # the user to run this very command (issue #1309), so the
-                    # only command that could fix the drift was the one the
-                    # drift killed. Both repairs below work on either column
-                    # set, so say what failed and carry on.
-                    console.print(
-                        f"  [yellow]Full-text index upgrade skipped: {exc}[/yellow]"
-                    )
-                # Orphans first, deliberately. Deleting one needs nothing but
-                # its page_id, so it works on any column set this class has
-                # ever written — including the one an upgrade just failed to
-                # leave behind. Re-indexing a missing page writes every column
-                # and would raise there, taking the repair that *can* run down
-                # with it.
-                if orphaned_fts:
-                    # One transaction for the lot. Per-id deletes cost a write
-                    # lock each, and the store that needs this most is the one
-                    # with thousands of them.
-                    await fts.delete_many(list(orphaned_fts))
-                    repaired += len(orphaned_fts)
-                if missing_from_fts:
-                    # Fetch full page data for missing pages
-                    async with get_session(sf) as session:
-                        from sqlalchemy import select
-
-                        from repowise.core.persistence.models import Page
-
-                        # Page's natural primary key is the column `id`; there
-                        # is no `page_id` attribute, so the old spelling raised
-                        # AttributeError and no repair ever ran.
-                        rows = await session.execute(
-                            select(Page).where(Page.id.in_(list(missing_from_fts)))
-                        )
-                        # ORM rows key on ``id``, not ``page_id``, so they go
-                        # to index_many as tuples rather than to index_pages.
-                        batch = [
-                            (p.id, p.title, p.content, p.summary, p.target_path, p.digest)
-                            for p in rows.scalars().all()
-                        ]
-                        await fts.index_many(batch)
-                        repaired += len(batch)
-
-            # Repair vector store: re-embed missing pages, delete orphaned
-            lance_dir = repowise_dir / "lancedb"
-            if lance_dir.exists() and (missing_from_vector or orphaned_vector):
+                    # Old-column deletes still work when widening the index
+                    # fails. Keep retirement independent of schema repair.
+                    console.print(f"  [yellow]Full-text index upgrade skipped: {exc}[/yellow]")
                 try:
-                    from repowise.cli.providers import (
-                        build_embedder,
-                        build_vector_store,
-                        resolve_embedder_for_repo,
-                    )
-
-                    # Repair with the embedder that built this store, not a
-                    # hardcoded mock. The mock was chosen to avoid API costs,
-                    # but writing its 8-wide vectors into a real table makes
-                    # LanceDB drop the table: a repair that deletes the index
-                    # it was asked to fix. build_vector_store refuses that
-                    # combination and returns None, so a repo whose embedder is
-                    # unavailable is left alone instead of wrecked.
-                    embedder_name = resolve_embedder_for_repo(repo_path)
-                    embedder = build_embedder(embedder_name, repo_path)
-                    vs = build_vector_store(_DoctorPath(repo_path), embedder)
-                    if vs is None:
-                        raise RuntimeError(
-                            "no embedder available that can write this store; "
-                            "set an embedder key and run `repowise reindex`"
-                        )
-                    # This repair has never actually run (it raised on a column
-                    # that does not exist), so a hosted embedder here is a new
-                    # charge on a command people run to diagnose, not to spend.
-                    # Say so. It is bounded by the missing pages, not the wiki.
-                    reindex_instead = (
-                        bool(missing_from_vector) and embedder_name != "mock" and vector_store_empty
-                    )
-                    if reindex_instead:
-                        console.print(
-                            f"  [yellow]The vector store is empty: {len(missing_from_vector)} "
-                            f"page(s) need embedding with {embedder_name}. Not starting a "
-                            "paid re-embed of the whole wiki from doctor; run "
-                            "`repowise reindex` to do it.[/yellow]"
-                        )
-                    elif missing_from_vector and embedder_name != "mock":
-                        console.print(
-                            f"  [dim]Embedding {len(missing_from_vector)} missing "
-                            f"page(s) with {embedder_name}.[/dim]"
-                        )
-
-                    if missing_from_vector and not reindex_instead:
+                    repaired += await cleanup(fts, "fts", orphaned_fts)
+                    pages = await missing_pages(missing_from_fts - await fts.list_indexed_ids())
+                    batch = [
+                        (p.id, p.title, p.content, p.summary, p.target_path, p.digest)
+                        for p in pages
+                    ]
+                    await fts.index_many(batch)
+                    repaired += len(batch)
+                    # Clear only this managed failure, after independently
+                    # proving no retired/orphan FTS row or FTS debt remains.
+                    if has_cleanup_warning and not load_cleanup_debt(repo_path)["fts"]:
+                        indexed = await fts.list_indexed_ids()
                         async with get_session(sf) as session:
-                            from sqlalchemy import select
-
-                            from repowise.core.persistence.models import Page
-                            from repowise.core.persistence.vector_store import embed_item
-
                             rows = await session.execute(
-                                select(Page).where(Page.id.in_(list(missing_from_vector)))
+                                select(Page.id).where(Page.freshness_status != "tombstone")
                             )
-                            for page in rows.scalars().all():
-                                if not (page.title or "").strip():
-                                    # A repair that writes an unfindable row is
-                                    # not a repair. Leave it reported as missing
-                                    # rather than filling the gap with a vector
-                                    # no search can reach by name.
-                                    console.print(
-                                        f"  [yellow]Skipped {page.id}: no title to "
-                                        f"index it by.[/yellow]"
-                                    )
-                                    continue
-                                # Same recipe as generation and ``reindex``, so a
-                                # repaired page is comparable with its neighbours
-                                # instead of being embedded on different terms.
-                                item = embed_item(
-                                    page.id,
-                                    title=page.title,
-                                    page_type=page.page_type or "",
-                                    target_path=page.target_path or "",
-                                    summary=page.summary or "",
-                                    content=page.content or "",
-                                    page_metadata=page.metadata_json,
-                                    digest=page.digest or "",
+                            live_ids = set(rows.scalars())
+                        if not (indexed - live_ids):
+                            from repowise.cli.helpers import load_config, save_state
+                            from repowise.core.index_scope import (
+                                resolve_index_scope,
+                                stamp_index_scope,
+                            )
+
+                            state = load_state(repo_path)
+                            if cleanup_warning in (state.get("degraded") or []):
+                                state["degraded"] = [
+                                    v for v in state["degraded"] if v != cleanup_warning
+                                ]
+                            scope = resolve_index_scope(state, load_config(repo_path))
+                            unavailable = scope["analysis"]["unavailable"]
+                            stamp_index_scope(
+                                state,
+                                load_config(repo_path),
+                                analysis={
+                                    "unavailable": [v for v in unavailable if v != cleanup_warning],
+                                },
+                            )
+                            save_state(repo_path, state)
+                except Exception as exc:
+                    console.print(f"[yellow]Full-text repair skipped: {exc}[/yellow]")
+
+                # Each store recovers independently; an FTS error must not
+                # strand missing live vectors or durable vector cleanup debt.
+                lance_dir = repowise_dir / "lancedb"
+                if lance_dir.exists() and (
+                    missing_from_vector
+                    or orphaned_vector
+                    or load_cleanup_debt(repo_path)["vectors"]
+                ):
+                    vs = None
+                    try:
+                        from repowise.cli.providers import (
+                            build_embedder,
+                            build_vector_store,
+                            resolve_embedder_for_repo,
+                        )
+                        from repowise.core.persistence.vector_store import embed_item
+
+                        embedder_name = resolve_embedder_for_repo(repo_path)
+                        embedder = build_embedder(embedder_name, repo_path)
+                        vs = build_vector_store(_DoctorPath(repo_path), embedder)
+                        if vs is None:
+                            raise RuntimeError(
+                                "no embedder available that can write this store; "
+                                "set an embedder key and run `repowise reindex`"
+                            )
+                        repaired += await cleanup(vs, "vectors", orphaned_vector)
+                        pages = await missing_pages(
+                            missing_from_vector - await vs.list_page_ids(), vectors=True
+                        )
+                        reindex_instead = (
+                            bool(pages) and embedder_name != "mock" and vector_store_empty
+                        )
+                        if reindex_instead:
+                            console.print(
+                                f"  [yellow]The vector store is empty: {len(pages)} "
+                                f"page(s) need embedding with {embedder_name}. Not starting a "
+                                "paid re-embed of the whole wiki from doctor; run "
+                                "`repowise reindex` to do it.[/yellow]"
+                            )
+                        elif pages and embedder_name != "mock":
+                            console.print(
+                                f"  [dim]Embedding {len(pages)} missing page(s) "
+                                f"with {embedder_name}.[/dim]"
+                            )
+                        for page in [] if reindex_instead else pages:
+                            if not (page.title or "").strip():
+                                console.print(
+                                    f"  [yellow]Skipped {page.id}: no title to index it by.[/yellow]"
                                 )
-                                if item is None:
-                                    # Below the information floor, so its absence
-                                    # from the store is correct and there is
-                                    # nothing to repair. Said out loud, because a
-                                    # page silently left missing by the repair
-                                    # reads as the repair having failed on it.
-                                    console.print(
-                                        f"  [dim]Left out {page.id}: too thin to index.[/dim]"
-                                    )
-                                    continue
+                                continue
+                            item = embed_item(
+                                page.id,
+                                title=page.title,
+                                page_type=page.page_type or "",
+                                target_path=page.target_path or "",
+                                summary=page.summary or "",
+                                content=page.content or "",
+                                page_metadata=page.metadata_json,
+                                digest=page.digest or "",
+                            )
+                            if item is not None:
                                 await vs.embed_and_upsert(*item)
                                 repaired += 1
+                    except Exception as exc:
+                        console.print(f"[yellow]Vector repair skipped: {exc}[/yellow]")
+                    finally:
+                        if vs is not None:
+                            await vs.close()
+                return repaired
+            finally:
+                await engine.dispose()
 
-                    for pid in orphaned_vector:
-                        await vs.delete(pid)
-                        repaired += 1
+        from repowise.core.update_lock import UpdateLockUnavailableError, strict_update_lock
 
-                    await vs.close()
-                except Exception as exc:
-                    console.print(f"[yellow]Vector repair skipped: {exc}[/yellow]")
-
-            await engine.dispose()
-            return repaired
-
-        repaired_count = run_async(_repair())
-        console.print(f"[bold green]Repaired {repaired_count} entries.[/bold green]")
+        try:
+            with strict_update_lock(repo_path):
+                repaired_count = run_async(_repair())
+            console.print(f"[bold green]Repaired {repaired_count} entries.[/bold green]")
+        except UpdateLockUnavailableError as exc:
+            console.print(f"[yellow]Store repair deferred: {exc}[/yellow]")
         if stale_count:
             console.print(f"[yellow]{_stale_page_guidance(stale_counts)}[/yellow]")
     elif repair and not has_mismatches and not registration_wedged and not agents_need_refresh:
         if stale_count:
             console.print(
-                f"[yellow]No store drift to repair. "
-                f"{_stale_page_guidance(stale_counts)}[/yellow]"
+                f"[yellow]No store drift to repair. {_stale_page_guidance(stale_counts)}[/yellow]"
             )
         else:
             console.print("[green]Nothing to repair.[/green]")

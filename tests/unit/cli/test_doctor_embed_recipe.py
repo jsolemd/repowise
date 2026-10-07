@@ -36,6 +36,12 @@ class _RecordingStore:
     async def delete(self, page_id: str) -> None:
         return None
 
+    async def delete_many(self, page_ids: list[str]) -> None:
+        assert not page_ids  # This fixture contains no retirement candidates.
+
+    async def list_page_ids(self) -> set[str]:
+        return {PAGE_IN_STORE} | {item[0] for item in self.items}
+
     async def close(self) -> None:
         return None
 

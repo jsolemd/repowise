@@ -156,7 +156,7 @@ class AtomicStorageCoordinator:
         page drift even though nothing is wrong with the pages (issue #374).
 
         This compares like with like:
-          * ``wiki_pages``        <-> page vectors  -> ``page_drift``
+          * live ``wiki_pages``   <-> page vectors  -> ``page_drift``
           * ``decision_records``  <-> decision vectors -> ``decision_drift``
 
         ``drift`` is kept as an alias of ``page_drift`` for backwards
@@ -176,7 +176,9 @@ class AtomicStorageCoordinator:
             "decision_drift": None,
         }
         try:
-            res = await self._session.execute(text("SELECT COUNT(*) FROM wiki_pages"))
+            res = await self._session.execute(
+                text("SELECT COUNT(*) FROM wiki_pages WHERE freshness_status != 'tombstone'")
+            )
             report["sql_pages"] = int(res.scalar() or 0)
         except Exception as e:
             report["sql_pages_error"] = str(e)

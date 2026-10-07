@@ -145,9 +145,7 @@ async def _stored_vocabulary(conn: Any, page_ids: Sequence[str]) -> dict[str, st
 # ``NOT EXISTS`` rather than ``NOT IN``: the subquery's column is a primary key
 # and can never be NULL today, but ``NOT IN`` returns no rows at all the day one
 # is, which would turn this into a silent no-op instead of a visible failure.
-_ORPHAN_PREDICATE = (
-    "NOT EXISTS (SELECT 1 FROM wiki_pages p WHERE p.id = page_fts.page_id)"
-)
+_ORPHAN_PREDICATE = "NOT EXISTS (SELECT 1 FROM wiki_pages p WHERE p.id = page_fts.page_id)"
 _ORPHAN_COUNT_SQL = f"SELECT count(*) FROM page_fts WHERE {_ORPHAN_PREDICATE}"
 _ORPHAN_DELETE_SQL = f"DELETE FROM page_fts WHERE {_ORPHAN_PREDICATE}"
 
@@ -316,7 +314,9 @@ class FullTextSearch:
 
             indexed_rows = await conn.execute(text("SELECT count(*) FROM page_fts"))
             indexed_count = int(indexed_rows.scalar() or 0)
-            page_rows = await conn.execute(text("SELECT count(*) FROM wiki_pages"))
+            page_rows = await conn.execute(
+                text("SELECT count(*) FROM wiki_pages WHERE freshness_status != 'tombstone'")
+            )
             page_count = int(page_rows.scalar() or 0)
             orphan_count = await self._count_orphans(conn)
 
@@ -366,7 +366,7 @@ class FullTextSearch:
                     "SELECT id, COALESCE(title,''), COALESCE(content,''), "
                     "       COALESCE(summary,''), COALESCE(target_path,''), "
                     f"      {_VOCABULARY_SQL}, COALESCE(digest,'') "
-                    "FROM wiki_pages"
+                    "FROM wiki_pages WHERE freshness_status != 'tombstone'"
                 )
             )
             written = await conn.execute(text("SELECT count(*) FROM page_fts"))
@@ -624,10 +624,12 @@ class FullTextSearch:
             async with self._engine.connect() as conn:
                 rows = await conn.execute(text("SELECT page_id FROM page_fts"))
                 return {r[0] for r in rows.fetchall()}
-        # PostgreSQL: all wiki_pages rows are automatically indexed via GIN,
-        # so the set of "indexed" ids is all page ids in the table.
+        # PostgreSQL's GIN index shares the page rows. Retirement is enforced
+        # by the search predicate, so report its live searchable IDs here.
         async with self._engine.connect() as conn:
-            rows = await conn.execute(text("SELECT id FROM wiki_pages"))
+            rows = await conn.execute(
+                text("SELECT id FROM wiki_pages WHERE freshness_status != 'tombstone'")
+            )
             return {r[0] for r in rows.fetchall()}
 
     async def search(
@@ -822,11 +824,12 @@ class FullTextSearch:
         if term:
             sql = (
                 f"SELECT count(*) FROM wiki_pages "
-                f"WHERE {PG_FTS_EXPRESSION} @@ to_tsquery('english', :q)"
+                f"WHERE freshness_status != 'tombstone' "
+                f"AND {PG_FTS_EXPRESSION} @@ to_tsquery('english', :q)"
             )
             params = {"q": _pg_term(term)}
         else:
-            sql = "SELECT count(*) FROM wiki_pages"
+            sql = "SELECT count(*) FROM wiki_pages WHERE freshness_status != 'tombstone'"
             params = {}
         try:
             row = await conn.execute(text(sql), params)
@@ -887,6 +890,7 @@ class FullTextSearch:
                         f"  ts_rank({PG_FTS_EXPRESSION}, to_tsquery('english', :q)) AS rank "
                         f"FROM wiki_pages "
                         f"WHERE {PG_FTS_EXPRESSION} @@ to_tsquery('english', :q) "
+                        f"  AND freshness_status != 'tombstone' "
                         f"  AND repository_id = :repo_id "
                         f"ORDER BY rank DESC "
                         f"LIMIT :lim",
@@ -900,6 +904,7 @@ class FullTextSearch:
                         f"  ts_rank({PG_FTS_EXPRESSION}, to_tsquery('english', :q)) AS rank "
                         f"FROM wiki_pages "
                         f"WHERE {PG_FTS_EXPRESSION} @@ to_tsquery('english', :q) "
+                        f"  AND freshness_status != 'tombstone' "
                         f"ORDER BY rank DESC "
                         f"LIMIT :lim",
                     ),

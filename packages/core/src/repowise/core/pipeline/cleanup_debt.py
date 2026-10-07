@@ -56,7 +56,7 @@ def clear_cleanup_debt(repo_path: Path, kind: str, page_ids: set[str]) -> None:
 async def exclude_live_cleanup_ids(
     repo_path: Path, engine: AsyncEngine, page_ids: set[str]
 ) -> set[str]:
-    """Keep restored pages out of post-commit index deletion.
+    """Keep restored pages and projection-owned decisions out of page deletion.
 
     Page IDs survive deletion and regeneration. Retry debt therefore records an
     intent to recheck, not unconditional permission to delete. Call only after
@@ -69,8 +69,11 @@ async def exclude_live_cleanup_ids(
 
     from repowise.core.persistence.models import Page
 
-    live: set[str] = set()
-    ids = sorted(page_ids)
+    # Decision projection publishes its vector before SQL commits and does
+    # not take the page writer lock. Absence from this snapshot therefore
+    # cannot authorize deleting a decision; its journal owns that lifecycle.
+    live = {pid for pid in page_ids if pid.startswith("decision:")}
+    ids = sorted(page_ids - live)
     async with engine.connect() as connection:
         for offset in range(0, len(ids), 500):
             rows = await connection.execute(
@@ -80,7 +83,7 @@ async def exclude_live_cleanup_ids(
                 )
             )
             live.update(rows.scalars())
-    # A committed live page invalidates both kinds of historical deletion debt.
+    # Live pages and decision-owned IDs invalidate both kinds of page debt.
     debt = load_cleanup_debt(repo_path)
     for kind in _KINDS:
         clear_cleanup_debt(repo_path, kind, live & debt[kind])

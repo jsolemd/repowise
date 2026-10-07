@@ -82,6 +82,24 @@ async def test_empty_cleanup_never_opens_authority(tmp_path):
     engine.connect.assert_not_called()
 
 
+async def test_decision_projection_owns_both_committed_and_inflight_vectors(
+    async_engine, async_session, tmp_path
+):
+    from repowise.core.persistence.models import DecisionRecord
+
+    repo = await insert_repo(async_session)
+    decision = DecisionRecord(
+        repository_id=repo.id, title="Keep it", decision="Retain this accepted record"
+    )
+    async_session.add(decision)
+    await async_session.commit()
+    live = f"decision:{decision.id}"
+    ids = {live, "decision:projection-not-committed-yet", "removed-page"}
+    record_cleanup_debt(tmp_path, "vectors", ids)
+    assert await exclude_live_cleanup_ids(tmp_path, async_engine, ids) == {"removed-page"}
+    assert load_cleanup_debt(tmp_path)["vectors"] == {"removed-page"}
+
+
 async def test_hostless_incremental_does_not_restore_cleared_debt(tmp_path):
     from types import SimpleNamespace
 
