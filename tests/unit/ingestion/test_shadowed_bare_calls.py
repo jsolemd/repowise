@@ -105,7 +105,8 @@ class TestTypeScript:
         assert _callees(tmp_path, files, "typescript", "_union") == set()
 
     def test_local_shadows_the_imported_function(self, tmp_path: Path, files) -> None:
-        assert _callees(tmp_path, files, "typescript", "withLocal") == set()
+        # The fork resolves a proven lexical callable while excluding the import.
+        assert _callees(tmp_path, files, "typescript", "withLocal") == {"api.ts::withLocal::helper"}
 
     def test_unshadowed_names_still_resolve(self, tmp_path: Path, files) -> None:
         assert _callees(tmp_path, files, "typescript", "plain") == {
@@ -168,7 +169,7 @@ class TestJavaScript:
         assert _callees(tmp_path, files, "javascript", "plain") == {"util.js::helper"}
 
     def test_a_later_function_declaration_is_hoisted(self, tmp_path: Path, files) -> None:
-        assert _callees(tmp_path, files, "javascript", "hoisted") == set()
+        assert _callees(tmp_path, files, "javascript", "hoisted") == {"api.js::hoisted::helper"}
 
     def test_a_declaration_hoists_only_into_its_own_function(self, tmp_path: Path, files) -> None:
         # `helper` is declared inside `later`, so `outer` still calls the import.

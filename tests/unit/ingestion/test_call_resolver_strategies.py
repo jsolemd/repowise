@@ -552,7 +552,7 @@ class TestFieldTypedReceiver:
         assert not [e for e in _edges(parsed, tmp_path) if e[3].startswith("receiver_field_")]
 
     def test_a_nested_class_field_types_its_receiver(self, tmp_path: Path) -> None:
-        """A nested class's id carries its outer class; its methods' ids do not."""
+        """Nested methods retain their complete lexical owner chain."""
         parsed = _parse_all(
             tmp_path,
             {
@@ -577,14 +577,16 @@ class TestFieldTypedReceiver:
             },
         )
         assert (
-            "p/Token.java::Chars::data",
+            "p/Token.java::Token::Chars::data",
             "p/TokenData.java::TokenData::set",
             0.90,
             "receiver_field_same_package",
         ) in _edges(parsed, tmp_path)
 
-    def test_two_nested_classes_sharing_a_name_type_no_field(self, tmp_path: Path) -> None:
-        """Both ``Holder.run`` bodies mint one id, so which class it is stays open."""
+    def test_two_nested_classes_sharing_a_name_resolve_their_own_fields(
+        self, tmp_path: Path
+    ) -> None:
+        """Exact parent identities keep same-named nested classes independent."""
         parsed = _parse_all(
             tmp_path,
             {
@@ -614,7 +616,20 @@ class TestFieldTypedReceiver:
                 ),
             },
         )
-        assert not [e for e in _edges(parsed, tmp_path) if e[3].startswith("receiver_field_")]
+        assert {e for e in _edges(parsed, tmp_path) if e[3].startswith("receiver_field_")} == {
+            (
+                "p/Pair.java::First::Holder::run",
+                "p/Finder.java::Finder::find",
+                0.90,
+                "receiver_field_same_package",
+            ),
+            (
+                "p/Pair.java::Second::Holder::run",
+                "p/Other.java::Other::find",
+                0.90,
+                "receiver_field_same_package",
+            ),
+        }
 
     def test_a_nested_class_reaches_an_inherited_method(self, tmp_path: Path) -> None:
         """The hierarchy is keyed on the nested class's own id, outer name and all."""
@@ -644,7 +659,7 @@ class TestFieldTypedReceiver:
             (rc.caller_id, rc.callee_id, rc.origin)
             for rc in resolver.resolve_file("Token.cs", parsed["Token.cs"].calls)
         ]
-        assert ("Token.cs::Chars::Clear", "Base.cs::Base::Reset", "self_inherited") in edges
+        assert ("Token.cs::Token::Chars::Clear", "Base.cs::Base::Reset", "self_inherited") in edges
 
 
 _GO_DETECT = (
@@ -1392,7 +1407,7 @@ class TestExternalReceiverType:
         caller = self._caller("", "Outer.Inner x) {\n        return x.get(0);")
         assert (
             "src/org/acme/Caller.java::Caller::run",
-            "src/org/acme/Outer.java::Inner::get",
+            "src/org/acme/Outer.java::Outer::Inner::get",
             0.90,
             "receiver_typed_same_package",
         ) in self._caller_edges(tmp_path, caller, **{"Outer.java": outer})

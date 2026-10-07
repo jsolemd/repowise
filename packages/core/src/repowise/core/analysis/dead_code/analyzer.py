@@ -1922,11 +1922,9 @@ class DeadCodeAnalyzer:
             # reported all three as unused. The set is shared with the
             # unused-export pass, so it also carries types this population can
             # never hold â€” a method or an interface is filtered out above.
-            # ``new X(..)`` lands on X's constructor (``path::X::X``) when X
-            # declares one, and constructing a type uses it.
-            if self._has_inbound_use(node) or self._has_inbound_use(
-                f"{file_path}::{sym_name}::{sym_name}"
-            ):
+            # ``new X(..)`` can land on X's constructor. Keep the type's exact
+            # parent/generic identity; _has_inbound_use also checks overloads.
+            if self._has_inbound_use(node) or self._has_inbound_use(f"{node}::{sym_name}"):
                 continue
 
             # Dispatch-table pattern: a private helper imported by name

@@ -171,7 +171,7 @@ class TestPartialFragmentScope:
         calls = _calls(_build(tmp_path), "Registry.cs::Registry::Get")
         assert calls == {
             # ``new GenericRegistry<TResult>(..)`` reaches the constructor.
-            "Registry.TResult.cs::GenericRegistry::GenericRegistry": "enclosing_class",
+            "Registry.TResult.cs::Registry::GenericRegistry::GenericRegistry": "enclosing_class",
             "Registry.TResult.cs::Registry::Helper": "enclosing_class",
             "Registry.TResult.cs::Registry::Other": "self_scope",
         }
@@ -305,6 +305,39 @@ class TestPartialFragmentScope:
         # C# methods are not judged by this pass; nested types are.
         assert flagged == {"Spare"}
 
+    def test_nested_overloaded_constructor_keeps_its_type_used(self, tmp_path: Path) -> None:
+        from repowise.core.analysis.dead_code import DeadCodeAnalyzer, DeadCodeKind
+
+        (tmp_path / "Registry.cs").write_text(_REGISTRY)
+        (tmp_path / "Registry.TResult.cs").write_text(
+            _REGISTRY_TRESULT.replace(
+                "public GenericRegistry(Registry owner) { }",
+                "public GenericRegistry() { }\n        public GenericRegistry(Registry owner) { }",
+            )
+        )
+        graph = _build(tmp_path)
+        type_id = "Registry.TResult.cs::Registry::GenericRegistry"
+        constructor = f"{type_id}::GenericRegistry#1"
+        assert graph.nodes[constructor]["parent_symbol_id"] == type_id
+        assert _calls(graph, "Registry.cs::Registry::Get") == {
+            constructor: "enclosing_class",
+            "Registry.TResult.cs::Registry::Helper": "enclosing_class",
+            "Registry.TResult.cs::Registry::Other": "self_scope",
+        }
+        report = DeadCodeAnalyzer(graph, git_meta_map={}).analyze(
+            {
+                "detect_unreachable_files": False,
+                "detect_unused_exports": False,
+                "detect_zombie_packages": False,
+                "min_confidence": 0.0,
+            }
+        )
+        assert {
+            finding.symbol_name
+            for finding in report.findings
+            if finding.kind == DeadCodeKind.UNUSED_INTERNAL
+        } == {"Spare"}
+
 
 class TestNestedTypeResolution:
     def test_outer_inner_type_ref_resolves(self, tmp_path: Path) -> None:
@@ -322,4 +355,3 @@ class TestNestedTypeResolution:
         edge = graph.get_edge_data("Report.cs", "Outer.cs")
         assert edge is not None
         assert edge["edge_type"] in ("imports", "type_use")
-

@@ -80,6 +80,19 @@ def test_a_constructor_overload_rescues_its_class() -> None:
     assert ("Spare", 30) in found
 
 
+def test_nested_constructor_use_preserves_generic_type_identity() -> None:
+    """A generic constructor keeps its own type live, not a same-name sibling."""
+    symbols = [
+        ("Outer::Inner", "Inner", "class", 3),
+        ("Outer::Inner`1", "Inner", "class", 10),
+        ("Outer::Inner`1::Inner#0", "Inner", "method", 11),
+        ("Outer::Inner`1::Inner#2", "Inner", "method", 12),
+        ("Spare", "Spare", "class", 30),
+    ]
+    found = _unused(_graph(symbols, [("src/Main.cs::Main::Run", "Outer::Inner`1::Inner#2")]))
+    assert found == [("Inner", 3), ("Spare", 30)]
+
+
 def test_a_call_to_one_cpp_overload_uses_the_exported_set() -> None:
     """C++ free functions are exports; a call to ``pad#3`` uses ``pad#1`` too."""
     g = nx.DiGraph()

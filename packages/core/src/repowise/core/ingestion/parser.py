@@ -1610,7 +1610,13 @@ class ASTParser:
             )
 
         return self._finalize_symbol_parentage(
-            symbols, symbol_nodes, config, file_info, src, cpp_exports.parents
+            symbols,
+            symbol_nodes,
+            config,
+            file_info,
+            src,
+            cpp_exports.parents,
+            cpp_exports.namespace_ids,
         )
 
     @staticmethod
@@ -1668,6 +1674,7 @@ class ASTParser:
         file_info: FileInfo,
         src: str,
         cpp_export_type_parents: dict[int, str] | None = None,
+        cpp_namespace_ids: frozenset[int] = frozenset(),
     ) -> list[Symbol]:
         """Classify lexical locals and assign exact immediate-parent IDs.
 
@@ -1700,6 +1707,12 @@ class ASTParser:
             represented_callable: int | None = None
             ancestor = node.parent
             while ancestor is not None:
+                # A namespace opened after a macro may parse as a function.
+                # The C++ recovery pass proves these are namespace scopes,
+                # so they neither own locals nor suppress their definitions.
+                if ancestor.id in cpp_namespace_ids:
+                    ancestor = ancestor.parent
+                    continue
                 candidate_index = by_node.get(ancestor.id)
                 if (
                     candidate_index is not None

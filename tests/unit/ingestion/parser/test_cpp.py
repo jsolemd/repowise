@@ -826,7 +826,7 @@ EXPORT_API const struct S *find_s(int a) { return nullptr; }
 
         assert {"make_s", "find_s"} <= names
 
-    def test_still_drops_a_function_nested_in_a_real_function(self, parser: ASTParser) -> None:
+    def test_keeps_exact_local_ownership_inside_a_real_function(self, parser: ASTParser) -> None:
         source = b"""MYLIB_API int outer() {
   struct Local { int f() { return 1; } };
   return Local().f();
@@ -835,7 +835,16 @@ EXPORT_API const struct S *find_s(int a) { return nullptr; }
         fi = _make_file_info("cpp_pkg/outer.cc", "cpp")
         result = parser.parse_file(fi, source)
 
-        assert [symbol.name for symbol in result.symbols if symbol.name == "f"] == []
+        # The fork retains addressable nested symbols, but they must remain
+        # local to the real callable rather than surfacing as module members.
+        symbols = {symbol.id: symbol for symbol in result.symbols}
+        outer = symbols["cpp_pkg/outer.cc::outer"]
+        local = symbols["cpp_pkg/outer.cc::outer::Local"]
+        method = symbols["cpp_pkg/outer.cc::outer::Local::f"]
+        assert local.visibility == method.visibility == "local"
+        assert local.parent_symbol_id == outer.id
+        assert method.parent_symbol_id == local.id
+        assert len([symbol for symbol in result.symbols if symbol.name == "f"]) == 1
 
     def test_preserves_conditional_export_macro_body_recovery(self, parser: ASTParser) -> None:
         fi = _make_file_info("cpp_pkg/conditional_options.hpp", "cpp")
