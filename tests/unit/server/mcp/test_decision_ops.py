@@ -166,11 +166,11 @@ def test_tool_guidance_preserves_explicit_authority_and_review_boundaries():
     from repowise.server.mcp_server.tool_decisions import manage_decision
 
     guidance = " ".join((manage_decision.__doc__ or "").split())
-    assert "always lands ``proposed``" in guidance
+    assert "``record`` creates ``proposed``" in guidance
     assert "explicit user instruction or applicable standing delegation" in guidance
-    assert "review-only tasks authorize no writes" in guidance
+    assert "review-only tasks permit no writes" in guidance
     assert "actual actor" in guidance
-    assert "not stored in the journal row" in guidance
+    assert "``actor`` is logged, not stored" in guidance
 
 
 @pytest.mark.asyncio

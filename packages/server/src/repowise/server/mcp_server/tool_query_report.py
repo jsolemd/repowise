@@ -108,15 +108,15 @@ async def get_query_quality(
 
     ``report`` buckets the agents' searches in the source-search query log into
     no-match, low-confidence, wrong-owner and error, with counts, rates, a trend
-    and the worst offenders in each. Suite runs and clients that are not agents,
-    such as health probes, are counted under ``traffic`` and kept out of the rates. Rows it could not use are declared in ``caveats``,
-    never dropped. ``export`` turns one bucket into fixture cases; where the log
+    and worst offenders. Suite runs and non-agent clients, including health probes,
+    appear under ``traffic`` and stay out of the rates. Unusable rows are declared
+    in ``caveats``, never dropped. ``export`` turns one bucket into fixture cases; where the log
     does not establish the right answer the case is ``expect.kind = "todo"`` and
     reports as pending. ``run`` executes a written suite; pending never fails.
 
     Args:
         mode: ``report`` (default), ``export`` or ``run``.
-        bucket: Which bucket to export. Required for export mode.
+        bucket: Bucket to export (required in export mode).
         window: Trend granularity — ``hour``, ``day`` (default) or ``week``.
         intent: ``goal`` (default) asserts the behaviour after the fix, so the
             suite is red until retrieval improves. ``guard`` asserts today's
@@ -124,8 +124,7 @@ async def get_query_quality(
         limit: Offenders per bucket in report mode; cases in export mode.
         write_to: Filename for the exported suite. Writes are confined to the
             repository's ``.repowise/source_search/eval/`` directory.
-        suite: Filename of the suite to execute. Required for run mode, read
-            from that same directory.
+        suite: Suite filename, required for run mode; read from the same directory.
         verdicts: Filename of a JSON object mapping query to correct owner,
             read from that same directory. Turns wrong-owner from an inference
             into a measurement.

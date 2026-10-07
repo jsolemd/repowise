@@ -2126,8 +2126,8 @@ async def test_meta_omits_the_commit_when_no_row_records_one(setup_mcp, health_d
     assert analysis["status"] == "provenance_unknown"
     assert analysis["reason"] == "analysis_commit_not_recorded"
     assert analysis["refresh"] == {
-        "command": "repowise update",
-        "precondition": "commit health-relevant working-tree changes first",
+        "command": "repowise update --include-working-tree",
+        "precondition": "save health-relevant working-tree changes",
         "required_before_comparison": True,
     }
 

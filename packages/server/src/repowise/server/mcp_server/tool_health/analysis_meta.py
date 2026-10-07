@@ -92,8 +92,8 @@ def _write_health_analysis_meta(
             "source_bytes_verified": False,
         },
         "refresh": {
-            "command": "repowise update",
-            "precondition": "commit health-relevant working-tree changes first",
+            "command": "repowise update --include-working-tree",
+            "precondition": "save health-relevant working-tree changes",
             "required_before_comparison": True,
         },
     }

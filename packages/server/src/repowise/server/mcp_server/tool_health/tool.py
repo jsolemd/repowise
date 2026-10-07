@@ -149,7 +149,7 @@ async def get_health(
 
     No ``targets``: a dashboard led by ``fix_first``, what to fix first;
     targets rank files and findings.
-    Stored analysis: refresh with ``repowise update``.
+    Refresh with ``repowise update --include-working-tree``.
     Reference: docs/agent/MCP_TOOLS.md.
 
     Args:
