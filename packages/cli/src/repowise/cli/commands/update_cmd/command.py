@@ -1124,8 +1124,6 @@ def run_update(
         and head == base_ref
         and not config_changed
         and not renderer_changed
-        and not source_recipe_changes
-        and not source_pending
         and not parser_refresh_required
         and not prune_retry
         and not working_tree_diffs
@@ -1136,6 +1134,9 @@ def run_update(
     extraction_changed = git_is_current and parser_changed(repo_path)
     if extraction_changed:
         git_is_current = False
+    # Source publication prevents a no-op, but its separate retry queue must
+    # not suppress invalidation of stale graph edges in an otherwise idle repo.
+    git_is_current = git_is_current and not (source_recipe_changes or source_pending)
     if analyzer_changed or extraction_changed:
         # Not a code change, but every stored score or edge is a release behind.
         # Falls through to the re-parse below, which re-scores from the graph it
