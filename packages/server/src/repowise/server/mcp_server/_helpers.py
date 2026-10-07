@@ -218,8 +218,9 @@ async def _resolve_repo_context(repo: str | None = None) -> Any:
 
 
 async def _resolve_all_contexts() -> list[Any]:
-    """Return ``RepoContext`` objects for all repos in the workspace.
+    """Return contexts eligible for ``repo='all'`` federation.
 
+    Discovery still lists scoped-only members; an explicit alias can read them.
     In single-repo mode, returns a single-element list wrapping ``_state``.
     """
     registry = _state._registry
@@ -227,7 +228,7 @@ async def _resolve_all_contexts() -> list[Any]:
         ctx = await _resolve_repo_context(None)
         return [ctx]
     contexts = []
-    for alias in registry.get_all_aliases():
+    for alias in registry.get_federated_aliases():
         contexts.append(await registry.get(alias))
     return contexts
 

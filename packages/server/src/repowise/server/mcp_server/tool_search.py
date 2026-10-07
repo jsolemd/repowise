@@ -1303,7 +1303,7 @@ async def _structured_search(
             results = [item for item in results if hit_file_path(item)]
 
     repository = None
-    if not multi:
+    if len(contexts) == 1:
         async with get_session(contexts[0].session_factory) as session:
             repository = await _get_repo(session)
 

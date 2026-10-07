@@ -506,6 +506,31 @@ async def test_native_failed_scope_discloses_fallback_and_repair(native_workspac
     assert "retrieval_degraded" not in recovered["_meta"]
 
 
+async def test_native_federation_names_only_failed_participants(native_workspace):
+    from repowise.server.mcp_server import _state, search_codebase
+
+    _, loaded = native_workspace
+    _state._vector_store_errors.update({"bad": "bad index failed", "private": "private failed"})
+    response = await search_codebase(_QUERY, repo="all")
+    assert response["_meta"]["retrieval_degraded_repos"] == {"bad": "bad index failed"}
+    assert any(row["repo"] == "good" and "vector" in row["sources"] for row in response["results"])
+    assert "private" not in loaded
+    # Discovery and explicit access remain available for scoped-only members.
+    assert "private" in _state._registry.get_all_aliases()
+    await search_codebase(_QUERY, repo="private")
+    assert "private" in loaded
+
+
+async def test_native_federation_ignores_an_excluded_member_failure(native_workspace):
+    from repowise.server.mcp_server import _state, search_codebase
+
+    _state._vector_store_errors["private"] = "private index failed"
+    response = await search_codebase(_QUERY, repo="all")
+    assert response["_meta"]["embedder_degraded"] is False
+    assert "retrieval_degraded" not in response["_meta"]
+    assert {row["repo"] for row in response["results"]} == {"good", "bad"}
+
+
 async def test_loading_native_store_is_not_a_settled_empty_index(monkeypatch):
     from repowise.server.mcp_server import _state
 
@@ -547,3 +572,15 @@ async def test_embedded_settled_store_does_not_invent_a_background_load(setup_mc
     tool_search._begin_retrieval_record()
     await tool_search._safe_vector(ctx, "q", 5)
     assert tool_search._retrieval_disclosure() == {}
+
+
+@pytest.mark.parametrize("mode", ["symbol", "path", "hybrid"])
+async def test_native_all_without_participating_members_is_empty(native_workspace, mode):
+    from repowise.server.mcp_server import _state, search_codebase
+
+    _, loaded = native_workspace
+    _state._registry.get_federated_aliases = lambda: []
+    response = await search_codebase(_QUERY, repo="all", mode=mode)
+    assert response["results"] == []
+    assert loaded == []
+    assert "error" not in response
