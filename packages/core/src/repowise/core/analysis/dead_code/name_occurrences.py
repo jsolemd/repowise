@@ -742,13 +742,15 @@ def drop_reference_assembly_api(
     neither the type nor the file declaring it is dead. *type_names* maps an
     unreachable file to the types it declares. Returns a new list.
     """
-    references = {p: b for p, b in source_map.items() if _is_reference_assembly(p)}
     names = {
         id(f): _type_names_of(f, type_names)
         for f in findings
         if f.file_path.endswith(".cs") and not _is_reference_assembly(f.file_path)
     }
-    if not references or not names:
+    if not names:
+        return findings
+    references = {p: b for p, b in source_map.items() if _is_reference_assembly(p)}
+    if not references:
         return findings
     listed = _writers(references, names)
     return [
