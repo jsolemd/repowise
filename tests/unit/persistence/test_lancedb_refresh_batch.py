@@ -194,3 +194,22 @@ async def test_an_ephemeral_store_embeds_every_page() -> None:
     assert await store.refresh_batch(items) == 2
     assert await store.refresh_batch(items) == 2
     assert len(embedder.texts) == 4
+
+
+@pytest.mark.parametrize("last", ["unchanged", "metadata", "text"])
+async def test_duplicate_page_ids_keep_only_the_last_requested_state(seeded, last) -> None:
+    store, embedder, items = seeded
+    stale = _item("a", content="Earlier input that should be superseded.")
+    final = {
+        "unchanged": items[0],
+        "metadata": _item("a", page_type="module_page"),
+        "text": _item("a", content="The final content."),
+    }[last]
+
+    embedded = await store.refresh_batch([stale, final])
+
+    assert embedded == int(last == "text")
+    assert embedder.texts == ([final[1]] if last == "text" else [])
+    row = (await store._table.query().where("page_id = 'a'").to_list())[0]
+    assert row["content_snippet"] == final[2]["content"]
+    assert row["page_type"] == final[2]["page_type"]

@@ -436,6 +436,9 @@ class LanceDBVectorStore(VectorStore):
         """
         if not items:
             return 0
+        # The final state of a page wins before splitting metadata rewrites
+        # from embeddings; otherwise an earlier stale value can overwrite it.
+        items = list({item[0]: item for item in items}.values())
         await self._ensure_connected()
         stored = await self._stored_rows([page_id for page_id, _text, _metadata in items])
         pending: list[tuple[str, str, dict]] = []
