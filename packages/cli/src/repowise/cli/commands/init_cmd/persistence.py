@@ -37,6 +37,7 @@ from repowise.core.index_scope import (
     stamp_index_scope,
 )
 from repowise.core.ingestion.git_indexer import GIT_HISTORY_VERSION, GIT_HISTORY_VERSION_KEY
+from repowise.core.pipeline.index_persistence import publish_index_persistence
 from repowise.core.repo_config import config_dependency_fingerprints
 
 logger = structlog.get_logger(__name__)
@@ -311,6 +312,7 @@ async def persist_result(
     # stopped short of them reported a different span per run mode.
     if progress is not None:
         progress.on_phase_done("persist")
+    await publish_index_persistence(repo.id, repo_path)
 
 
 # ---------------------------------------------------------------------------

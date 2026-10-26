@@ -64,6 +64,24 @@ async def _seed_repo_and_job(
 
 
 @pytest.mark.asyncio
+async def test_execute_job_publishes_index_records(session_factory, tmp_path):
+    job_id = await _seed_repo_and_job(session_factory, tmp_path)
+    app_state = SimpleNamespace(session_factory=session_factory, fts=None, vector_store=None)
+    publish = AsyncMock(side_effect=RuntimeError("publish failed"))
+    with (
+        patch("repowise.server.job_executor.run_pipeline", AsyncMock(return_value=_fake_result())),
+        patch("repowise.server.job_executor.persist_pipeline_result", AsyncMock()),
+        patch("repowise.server.job_executor.publish_index_persistence", publish),
+        patch("repowise.server.provider_config.get_chat_provider_instance", return_value=None),
+    ):
+        await execute_job(job_id, app_state)
+    async with session_factory() as session:
+        job = await get_generation_job(session, job_id)
+    publish.assert_awaited_once_with(job.repository_id, tmp_path)
+    assert (job.status, job.error_message) == ("failed", "publish failed")
+
+
+@pytest.mark.asyncio
 async def test_execute_job_passes_exclude_patterns_from_settings(session_factory, tmp_path):
     """settings_json exclude_patterns must reach run_pipeline."""
     job_id = await _seed_repo_and_job(

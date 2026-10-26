@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from repowise.core.ingestion.git_indexer._constants import _DEFAULT_COMMIT_LIMIT
+from repowise.core.pipeline.index_persistence import publish_index_persistence
 
 
 async def index_repo_full(
@@ -140,4 +141,5 @@ async def index_repo_full(
 
         save_knowledge_graph_json(repo_path, kg)
 
+    await publish_index_persistence(repo.id, repo_path)
     return result

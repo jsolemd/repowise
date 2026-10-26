@@ -25,6 +25,7 @@ from repowise.core.pipeline.incremental.persist_index import (
     persist_git,
     persist_health,
     persist_knowledge_graph,
+    persist_plugin_records,
     persist_security,
     persist_symbols,
     prune_deleted,
@@ -33,6 +34,7 @@ from repowise.core.pipeline.incremental.persist_index import (
     reconcile_scope,
     sweep_retired,
 )
+from repowise.core.pipeline.index_persistence import publish_index_persistence
 from repowise.core.pipeline.phase_timing import timed
 from repowise.core.pipeline.step_runner import Step, run_steps
 
@@ -381,6 +383,7 @@ FULL_UPDATE_STEPS: tuple[Step, ...] = (
     Step("Generation job record", record_generation_job),
     Step("Page count", count_pages),
     Step("Config rebuild check", check_config_rebuild, guarded=False),
+    Step("Plugin records", persist_plugin_records, guarded=False),
 )
 
 
@@ -490,9 +493,10 @@ async def write_full_update(ctx: FullUpdatePersist) -> int:
             await refresh_commit_health_after_update(sf, ctx.repo_id, str(ctx.repo_path))
         with timed(timings, "persist.planner_stats"):
             await refresh_planner_stats(ctx.engine)
-        return ctx.total_pages
     finally:
         await ctx.engine.dispose()
+    await publish_index_persistence(ctx.repo_id, Path(ctx.repo_path))
+    return ctx.total_pages
 
 
 __all__ = [

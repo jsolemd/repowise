@@ -215,6 +215,7 @@ module in the last column and call `.register(name, impl)`, for example
 | Seam | Registry object | One or every | When it runs | On failure | Defined in |
 |------|-----------------|--------------|--------------|------------|------------|
 | `event-sink` | `event_sinks` | every sink named in `events.sinks` (default: the seam default, `jsonl`) | after an index run stores component events | logged; the events stay in the store | `packages/core/src/repowise/core/events/sinks.py` |
+| `index-persistence` | `index_persistence` | every | `apply` inside the index write's transaction, before commit; `publish` after commit and cleanup | an `apply` failure rolls back and propagates (the init checkpoint logs it and the final write retries); a `publish` failure propagates and the commit stays | `packages/core/src/repowise/core/pipeline/index_persistence.py` |
 | `report-section` | `report_sections` | every | `repowise report` builds a document | the section becomes one inconclusive item marked `failed`; other sections run | `packages/core/src/repowise/core/report/model.py` |
 | `report-renderer` | `report_renderers` | one, chosen by `repowise report assessment --format` | when a report is written | propagates | `packages/core/src/repowise/core/report/render.py` |
 | `change-outcome` | `change_outcome_providers` | every | when a change record's outcomes are read | `OutcomeUnknownError` marks the outcome unknown; any other exception propagates | `packages/core/src/repowise/core/changes/outcomes.py` |

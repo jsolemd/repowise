@@ -13,6 +13,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from repowise.core.pipeline.index_persistence import (
+    IndexWrite,
+    apply_index_persistence,
+    publish_index_persistence,
+)
 from repowise.core.pipeline.phase_timing import PhaseTimings, timed
 from repowise.core.pipeline.step_runner import PersistRun, Step, run_steps
 
@@ -342,6 +347,23 @@ async def prune_deleted(ctx: IncrementalPersist) -> None:
     )
 
 
+async def persist_plugin_records(ctx: IncrementalPersist) -> None:
+    from repowise.core.pipeline.persist import tombstone_candidates
+
+    await apply_index_persistence(
+        ctx.session,
+        ctx.repo_id,
+        IndexWrite(
+            "incremental",
+            ctx.parsed_files,
+            changed_paths=tuple(ctx.changed_paths),
+            deleted_paths=tuple(path for path, _ in tombstone_candidates(ctx.file_diffs)),
+            traversal_complete=ctx.reconcile_full_scope,
+            failures=tuple(ctx.degraded or []),
+        ),
+    )
+
+
 def _has_git_input(ctx: IncrementalPersist) -> bool:
     return bool(ctx.git_meta_map or ctx.git_decay_map or ctx.full_git_summary is not None)
 
@@ -407,6 +429,8 @@ INCREMENTAL_STEPS: tuple[Step, ...] = (
     Step("Decision purge", purge_retired_decisions),
     # Reports its own failures, one sub-step at a time.
     Step("Deleted-file prune", prune_deleted, guarded=False),
+    # Unguarded and last: plugins see the final rows, and a raise rolls back the update.
+    Step("Plugin records", persist_plugin_records, guarded=False),
 )
 
 
@@ -665,3 +689,5 @@ async def _write(ctx: IncrementalPersist) -> None:
         await ctx.engine.dispose()
         if timings is not None:
             timings.stop("persist")
+
+    await publish_index_persistence(ctx.repo_id, Path(ctx.repo_path))
