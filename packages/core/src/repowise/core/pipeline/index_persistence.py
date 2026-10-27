@@ -4,6 +4,10 @@ Every implementation runs, in registration order. ``apply`` writes in the
 index transaction and must not commit; raising rolls back the whole write.
 ``publish`` runs after the commit and the writer's cleanup; its failure reaches
 the caller and the commit stays, so a plugin retries from what ``apply`` recorded.
+
+Writers that only refresh derived rows (health, git tier, module labels) do not
+run this seam. Deleting a repository does not run it either; plugin tables should
+reference ``repositories.id`` with ``ON DELETE CASCADE``.
 """
 
 from __future__ import annotations
@@ -19,12 +23,30 @@ from repowise.core.registry.plugins import SeamRegistry
 
 @dataclass(frozen=True)
 class IndexWrite:
-    mode: Literal["full", "incremental"]
+    mode: Literal["full", "incremental", "checkpoint"]
+    """``checkpoint`` is init's INDEX checkpoint, committed before analysis; the run's
+    final ``full`` write follows it, and no ``publish`` runs after it."""
+
     parsed_files: list[Any] | None
+    """The files that parsed. Not a presence list: a file that failed to read or parse
+    is missing here and still indexed. Read analysed values from *session*."""
+
     changed_paths: tuple[str, ...] = ()
+    """Incremental: the diff's paths, deleted ones included, or every parsed path
+    when ``traversed_paths`` is set."""
+
     deleted_paths: tuple[str, ...] = ()
-    traversal_complete: bool = False
-    failures: tuple[str, ...] = ()  # Degraded update steps; empty for full writes.
+    """Incremental: the paths whose rows this write deleted, by the liveness prune
+    or, on a health re-score, by the exclude patterns. A rename is its old path here
+    and its new path in ``changed_paths``."""
+
+    traversed_paths: frozenset[str] | None = None
+    """Every path the walk found, when the write covers the whole scope; None for a
+    partial write. A file outside it is out of the index, though ``git_metadata``
+    keeps a row for every tracked file, walked or not."""
+
+    degraded: tuple[str, ...] = ()
+    """Incremental: ``"<step>: <error>"`` for each thing this update skipped so far."""
 
 
 class IndexPersistence(Protocol):

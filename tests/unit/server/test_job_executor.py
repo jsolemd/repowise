@@ -13,13 +13,16 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from sqlalchemy import text
 
+from repowise.core.ingestion import GraphBuilder
 from repowise.core.persistence.crud import (
     get_generation_job,
     update_job_status,
     upsert_generation_job,
     upsert_repository,
 )
+from repowise.core.pipeline.index_persistence import index_persistence
 from repowise.server.job_executor import (
     JobProgressCallback,
     _build_generation_config,
@@ -64,21 +67,47 @@ async def _seed_repo_and_job(
 
 
 @pytest.mark.asyncio
-async def test_execute_job_publishes_index_records(session_factory, tmp_path):
+@pytest.mark.parametrize("failure", ["apply", "publish"])
+async def test_execute_job_index_transaction(
+    session_factory, test_engine, tmp_path, monkeypatch, failure
+):
+    monkeypatch.setattr(index_persistence, "_impls", {})
+    async with test_engine.begin() as conn:
+        await conn.execute(text("CREATE TABLE plugin_records (name TEXT)"))
     job_id = await _seed_repo_and_job(session_factory, tmp_path)
     app_state = SimpleNamespace(session_factory=session_factory, fts=None, vector_store=None)
     publish = AsyncMock(side_effect=RuntimeError("publish failed"))
+
+    async def apply(session, repo_id, write):
+        assert await session.scalar(text("SELECT COUNT(*) FROM git_metadata")) == 1
+        await session.execute(text("INSERT INTO plugin_records VALUES ('job')"))
+        if failure == "apply":
+            raise RuntimeError("apply failed")
+
+    index_persistence.register("test", SimpleNamespace(apply=apply, publish=publish))
+    result = _fake_result()
+    result.file_infos = []
+    result.graph_builder = GraphBuilder(tmp_path)
+    result.git_metadata_list = [{"file_path": "new.py"}]
+    result.dead_code_report = result.decision_report = result.execution_flow_report = None
     with (
-        patch("repowise.server.job_executor.run_pipeline", AsyncMock(return_value=_fake_result())),
-        patch("repowise.server.job_executor.persist_pipeline_result", AsyncMock()),
-        patch("repowise.server.job_executor.publish_index_persistence", publish),
+        patch("repowise.server.job_executor.run_pipeline", AsyncMock(return_value=result)),
         patch("repowise.server.provider_config.get_chat_provider_instance", return_value=None),
     ):
         await execute_job(job_id, app_state)
     async with session_factory() as session:
         job = await get_generation_job(session, job_id)
-    publish.assert_awaited_once_with(job.repository_id, tmp_path)
-    assert (job.status, job.error_message) == ("failed", "publish failed")
+        assert await session.scalar(text("SELECT COUNT(*) FROM git_metadata")) == (
+            0 if failure == "apply" else 1
+        )
+        assert await session.scalar(text("SELECT COUNT(*) FROM plugin_records")) == (
+            0 if failure == "apply" else 1
+        )
+    if failure == "apply":
+        publish.assert_not_awaited()
+    else:
+        publish.assert_awaited_once_with(job.repository_id, tmp_path)
+    assert (job.status, job.error_message) == ("failed", f"{failure} failed")
 
 
 @pytest.mark.asyncio

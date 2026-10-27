@@ -196,7 +196,7 @@ class ResumeController:
                     await apply_index_persistence(
                         session,
                         self._repo_id,
-                        IndexWrite("full", parsed_files, traversal_complete=True),
+                        IndexWrite("checkpoint", parsed_files),
                     )
         except Exception as exc:
             logger.warning("resume_checkpoint_index_failed", error=str(exc))

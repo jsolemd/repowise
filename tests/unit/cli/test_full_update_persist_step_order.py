@@ -90,7 +90,6 @@ HAPPY_ORDER = [
     "finalize_performance_opportunities",
     "finalize_refactoring_opportunities",
     "upsert_generation_job",
-    "tombstone_candidates",
     # After the session closes.
     "fts.ensure_index",
     "fts.index_pages",
@@ -261,7 +260,6 @@ async def test_every_failing_step_degrades_in_order(repo, monkeypatch):
         "_analyzed_commit",
         "finalize_performance_opportunities",
         "upsert_generation_job",
-        "tombstone_candidates",
         "fts.ensure_index",
         "vectors.delete_many",
         "refresh_commit_health_after_update",

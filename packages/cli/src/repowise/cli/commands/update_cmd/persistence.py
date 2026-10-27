@@ -30,6 +30,11 @@ from repowise.cli.helpers import (
 )
 from repowise.core.ingestion.git_indexer import GIT_HISTORY_VERSION, GIT_HISTORY_VERSION_KEY
 from repowise.core.pipeline import PhaseTimings, timed
+from repowise.core.pipeline.index_persistence import (
+    IndexWrite,
+    apply_index_persistence,
+    publish_index_persistence,
+)
 
 from .incremental import _build_repo_graph
 
@@ -1174,6 +1179,12 @@ async def _rescore_health_from_db(
                     ),
                     provenance=coverage.provenance,
                 )
+            await apply_index_persistence(
+                session,
+                repo_id,
+                IndexWrite("incremental", parsed_files, deleted_paths=tuple(excluded_git_paths)),
+            )
+        await publish_index_persistence(repo_id, repo_path)
 
     await _rescore()
 

@@ -233,6 +233,10 @@ async def persist_pipeline_result(
         git_files=len(result.git_metadata_list),
     )
     await apply_index_persistence(
-        session, repo_id, IndexWrite("full", result.parsed_files, traversal_complete=True)
+        session,
+        repo_id,
+        IndexWrite(
+            "full", result.parsed_files, traversed_paths=frozenset(current_graph_file_paths)
+        ),
     )
     return swept_page_ids

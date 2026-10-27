@@ -277,6 +277,7 @@ async def prune_deleted_file_rows(
     repo_path: Any,
     *,
     live_hint: set[str] | None = None,
+    pruned: set[str] | None = None,
 ) -> tuple[int, list[str]]:
     """Delete file-scoped rows for files that are gone, on an incremental update.
 
@@ -447,4 +448,6 @@ async def prune_deleted_file_rows(
     # question is the only authority available here too.
     await _prune_table(GitMetadata, GitMetadata.file_path, "git_metadata", git_liveness)
 
+    if pruned is not None:
+        pruned.update(deleted)
     return len(deleted), refusals

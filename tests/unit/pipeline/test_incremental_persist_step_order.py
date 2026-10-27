@@ -54,7 +54,6 @@ HAPPY_ORDER = [
     "_analyzed_commit",
     "finalize_performance_opportunities",
     "finalize_refactoring_opportunities",
-    "tombstone_candidates",
     # After the session closes.
     "refresh_commit_health_after_update",
     "fts.ensure_index",
@@ -175,7 +174,6 @@ async def test_every_failing_step_degrades_and_only_range_scoped_ones_are_marked
         "prune_deleted_file_rows",
         "_analyzed_commit",
         "finalize_performance_opportunities",
-        "tombstone_candidates",
         "refresh_commit_health_after_update",
         "fts.ensure_index",
         "vectors.delete_many",

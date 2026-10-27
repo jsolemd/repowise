@@ -37,7 +37,11 @@ from repowise.core.index_scope import (
     stamp_index_scope,
 )
 from repowise.core.ingestion.git_indexer import GIT_HISTORY_VERSION, GIT_HISTORY_VERSION_KEY
-from repowise.core.pipeline.index_persistence import publish_index_persistence
+from repowise.core.pipeline.index_persistence import (
+    IndexWrite,
+    apply_index_persistence,
+    publish_index_persistence,
+)
 from repowise.core.repo_config import config_dependency_fingerprints
 
 logger = structlog.get_logger(__name__)
@@ -227,6 +231,15 @@ async def persist_result(
                 result.generated_pages,
                 getattr(result, "authoritative_page_types", None),
                 getattr(result, "preserved_page_ids", None),
+            )
+            await apply_index_persistence(
+                session,
+                repo.id,
+                IndexWrite(
+                    "full",
+                    result.parsed_files,
+                    traversed_paths=frozenset(fi.path for fi in result.file_infos),
+                ),
             )
         else:
             swept_page_ids = await persist_pipeline_result(result, session, repo.id)
