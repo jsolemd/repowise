@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from collections.abc import Collection, Iterable, Mapping, Sequence
+    from collections.abc import Collection, Coroutine, Iterable, Mapping, Sequence
 
     from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -313,7 +313,7 @@ class WorkspaceIndex:
         try:
             opened = await asyncio.gather(*tasks, return_exceptions=True)
         except asyncio.CancelledError:
-            await _close_opened(tasks)
+            await _run_to_end(_close_opened(tasks))
             raise
         for (alias, _path), index in zip(todo, opened, strict=True):
             if isinstance(index, BaseException):
@@ -337,28 +337,41 @@ async def _close_index_db(session: AsyncSession, engine: Any) -> None:
         finally:
             await engine.dispose()
 
-    task = asyncio.create_task(close())
-    try:
-        await asyncio.shield(task)
-    except asyncio.CancelledError:
+    await _run_to_end(close())
+
+
+async def _run_to_end(cleanup: Coroutine[Any, Any, None]) -> None:
+    """Finish *cleanup* however often the caller is cancelled, then re-raise.
+
+    A shield holds off one cancellation. An anyio cancel scope, which MCP tool
+    calls run under, cancels again on every pass of the loop, and the next one
+    would reach the cleanup and leave its connection checked out.
+    """
+    task = asyncio.create_task(cleanup)
+    cancelled: asyncio.CancelledError | None = None
+    while not task.done():
         try:
-            await task
-        except Exception:
-            _log.warning("Error closing index database", exc_info=True)
-        raise
+            # asyncio.wait never cancels the task it waits on.
+            await asyncio.wait({task})
+        except asyncio.CancelledError as exc:
+            cancelled = cancelled or exc
+    if cancelled is None:
+        return task.result()
+    if not task.cancelled() and task.exception() is not None:
+        _log.warning("Error closing index database", exc_info=task.exception())
+    raise cancelled
 
 
 async def _close_opened(tasks: list[asyncio.Task[RepoIndex | None]]) -> None:
-    """A cancelled ensure returns only after its opens settle, because an open
-    that finishes later would hold its connection with no owner.
+    """gather settles every open before it re-raises a cancellation, so each
+    index that opened is closed here and none finishes later with no owner.
     """
-    for task in tasks:
-        if not task.done():
-            task.cancel()
-    settled = await asyncio.shield(asyncio.gather(*tasks, return_exceptions=True))
-    for result in settled:
+    for result in await asyncio.gather(*tasks, return_exceptions=True):
         if result is not None and not isinstance(result, BaseException):
-            await result.close()
+            try:
+                await result.close()
+            except Exception:
+                _log.warning("Error closing index for '%s'", result.alias, exc_info=True)
 
 
 async def checkout_repository(session: AsyncSession, repo_path: Path) -> Any:

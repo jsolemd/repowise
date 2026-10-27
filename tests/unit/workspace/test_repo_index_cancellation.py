@@ -45,6 +45,9 @@ async def test_cancelled_cleanup_returns_connection(tmp_path, monkeypatch, opera
     try:
         await closing.wait()
         task.cancel()
+        await asyncio.sleep(0)
+        # An anyio cancel scope cancels again on every pass of the loop.
+        task.cancel()
         resume.set()
         with pytest.raises(asyncio.CancelledError):
             await task
@@ -78,29 +81,59 @@ async def test_cancelled_close_preserves_cancellation_when_session_close_fails()
     assert disposed
 
 
-async def test_cancelled_workspace_open_closes_already_opened_siblings(tmp_path, monkeypatch):
-    index = await make_repo_index(tmp_path / "alpha", {})
+@pytest.mark.parametrize("close_fails", [False, True])
+async def test_cancelled_workspace_open_closes_already_opened_siblings(
+    tmp_path, monkeypatch, close_fails
+):
+    indexes = {
+        alias: await make_repo_index(tmp_path / alias, {}, alias=alias)
+        for alias in ("alpha", "beta")
+    }
     returned = []
-    event.listen(index._engine.sync_engine, "checkin", lambda c, r: returned.append(True))
-    first_ready = asyncio.Event()
-    second_started = asyncio.Event()
+    for alias, index in indexes.items():
+        event.listen(
+            index._engine.sync_engine,
+            "checkin",
+            lambda c, r, alias=alias: returned.append(alias),
+        )
+    original_close = indexes["alpha"].session.close
+    closing, resume = asyncio.Event(), asyncio.Event()
+
+    async def block_close():
+        closing.set()
+        await resume.wait()
+        if close_fails:
+            raise RuntimeError("close failed")
+        await original_close()
+
+    monkeypatch.setattr(indexes["alpha"].session, "close", block_close)
+    ready = {alias: asyncio.Event() for alias in indexes}
+    third_started = asyncio.Event()
 
     async def open_index(alias, path):
-        if alias == "alpha":
-            first_ready.set()
-            return index
-        second_started.set()
+        if alias in indexes:
+            ready[alias].set()
+            return indexes[alias]
+        third_started.set()
         await asyncio.Event().wait()
 
     monkeypatch.setattr(module, "open_repo_index", open_index)
-    config = SimpleNamespace(repos=[SimpleNamespace(alias=a, path=a) for a in ("alpha", "beta")])
+    config = SimpleNamespace(
+        repos=[SimpleNamespace(alias=a, path=a) for a in ("alpha", "beta", "gamma")]
+    )
     task = asyncio.create_task(module.open_workspace_index(config, tmp_path))
     try:
-        await first_ready.wait()
-        await second_started.wait()
+        for opened in ready.values():
+            await opened.wait()
+        await third_started.wait()
         task.cancel()
+        await asyncio.wait_for(closing.wait(), timeout=5)
+        task.cancel()
+        resume.set()
         with pytest.raises(asyncio.CancelledError):
             await task
-        assert returned
+        assert returned == (["beta"] if close_fails else ["alpha", "beta"])
     finally:
-        await index.close()
+        monkeypatch.setattr(indexes["alpha"].session, "close", original_close)
+        for index in indexes.values():
+            await index.close()
