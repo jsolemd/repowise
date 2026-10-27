@@ -118,10 +118,9 @@ async def test_cancelled_workspace_open_closes_already_opened_siblings(
         await asyncio.Event().wait()
 
     monkeypatch.setattr(module, "open_repo_index", open_index)
-    config = SimpleNamespace(
-        repos=[SimpleNamespace(alias=a, path=a) for a in ("alpha", "beta", "gamma")]
-    )
-    task = asyncio.create_task(module.open_workspace_index(config, tmp_path))
+    openable = {alias: tmp_path / alias for alias in ("alpha", "beta", "gamma")}
+    workspace = module.WorkspaceIndex({}, openable)
+    task = asyncio.create_task(workspace.ensure(openable))
     try:
         for opened in ready.values():
             await opened.wait()
@@ -133,6 +132,17 @@ async def test_cancelled_workspace_open_closes_already_opened_siblings(
         with pytest.raises(asyncio.CancelledError):
             await task
         assert returned == (["beta"] if close_fails else ["alpha", "beta"])
+        reopened = {}
+
+        async def reopen_index(alias, path):
+            reopened[alias] = object()
+            return reopened[alias]
+
+        monkeypatch.setattr(module, "open_repo_index", reopen_index)
+        await workspace.ensure(openable)
+        assert reopened.keys() == openable.keys()
+        for alias in openable:
+            assert workspace.get(alias) is reopened[alias]
     finally:
         monkeypatch.setattr(indexes["alpha"].session, "close", original_close)
         for index in indexes.values():

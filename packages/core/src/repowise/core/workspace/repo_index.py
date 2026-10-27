@@ -313,6 +313,8 @@ class WorkspaceIndex:
         try:
             opened = await asyncio.gather(*tasks, return_exceptions=True)
         except asyncio.CancelledError:
+            # Restore aliases before cleanup can re-raise a repeated cancellation.
+            self._openable.update(todo)
             await _run_to_end(_close_opened(tasks))
             raise
         for (alias, _path), index in zip(todo, opened, strict=True):
