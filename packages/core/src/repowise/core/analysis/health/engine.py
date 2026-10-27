@@ -69,7 +69,11 @@ from .refactoring import (
     performance_fix_suggestions,
     rank_suggestions,
 )
-from .refactoring.graph_signals import build_file_scc_index, build_methods_by_file
+from .refactoring.graph_signals import (
+    build_file_scc_index,
+    build_methods_by_file,
+    build_split_partial_types,
+)
 from .repo_tests import RepoTestIndex
 from .repo_tests import _has_paired_test_file as _has_paired_test_file
 from .repo_tests import _path_basenames as _path_basenames
@@ -102,16 +106,14 @@ log = structlog.get_logger(__name__)
 # Not a licence to move a calibrated scoring weight — those are frozen
 # independently of this stamp.
 #
-# v43: the code-origin classifier moved for several path shapes: a nested
-# ``tools/`` folder is production (only a repo-root or engineering ``tools/``
-# stays tooling), Python ``_vendor/`` folders and Salesforce static-resource
-# libraries read as vendored, and prefixed migration folders under ``db/`` read
-# as migrations. Stored origins decide health and dead-code scope, so those
-# files re-score.
+# v44: ternary dispatch chains in Java, C, C++, C#, Dart, Objective-C and PHP
+# keep each decision but do not add nesting for their else-arms, matching
+# Python and JS/TS. Re-score stored metrics and invalidate cached walks so
+# old false nested-complexity findings do not survive the new language maps.
 #
 # Earlier bumps and their reasons: ``git log -S"HEALTH_ANALYZER_VERSION =" -p``
 # on this file.
-HEALTH_ANALYZER_VERSION = 43
+HEALTH_ANALYZER_VERSION = 44
 
 
 def _log_duplication_diagnostics(report: DuplicationReport) -> None:
@@ -706,6 +708,7 @@ class HealthAnalyzer:
             active_contributors=_compute_repo_active_contributors(self.git_meta_map),
             file_scc_index=build_file_scc_index(self.graph),
             methods_by_file=build_methods_by_file(self.graph),
+            split_partial_types=build_split_partial_types(self.graph),
             dataflow_cache=dataflow_cache,
             function_tests=function_tests,
             paired_test_files=paired_test_index(self.test_index.all_test_files()),

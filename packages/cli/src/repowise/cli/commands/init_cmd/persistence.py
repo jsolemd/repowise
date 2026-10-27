@@ -238,7 +238,6 @@ async def persist_result(
                 IndexWrite(
                     "full",
                     result.parsed_files,
-                    traversed_paths=frozenset(fi.path for fi in result.file_infos),
                 ),
             )
         else:

@@ -41,9 +41,9 @@ class IndexWrite:
     and its new path in ``changed_paths``."""
 
     traversed_paths: frozenset[str] | None = None
-    """Every path the walk found, when the write covers the whole scope; None for a
-    partial write. A file outside it is out of the index, though ``git_metadata``
-    keeps a row for every tracked file, walked or not."""
+    """The paths the walk found, when core reconciled the index against them on this
+    write; None otherwise. ``git_metadata`` keeps a row for every tracked file,
+    walked or not."""
 
     degraded: tuple[str, ...] = ()
     """Incremental: ``"<step>: <error>"`` for each thing this update skipped so far."""
