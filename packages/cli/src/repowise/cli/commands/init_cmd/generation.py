@@ -135,6 +135,7 @@ def concept_page_count(plans: list[Any]) -> int:
 # in the mode panel was the old state.
 _PAGE_TYPE_LABELS: tuple[tuple[str, str, str], ...] = (
     ("module_page", "Subsystem pages", "subsystem"),
+    ("flow_page", "Walkthrough pages", "walkthrough"),
     ("repo_overview", "Repo overview", "overview"),
     ("architecture_diagram", "Architecture diagram", "diagram"),
     ("onboarding", "Onboarding pages", "onboarding"),
@@ -142,7 +143,6 @@ _PAGE_TYPE_LABELS: tuple[tuple[str, str, str], ...] = (
     ("api_contract", "API contract pages", "API"),
     ("symbol_spotlight", "Symbol spotlights", "symbol"),
     ("scc_page", "Dependency cycle pages", "cycle"),
-    ("layer_page", "Layer pages", "layer"),
     ("infra_page", "Infrastructure pages", "infra"),
 )
 
@@ -318,6 +318,10 @@ def run_repo_generation(
     generation wrapper, enriches the KG, and flushes buffered cost rows in one
     transaction (kept out of the contended generation window, issue #326).
 
+    ``gen_config.reuse_prior_pages=False`` (``repowise init --force``) disables the
+    cross-run reuse gate so every page is regenerated, as the flag's help
+    text has always promised (issue #1089).
+
     Mutates ``result`` in place with ``generated_pages``, ``preserved_page_ids``
     (the pages a resumed run skipped, which persistence must not sweep) and
     ``vector_store``
@@ -421,6 +425,7 @@ def run_repo_generation(
                 progress=gen_callback,
                 resume=resume,
                 preserved_page_ids=preserved_page_ids,
+                reuse_prior_pages=getattr(gen_config, "reuse_prior_pages", True),
                 cost_tracker=cost_tracker,
                 generation_config=gen_config,
                 # In-memory curated modules: on a fresh init the

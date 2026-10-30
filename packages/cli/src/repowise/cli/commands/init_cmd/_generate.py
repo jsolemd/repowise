@@ -261,6 +261,7 @@ def _run_generation_phase(
     test_run: bool,
     timings: Any | None = None,
     warnings: list[str] | None = None,
+    reuse_prior_pages: bool = True,
     folder_coverage_rules: tuple[str, ...] = (),
 ) -> tuple[bool, bool]:
     """Run the LLM generation phase for a single-repo init.
@@ -269,6 +270,9 @@ def _run_generation_phase(
     and the caller should return immediately; ``cost_declined`` is True when the
     user declined the cost gate (generation skipped, index still saved). Mutates
     ``result`` in place with the generated pages, vector store, and enriched KG.
+
+    ``reuse_prior_pages=False`` is ``--force``: every page is regenerated
+    instead of reused from the prior run (issue #1089).
     """
     from repowise.core.generation import GenerationConfig
 
@@ -287,6 +291,7 @@ def _run_generation_phase(
         enable_onboarding=onboarding,
         wiki_style=wiki_style,
         max_file_pages=max_file_pages,
+        reuse_prior_pages=reuse_prior_pages,
         **folder_coverage_override(folder_coverage_rules),
     )
     plans, est = estimate_generation(
@@ -393,6 +398,9 @@ def _generate_with_model(run: InitRun) -> bool:
         warnings=run.run_warnings,
         test_run=opts.test_run,
         timings=run.recorder.table,
+        # ``--force`` regenerates every page: the reuse gate is off, so
+        # nothing is carried over from the prior run (issue #1089).
+        reuse_prior_pages=not opts.force,
     )
     if gen_stop:
         return True
